@@ -16,11 +16,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/irahardianto/pi-mcp.git"
+    "url": "git+https://github.com/irahardianto/pi-mcp-extension.git"
   },
-  "homepage": "https://github.com/irahardianto/pi-mcp",
+  "homepage": "https://github.com/irahardianto/pi-mcp-extension",
   "bugs": {
-    "url": "https://github.com/irahardianto/pi-mcp/issues"
+    "url": "https://github.com/irahardianto/pi-mcp-extension/issues"
   },
   "files": [
     "src/",

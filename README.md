@@ -1,11 +1,11 @@
-# pi-mcp
+# pi-mcp-extension
 
-[![npm version](https://img.shields.io/npm/v/pi-mcp.svg)](https://www.npmjs.com/package/pi-mcp)
-[![license](https://img.shields.io/npm/l/pi-mcp.svg)](https://github.com/irahardianto/pi-mcp/blob/main/LICENSE)
+[![npm version](https://img.shields.io/npm/v/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
+[![license](https://img.shields.io/npm/l/pi-mcp-extension.svg)](https://github.com/irahardianto/pi-mcp-extension/blob/main/LICENSE)
 
 **Connect [Pi](https://pi.dev) to any MCP server.** Supabase, DeepSource, Playwright, Context7, filesystem, databases — if it speaks [MCP](https://modelcontextprotocol.io), Pi can use it.
 
-`pi-mcp` is a production-ready [Model Context Protocol](https://modelcontextprotocol.io/) client extension for the [Pi coding agent](https://pi.dev). It manages server connections, discovers tools, and bridges them into Pi so the LLM can call them directly.
+`pi-mcp-extension` is a production-ready [Model Context Protocol](https://modelcontextprotocol.io/) client extension for the [Pi coding agent](https://pi.dev). It manages server connections, discovers tools, and bridges them into Pi so the LLM can call them directly.
 
 ## Features
 
@@ -25,20 +25,20 @@
 ## Installation
 
 ```bash
-pi install npm:pi-mcp
+pi install npm:pi-mcp-extension
 ```
 
 Or try without installing:
 
 ```bash
-pi -e npm:pi-mcp
+pi -e npm:pi-mcp-extension
 ```
 
 ## Quick Start
 
 1. Install the extension:
    ```bash
-   pi install npm:pi-mcp
+   pi install npm:pi-mcp-extension
    ```
 
 2. Create a config file at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (project-level):
