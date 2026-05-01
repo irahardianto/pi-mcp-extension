@@ -27,7 +27,7 @@ function makeMockConfig(overrides?: Partial<McpConfig>): McpConfig {
     mcpServers: {
       test: {
         command: "node",
-        args: ["--experimental-transform-types", MOCK_SERVER_PATH],
+        args: ["--import", "tsx/esm", MOCK_SERVER_PATH],
         transport: "stdio",
         lifecycle: "lazy",
         requestTimeoutMs: 5000,
