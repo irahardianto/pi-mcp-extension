@@ -1,0 +1,54 @@
+{
+  "name": "pi-mcp",
+  "version": "1.0.0",
+  "description": "MCP (Model Context Protocol) client extension for the Pi coding agent — connect Pi to any MCP server",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "mcp",
+    "model-context-protocol",
+    "pi",
+    "pi-extension",
+    "ai-agent",
+    "tool-bridge"
+  ],
+  "author": "irahardianto",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/irahardianto/pi-mcp.git"
+  },
+  "homepage": "https://github.com/irahardianto/pi-mcp",
+  "bugs": {
+    "url": "https://github.com/irahardianto/pi-mcp/issues"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx/esm --test ./tests/*.test.ts",
+    "test:integration": "node --import tsx/esm --test ./tests/server-manager.test.ts"
+  }
+}

@@ -1,0 +1,38 @@
+name: Publish npm Package
+
+on:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies (generate package-lock.json)
+        run: npm install
+
+      - name: Bump version and publish
+        uses: phips28/gh-action-bump-version@v10.0.3
+        id: version
+        with:
+          commit-message: 'chore: release v{{version}}'
+          patch-wording: 'fix, patch, bugfix, chore, docs, refactor, perf, test, ci'
+          minor-wording: 'feat, feature, add'
+          major-wording: 'BREAKING CHANGE, breaking'
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

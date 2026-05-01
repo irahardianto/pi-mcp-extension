@@ -1,0 +1,7 @@
+tests/
+.github/
+node_modules/
+*.test.ts
+tsconfig.json
+.gitignore
+.npmignore
