@@ -1,6 +1,6 @@
 {
   "name": "@irahardianto/pi-mcp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "MCP (Model Context Protocol) client extension for the Pi coding agent — connect Pi to any MCP server",
   "type": "module",
   "keywords": [
