@@ -10,6 +10,8 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Skip runs triggered by the automated version-bump commit to avoid infinite loops
+    if: "!contains(github.event.head_commit.message, 'chore: release v')"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,10 +22,16 @@ jobs:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Install dependencies (generate package-lock.json)
+      - name: Install dependencies
         run: npm install
 
-      - name: Bump version and publish
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Bump version and tag
         uses: phips28/gh-action-bump-version@v10.0.3
         id: version
         with:
