@@ -5,13 +5,15 @@ on:
     branches: [ main, master ]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:
@@ -27,15 +29,69 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Publish to npm (skip if version already exists)
+      - name: Determine version bump
+        id: bump
+        run: |
+          # Get the latest commit message(s) since last published version
+          # Check if there's a previous commit to compare against
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%s")
+          else
+            LOG=$(git log -1 --pretty=format:"%s")
+          fi
+
+          # Default to patch
+          BUMP="patch"
+
+          # Check for breaking change indicator
+          if echo "$LOG" | grep -qE "^[a-z]+(\(.+\))?!:|BREAKING CHANGE:"; then
+            BUMP="major"
+          # Check for feature commits
+          elif echo "$LOG" | grep -qE "^feat(\(.+\))?:"; then
+            BUMP="minor"
+          # Check for fix commits
+          elif echo "$LOG" | grep -qE "^fix(\(.+\))?:"; then
+            BUMP="patch"
+          fi
+
+          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
+          echo "Detected bump level: ${BUMP}"
+
+      - name: Bump version
+        id: version
+        run: |
+          # Bump the version in package.json (no commit, no tag yet)
+          OLD_VERSION=$(node -p "require('./package.json').version")
+          npm version ${{ steps.bump.outputs.bump }} --no-git-tag-version --allow-same-version
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumped ${OLD_VERSION} → ${NEW_VERSION}"
+
+      - name: Publish to npm
         run: |
           PACKAGE=$(node -p "require('./package.json').name")
           VERSION=$(node -p "require('./package.json').version")
           if npm view "${PACKAGE}@${VERSION}" version &>/dev/null; then
             echo "Version ${VERSION} already published — skipping."
+            echo "publish=false" >> "$GITHUB_ENV"
           else
             npm publish --access public
             echo "Published ${PACKAGE}@${VERSION}"
+            echo "publish=true" >> "$GITHUB_ENV"
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Commit version bump and tag
+        if: env.publish == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          VERSION=$(node -p "require('./package.json').version")
+          git add package.json
+          git commit -m "chore: release v${VERSION}"
+          git tag "v${VERSION}"
+          git push
+          git push --tags
