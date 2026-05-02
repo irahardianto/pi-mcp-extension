@@ -1,0 +1,85 @@
+// Example MCP server configuration for pi-mcp-extension
+// Copy this to ~/.pi/agent/mcp.json (global) or .pi/mcp.json (project)
+// and customize with your actual servers and credentials.
+//
+// IMPORTANT: Never commit your actual mcp.json with secrets/API keys.
+// The .pi/ directory should be in your .gitignore.
+{
+  "settings": {
+    "toolPrefix": "mcp",
+    "requestTimeoutMs": 30000,
+    "maxRetries": 5
+  },
+  "mcpServers": {
+    // ── HTTP-based servers (streamable-http) ───────────────────────────────
+    // Use "transport": "streamable-http" for:
+    // - Supabase (https://mcp.supabase.com)
+    // - DeepSource (https://mcp.deepsource.com)
+    // - Z.ai / other modern MCP HTTP servers
+    //
+    // COMMON PITFALLS TO AVOID:
+    // - Don't use "type": "http" — use "transport": "streamable-http"
+    // - Don't omit "transport" — default is "stdio" which requires "command"
+
+    "supabase": {
+      "transport": "streamable-http",
+      "url": "https://mcp.supabase.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_SUPABASE_ANON_KEY",
+        "x-project-id": "YOUR_PROJECT_ID"
+      },
+      "lifecycle": "eager"
+    },
+
+    "deepsource": {
+      "transport": "streamable-http",
+      "url": "https://mcp.deepsource.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_DEEPSOURCE_API_KEY"
+      },
+      "lifecycle": "eager"
+    },
+
+    "zai-web-search": {
+      "transport": "streamable-http",
+      "url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_ZAI_API_KEY"
+      },
+      "lifecycle": "eager"
+    },
+
+    // ── Legacy SSE servers ─────────────────────────────────────────────────
+    "legacy-sse-server": {
+      "transport": "sse",
+      "url": "https://example.com/mcp/sse",
+      "lifecycle": "lazy"
+    },
+
+    // ── stdio subprocess servers ───────────────────────────────────────────
+    // Use "transport": "stdio" (or omit, since it's the default) along with
+    // "command" and optionally "args" and "env" for subprocess-based servers.
+
+    "pathfinder": {
+      "transport": "stdio",
+      "command": "pathfinder-mcp",
+      "args": ["/path/to/your/project"],
+      "lifecycle": "eager"
+    },
+
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@context7/mcp"],
+      "env": {
+        "CONTEXT7_API_KEY": "YOUR_API_KEY"
+      },
+      "lifecycle": "lazy"
+    },
+
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+      "lifecycle": "lazy"
+    }
+  }
+}
