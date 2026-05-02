@@ -10,8 +10,28 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { ServerManager } from "./server-manager.js";
+import type { TransportAuthCallbacks } from "./server-manager.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError } from "./errors.js";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+
+const execAsync = promisify(exec);
+
+/**
+ * Open a URL in the user's default browser.
+ * Works on macOS, Linux, and Windows.
+ */
+function openBrowser(url: string): void {
+  const cmd = process.platform === "darwin"
+    ? `open "${url}"`
+    : process.platform === "win32"
+      ? `start "" "${url}"`
+      : `xdg-open "${url}"`;
+  exec(cmd, (err) => {
+    if (err) console.error(`[pi-mcp] Failed to open browser: ${err.message}`);
+  });
+}
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   // ── 1. Load and validate config ──────────────────────────────────────────
@@ -35,7 +55,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   // ── 2. Initialize bridge components ──────────────────────────────────────
-  const manager = new ServerManager(config);
+  // Auth callbacks — opens browser and notifies user when OAuth is needed
+  const authCallbacks: TransportAuthCallbacks = {
+    onAuthRequired: (serverName: string, authorizationUrl: URL): void => {
+      console.error(
+        `[pi-mcp] OAuth required for "${serverName}". Opening browser for authorization...`,
+      );
+      openBrowser(authorizationUrl.toString());
+    },
+  };
+
+  const manager = new ServerManager(config, authCallbacks);
   const bridge = new ToolBridge(config.settings, pi);
 
   // Connect tool refresh callback: called on connect and on list_changed

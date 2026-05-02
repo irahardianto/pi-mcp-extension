@@ -17,6 +17,28 @@ import { McpError } from "./errors.js";
 
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
+const AuthConfigSchema = z.object({
+  /** Auth type. Currently only "oauth" is supported. Default: "oauth". */
+  type: z.enum(["oauth"]).default("oauth"),
+  /**
+   * Callback URL for the OAuth redirect.
+   * Default: auto-detected local callback server.
+   */
+  redirectUrl: z.string().optional(),
+  /**
+   * Optional scope to request during authorization.
+   */
+  scope: z.string().optional(),
+  /**
+   * Pre-registered client_id (skip dynamic client registration).
+   */
+  clientId: z.string().optional(),
+  /**
+   * Pre-registered client_secret.
+   */
+  clientSecret: z.string().optional(),
+});
+
 const ServerConfigSchema = z
   .object({
     /** Executable to spawn (e.g. "npx", "node", "uvx"). Required for stdio. */
@@ -36,6 +58,19 @@ const ServerConfigSchema = z
      * Must be a valid URL (e.g. "https://my-mcp-server.example.com/mcp").
      */
     url: z.string().url().optional(),
+    /**
+     * Static HTTP headers to include with every request (streamable-http / sse only).
+     * Useful for API-key-based auth (e.g. { "Authorization": "Bearer <key>" }).
+     * For OAuth2, use the "auth" field instead.
+     */
+    headers: z.record(z.string()).optional(),
+    /**
+     * OAuth2 configuration for servers that require authorization.
+     * When set, the transport will use the SDK's OAuth flow (discovery,
+     * dynamic client registration, PKCE, token refresh).
+     * Only applies to streamable-http and sse transports.
+     */
+    auth: AuthConfigSchema.optional(),
     /**
      * "eager" — start at session_start.
      * "lazy"  — start manually via /mcp:start command.
@@ -85,6 +120,7 @@ const McpConfigSchema = z.object({
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
+export type AuthConfig = z.output<typeof AuthConfigSchema>;
 export type ServerConfig = z.output<typeof ServerConfigSchema>;
 export type Settings = z.output<typeof SettingsSchema>;
 export type McpConfig = z.output<typeof McpConfigSchema>;

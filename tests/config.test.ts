@@ -211,4 +211,93 @@ describe("loadConfig", () => {
       );
     });
   });
+
+  it("loads server config with static headers", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          api: {
+            transport: "streamable-http",
+            url: "https://api.example.com/mcp",
+            headers: {
+              "Authorization": "Bearer my-api-key",
+              "X-Custom": "value",
+            },
+          },
+        },
+      });
+      const cfg = await loadConfig(dir);
+      const server = cfg.mcpServers["api"]!;
+      assert.ok(server);
+      assert.equal(server.headers?.["Authorization"], "Bearer my-api-key");
+      assert.equal(server.headers?.["X-Custom"], "value");
+    });
+  });
+
+  it("loads server config with OAuth auth", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          deepsource: {
+            transport: "streamable-http",
+            url: "https://mcp.deepsource.com/mcp",
+            auth: {
+              type: "oauth",
+            },
+          },
+        },
+      });
+      const cfg = await loadConfig(dir);
+      const server = cfg.mcpServers["deepsource"]!;
+      assert.ok(server);
+      assert.ok(server.auth);
+      assert.equal(server.auth.type, "oauth");
+    });
+  });
+
+  it("loads server config with OAuth auth and static credentials", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          custom: {
+            transport: "streamable-http",
+            url: "https://custom.example.com/mcp",
+            auth: {
+              type: "oauth",
+              clientId: "my-client-id",
+              clientSecret: "my-client-secret",
+              redirectUrl: "http://localhost:8080/callback",
+              scope: "read write",
+            },
+          },
+        },
+      });
+      const cfg = await loadConfig(dir);
+      const server = cfg.mcpServers["custom"]!;
+      assert.ok(server.auth);
+      assert.equal(server.auth.clientId, "my-client-id");
+      assert.equal(server.auth.clientSecret, "my-client-secret");
+      assert.equal(server.auth.redirectUrl, "http://localhost:8080/callback");
+      assert.equal(server.auth.scope, "read write");
+    });
+  });
+
+  it("loads server config with both headers and auth", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          dual: {
+            transport: "streamable-http",
+            url: "https://dual.example.com/mcp",
+            headers: { "X-Api-Key": "key123" },
+            auth: { type: "oauth" },
+          },
+        },
+      });
+      const cfg = await loadConfig(dir);
+      const server = cfg.mcpServers["dual"]!;
+      assert.ok(server.headers);
+      assert.ok(server.auth);
+    });
+  });
 });

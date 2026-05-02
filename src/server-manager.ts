@@ -23,7 +23,9 @@ import {
   LoggingMessageNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "./errors.js";
-import type { McpConfig, ServerConfig, Settings } from "./config.js";
+import type { McpConfig, ServerConfig, Settings, AuthConfig } from "./config.js";
+import { McpOAuthProvider } from "./oauth-provider.js";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -54,12 +56,36 @@ export interface ManagedServer {
 /** Called after tool list is refreshed for a server (e.g. on list_changed notification). */
 export type ToolRefreshCallback = (serverName: string, client: Client) => Promise<void>;
 
+export interface TransportAuthCallbacks {
+  /** Called when OAuth authorization is required (browser redirect needed). */
+  onAuthRequired: (serverName: string, authorizationUrl: URL) => void | Promise<void>;
+}
+
 // ─── Transport Factory ────────────────────────────────────────────────────────
 
 function createTransport(
+  serverName: string,
   config: ServerConfig,
   onStderr: (line: string) => void,
+  authCallbacks?: TransportAuthCallbacks,
 ): Transport {
+  // Build requestInit for static headers (API keys, etc.)
+  const requestInit: RequestInit | undefined = config.headers
+    ? { headers: config.headers }
+    : undefined;
+
+  // Build OAuth authProvider if auth config is present
+  let authProvider: OAuthClientProvider | undefined;
+  if (config.auth && config.transport !== "stdio") {
+    authProvider = new McpOAuthProvider(
+      serverName,
+      config.auth,
+      authCallbacks
+        ? (url: URL) => authCallbacks.onAuthRequired(serverName, url)
+        : undefined,
+    );
+  }
+
   switch (config.transport) {
     case "stdio": {
       // Build clean env: process.env may contain undefined values,
@@ -83,11 +109,21 @@ function createTransport(
       return transport;
     }
     case "streamable-http":
-      // Cast needed: exactOptionalPropertyTypes conflicts with sessionId?: string vs string
-      return new StreamableHTTPClientTransport(new URL(config.url!)) as unknown as Transport;
+      return new StreamableHTTPClientTransport(
+        new URL(config.url!),
+        {
+          ...(requestInit && { requestInit }),
+          ...(authProvider && { authProvider }),
+        },
+      ) as unknown as Transport;
     case "sse":
-      // Legacy HTTP+SSE transport (2024-11-05 spec) — backwards compatibility
-      return new SSEClientTransport(new URL(config.url!));
+      return new SSEClientTransport(
+        new URL(config.url!),
+        {
+          ...(requestInit && { requestInit }),
+          ...(authProvider && { authProvider }),
+        },
+      );
   }
 }
 
@@ -98,8 +134,11 @@ export class ServerManager {
   private settings: Settings;
   private onToolRefresh: ToolRefreshCallback | null = null;
 
-  constructor(config: McpConfig) {
+  private authCallbacks: TransportAuthCallbacks | undefined;
+
+  constructor(config: McpConfig, authCallbacks?: TransportAuthCallbacks) {
     this.settings = config.settings;
+    this.authCallbacks = authCallbacks;
     for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
       this.servers.set(name, {
         name,
@@ -227,7 +266,7 @@ export class ServerManager {
 
     let transport: Transport;
     try {
-      transport = createTransport(server.config, appendStderr);
+      transport = createTransport(server.name, server.config, appendStderr, this.authCallbacks);
     } catch (err) {
       server.state = "stopped";
       server.lastError = err instanceof Error ? err : new Error(String(err));
