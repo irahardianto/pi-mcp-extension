@@ -276,3 +276,41 @@ export class McpOAuthProvider implements OAuthClientProvider {
     await saveState(this.serverName, state);
   }
 }
+
+// ─── Public Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Get auth status info for a server — whether tokens exist, when they were saved, etc.
+ * Returns null if no auth state file exists at all.
+ */
+export async function getAuthStatus(serverName: string): Promise<{
+  hasTokens: boolean;
+  hasClientInfo: boolean;
+  savedAt: string | undefined;
+  scope: string | undefined;
+} | null> {
+  const state = await loadState(serverName);
+  if (
+    state.clientInfo === undefined &&
+    state.tokens === undefined &&
+    state.codeVerifier === undefined &&
+    state.discoveryState === undefined
+  ) {
+    return null;
+  }
+  return {
+    hasTokens: state.tokens !== undefined,
+    hasClientInfo: state.clientInfo !== undefined,
+    savedAt: state.tokens?.saved_at,
+    scope: state.tokens?.scope,
+  };
+}
+
+/**
+ * Reset all OAuth state for a server (tokens, client info, PKCE verifier, discovery).
+ * Used to force re-authorization on next connection.
+ */
+export async function resetAuth(serverName: string): Promise<void> {
+  const provider = new McpOAuthProvider(serverName, {});
+  await provider.invalidateCredentials("all");
+}

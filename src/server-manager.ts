@@ -24,7 +24,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings, AuthConfig } from "./config.js";
-import { McpOAuthProvider } from "./oauth-provider.js";
+import { McpOAuthProvider, getAuthStatus, resetAuth } from "./oauth-provider.js";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -183,6 +183,21 @@ export class ServerManager {
     });
     const ready = all.filter((s) => s.state === "ready").length;
     return [`MCP: ${ready}/${all.length} servers ready`, ...lines].join("\n");
+  }
+
+  /** Reset OAuth credentials for a server, forcing re-authorization on next connect. */
+  async resetServerAuth(name: string): Promise<void> {
+    await resetAuth(name);
+  }
+
+  /** Get auth status for a server. */
+  async getServerAuthStatus(name: string): Promise<{
+    hasTokens: boolean;
+    hasClientInfo: boolean;
+    savedAt: string | undefined;
+    scope: string | undefined;
+  } | null> {
+    return getAuthStatus(name);
   }
 
   /** Get recent stderr output for a server. */

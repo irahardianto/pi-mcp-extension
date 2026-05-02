@@ -197,4 +197,82 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
     },
   });
+
+  // ── 7. /mcp:auth — trigger OAuth authentication for a server ────────────────
+  pi.registerCommand("mcp:auth", {
+    description:
+      "Trigger OAuth authentication for a server. Resets credentials and opens browser for re-authorization. Usage: /mcp:auth <server-name>",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const serverName = args.trim();
+      if (!serverName) {
+        // List servers with auth config
+        const authServers = manager.getAllServers().filter((s) => s.config.auth);
+        if (authServers.length === 0) {
+          ctx.ui.notify(
+            "pi-mcp: No servers with OAuth configured. Add `auth: { type: \"oauth\" }` to a server in mcp.json.",
+            "error",
+          );
+          return;
+        }
+        const lines = authServers.map(async (s) => {
+          const status = await manager.getServerAuthStatus(s.name);
+          const authIcon = status?.hasTokens ? "\u2705 authenticated" : "\u274C not authenticated";
+          const savedInfo = status?.savedAt ? ` (since ${status.savedAt})` : "";
+          return `  ${s.name}: ${authIcon}${savedInfo}`;
+        });
+        const statusLines = await Promise.all(lines);
+        ctx.ui.notify(
+          [
+            "Usage: /mcp:auth <server-name>",
+            "",
+            "OAuth-enabled servers:",
+            ...statusLines,
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+      const server = manager.getServer(serverName);
+      if (!server) {
+        ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
+        return;
+      }
+      if (!server.config.auth) {
+        ctx.ui.notify(
+          `pi-mcp: Server "${serverName}" does not have OAuth configured. Add \`auth: { type: "oauth" }\` to its config in mcp.json.`,
+          "error",
+        );
+        return;
+      }
+
+      try {
+        // Stop the server if running
+        if (server.state !== "stopped") {
+          bridge.deactivateServer(serverName);
+          await manager.stopServer(serverName);
+        }
+        // Reset all OAuth credentials (tokens, client info, PKCE, discovery)
+        await manager.resetServerAuth(serverName);
+        ctx.ui.notify(
+          `pi-mcp: Reset credentials for ${serverName}. Starting server — a browser window will open for authentication...`,
+          "info",
+        );
+        // Start the server — this triggers the OAuth flow and opens the browser
+        await manager.startServer(serverName, ctx.cwd);
+
+        const newStatus = await manager.getServerAuthStatus(serverName);
+        if (newStatus?.hasTokens) {
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+        } else {
+          ctx.ui.notify(
+            `pi-mcp: ${serverName} started but authentication may still be in progress. Check the browser window.`,
+            "info",
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof McpError ? err.userMessage : String(err);
+        ctx.ui.notify(`pi-mcp: Authentication failed for ${serverName} — ${msg}`, "error");
+      }
+    },
+  });
 }
