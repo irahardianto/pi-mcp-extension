@@ -103,15 +103,68 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.ok(typeof schema === "object");
   });
 
-  it("falls back to Any for oneOf", () => {
+  it("converts oneOf to Union", () => {
     const schema = convertJsonSchemaToTypebox({
       oneOf: [{ type: "string" }, { type: "number" }],
     }) as any;
+    assert.ok(schema.anyOf, "oneOf should produce a Union (anyOf)");
+    assert.equal(schema.anyOf.length, 2);
+    assert.equal(schema.anyOf[0].type, "string");
+    assert.equal(schema.anyOf[1].type, "number");
+  });
+
+  it("converts anyOf to Union", () => {
+    const schema = convertJsonSchemaToTypebox({
+      anyOf: [{ type: "boolean" }, { type: "null" }],
+    }) as any;
+    assert.ok(schema.anyOf, "anyOf should produce a Union");
+    assert.equal(schema.anyOf.length, 2);
+  });
+
+  it("converts allOf to Intersect", () => {
+    const schema = convertJsonSchemaToTypebox({
+      allOf: [
+        { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+        { type: "object", properties: { age: { type: "number" } }, required: ["age"] },
+      ],
+    }) as any;
+    assert.ok(schema.allOf, "allOf should produce an Intersect (allOf)");
+    assert.equal(schema.allOf.length, 2);
+  });
+
+  it("resolves $ref to #/$defs/", () => {
+    const schema = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/MyString",
+      $defs: { MyString: { type: "string" } },
+    }) as any;
+    assert.equal(schema.type, "string", "$ref should resolve to the referenced type");
+  });
+
+  it("resolves $ref to #/definitions/", () => {
+    const schema = convertJsonSchemaToTypebox({
+      $ref: "#/definitions/Foo",
+      definitions: { Foo: { type: "boolean" } },
+    }) as any;
+    assert.equal(schema.type, "boolean");
+  });
+
+  it("resolves $ref with description passthrough", () => {
+    const schema = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/Inner",
+      description: "A description from the ref",
+      $defs: { Inner: { type: "string" } },
+    }) as any;
+    assert.equal(schema.type, "string");
+    assert.equal(schema.description, "A description from the ref");
+  });
+
+  it("falls back to Any for unresolvable $ref", () => {
+    const schema = convertJsonSchemaToTypebox({ $ref: "#/definitions/NonExistent" }) as any;
     assert.ok(typeof schema === "object");
   });
 
-  it("falls back to Any for $ref", () => {
-    const schema = convertJsonSchemaToTypebox({ $ref: "#/definitions/Foo" }) as any;
+  it("falls back to Any for external $ref", () => {
+    const schema = convertJsonSchemaToTypebox({ $ref: "external-schema.json#/Foo" }) as any;
     assert.ok(typeof schema === "object");
   });
 
