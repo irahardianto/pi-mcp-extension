@@ -3,3 +3,6 @@ node_modules/
 .env
 
 .pi/
+
+# Pathfinder LSP cache isolation
+.pathfinder/

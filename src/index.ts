@@ -14,9 +14,17 @@ import type { TransportAuthCallbacks } from "./server-manager.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError } from "./errors.js";
 import { exec } from "node:child_process";
-import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+// OAuth imports
+import {
+  ensureCallbackServer,
+  waitForCallback,
+  cancelCallback,
+  stopCallbackServer,
+} from "./callback-server.js";
+import { setCallbackPort, McpOAuthProvider } from "./oauth-provider.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 
 /**
  * Open a URL in the user's default browser.
@@ -28,8 +36,15 @@ function openBrowser(url: string): void {
     : process.platform === "win32"
       ? `start "" "${url}"`
       : `xdg-open "${url}"`;
-  exec(cmd, (err) => {
-    if (err) console.error(`[pi-mcp] Failed to open browser: ${err.message}`);
+
+  exec(cmd, (err, stdout, stderr) => {
+    if (err) {
+      const errorMsg = `[pi-mcp] Failed to open browser: ${err.message}`;
+      console.error(errorMsg);
+      if (stderr) {
+        console.error(`[pi-mcp] Browser error output: ${stderr}`);
+      }
+    }
   });
 }
 
@@ -116,6 +131,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
+    // Stop the callback server
+    await stopCallbackServer().catch(() => {});
+
     // Deactivate all tools before shutting down servers
     for (const server of manager.getAllServers()) {
       bridge.deactivateServer(server.name);
@@ -245,33 +263,108 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         return;
       }
 
+      const config = server.config;
+      let oauthState: string | undefined;
+
       try {
         // Stop the server if running
         if (server.state !== "stopped") {
           bridge.deactivateServer(serverName);
           await manager.stopServer(serverName);
         }
-        // Reset all OAuth credentials (tokens, client info, PKCE, discovery)
-        await manager.resetServerAuth(serverName);
-        ctx.ui.notify(
-          `pi-mcp: Reset credentials for ${serverName}. Starting server — a browser window will open for authentication...`,
-          "info",
-        );
-        // Start the server — this triggers the OAuth flow and opens the browser
-        await manager.startServer(serverName, ctx.cwd);
 
-        const newStatus = await manager.getServerAuthStatus(serverName);
-        if (newStatus?.hasTokens) {
-          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
-        } else {
-          ctx.ui.notify(
-            `pi-mcp: ${serverName} started but authentication may still be in progress. Check the browser window.`,
-            "info",
+        // Validate that we have a server URL (required for OAuth)
+        if (!config.url) {
+          throw new McpError(
+            `Server "${serverName}" has OAuth configured but no URL. OAuth requires a URL-based server transport.`,
+            serverName,
+            "config",
           );
         }
+
+        // Reset all OAuth credentials (tokens, client info, PKCE, discovery)
+        await manager.resetServerAuth(serverName);
+
+        ctx.ui.notify(
+          `pi-mcp: Starting OAuth flow for ${serverName}...`,
+          "info",
+        );
+
+        // 1. Start the callback server
+        const port = await ensureCallbackServer();
+        setCallbackPort(port);
+
+        // 2. Generate a cryptographically secure state parameter for CSRF protection
+        oauthState = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+          .map((b: number) => b.toString(16).padStart(2, "0"))
+          .join("");
+
+        // 3. Register the callback promise BEFORE opening the browser
+        const callbackPromise = waitForCallback(oauthState);
+
+        // 4. Create auth provider and transport
+        const authProvider = new McpOAuthProvider(
+          serverName,
+          config.auth || { type: "oauth" },
+          (url: URL) => {
+            console.error(`[pi-mcp] Opening browser for ${serverName}...`);
+            openBrowser(url.toString());
+          },
+        );
+
+        // CRITICAL FIX #1: Set the OAuth state on the provider before calling auth()
+        // This ensures the state parameter is included in the authorization URL
+        authProvider.setState(oauthState);
+
+        const transport = new StreamableHTTPClientTransport(
+          new URL(config.url),
+          { authProvider },
+        );
+
+        // 5. Start the auth flow - this will trigger redirectToAuthorization which opens the browser
+        // CRITICAL FIX #2: Check the return value of auth() instead of catching UnauthorizedError
+        // The SDK returns 'REDIRECT' when it needs browser interaction, not an error
+        const authResult = await auth(authProvider, { serverUrl: config.url });
+
+        if (authResult === "AUTHORIZED") {
+          // Auth succeeded without needing browser interaction (e.g., had valid tokens)
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+        } else if (authResult === "REDIRECT") {
+          // Browser was opened, wait for the callback from the user
+          ctx.ui.notify(
+            `pi-mcp: Browser opened for ${serverName}. Complete authorization to continue...`,
+            "info",
+          );
+
+          // 6. Wait for the callback (this blocks until the user authorizes)
+          const code = await callbackPromise;
+
+          // 7. Complete the OAuth flow with the authorization code
+          await transport.finishAuth(code);
+
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+        } else {
+          throw new McpError(
+            `Unexpected auth result: ${authResult}`,
+            serverName,
+            "protocol",
+          );
+        }
+
+        // 8. Close the transport (we'll create a new one when starting the server)
+        await transport.close().catch(() => {});
+
+        // 9. Start the server with fresh auth credentials
+        await manager.startServer(serverName, ctx.cwd);
+
       } catch (err) {
         const msg = err instanceof McpError ? err.userMessage : String(err);
         ctx.ui.notify(`pi-mcp: Authentication failed for ${serverName} — ${msg}`, "error");
+
+        // Clean up on error
+        if (oauthState) {
+          cancelCallback(oauthState);
+        }
       }
     },
   });

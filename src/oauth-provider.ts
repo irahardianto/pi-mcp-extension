@@ -13,7 +13,7 @@
 
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthClientMetadata, OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -41,6 +41,20 @@ export interface AuthConfig {
    * Pre-registered client_secret.
    */
   clientSecret?: string | undefined;
+}
+
+// ─── Callback Server Port ───────────────────────────────────────────────────────
+
+let callbackPort = 19876;
+
+/** Set the callback server port. Called by the auth flow when the server starts. */
+export function setCallbackPort(port: number): void {
+  callbackPort = port;
+}
+
+/** Get the current callback server port. */
+export function getCallbackPort(): number {
+  return callbackPort;
 }
 
 // ─── Persistent State Types ───────────────────────────────────────────────────
@@ -115,6 +129,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private authConfig: AuthConfig;
   private _redirectUrl: string | undefined;
   private _onAuthRequired: ((url: URL) => void | Promise<void>) | undefined;
+  private _oauthState: string | undefined;
 
   constructor(
     serverName: string,
@@ -129,16 +144,19 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   // --- redirectUrl ---
 
-  get redirectUrl(): string | URL | undefined {
-    return this._redirectUrl;
+  get redirectUrl(): string | URL {
+    // Use configured redirect URL if provided, otherwise use the callback server
+    // Use 127.0.0.1 explicitly (IPv4) to match the callback server binding
+    return this._redirectUrl || `http://127.0.0.1:${callbackPort}/callback`;
   }
 
   // --- clientMetadata ---
 
   get clientMetadata(): OAuthClientMetadata {
+    const redirectUrl = String(this.redirectUrl);
     return {
       client_name: `pi-mcp/${this.serverName}`,
-      redirect_uris: this._redirectUrl ? [this._redirectUrl] : [],
+      redirect_uris: [redirectUrl],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: this.authConfig.clientSecret ? "client_secret_basic" : "none",
@@ -182,6 +200,21 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async tokens(): Promise<OAuthTokens | undefined> {
     const state = await loadState(this.serverName);
     if (!state.tokens) return undefined;
+
+    // Always return stored tokens — even if expired.
+    // The SDK's auth() function checks tokens?.refresh_token and attempts
+    // silent refresh before falling back to a new authorization flow.
+    // Returning undefined for expired tokens would prevent that silent refresh
+    // and force the user to re-authenticate via browser every time.
+    //
+    // Flow when we return expired tokens:
+    //   transport sends expired access_token → 401
+    //   → auth() sees refresh_token → silent refresh → success → retry
+    //
+    // Flow when we return undefined (WRONG):
+    //   transport has no token → auth() → no refresh possible → REDIRECT
+    //   → user must re-authenticate in browser
+
     // Build OAuthTokens — only include defined fields
     const tokens: Record<string, string> = {
       access_token: state.tokens.access_token,
@@ -249,6 +282,25 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return state.discoveryState;
   }
 
+  // --- OAuth state parameter (CSRF protection) ---
+
+  /**
+   * Set the OAuth state parameter before calling auth().
+   * This should be called with a cryptographically random value.
+   */
+  setState(state: string): void {
+    this._oauthState = state;
+  }
+
+  /**
+   * Returns the OAuth state parameter for CSRF protection.
+   * This is called by the SDK's auth() function when building the authorization URL.
+   * Returns empty string if no state has been set (no CSRF protection).
+   */
+  async state(): Promise<string> {
+    return this._oauthState || "";
+  }
+
   // --- Credential invalidation ---
 
   async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
@@ -311,6 +363,5 @@ export async function getAuthStatus(serverName: string): Promise<{
  * Used to force re-authorization on next connection.
  */
 export async function resetAuth(serverName: string): Promise<void> {
-  const provider = new McpOAuthProvider(serverName, {});
-  await provider.invalidateCredentials("all");
+  await unlink(statePath(serverName)).catch(() => {});
 }
