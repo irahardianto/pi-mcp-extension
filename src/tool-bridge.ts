@@ -223,34 +223,112 @@ export function buildToolName(prefix: string, serverName: string, toolName: stri
 
 // ─── Content Conversion ───────────────────────────────────────────────────────
 
-type PiTextContent = { type: "text"; text: string };
+/** A Pi text content block that may preserve MCP annotations. */
+export interface PiContent {
+  type: "text";
+  text: string;
+  /**
+   * MCP content annotations as defined in the spec:
+   * https://modelcontextprotocol.io/specification/2025-11-25/server/resources#annotations
+   */
+  annotations?: {
+    audience?: Array<"user" | "assistant">;
+    priority?: number;
+    lastModified?: string;
+  };
+  /**
+   * For `resource` content blocks, the resource object may carry its own
+   * nested annotations.
+   */
+  resource?: {
+    uri: string;
+    mimeType?: string;
+    annotations?: {
+      audience?: Array<"user" | "assistant">;
+      priority?: number;
+      lastModified?: string;
+    };
+  };
+}
 
-function convertMcpContent(items: unknown[]): PiTextContent[] {
+/**
+ * Convert MCP content items to Pi-compatible content, preserving MCP
+ * content annotations (audience, priority, lastModified) for downstream
+ * consumers (e.g., extensions that filter by audience).
+ */
+export function convertMcpContent(items: unknown[]): PiContent[] {
   return items.map((item: any) => {
     if (!item || typeof item !== "object") {
       return { type: "text", text: String(item) };
     }
+
+    // Preserve block-level annotations
+    const annotations = item.annotations
+      ? {
+          audience: item.annotations.audience,
+          priority: item.annotations.priority,
+          lastModified: item.annotations.lastModified,
+        }
+      : undefined;
+
     switch (item.type) {
       case "text":
-        return { type: "text", text: String(item.text ?? "") };
+        return {
+          type: "text",
+          text: String(item.text ?? ""),
+          ...(annotations ? { annotations } : {}),
+        };
       case "image":
         return {
           type: "text",
           text: `[Image: ${item.mimeType ?? "unknown"}, base64 encoded]`,
+          ...(annotations ? { annotations } : {}),
         };
       case "audio":
         return {
           type: "text",
           text: `[Audio: ${item.mimeType ?? "unknown"}, base64 encoded]`,
+          ...(annotations ? { annotations } : {}),
         };
       case "resource": {
         const r = item.resource;
-        if (r?.text) return { type: "text", text: r.text };
-        if (r?.blob) return { type: "text", text: `[Resource blob: ${r.uri}]` };
-        return { type: "text", text: `[Resource: ${r?.uri ?? "unknown"}]` };
+
+        // Preserve resource-level annotations (nested inside resource object)
+        const resourceAnnotations = r?.annotations
+          ? {
+              audience: r.annotations.audience,
+              priority: r.annotations.priority,
+              lastModified: r.annotations.lastModified,
+            }
+          : undefined;
+
+        const text = r?.text
+          ? r.text
+          : r?.blob
+            ? `[Resource blob: ${r.uri}]`
+            : `[Resource: ${r?.uri ?? "unknown"}]`;
+
+        return {
+          type: "text",
+          text,
+          ...(annotations ? { annotations } : {}),
+          ...(resourceAnnotations
+            ? {
+                resource: {
+                  uri: r?.uri ?? "",
+                  ...(r?.mimeType ? { mimeType: r.mimeType } : {}),
+                  annotations: resourceAnnotations,
+                },
+              }
+            : {}),
+        };
       }
       default:
-        return { type: "text", text: JSON.stringify(item) };
+        return {
+          type: "text",
+          text: JSON.stringify(item),
+          ...(annotations ? { annotations } : {}),
+        };
     }
   });
 }
