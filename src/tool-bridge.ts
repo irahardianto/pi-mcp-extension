@@ -224,7 +224,7 @@ export function buildToolName(prefix: string, serverName: string, toolName: stri
 // ─── Content Conversion ───────────────────────────────────────────────────────
 
 /** A Pi text content block that may preserve MCP annotations. */
-interface PiContent {
+export interface PiContent {
   type: "text";
   text: string;
   /**
@@ -256,7 +256,7 @@ interface PiContent {
  * content annotations (audience, priority, lastModified) for downstream
  * consumers (e.g., extensions that filter by audience).
  */
-function convertMcpContent(items: unknown[]): PiContent[] {
+export function convertMcpContent(items: unknown[]): PiContent[] {
   return items.map((item: any) => {
     if (!item || typeof item !== "object") {
       return { type: "text", text: String(item) };
