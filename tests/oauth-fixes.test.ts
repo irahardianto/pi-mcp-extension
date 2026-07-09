@@ -15,7 +15,16 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import { McpOAuthProvider } from "../src/oauth-provider.js";
 import type { AuthConfig } from "../src/oauth-provider.js";
-import { ensureCallbackServer, stopCallbackServer } from "../src/callback-server.js";
+import { Agent, createServer, request } from "node:http";
+import {
+  callbackServerConfigFromRedirectUrl,
+  DEFAULT_PORT,
+  ensureCallbackServer,
+  stopCallbackServer,
+  waitForCallback,
+} from "../src/callback-server.js";
+import { discoverManualAuthChallenge } from "../src/auth-challenge.js";
+import { AuthCancelledError, authCancelOption, authRetryOption, browserOpenCommand, waitForOAuthCallbackWithUserControl } from "../src/index.js";
 
 describe("OAuth Security Fixes", () => {
   const testServerName = "test-oauth-server";
@@ -151,6 +160,52 @@ describe("OAuth Security Fixes", () => {
     });
   });
 
+  describe("Manual Auth Challenge Discovery", () => {
+    it("should extract path-prefixed resource metadata and scope from a 401 challenge", async () => {
+      const resourceMetadataUrl = "https://services.prewave.ai/mcp/staging/infotag-mcp/.well-known/oauth-protected-resource/mcp";
+      const response = new Response("", {
+        status: 401,
+        headers: {
+          "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadataUrl}" scope="openid profile email"`,
+        },
+      });
+
+      const challenge = await discoverManualAuthChallenge(
+        "https://services.prewave.ai/mcp/staging/infotag-mcp/mcp",
+        async () => response,
+      );
+
+      assert.strictEqual(challenge.resourceMetadataUrl?.toString(), resourceMetadataUrl);
+      assert.strictEqual(challenge.scope, "openid profile email");
+    });
+
+    it("should extract scope from a 403 insufficient-scope challenge", async () => {
+      const response = new Response("", {
+        status: 403,
+        headers: {
+          "WWW-Authenticate": 'Bearer error="insufficient_scope" scope="openid profile email"',
+        },
+      });
+
+      const challenge = await discoverManualAuthChallenge(
+        "https://example.com/mcp",
+        async () => response,
+      );
+
+      assert.strictEqual(challenge.scope, "openid profile email");
+      assert.strictEqual(challenge.resourceMetadataUrl, undefined);
+    });
+
+    it("should return an empty challenge when the server does not require auth", async () => {
+      const challenge = await discoverManualAuthChallenge(
+        "https://example.com/mcp",
+        async () => new Response("ok", { status: 200 }),
+      );
+
+      assert.deepStrictEqual(challenge, {});
+    });
+  });
+
   describe("Medium Fix #5: Port Tracking", () => {
     it("should track the actual server port when it differs from preferred", async () => {
       // Stop any existing server
@@ -166,6 +221,113 @@ describe("OAuth Security Fixes", () => {
 
       // Cleanup
       await stopCallbackServer();
+    });
+
+
+    it("should derive fixed callback server settings from a local redirect URL", () => {
+      const config = callbackServerConfigFromRedirectUrl("http://localhost:8787/callback");
+
+      assert.deepStrictEqual(config, {
+        preferredPort: 8787,
+        host: "localhost",
+        allowPortFallback: false,
+      });
+    });
+
+    it("should keep fallback scanning when no local redirect URL is configured", () => {
+      const config = callbackServerConfigFromRedirectUrl();
+
+      assert.strictEqual(config.preferredPort, DEFAULT_PORT);
+      assert.strictEqual(config.allowPortFallback, true);
+    });
+
+    it("should fail instead of incrementing the port for fixed redirect URLs", async () => {
+      await stopCallbackServer().catch(() => {});
+
+      const blocker = createServer((_req, res) => {
+        res.end("busy");
+      });
+      await new Promise<void>((resolve) => {
+        blocker.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = blocker.address();
+      assert.ok(address && typeof address === "object");
+
+      try {
+        await assert.rejects(
+          () => ensureCallbackServer(address.port, { host: "127.0.0.1", allowPortFallback: false }),
+          /requires this exact port/,
+        );
+      } finally {
+        await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
+    });
+
+
+    it("should rebind from the default callback listener to a fixed redirect listener when no auth is pending", async () => {
+      await stopCallbackServer().catch(() => {});
+
+      const defaultPort = await ensureCallbackServer(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
+      assert.strictEqual(defaultPort, DEFAULT_PORT);
+
+      const fixedPort = DEFAULT_PORT + 1;
+      const reboundPort = await ensureCallbackServer(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
+      assert.strictEqual(reboundPort, fixedPort);
+
+      await stopCallbackServer();
+    });
+
+    it("should rebind from a fixed redirect listener back to the default listener when no auth is pending", async () => {
+      await stopCallbackServer().catch(() => {});
+
+      const fixedPort = DEFAULT_PORT + 2;
+      const fixedListenerPort = await ensureCallbackServer(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
+      assert.strictEqual(fixedListenerPort, fixedPort);
+
+      const defaultPort = await ensureCallbackServer(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
+      assert.strictEqual(defaultPort, DEFAULT_PORT);
+
+      await stopCallbackServer();
+    });
+
+
+    it("should stop the callback server when a browser keeps the callback socket open", async () => {
+      await stopCallbackServer().catch(() => {});
+
+      const port = DEFAULT_PORT + 20;
+      const state = "keepalive-state";
+      await ensureCallbackServer(port, { host: "127.0.0.1", allowPortFallback: false });
+      const callbackPromise = waitForCallback(state);
+
+      const agent = new Agent({ keepAlive: true });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const req = request(
+            {
+              hostname: "127.0.0.1",
+              port,
+              path: `/callback?code=test-code&state=${state}`,
+              agent,
+            },
+            (res) => {
+              res.resume();
+              res.on("end", resolve);
+            },
+          );
+          req.on("error", reject);
+          req.end();
+        });
+
+        assert.strictEqual(await callbackPromise, "test-code");
+
+        await Promise.race([
+          stopCallbackServer(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("stopCallbackServer timed out")), 1000)),
+        ]);
+      } finally {
+        agent.destroy();
+        await stopCallbackServer().catch(() => {});
+      }
     });
 
     it("should return the same port on subsequent calls", async () => {
@@ -197,6 +359,106 @@ describe("OAuth Security Fixes", () => {
       const redirectUrl = String(provider.redirectUrl);
 
       assert.strictEqual(redirectUrl, customUrl, "Custom redirect URL should be preserved");
+    });
+  });
+
+
+  describe("Browser Opening", () => {
+    it("should pass authorization URLs as literal process arguments", () => {
+      const url = 'https://example.com/authorize?state=$(touch /tmp/pi-mcp-owned)&x="quoted"';
+      const command = browserOpenCommand(url);
+
+      assert.ok(command.args.includes(url));
+      assert.ok(command.args.every((arg) => !arg.includes("open ")));
+    });
+  });
+
+  describe("Manual OAuth Wait Controls", () => {
+    function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+      let resolve!: (value: T) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<T>((promiseResolve, promiseReject) => {
+        resolve = promiseResolve;
+        reject = promiseReject;
+      });
+      return { promise, resolve, reject };
+    }
+
+    it("should return the callback code and dismiss the retry/cancel dialog", async () => {
+      const callback = deferred<string>();
+      let dialogAborted = false;
+      const ui = {
+        select: async (_title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
+          return new Promise<string | undefined>((resolve) => {
+            opts?.signal?.addEventListener("abort", () => {
+              dialogAborted = true;
+              resolve(undefined);
+            });
+          });
+        },
+      };
+
+      const resultPromise = waitForOAuthCallbackWithUserControl(
+        "test-server",
+        callback.promise,
+        () => assert.fail("Browser should not reopen when callback completes"),
+        ui,
+      );
+
+      callback.resolve("auth-code");
+
+      assert.strictEqual(await resultPromise, "auth-code");
+      assert.strictEqual(dialogAborted, true);
+    });
+
+    it("should reopen the browser when the user chooses retry", async () => {
+      const callback = deferred<string>();
+      let selectCalls = 0;
+      let reopenCount = 0;
+      const ui = {
+        select: async (_title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
+          selectCalls += 1;
+          if (selectCalls === 1) {
+            return authRetryOption;
+          }
+          return new Promise<string | undefined>((resolve) => {
+            opts?.signal?.addEventListener("abort", () => resolve(undefined));
+          });
+        },
+      };
+
+      const resultPromise = waitForOAuthCallbackWithUserControl(
+        "test-server",
+        callback.promise,
+        () => {
+          reopenCount += 1;
+        },
+        ui,
+      );
+
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.strictEqual(reopenCount, 1);
+
+      callback.resolve("auth-code-after-retry");
+
+      assert.strictEqual(await resultPromise, "auth-code-after-retry");
+    });
+
+    it("should cancel authentication when the user chooses cancel", async () => {
+      const callback = deferred<string>();
+      const ui = {
+        select: async () => authCancelOption,
+      };
+
+      await assert.rejects(
+        () => waitForOAuthCallbackWithUserControl(
+          "test-server",
+          callback.promise,
+          () => assert.fail("Browser should not reopen when auth is cancelled"),
+          ui,
+        ),
+        AuthCancelledError,
+      );
     });
   });
 

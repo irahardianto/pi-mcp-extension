@@ -7,13 +7,13 @@
  * Wires together: config → server manager → tool bridge → Pi API.
  */
 
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { ServerManager } from "./server-manager.js";
 import type { TransportAuthCallbacks } from "./server-manager.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError } from "./errors.js";
-import { exec } from "node:child_process";
+import { spawn } from "node:child_process";
 
 // OAuth imports
 import {
@@ -21,31 +21,128 @@ import {
   waitForCallback,
   cancelCallback,
   stopCallbackServer,
+  callbackServerConfigFromRedirectUrl,
 } from "./callback-server.js";
 import { setCallbackPort, McpOAuthProvider } from "./oauth-provider.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
+import { discoverManualAuthChallenge } from "./auth-challenge.js";
+import type { ManualAuthChallenge } from "./auth-challenge.js";
+
+export interface BrowserOpenCommand {
+  command: string;
+  args: string[];
+}
+
+export function browserOpenCommand(url: string): BrowserOpenCommand {
+  if (process.platform === "darwin") {
+    return { command: "open", args: [url] };
+  }
+  if (process.platform === "win32") {
+    return { command: "rundll32", args: ["url.dll,FileProtocolHandler", url] };
+  }
+  return { command: "xdg-open", args: [url] };
+}
 
 /**
  * Open a URL in the user's default browser.
  * Works on macOS, Linux, and Windows.
  */
 function openBrowser(url: string): void {
-  const cmd = process.platform === "darwin"
-    ? `open "${url}"`
-    : process.platform === "win32"
-      ? `start "" "${url}"`
-      : `xdg-open "${url}"`;
-
-  exec(cmd, (err, stdout, stderr) => {
-    if (err) {
-      const errorMsg = `[pi-mcp] Failed to open browser: ${err.message}`;
-      console.error(errorMsg);
-      if (stderr) {
-        console.error(`[pi-mcp] Browser error output: ${stderr}`);
-      }
-    }
+  const { command, args } = browserOpenCommand(url);
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
   });
+
+  child.once("error", (err) => {
+    console.error(`[pi-mcp] Failed to open browser: ${err.message}`);
+  });
+
+  child.unref();
+}
+
+export class AuthCancelledError extends Error {
+  constructor(serverName: string) {
+    super(`Authentication cancelled for ${serverName}`);
+    this.name = "AuthCancelledError";
+  }
+}
+
+export const authRetryOption = "Retry: open browser again";
+export const authCancelOption = "Cancel authentication";
+
+interface OAuthCallbackResult {
+  type: "callback";
+  code: string;
+}
+
+interface OAuthCallbackErrorResult {
+  type: "callbackError";
+  error: unknown;
+}
+
+interface OAuthUserChoiceResult {
+  type: "choice";
+  choice: string | undefined;
+}
+
+interface OAuthDialogAbortedResult {
+  type: "dialogAborted";
+}
+
+type OAuthWaitResult = OAuthCallbackResult | OAuthCallbackErrorResult | OAuthUserChoiceResult | OAuthDialogAbortedResult;
+
+export async function waitForOAuthCallbackWithUserControl(
+  serverName: string,
+  callbackPromise: Promise<string>,
+  reopenBrowser: () => void,
+  ui: Pick<ExtensionUIContext, "select">,
+): Promise<string> {
+  const callbackResultPromise: Promise<OAuthWaitResult> = callbackPromise
+    .then((code): OAuthCallbackResult => ({ type: "callback", code }))
+    .catch((error): OAuthCallbackErrorResult => ({ type: "callbackError", error }));
+
+  while (true) {
+    const dialogAbortController = new AbortController();
+    const choicePromise: Promise<OAuthWaitResult> = ui
+      .select(
+        `OAuth pending for ${serverName}`,
+        [authRetryOption, authCancelOption],
+        { signal: dialogAbortController.signal },
+      )
+      .then((choice): OAuthUserChoiceResult => ({ type: "choice", choice }))
+      .catch((error): OAuthDialogAbortedResult => {
+        if (dialogAbortController.signal.aborted) {
+          return { type: "dialogAborted" };
+        }
+        throw error;
+      });
+
+    const result = await Promise.race([callbackResultPromise, choicePromise]);
+
+    if (result.type === "callback") {
+      dialogAbortController.abort();
+      return result.code;
+    }
+
+    if (result.type === "callbackError") {
+      dialogAbortController.abort();
+      throw result.error;
+    }
+
+    if (result.type === "dialogAborted") {
+      continue;
+    }
+
+    if (result.choice === authRetryOption) {
+      reopenBrowser();
+      continue;
+    }
+
+    dialogAbortController.abort();
+    throw new AuthCancelledError(serverName);
+  }
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
@@ -70,12 +167,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   // ── 2. Initialize bridge components ──────────────────────────────────────
-  // Auth callbacks — opens browser and notifies user when OAuth is needed
+  // Auth callbacks — opens the browser when OAuth is needed.
   const authCallbacks: TransportAuthCallbacks = {
-    onAuthRequired: (serverName: string, authorizationUrl: URL): void => {
-      console.error(
-        `[pi-mcp] OAuth required for "${serverName}". Opening browser for authorization...`,
-      );
+    onAuthRequired: (_serverName: string, authorizationUrl: URL): void => {
       openBrowser(authorizationUrl.toString());
     },
   };
@@ -265,6 +359,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
       const config = server.config;
       let oauthState: string | undefined;
+      let callbackPromise: Promise<string> | undefined;
+      let latestAuthorizationUrl: URL | undefined;
 
       try {
         // Stop the server if running
@@ -291,7 +387,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         );
 
         // 1. Start the callback server
-        const port = await ensureCallbackServer();
+        const callbackServerConfig = callbackServerConfigFromRedirectUrl(config.auth?.redirectUrl);
+        const port = await ensureCallbackServer(callbackServerConfig.preferredPort, {
+          host: callbackServerConfig.host,
+          allowPortFallback: callbackServerConfig.allowPortFallback,
+        });
         setCallbackPort(port);
 
         // 2. Generate a cryptographically secure state parameter for CSRF protection
@@ -299,15 +399,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           .map((b: number) => b.toString(16).padStart(2, "0"))
           .join("");
 
-        // 3. Register the callback promise BEFORE opening the browser
-        const callbackPromise = waitForCallback(oauthState);
+        // 3. Register the callback promise BEFORE opening the browser.
+        // Attach a catch handler so cancellation does not produce an unhandled rejection
+        // if the SDK completes without a browser redirect.
+        callbackPromise = waitForCallback(oauthState);
+        callbackPromise.catch(() => {});
 
         // 4. Create auth provider and transport
         const authProvider = new McpOAuthProvider(
           serverName,
           config.auth || { type: "oauth" },
           (url: URL) => {
-            console.error(`[pi-mcp] Opening browser for ${serverName}...`);
+            latestAuthorizationUrl = new URL(url.toString());
             openBrowser(url.toString());
           },
         );
@@ -316,33 +419,93 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         // This ensures the state parameter is included in the authorization URL
         authProvider.setState(oauthState);
 
-        const transport = new StreamableHTTPClientTransport(
-          new URL(config.url),
-          { authProvider },
-        );
+        const authChallenge: ManualAuthChallenge = await discoverManualAuthChallenge(config.url).catch((): ManualAuthChallenge => {
+          console.warn(
+            `[pi-mcp] Failed to discover OAuth challenge for "${serverName}"; falling back to standard discovery`,
+          );
+          return {};
+        });
+
+        const authOptions: {
+          serverUrl: string;
+          resourceMetadataUrl?: URL;
+          scope?: string;
+        } = { serverUrl: config.url };
+        if (authChallenge.resourceMetadataUrl) {
+          authOptions.resourceMetadataUrl = authChallenge.resourceMetadataUrl;
+        }
+        if (authChallenge.scope) {
+          authOptions.scope = authChallenge.scope;
+        }
 
         // 5. Start the auth flow - this will trigger redirectToAuthorization which opens the browser
         // CRITICAL FIX #2: Check the return value of auth() instead of catching UnauthorizedError
         // The SDK returns 'REDIRECT' when it needs browser interaction, not an error
-        const authResult = await auth(authProvider, { serverUrl: config.url });
+        const authResult = await auth(authProvider, authOptions);
 
         if (authResult === "AUTHORIZED") {
-          // Auth succeeded without needing browser interaction (e.g., had valid tokens)
-          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+          // Auth succeeded without needing browser interaction (e.g., had valid tokens).
+          // Cancel the unused callback wait registered before auth() so no timeout remains.
+          cancelCallback(oauthState);
+          await stopCallbackServer().catch(() => {});
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
         } else if (authResult === "REDIRECT") {
           // Browser was opened, wait for the callback from the user
           ctx.ui.notify(
-            `pi-mcp: Browser opened for ${serverName}. Complete authorization to continue...`,
+            `pi-mcp: Browser opened for ${serverName}. Complete authorization to continue. Choose Retry to reopen the browser or Cancel to stop authentication.`,
             "info",
           );
 
-          // 6. Wait for the callback (this blocks until the user authorizes)
-          const code = await callbackPromise;
+          // 6. Wait for the callback while giving the user an escape hatch.
+          const code = await waitForOAuthCallbackWithUserControl(
+            serverName,
+            callbackPromise,
+            () => {
+              if (!latestAuthorizationUrl) {
+                throw new McpError(
+                  `Authorization URL is not available for ${serverName}`,
+                  serverName,
+                  "protocol",
+                );
+              }
+              openBrowser(latestAuthorizationUrl.toString());
+            },
+            ctx.ui,
+          );
+          ctx.ui.notify(
+            `pi-mcp: Authorization callback received for ${serverName}. Exchanging token...`,
+            "info",
+          );
+          await stopCallbackServer().catch(() => {});
 
           // 7. Complete the OAuth flow with the authorization code
-          await transport.finishAuth(code);
+          const finishAuthOptions: {
+            serverUrl: string;
+            authorizationCode: string;
+            resourceMetadataUrl?: URL;
+            scope?: string;
+          } = {
+            serverUrl: config.url,
+            authorizationCode: code,
+          };
+          if (authChallenge.resourceMetadataUrl) {
+            finishAuthOptions.resourceMetadataUrl = authChallenge.resourceMetadataUrl;
+          }
+          if (authChallenge.scope) {
+            finishAuthOptions.scope = authChallenge.scope;
+          }
 
-          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+          const finishAuthResult = await auth(authProvider, finishAuthOptions);
+
+          if (finishAuthResult !== "AUTHORIZED") {
+            throw new McpError(
+              `Unexpected auth completion result: ${finishAuthResult}`,
+              serverName,
+              "protocol",
+            );
+          }
+
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
         } else {
           throw new McpError(
             `Unexpected auth result: ${authResult}`,
@@ -351,20 +514,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           );
         }
 
-        // 8. Close the transport (we'll create a new one when starting the server)
-        await transport.close().catch(() => {});
-
-        // 9. Start the server with fresh auth credentials
+        // 8. Start the server with fresh auth credentials
         await manager.startServer(serverName, ctx.cwd);
+        ctx.ui.notify(`pi-mcp: ${serverName} is ready.`, "info");
 
       } catch (err) {
-        const msg = err instanceof McpError ? err.userMessage : String(err);
-        ctx.ui.notify(`pi-mcp: Authentication failed for ${serverName} — ${msg}`, "error");
+        if (err instanceof AuthCancelledError) {
+          ctx.ui.notify(`pi-mcp: Authentication cancelled for ${serverName}.`, "info");
+        } else {
+          const msg = err instanceof McpError ? err.userMessage : String(err);
+          ctx.ui.notify(`pi-mcp: Authentication failed for ${serverName} — ${msg}`, "error");
+        }
 
         // Clean up on error
         if (oauthState) {
           cancelCallback(oauthState);
         }
+        await stopCallbackServer().catch(() => {});
       }
     },
   });
