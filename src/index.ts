@@ -48,6 +48,42 @@ function openBrowser(url: string): void {
   });
 }
 
+interface ServerCompletionEntry {
+  name: string;
+  state: string;
+  config: {
+    transport: string;
+    lifecycle: string;
+    auth?: unknown;
+  };
+}
+
+export function serverNameCompletions(
+  argumentPrefix: string,
+  servers: ServerCompletionEntry[],
+  options: { authOnly?: boolean } = {},
+) {
+  const prefix = argumentPrefix.trimStart();
+  const completions = servers
+    .filter((server) => !options.authOnly || server.config.auth)
+    .filter((server) => server.name.startsWith(prefix))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((server) => ({
+      value: server.name,
+      label: server.name,
+      description: [
+        server.state,
+        server.config.transport,
+        server.config.lifecycle,
+        server.config.auth ? "OAuth" : undefined,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    }));
+
+  return completions.length > 0 ? completions : null;
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
   // ── 1. Load and validate config ──────────────────────────────────────────
   // cwd is available on the ExtensionContext passed to event handlers.
@@ -145,6 +181,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.registerCommand("mcp", {
     description:
       "Show MCP server status. Usage: /mcp [server-name] for detail.",
+    getArgumentCompletions: (prefix) => serverNameCompletions(prefix, manager.getAllServers()),
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const serverName = args.trim();
       if (serverName) {
@@ -177,6 +214,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // ── 5. /mcp:stop — stop a server ─────────────────────────────────────────
   pi.registerCommand("mcp:stop", {
     description: "Stop an MCP server. Usage: /mcp:stop <server-name>",
+    getArgumentCompletions: (prefix) => serverNameCompletions(prefix, manager.getAllServers()),
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const serverName = args.trim();
       if (!serverName) {
@@ -196,6 +234,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // ── 6. /mcp:start — manually start a lazy server ─────────────────────────
   pi.registerCommand("mcp:start", {
     description: "Start an MCP server. Usage: /mcp:start <server-name>",
+    getArgumentCompletions: (prefix) => serverNameCompletions(prefix, manager.getAllServers()),
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const serverName = args.trim();
       if (!serverName) {
@@ -220,6 +259,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.registerCommand("mcp:auth", {
     description:
       "Trigger OAuth authentication for a server. Resets credentials and opens browser for re-authorization. Usage: /mcp:auth <server-name>",
+    getArgumentCompletions: (prefix) => serverNameCompletions(prefix, manager.getAllServers(), { authOnly: true }),
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const serverName = args.trim();
       if (!serverName) {
