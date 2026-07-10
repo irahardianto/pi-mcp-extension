@@ -159,6 +159,8 @@ Config files are loaded from two locations. **Project config overrides global co
 
 ## Commands
 
+Server-name arguments provide autocomplete suggestions from the configured MCP servers. `/mcp:auth` suggests only servers configured for OAuth.
+
 | Command | Description |
 |---|---|
 | `/mcp` | Show status summary of all configured servers |
