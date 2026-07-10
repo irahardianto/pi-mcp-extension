@@ -93,19 +93,23 @@ interface OAuthDialogAbortedResult {
 
 type OAuthWaitResult = OAuthCallbackResult | OAuthCallbackErrorResult | OAuthUserChoiceResult | OAuthDialogAbortedResult;
 
-export async function waitForOAuthCallbackWithUserControl(
+export async function waitForOAuthCallback(
   serverName: string,
   callbackPromise: Promise<string>,
   reopenBrowser: () => void,
-  ui: Pick<ExtensionUIContext, "select">,
+  context: { hasUI: boolean; ui: Pick<ExtensionUIContext, "select"> },
 ): Promise<string> {
+  if (!context.hasUI) {
+    return callbackPromise;
+  }
+
   const callbackResultPromise: Promise<OAuthWaitResult> = callbackPromise
     .then((code): OAuthCallbackResult => ({ type: "callback", code }))
     .catch((error): OAuthCallbackErrorResult => ({ type: "callbackError", error }));
 
   while (true) {
     const dialogAbortController = new AbortController();
-    const choicePromise: Promise<OAuthWaitResult> = ui
+    const choicePromise: Promise<OAuthWaitResult> = context.ui
       .select(
         `OAuth pending for ${serverName}`,
         [authRetryOption, authCancelOption],
@@ -176,6 +180,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   const manager = new ServerManager(config, authCallbacks);
   const bridge = new ToolBridge(config.settings, pi);
+  let activeManualAuthServer: string | undefined;
 
   // Connect tool refresh callback: called on connect and on list_changed
   manager.setToolRefreshCallback(async (serverName, client) => {
@@ -357,10 +362,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         return;
       }
 
+      if (activeManualAuthServer) {
+        ctx.ui.notify(
+          `pi-mcp: Authentication is already in progress for ${activeManualAuthServer}.`,
+          "error",
+        );
+        return;
+      }
+
       const config = server.config;
       let oauthState: string | undefined;
-      let callbackPromise: Promise<string> | undefined;
       let latestAuthorizationUrl: URL | undefined;
+      activeManualAuthServer = serverName;
 
       try {
         // Stop the server if running
@@ -399,13 +412,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           .map((b: number) => b.toString(16).padStart(2, "0"))
           .join("");
 
-        // 3. Register the callback promise BEFORE opening the browser.
-        // Attach a catch handler so cancellation does not produce an unhandled rejection
-        // if the SDK completes without a browser redirect.
-        callbackPromise = waitForCallback(oauthState);
-        callbackPromise.catch(() => {});
-
-        // 4. Create auth provider and transport
+        // 3. Create the auth provider.
         const authProvider = new McpOAuthProvider(
           serverName,
           config.auth || { type: "oauth" },
@@ -415,16 +422,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           },
         );
 
-        // CRITICAL FIX #1: Set the OAuth state on the provider before calling auth()
-        // This ensures the state parameter is included in the authorization URL
+        // Set the state before auth() builds the authorization URL.
         authProvider.setState(oauthState);
 
-        const authChallenge: ManualAuthChallenge = await discoverManualAuthChallenge(config.url).catch((): ManualAuthChallenge => {
+        const authChallenge: ManualAuthChallenge = await discoverManualAuthChallenge(config.url, {
+          headers: config.headers,
+        }).catch((): ManualAuthChallenge => {
           console.warn(
             `[pi-mcp] Failed to discover OAuth challenge for "${serverName}"; falling back to standard discovery`,
           );
           return {};
         });
+
+        // Register the callback immediately before auth() can open the browser.
+        // Attach a catch handler so cancellation after immediate authorization
+        // does not produce an unhandled rejection.
+        const callbackPromise = waitForCallback(oauthState);
+        callbackPromise.catch(() => {});
 
         const authOptions: {
           serverUrl: string;
@@ -438,16 +452,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           authOptions.scope = authChallenge.scope;
         }
 
-        // 5. Start the auth flow - this will trigger redirectToAuthorization which opens the browser
-        // CRITICAL FIX #2: Check the return value of auth() instead of catching UnauthorizedError
-        // The SDK returns 'REDIRECT' when it needs browser interaction, not an error
+        // Start the auth flow. REDIRECT means browser interaction is required.
         const authResult = await auth(authProvider, authOptions);
 
         if (authResult === "AUTHORIZED") {
           // Auth succeeded without needing browser interaction (e.g., had valid tokens).
-          // Cancel the unused callback wait registered before auth() so no timeout remains.
-          cancelCallback(oauthState);
-          await stopCallbackServer().catch(() => {});
           ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
         } else if (authResult === "REDIRECT") {
           // Browser was opened, wait for the callback from the user
@@ -457,7 +466,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           );
 
           // 6. Wait for the callback while giving the user an escape hatch.
-          const code = await waitForOAuthCallbackWithUserControl(
+          const code = await waitForOAuthCallback(
             serverName,
             callbackPromise,
             () => {
@@ -470,14 +479,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               }
               openBrowser(latestAuthorizationUrl.toString());
             },
-            ctx.ui,
+            ctx,
           );
           ctx.ui.notify(
             `pi-mcp: Authorization callback received for ${serverName}. Exchanging token...`,
             "info",
           );
-          await stopCallbackServer().catch(() => {});
-
           // 7. Complete the OAuth flow with the authorization code
           const finishAuthOptions: {
             serverUrl: string;
@@ -525,12 +532,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           const msg = err instanceof McpError ? err.userMessage : String(err);
           ctx.ui.notify(`pi-mcp: Authentication failed for ${serverName} — ${msg}`, "error");
         }
-
-        // Clean up on error
+      } finally {
         if (oauthState) {
           cancelCallback(oauthState);
         }
         await stopCallbackServer().catch(() => {});
+        activeManualAuthServer = undefined;
       }
     },
   });

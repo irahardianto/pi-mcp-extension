@@ -13,7 +13,7 @@
 
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthClientMetadata, OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -83,12 +83,14 @@ interface StoredState {
 
 // ─── File helpers ─────────────────────────────────────────────────────────────
 
-const AUTH_DIR = join(homedir(), ".pi", "agent", "mcp-auth");
+function authDir(): string {
+  return join(homedir(), ".pi", "agent", "mcp-auth");
+}
 
 function statePath(serverName: string): string {
   // Hash the server name to avoid filesystem issues with special chars
   const hash = createHash("sha256").update(serverName).digest("hex").slice(0, 16);
-  return join(AUTH_DIR, `${hash}.json`);
+  return join(authDir(), `${hash}.json`);
 }
 
 async function loadState(serverName: string): Promise<StoredState> {
@@ -112,14 +114,18 @@ async function loadState(serverName: string): Promise<StoredState> {
 }
 
 async function saveState(serverName: string, state: StoredState): Promise<void> {
-  await mkdir(AUTH_DIR, { recursive: true });
+  const directory = authDir();
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
   // Only write defined fields
   const toWrite: Record<string, unknown> = {};
   if (state.clientInfo !== undefined) toWrite.clientInfo = state.clientInfo;
   if (state.tokens !== undefined) toWrite.tokens = state.tokens;
   if (state.codeVerifier !== undefined) toWrite.codeVerifier = state.codeVerifier;
   if (state.discoveryState !== undefined) toWrite.discoveryState = state.discoveryState;
-  await writeFile(statePath(serverName), JSON.stringify(toWrite, null, 2), "utf8");
+  const path = statePath(serverName);
+  await writeFile(path, JSON.stringify(toWrite, null, 2), { encoding: "utf8", mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 // ─── OAuthClientProvider Implementation ────────────────────────────────────────
@@ -160,6 +166,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: this.authConfig.clientSecret ? "client_secret_basic" : "none",
+      ...(this.authConfig.scope && { scope: this.authConfig.scope }),
     };
   }
 

@@ -73,7 +73,7 @@ function escapeHtml(text: string): string {
  * Handle incoming HTTP requests to the callback server.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse): void {
-  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  const url = new URL(req.url || "/", "http://localhost");
 
   // Only handle the callback path
   if (url.pathname !== CALLBACK_PATH) {
@@ -178,19 +178,28 @@ export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): Callb
 
   const url = new URL(redirectUrl);
   if (url.protocol !== "http:" || !isLocalCallbackHost(url.hostname)) {
-    return {
-      preferredPort: DEFAULT_PORT,
-      host: DEFAULT_HOST,
-      allowPortFallback: true,
-    };
+    throw new Error("Manual OAuth redirect URL must use HTTP with localhost, 127.0.0.1, or ::1");
+  }
+
+  if (url.hash) {
+    throw new Error("Manual OAuth redirect URL must not include a fragment");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("Manual OAuth redirect URL must not include credentials");
   }
 
   if (url.pathname !== CALLBACK_PATH) {
     throw new Error(`Local OAuth redirect URL must use path ${CALLBACK_PATH}`);
   }
 
+  const preferredPort = Number(url.port || "80");
+  if (preferredPort === 0) {
+    throw new Error("Manual OAuth redirect URL must use a fixed non-zero port");
+  }
+
   return {
-    preferredPort: Number(url.port || "80"),
+    preferredPort,
     host: url.hostname === "[::1]" ? "::1" : url.hostname,
     allowPortFallback: false,
   };
@@ -198,7 +207,7 @@ export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): Callb
 
 /**
  * Ensure the callback server is running.
- * Scans forward for an available local port if the preferred port is busy.
+ * Scans forward for an available local port when port fallback is enabled.
  *
  * @param preferredPort - The preferred port to use (default: 19876)
  * @returns The actual port the server is listening on

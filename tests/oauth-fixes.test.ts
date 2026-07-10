@@ -11,8 +11,11 @@
  * 5. Port tracking - actual server port is correctly tracked
  */
 
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { McpOAuthProvider } from "../src/oauth-provider.js";
 import type { AuthConfig } from "../src/oauth-provider.js";
 import { Agent, createServer, request } from "node:http";
@@ -24,11 +27,30 @@ import {
   waitForCallback,
 } from "../src/callback-server.js";
 import { discoverManualAuthChallenge } from "../src/auth-challenge.js";
-import { AuthCancelledError, authCancelOption, authRetryOption, browserOpenCommand, waitForOAuthCallbackWithUserControl } from "../src/index.js";
+import { AuthCancelledError, authCancelOption, authRetryOption, browserOpenCommand, waitForOAuthCallback } from "../src/index.js";
 
 describe("OAuth Security Fixes", () => {
   const testServerName = "test-oauth-server";
   let provider: McpOAuthProvider;
+  let testHome: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
+
+  before(async () => {
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    testHome = await mkdtemp(join(tmpdir(), "pi-mcp-oauth-test-"));
+    process.env.HOME = testHome;
+    process.env.USERPROFILE = testHome;
+  });
+
+  after(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
+    await rm(testHome, { recursive: true, force: true });
+  });
 
   beforeEach(async () => {
     // Create a fresh provider for each test
@@ -72,6 +94,12 @@ describe("OAuth Security Fixes", () => {
   });
 
   describe("Token Handling", () => {
+    it("should expose configured scope through client metadata", () => {
+      provider = new McpOAuthProvider(testServerName, { scope: "read write" });
+
+      assert.strictEqual(provider.clientMetadata.scope, "read write");
+    });
+
     it("should always return expired tokens (to allow SDK silent refresh)", async () => {
       // CRITICAL: tokens() must ALWAYS return stored tokens, even if expired.
       // The SDK's auth() function checks tokens?.refresh_token to attempt silent
@@ -158,11 +186,36 @@ describe("OAuth Security Fixes", () => {
       const tokens = await provider.tokens();
       assert.strictEqual(tokens, undefined, "Should return undefined when no tokens stored");
     });
+
+    it("should restrict the auth directory and state file permissions", async () => {
+      await provider.saveTokens({
+        access_token: "permission-test-token",
+        token_type: "Bearer",
+      });
+
+      const { stat } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { homedir } = await import("node:os");
+      const { createHash } = await import("node:crypto");
+      const authDir = join(homedir(), ".pi", "agent", "mcp-auth");
+      const hash = createHash("sha256").update(testServerName).digest("hex").slice(0, 16);
+      const [directoryStats, fileStats] = await Promise.all([
+        stat(authDir),
+        stat(join(authDir, `${hash}.json`)),
+      ]);
+
+      assert.strictEqual(directoryStats.isDirectory(), true);
+      assert.strictEqual(fileStats.isFile(), true);
+      if (process.platform !== "win32") {
+        assert.strictEqual(directoryStats.mode & 0o777, 0o700);
+        assert.strictEqual(fileStats.mode & 0o777, 0o600);
+      }
+    });
   });
 
   describe("Manual Auth Challenge Discovery", () => {
     it("should extract path-prefixed resource metadata and scope from a 401 challenge", async () => {
-      const resourceMetadataUrl = "https://services.prewave.ai/mcp/staging/infotag-mcp/.well-known/oauth-protected-resource/mcp";
+      const resourceMetadataUrl = "https://mcp.example.com/team/service/.well-known/oauth-protected-resource/mcp";
       const response = new Response("", {
         status: 401,
         headers: {
@@ -171,8 +224,8 @@ describe("OAuth Security Fixes", () => {
       });
 
       const challenge = await discoverManualAuthChallenge(
-        "https://services.prewave.ai/mcp/staging/infotag-mcp/mcp",
-        async () => response,
+        "https://mcp.example.com/team/service/mcp",
+        { fetchFn: async () => response },
       );
 
       assert.strictEqual(challenge.resourceMetadataUrl?.toString(), resourceMetadataUrl);
@@ -189,17 +242,64 @@ describe("OAuth Security Fixes", () => {
 
       const challenge = await discoverManualAuthChallenge(
         "https://example.com/mcp",
-        async () => response,
+        { fetchFn: async () => response },
       );
 
       assert.strictEqual(challenge.scope, "openid profile email");
       assert.strictEqual(challenge.resourceMetadataUrl, undefined);
     });
 
+    it("should ignore scope from a 403 that is not an insufficient-scope challenge", async () => {
+      const response = new Response("", {
+        status: 403,
+        headers: {
+          "WWW-Authenticate": 'Bearer error="access_denied" scope="admin"',
+        },
+      });
+
+      const challenge = await discoverManualAuthChallenge(
+        "https://example.com/mcp",
+        { fetchFn: async () => response },
+      );
+
+      assert.deepStrictEqual(challenge, {});
+    });
+
+    it("should abort challenge discovery after the configured timeout", async () => {
+      const hangingFetch = async (_input: string | URL, init?: RequestInit): Promise<Response> => {
+        return new Promise<Response>((_resolve, reject) => {
+          const guardTimer = setTimeout(() => reject(new Error("Challenge timeout did not abort the request")), 1000);
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(guardTimer);
+            reject(init.signal?.reason);
+          }, { once: true });
+        });
+      };
+
+      await assert.rejects(
+        () => discoverManualAuthChallenge("https://example.com/mcp", { fetchFn: hangingFetch, timeoutMs: 10 }),
+        (error: unknown) => error instanceof DOMException && error.name === "TimeoutError",
+      );
+    });
+
+    it("should include configured static headers in challenge discovery", async () => {
+      let requestHeaders: Headers | undefined;
+      await discoverManualAuthChallenge("https://example.com/mcp", {
+        headers: { "X-Tenant": "example-team" },
+        fetchFn: async (_input, init) => {
+          requestHeaders = new Headers(init?.headers);
+          return new Response("ok", { status: 200 });
+        },
+      });
+
+      assert.strictEqual(requestHeaders?.get("x-tenant"), "example-team");
+      assert.strictEqual(requestHeaders?.get("accept"), "application/json, text/event-stream");
+    });
+
     it("should return an empty challenge when the server does not require auth", async () => {
       const challenge = await discoverManualAuthChallenge(
         "https://example.com/mcp",
-        async () => new Response("ok", { status: 200 }),
+        { fetchFn: async () => new Response("ok", { status: 200 }) },
       );
 
       assert.deepStrictEqual(challenge, {});
@@ -207,20 +307,30 @@ describe("OAuth Security Fixes", () => {
   });
 
   describe("Medium Fix #5: Port Tracking", () => {
+    async function getFreePort(): Promise<number> {
+      const listener = createServer();
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const address = listener.address();
+      assert.ok(address && typeof address === "object");
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+      return address.port;
+    }
+
     it("should track the actual server port when it differs from preferred", async () => {
-      // Stop any existing server
       await stopCallbackServer().catch(() => {});
+      const blocker = createServer();
+      await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+      const address = blocker.address();
+      assert.ok(address && typeof address === "object");
 
-      // Start with a preferred port that's likely to be free
-      const preferredPort = 19876;
-      const actualPort = await ensureCallbackServer(preferredPort);
-
-      // The actual port should match (or be close to) the preferred port
-      assert.ok(actualPort >= preferredPort, `Actual port ${actualPort} should be >= preferred ${preferredPort}`);
-      assert.ok(actualPort <= preferredPort + 25, `Actual port ${actualPort} should not exceed preferred + 25`);
-
-      // Cleanup
-      await stopCallbackServer();
+      try {
+        const actualPort = await ensureCallbackServer(address.port);
+        assert.ok(actualPort > address.port);
+        assert.ok(actualPort <= address.port + 24);
+      } finally {
+        await stopCallbackServer().catch(() => {});
+        await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
     });
 
 
@@ -239,6 +349,28 @@ describe("OAuth Security Fixes", () => {
 
       assert.strictEqual(config.preferredPort, DEFAULT_PORT);
       assert.strictEqual(config.allowPortFallback, true);
+    });
+
+    it("should reject non-local redirect URLs for the manual flow", () => {
+      assert.throws(
+        () => callbackServerConfigFromRedirectUrl("https://example.com/callback"),
+        /must use HTTP with localhost, 127\.0\.0\.1, or ::1/,
+      );
+    });
+
+    it("should reject redirect URLs with fragments, credentials, or port zero", () => {
+      assert.throws(
+        () => callbackServerConfigFromRedirectUrl("http://localhost:8787/callback#fragment"),
+        /must not include a fragment/,
+      );
+      assert.throws(
+        () => callbackServerConfigFromRedirectUrl("http://user:password@localhost:8787/callback"),
+        /must not include credentials/,
+      );
+      assert.throws(
+        () => callbackServerConfigFromRedirectUrl("http://localhost:0/callback"),
+        /must use a fixed non-zero port/,
+      );
     });
 
     it("should fail instead of incrementing the port for fixed redirect URLs", async () => {
@@ -264,28 +396,30 @@ describe("OAuth Security Fixes", () => {
     });
 
 
-    it("should rebind from the default callback listener to a fixed redirect listener when no auth is pending", async () => {
+    it("should rebind from a fallback callback listener to a fixed redirect listener when no auth is pending", async () => {
       await stopCallbackServer().catch(() => {});
 
-      const defaultPort = await ensureCallbackServer(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
-      assert.strictEqual(defaultPort, DEFAULT_PORT);
+      const fallbackPreferredPort = await getFreePort();
+      const fallbackPort = await ensureCallbackServer(fallbackPreferredPort, { host: "127.0.0.1", allowPortFallback: true });
+      assert.strictEqual(fallbackPort, fallbackPreferredPort);
 
-      const fixedPort = DEFAULT_PORT + 1;
+      const fixedPort = await getFreePort();
       const reboundPort = await ensureCallbackServer(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
       assert.strictEqual(reboundPort, fixedPort);
 
       await stopCallbackServer();
     });
 
-    it("should rebind from a fixed redirect listener back to the default listener when no auth is pending", async () => {
+    it("should rebind from a fixed redirect listener to a fallback listener when no auth is pending", async () => {
       await stopCallbackServer().catch(() => {});
 
-      const fixedPort = DEFAULT_PORT + 2;
+      const fixedPort = await getFreePort();
       const fixedListenerPort = await ensureCallbackServer(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
       assert.strictEqual(fixedListenerPort, fixedPort);
 
-      const defaultPort = await ensureCallbackServer(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
-      assert.strictEqual(defaultPort, DEFAULT_PORT);
+      const fallbackPreferredPort = await getFreePort();
+      const fallbackPort = await ensureCallbackServer(fallbackPreferredPort, { host: "127.0.0.1", allowPortFallback: true });
+      assert.strictEqual(fallbackPort, fallbackPreferredPort);
 
       await stopCallbackServer();
     });
@@ -294,7 +428,7 @@ describe("OAuth Security Fixes", () => {
     it("should stop the callback server when a browser keeps the callback socket open", async () => {
       await stopCallbackServer().catch(() => {});
 
-      const port = DEFAULT_PORT + 20;
+      const port = await getFreePort();
       const state = "keepalive-state";
       await ensureCallbackServer(port, { host: "127.0.0.1", allowPortFallback: false });
       const callbackPromise = waitForCallback(state);
@@ -331,15 +465,14 @@ describe("OAuth Security Fixes", () => {
     });
 
     it("should return the same port on subsequent calls", async () => {
-      // Stop any existing server
       await stopCallbackServer().catch(() => {});
 
-      const port1 = await ensureCallbackServer(19876);
-      const port2 = await ensureCallbackServer(19876);
+      const preferredPort = await getFreePort();
+      const port1 = await ensureCallbackServer(preferredPort);
+      const port2 = await ensureCallbackServer(preferredPort);
 
       assert.strictEqual(port1, port2, "Subsequent calls should return the same port");
 
-      // Cleanup
       await stopCallbackServer();
     });
   });
@@ -398,11 +531,11 @@ describe("OAuth Security Fixes", () => {
         },
       };
 
-      const resultPromise = waitForOAuthCallbackWithUserControl(
+      const resultPromise = waitForOAuthCallback(
         "test-server",
         callback.promise,
         () => assert.fail("Browser should not reopen when callback completes"),
-        ui,
+        { hasUI: true, ui },
       );
 
       callback.resolve("auth-code");
@@ -427,13 +560,13 @@ describe("OAuth Security Fixes", () => {
         },
       };
 
-      const resultPromise = waitForOAuthCallbackWithUserControl(
+      const resultPromise = waitForOAuthCallback(
         "test-server",
         callback.promise,
         () => {
           reopenCount += 1;
         },
-        ui,
+        { hasUI: true, ui },
       );
 
       await new Promise((resolve) => setImmediate(resolve));
@@ -451,14 +584,36 @@ describe("OAuth Security Fixes", () => {
       };
 
       await assert.rejects(
-        () => waitForOAuthCallbackWithUserControl(
+        () => waitForOAuthCallback(
           "test-server",
           callback.promise,
           () => assert.fail("Browser should not reopen when auth is cancelled"),
-          ui,
+          { hasUI: true, ui: ui as any },
         ),
         AuthCancelledError,
       );
+    });
+
+    it("should wait for the callback without opening a selector when UI is unavailable", async () => {
+      const callback = deferred<string>();
+      let selectCalled = false;
+      const ui = {
+        select: async () => {
+          selectCalled = true;
+          return undefined;
+        },
+      };
+
+      const resultPromise = waitForOAuthCallback(
+        "test-server",
+        callback.promise,
+        () => assert.fail("Browser should not reopen without UI"),
+        { hasUI: false, ui },
+      );
+      callback.resolve("headless-auth-code");
+
+      assert.strictEqual(await resultPromise, "headless-auth-code");
+      assert.strictEqual(selectCalled, false);
     });
   });
 
