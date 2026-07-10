@@ -11,6 +11,14 @@ export interface ManualAuthChallenge {
 
 export type AuthChallengeFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
+export const AUTH_CHALLENGE_TIMEOUT_MS = 10_000;
+
+export interface ManualAuthChallengeOptions {
+  fetchFn?: AuthChallengeFetch | undefined;
+  timeoutMs?: number | undefined;
+  headers?: Record<string, string> | undefined;
+}
+
 /**
  * Discover OAuth challenge parameters from an MCP resource server.
  *
@@ -21,13 +29,15 @@ export type AuthChallengeFetch = (input: string | URL, init?: RequestInit) => Pr
  */
 export async function discoverManualAuthChallenge(
   serverUrl: string,
-  fetchFn: AuthChallengeFetch = fetch,
+  options: ManualAuthChallengeOptions = {},
 ): Promise<ManualAuthChallenge> {
+  const fetchFn = options.fetchFn ?? fetch;
+  const headers = new Headers(options.headers);
+  headers.set("Accept", "application/json, text/event-stream");
   const response = await fetchFn(serverUrl, {
     method: "GET",
-    headers: {
-      Accept: "application/json, text/event-stream",
-    },
+    headers,
+    signal: AbortSignal.timeout(options.timeoutMs ?? AUTH_CHALLENGE_TIMEOUT_MS),
   });
 
   try {
@@ -35,7 +45,11 @@ export async function discoverManualAuthChallenge(
       return {};
     }
 
-    const { resourceMetadataUrl, scope } = extractWWWAuthenticateParams(response);
+    const { resourceMetadataUrl, scope, error } = extractWWWAuthenticateParams(response);
+    if (response.status === 403 && error !== "insufficient_scope") {
+      return {};
+    }
+
     return {
       ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
       ...(scope ? { scope } : {}),

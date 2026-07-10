@@ -21,6 +21,7 @@
 - **Global + project config** — Layered config (project overrides global) with per-server tuning
 - **Tool annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` surfaced in tool descriptions
 - **Structured error handling** — Distinct error codes for config, connection, protocol, and tool-level failures
+- **OAuth 2.1** — Browser authorization with PKCE, protected-resource discovery, token refresh, and secure local persistence
 
 ## Installation
 
@@ -80,6 +81,9 @@ Config files are loaded from two locations. **Project config overrides global co
     "supabase": {
       "transport": "streamable-http",
       "url": "https://mcp.supabase.com/mcp",
+      "auth": {
+        "type": "oauth"
+      },
       "lifecycle": "eager"
     },
     "deepsource": {
@@ -137,9 +141,21 @@ Config files are loaded from two locations. **Project config overrides global co
 | `args` | `string[]` | `[]` | Arguments for the command |
 | `env` | `Record<string, string>` | — | Extra environment variables for the child process |
 | `url` | `string` | — | Server URL (**required** for streamable-http/sse) |
+| `headers` | `Record<string, string>` | — | Static headers sent with HTTP and SSE requests |
+| `auth` | `object` | — | OAuth configuration described below |
 | `lifecycle` | `"eager" \| "lazy"` | `"lazy"` | `eager` = auto-start on session start, `lazy` = manual via `/mcp:start` |
 | `requestTimeoutMs` | `number` | global setting | Per-server timeout override |
 | `healthCheckIntervalMs` | `number` | disabled | Opt-in ping interval for connection health monitoring |
+
+### OAuth Config
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | `"oauth"` | `"oauth"` | Authentication type |
+| `scope` | `string` | discovered | Requested scope when the server does not advertise one |
+| `clientId` | `string` | dynamic registration | Pre-registered OAuth client ID |
+| `clientSecret` | `string` | — | Secret for a pre-registered confidential client |
+| `redirectUrl` | `string` | `http://127.0.0.1:19876/callback` | Local HTTP loopback callback used by `/mcp:auth` |
 
 ## Commands
 
@@ -149,6 +165,7 @@ Config files are loaded from two locations. **Project config overrides global co
 | `/mcp <name>` | Show detailed status and stderr log for a specific server |
 | `/mcp:start <name>` | Start a server (resets retry count) |
 | `/mcp:stop <name>` | Stop a running server and deactivate its tools |
+| `/mcp:auth <name>` | Reset OAuth credentials and authenticate a server |
 
 ## How It Works
 
@@ -217,7 +234,7 @@ npm install
 # Type check (strict mode)
 npm run typecheck
 
-# Run all tests (47 tests)
+# Run all tests
 npm test
 
 # Run integration tests only (real stdio server)
