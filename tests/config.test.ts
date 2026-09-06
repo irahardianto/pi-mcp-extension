@@ -3,12 +3,13 @@
  * Uses Node.js built-in test runner (node --test).
  */
 
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { mkdir, writeFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config.js";
+import { agentDir, loadConfig } from "../src/config.js";
 import { McpError } from "../src/errors.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -34,6 +35,23 @@ async function writeMcpJson(dir: string, content: unknown): Promise<void> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("loadConfig", () => {
+  // Every test below points the global config at an EMPTY agent dir, so the developer's real
+  // ~/.pi/agent/mcp.json cannot leak into the expectations (it did: two tests failed on any
+  // machine that had a global config).
+  let prevAgentDir: string | undefined;
+  let isolatedAgentDir: string;
+  before(async () => {
+    isolatedAgentDir = join(tmpdir(), `pi-mcp-test-agent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(isolatedAgentDir, { recursive: true });
+    prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+  });
+  after(async () => {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    await rm(isolatedAgentDir, { recursive: true, force: true });
+  });
+
   it("returns empty config when no files exist", async () => {
     await withTempDir(async (dir) => {
       const cfg = await loadConfig(dir);
@@ -298,6 +316,84 @@ describe("loadConfig", () => {
       const server = cfg.mcpServers["dual"]!;
       assert.ok(server.headers);
       assert.ok(server.auth);
+    });
+  });
+});
+
+// ── Agent dir + project settings merge ───────────────────────────────────────
+
+async function withAgentDir(
+  fn: (agent: string, cwd: string) => Promise<void>,
+): Promise<void> {
+  await withTempDir(async (root) => {
+    const agent = join(root, "agent");
+    const cwd = join(root, "project");
+    await mkdir(agent, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agent;
+    try {
+      await fn(agent, cwd);
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+}
+
+describe("agentDir", () => {
+  it("defaults to ~/.pi/agent", () => {
+    assert.equal(agentDir({}), join(homedir(), ".pi", "agent"));
+  });
+
+  it("follows PI_CODING_AGENT_DIR, with tilde expansion", () => {
+    assert.equal(agentDir({ PI_CODING_AGENT_DIR: "/opt/pi-agent" }), "/opt/pi-agent");
+    assert.equal(agentDir({ PI_CODING_AGENT_DIR: "~/.pi-other/agent" }), join(homedir(), ".pi-other", "agent"));
+  });
+});
+
+describe("loadConfig with PI_CODING_AGENT_DIR", () => {
+  it("reads the global config from the configured agent dir", async () => {
+    await withAgentDir(async (agent, cwd) => {
+      await writeFile(
+        join(agent, "mcp.json"),
+        JSON.stringify({ settings: { toolPrefix: "mcp_" }, mcpServers: { g: { command: "true" } } }),
+      );
+      const cfg = await loadConfig(cwd);
+      assert.equal(cfg.settings.toolPrefix, "mcp_");
+      assert.deepEqual(Object.keys(cfg.mcpServers), ["g"]);
+    });
+  });
+
+  it("a project file without settings keeps the global settings", async () => {
+    await withAgentDir(async (agent, cwd) => {
+      await writeFile(
+        join(agent, "mcp.json"),
+        JSON.stringify({ settings: { toolPrefix: "mcp_", requestTimeoutMs: 45000 }, mcpServers: { g: { command: "true" } } }),
+      );
+      await writeMcpJson(cwd, { mcpServers: { p: { command: "true" } } });
+      const cfg = await loadConfig(cwd);
+      assert.equal(cfg.settings.toolPrefix, "mcp_");
+      assert.equal(cfg.settings.requestTimeoutMs, 45000);
+      assert.equal(cfg.settings.maxRetries, 5);
+      assert.deepEqual(Object.keys(cfg.mcpServers).sort(), ["g", "p"]);
+    });
+  });
+
+  it("a project file that states a setting still overrides the global one", async () => {
+    await withAgentDir(async (agent, cwd) => {
+      await writeFile(join(agent, "mcp.json"), JSON.stringify({ settings: { toolPrefix: "mcp_" } }));
+      await writeMcpJson(cwd, { settings: { requestTimeoutMs: 1000 }, mcpServers: {} });
+      const cfg = await loadConfig(cwd);
+      assert.equal(cfg.settings.toolPrefix, "mcp_");
+      assert.equal(cfg.settings.requestTimeoutMs, 1000);
+    });
+  });
+
+  it("rejects an invalid project setting", async () => {
+    await withAgentDir(async (_agent, cwd) => {
+      await writeMcpJson(cwd, { settings: { toolPrefix: "bad prefix" } });
+      await assert.rejects(loadConfig(cwd), McpError);
     });
   });
 });
