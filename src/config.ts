@@ -2,8 +2,9 @@
  * Configuration loading, validation, and merging for pi-mcp.
  *
  * Config file locations (Pi-native convention, highest priority first):
- *   1. <cwd>/.pi/mcp.json   — project-level config
- *   2. ~/.pi/agent/mcp.json — global config
+ *   1. <cwd>/.pi/mcp.json      — project-level config
+ *   2. <agent dir>/mcp.json    — global config; the agent dir is what Pi itself uses:
+ *      $PI_CODING_AGENT_DIR when set (Pi profiles / alternative agent dirs), else ~/.pi/agent
  *
  * Project servers/settings override global servers/settings per-key (shallow merge).
  * No deep merge, no env var interpolation — WYSIWYG config.
@@ -118,6 +119,25 @@ const McpConfigSchema = z.object({
   mcpServers: z.record(ServerConfigSchema).default({}),
 });
 
+/**
+ * Project-level file: `settings` keys are optional and carry NO defaults, so a project file
+ * only overrides what it actually states. (Parsing it with SettingsSchema filled in the
+ * defaults — e.g. toolPrefix "mcp" — and the merge then overwrote the global settings.)
+ */
+const ProjectSettingsSchema = z.object({
+  toolPrefix: z
+    .string()
+    .regex(/^[a-zA-Z0-9_]+$/, "toolPrefix must match [a-zA-Z0-9_]")
+    .optional(),
+  requestTimeoutMs: z.number().positive().optional(),
+  maxRetries: z.number().int().min(0).max(10).optional(),
+});
+const ProjectConfigSchema = z.object({
+  settings: ProjectSettingsSchema.default({}),
+  mcpServers: z.record(ServerConfigSchema).default({}),
+});
+type ProjectConfig = z.output<typeof ProjectConfigSchema>;
+
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
 export type AuthConfig = z.output<typeof AuthConfigSchema>;
@@ -139,7 +159,15 @@ async function readJsonFile(path: string): Promise<unknown | null> {
 }
 
 function parseConfig(raw: unknown, sourcePath: string): McpConfig {
-  const result = McpConfigSchema.safeParse(raw);
+  return parseWith(McpConfigSchema, raw, sourcePath);
+}
+
+function parseWith<S extends z.ZodTypeAny>(
+  schema: S,
+  raw: unknown,
+  sourcePath: string,
+): z.output<S> {
+  const result = schema.safeParse(raw);
   if (!result.success) {
     const issues = result.error.issues
       .map((i) => `  ${i.path.join(".")}: ${i.message}`)
@@ -155,23 +183,42 @@ function parseConfig(raw: unknown, sourcePath: string): McpConfig {
 
 function mergeConfigs(
   globalCfg: McpConfig,
-  projectCfg: McpConfig,
+  projectCfg: ProjectConfig,
 ): McpConfig {
+  // Only the settings the project file states may override the global ones.
+  const stated = Object.fromEntries(
+    Object.entries(projectCfg.settings).filter(([, v]) => v !== undefined),
+  ) as Partial<Settings>;
   return {
     // Shallow spread: project settings override global settings per key
-    settings: { ...globalCfg.settings, ...projectCfg.settings },
+    settings: { ...globalCfg.settings, ...stated },
     // Per-server override: project server entry completely replaces global entry with same name
     mcpServers: { ...globalCfg.mcpServers, ...projectCfg.mcpServers },
   };
 }
 
 /**
- * Load and merge global (~/.pi/agent/mcp.json) and project (<cwd>/.pi/mcp.json) configs.
+ * Pi's agent directory, resolved the way Pi resolves it (`getAgentDir()` in
+ * @mariozechner/pi-coding-agent): $PI_CODING_AGENT_DIR when set (tilde expanded), else
+ * ~/.pi/agent. Pi profiles and alternative agent dirs only work through that variable.
+ */
+export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = env.PI_CODING_AGENT_DIR;
+  if (fromEnv && fromEnv.length > 0) {
+    if (fromEnv === "~") return homedir();
+    if (fromEnv.startsWith("~/")) return join(homedir(), fromEnv.slice(2));
+    return fromEnv;
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+/**
+ * Load and merge global (<agent dir>/mcp.json) and project (<cwd>/.pi/mcp.json) configs.
  * Project config takes precedence over global config.
  * Returns a fully validated, merged config.
  */
 export async function loadConfig(cwd: string): Promise<McpConfig> {
-  const globalPath = join(homedir(), ".pi", "agent", "mcp.json");
+  const globalPath = join(agentDir(), "mcp.json");
   const projectPath = join(cwd, ".pi", "mcp.json");
 
   const [globalRaw, projectRaw] = await Promise.all([
@@ -190,6 +237,6 @@ export async function loadConfig(cwd: string): Promise<McpConfig> {
 
   if (projectRaw === null) return globalCfg;
 
-  const projectCfg = parseConfig(projectRaw, projectPath);
+  const projectCfg = parseWith(ProjectConfigSchema, projectRaw, projectPath);
   return mergeConfigs(globalCfg, projectCfg);
 }
