@@ -15,8 +15,8 @@ import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprot
 import type { OAuthClientMetadata, OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { readFile, writeFile, mkdir, unlink, chmod, open, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { agentDir } from "./config.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ interface StoredState {
 // ─── File helpers ─────────────────────────────────────────────────────────────
 
 function authDir(storageDir?: string): string {
-  return storageDir ?? join(homedir(), ".pi", "agent", "mcp-auth");
+  return storageDir ?? join(agentDir(), "mcp-auth");
 }
 
 function statePath(serverName: string, storageDir?: string): string {
