@@ -378,6 +378,13 @@ export class ToolBridge {
     this._activateServerTools(serverName);
   }
 
+  /** Report discovery separately from the tools currently exposed by Pi. */
+  getToolActivity(serverName: string): { discovered: number; active: number } {
+    const names = this.serverToolNames.get(serverName) ?? new Set<string>();
+    const active = new Set(this.pi.getActiveTools());
+    return { discovered: names.size, active: [...names].filter((name) => active.has(name)).length };
+  }
+
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */
   deactivateServer(serverName: string): void {
     this._deactivateServerTools(serverName);

@@ -565,6 +565,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         const auth = server.config.auth ? await manager.getServerAuthStatus(server.name) : null;
         return {
           name: server.name, lifecycle: server.config.lifecycle, state: server.state,
+          tools: bridge.getToolActivity(server.name),
           auth: server.config.auth ? auth?.hasTokens ? "credentials stored" : "authorization may be required" : "not configured",
           error: server.lastError
             ? server.lastError instanceof AuthRequiredError
@@ -600,6 +601,10 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
                   ? "MCP tool discovery failed. Check the server and retry."
                   : "MCP connection failed. Check the server configuration and retry.";
         throw new Error(message);
+      }
+      const activity = bridge.getToolActivity(name);
+      if (activity.active !== activity.discovered) {
+        throw new Error("MCP server connected, but some discovered tools are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered and active counts.");
       }
       return { content: [{ type: "text", text: `MCP server ${name} ready; tools discovered and active.` }], details: {} };
     },

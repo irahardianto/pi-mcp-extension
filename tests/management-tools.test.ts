@@ -40,6 +40,25 @@ it("registers agent-visible status and connect tools without eagerly starting a 
     assert.match(result.content[0].text, /ready/);
     assert.ok(active.some((name) => name.includes("echo")));
     assert.ok(commands.has("mcp:start") && commands.has("mcp:stop") && commands.has("mcp:auth"));
+    const discovered = active.length;
+    const connectedStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.deepEqual(connectedStatus[0].tools, { discovered, active: discovered });
+    // Another extension may apply an intentional tool restriction after discovery.
+    active = active.slice(1);
+    await assert.rejects(
+      tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
+      /connected, but some discovered tools are inactive/,
+    );
+    assert.equal(active.length, discovered - 1, "Connect must not override another extension's restriction");
+    active = [];
+    await assert.rejects(
+      tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
+      /connected, but some discovered tools are inactive/,
+    );
+    assert.deepEqual(active, []);
+    const inactiveStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.equal(inactiveStatus[0].state, "ready", "Transport readiness and tool activation are separate states");
+    assert.deepEqual(inactiveStatus[0].tools, { discovered, active: 0 });
     await events.get("session_shutdown")({}, ctx);
     assert.equal(active.length, 0);
   } finally {

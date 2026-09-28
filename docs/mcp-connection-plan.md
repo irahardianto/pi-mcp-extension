@@ -33,3 +33,9 @@ No daemon, schema cache, idle timeout, package update, lockfile change, automati
 ## Remaining limits
 
 These limits are observations, not an acceptance of technical debt. The agent-visible `mcp_connect` tool returns fixed error categories, but the legacy `/mcp`, `/mcp:start`, and `/mcp:auth` commands still display raw server error text. A server that echoes a credential in an HTTP error can therefore expose it through those command outputs. The per-server exclusive lock prevents simultaneous interactive flows for the same server across Pi processes. A process killed during authorization can leave a stale lock, which requires manual removal after checking that no authorization is active. Independent Pi processes still do not share connection attempts, and a silent token refresh can race with another process before it acquires the interactive lock. Different-server flows are serialized only within one Pi process; two processes can compete for a configured fixed callback port. Source-checkout tests use an injected browser opener and mock Pi API; they do not verify activation in the installed Pi runtime.
+
+## Tool activation reporting follow-up
+
+An independent extension can deactivate server tools while the MCP connection remains ready. Report discovered and active tool counts separately. Before `mcp_connect` reports success, verify that every currently discovered tool remains active. Do not silently override external restrictions on an already connected server. Regression coverage removes one and then all discovered tools between two connect calls and verifies the inactive set remains unchanged.
+
+The related per-turn loss of dynamic tools belongs to the runtime composition in `pi-agent-suite`. Fixing that owner is separate from truthful connection reporting here.
