@@ -7,13 +7,14 @@
  * Wires together: config → server manager → tool bridge → Pi API.
  */
 
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { loadConfig } from "./config.js";
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
+import { loadConfig, type McpConfig } from "./config.js";
 import { ServerManager } from "./server-manager.js";
-import type { TransportAuthCallbacks } from "./server-manager.js";
+import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
+import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError } from "./errors.js";
-import { exec } from "node:child_process";
+import { spawn } from "node:child_process";
 
 // OAuth imports
 import {
@@ -21,42 +22,151 @@ import {
   waitForCallback,
   cancelCallback,
   stopCallbackServer,
+  callbackServerConfigFromRedirectUrl,
 } from "./callback-server.js";
-import { setCallbackPort, McpOAuthProvider } from "./oauth-provider.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { setCallbackPort, McpOAuthProvider, acquireAuthLock } from "./oauth-provider.js";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
+import { discoverManualAuthChallenge } from "./auth-challenge.js";
+import type { ManualAuthChallenge } from "./auth-challenge.js";
+
+export interface BrowserOpenCommand {
+  command: string;
+  args: string[];
+}
+
+export function browserOpenCommand(url: string): BrowserOpenCommand {
+  if (process.platform === "darwin") {
+    return { command: "open", args: [url] };
+  }
+  if (process.platform === "win32") {
+    return { command: "rundll32", args: ["url.dll,FileProtocolHandler", url] };
+  }
+  return { command: "xdg-open", args: [url] };
+}
 
 /**
  * Open a URL in the user's default browser.
  * Works on macOS, Linux, and Windows.
  */
 function openBrowser(url: string): void {
-  const cmd = process.platform === "darwin"
-    ? `open "${url}"`
-    : process.platform === "win32"
-      ? `start "" "${url}"`
-      : `xdg-open "${url}"`;
-
-  exec(cmd, (err, stdout, stderr) => {
-    if (err) {
-      const errorMsg = `[pi-mcp] Failed to open browser: ${err.message}`;
-      console.error(errorMsg);
-      if (stderr) {
-        console.error(`[pi-mcp] Browser error output: ${stderr}`);
-      }
-    }
+  const { command, args } = browserOpenCommand(url);
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
   });
+
+  child.once("error", (err) => {
+    console.error(`[pi-mcp] Failed to open browser: ${err.message}`);
+  });
+
+  child.unref();
 }
 
-export default async function (pi: ExtensionAPI): Promise<void> {
+export class AuthCancelledError extends Error {
+  constructor(serverName: string) {
+    super(`Authentication cancelled for ${serverName}`);
+    this.name = "AuthCancelledError";
+  }
+}
+
+export const authRetryOption = "Retry: open browser again";
+export const authCancelOption = "Cancel authentication";
+
+interface OAuthCallbackResult {
+  type: "callback";
+  code: string;
+}
+
+interface OAuthCallbackErrorResult {
+  type: "callbackError";
+  error: unknown;
+}
+
+interface OAuthUserChoiceResult {
+  type: "choice";
+  choice: string | undefined;
+}
+
+interface OAuthDialogAbortedResult {
+  type: "dialogAborted";
+}
+
+type OAuthWaitResult = OAuthCallbackResult | OAuthCallbackErrorResult | OAuthUserChoiceResult | OAuthDialogAbortedResult;
+
+export async function waitForOAuthCallback(
+  serverName: string,
+  callbackPromise: Promise<string>,
+  reopenBrowser: () => void,
+  context: { hasUI: boolean; ui: Pick<ExtensionUIContext, "select"> },
+): Promise<string> {
+  if (!context.hasUI) {
+    throw new Error(`Authorization for ${serverName} requires an interactive Pi session`);
+  }
+
+  const callbackResultPromise: Promise<OAuthWaitResult> = callbackPromise
+    .then((code): OAuthCallbackResult => ({ type: "callback", code }))
+    .catch((error): OAuthCallbackErrorResult => ({ type: "callbackError", error }));
+
+  while (true) {
+    const dialogAbortController = new AbortController();
+    const choicePromise: Promise<OAuthWaitResult> = context.ui
+      .select(
+        `OAuth pending for ${serverName}`,
+        [authRetryOption, authCancelOption],
+        { signal: dialogAbortController.signal },
+      )
+      .then((choice): OAuthUserChoiceResult => ({ type: "choice", choice }))
+      .catch((error): OAuthDialogAbortedResult => {
+        if (dialogAbortController.signal.aborted) {
+          return { type: "dialogAborted" };
+        }
+        throw error;
+      });
+
+    const result = await Promise.race([callbackResultPromise, choicePromise]);
+
+    if (result.type === "callback") {
+      dialogAbortController.abort();
+      return result.code;
+    }
+
+    if (result.type === "callbackError") {
+      dialogAbortController.abort();
+      throw result.error;
+    }
+
+    if (result.type === "dialogAborted") {
+      continue;
+    }
+
+    if (result.choice === authRetryOption) {
+      reopenBrowser();
+      continue;
+    }
+
+    dialogAbortController.abort();
+    throw new AuthCancelledError(serverName);
+  }
+}
+
+/** Resolve exact server names before interpreting the optional reset suffix. */
+export function parseAuthArguments(args: string, serverNames: string[]): { name: string; reset: boolean } {
+  const name = args.trim();
+  if (serverNames.includes(name)) return { name, reset: false };
+  const reset = /\s+--reset$/.test(name);
+  return { name: reset ? name.replace(/\s+--reset$/, "").trimEnd() : name, reset };
+}
+
+export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string; globalConfigPath?: string; authStorageDir?: string; browserOpen?: (url: string) => void } = {}): Promise<void> {
   // ── 1. Load and validate config ──────────────────────────────────────────
   // cwd is available on the ExtensionContext passed to event handlers.
   // We load config lazily on session_start to get the correct per-session cwd.
   // For the initial load we use process.cwd() as a bootstrap path to detect
   // whether any config exists at all.
-  let config;
+  let config: McpConfig;
   try {
-    config = await loadConfig(process.cwd());
+    config = await loadConfig(paths.bootstrapCwd ?? process.cwd(), paths.globalConfigPath);
   } catch (err) {
     // Can't notify yet (no ctx), so log to stderr. The session_start handler
     // will re-try with the real cwd and surface errors properly.
@@ -70,30 +180,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   // ── 2. Initialize bridge components ──────────────────────────────────────
-  // Auth callbacks — opens browser and notifies user when OAuth is needed
-  const authCallbacks: TransportAuthCallbacks = {
-    onAuthRequired: (serverName: string, authorizationUrl: URL): void => {
-      console.error(
-        `[pi-mcp] OAuth required for "${serverName}". Opening browser for authorization...`,
-      );
-      openBrowser(authorizationUrl.toString());
-    },
-  };
-
-  const manager = new ServerManager(config, authCallbacks);
+  const manager = new ServerManager(config, undefined, paths.authStorageDir);
   const bridge = new ToolBridge(config.settings, pi);
+  const connectAttempts = new Map<string, { promise: Promise<void>; controller: AbortController; reset: boolean }>();
+  let authQueue: Promise<void> = Promise.resolve();
 
-  // Connect tool refresh callback: called on connect and on list_changed
   manager.setToolRefreshCallback(async (serverName, client) => {
-    await bridge.refreshTools(serverName, client);
+    await bridge.refreshTools(serverName, client, () => {
+      const server = manager.getServer(serverName);
+      return server?.client === client && server.state !== "stopped";
+    });
   });
+  manager.setServerStoppedCallback((name) => bridge.deactivateServer(name));
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
     // Reload config with the real session cwd (project config may differ)
     let sessionConfig = config;
     try {
-      sessionConfig = await loadConfig(ctx.cwd);
+      sessionConfig = await loadConfig(ctx.cwd, paths.globalConfigPath);
     } catch (err) {
       const msg = err instanceof McpError ? err.userMessage : String(err);
       ctx.ui.notify(`pi-mcp: Config error — ${msg}`, "error");
@@ -111,6 +216,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       await manager.shutdownAll();
       // Rebuild server entries from new config
       manager.rebuildServers(sessionConfig);
+      config = sessionConfig;
     }
 
     const eagerServers = Object.entries(sessionConfig.mcpServers).filter(
@@ -131,7 +237,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
-    // Stop the callback server
+    for (const attempt of connectAttempts.values()) attempt.controller.abort();
     await stopCallbackServer().catch(() => {});
 
     // Deactivate all tools before shutting down servers
@@ -187,6 +293,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
         return;
       }
+      connectAttempts.get(serverName)?.controller.abort();
       bridge.deactivateServer(serverName);
       await manager.stopServer(serverName);
       ctx.ui.notify(`pi-mcp: Stopped ${serverName}`, "info");
@@ -207,7 +314,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         return;
       }
       try {
-        await manager.startServer(serverName, ctx.cwd);
+        await connectRequested(serverName, ctx);
         ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
       } catch (err) {
         const msg = err instanceof McpError ? err.userMessage : String(err);
@@ -216,63 +323,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
   });
 
-  // ── 7. /mcp:auth — trigger OAuth authentication for a server ────────────────
-  pi.registerCommand("mcp:auth", {
-    description:
-      "Trigger OAuth authentication for a server. Resets credentials and opens browser for re-authorization. Usage: /mcp:auth <server-name>",
-    handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const serverName = args.trim();
-      if (!serverName) {
-        // List servers with auth config
-        const authServers = manager.getAllServers().filter((s) => s.config.auth);
-        if (authServers.length === 0) {
-          ctx.ui.notify(
-            "pi-mcp: No servers with OAuth configured. Add `auth: { type: \"oauth\" }` to a server in mcp.json.",
-            "error",
-          );
-          return;
-        }
-        const lines = authServers.map(async (s) => {
-          const status = await manager.getServerAuthStatus(s.name);
-          const authIcon = status?.hasTokens ? "\u2705 authenticated" : "\u274C not authenticated";
-          const savedInfo = status?.savedAt ? ` (since ${status.savedAt})` : "";
-          return `  ${s.name}: ${authIcon}${savedInfo}`;
-        });
-        const statusLines = await Promise.all(lines);
-        ctx.ui.notify(
-          [
-            "Usage: /mcp:auth <server-name>",
-            "",
-            "OAuth-enabled servers:",
-            ...statusLines,
-          ].join("\n"),
-          "info",
-        );
-        return;
-      }
-      const server = manager.getServer(serverName);
-      if (!server) {
-        ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
-        return;
-      }
-      if (!server.config.auth) {
-        ctx.ui.notify(
-          `pi-mcp: Server "${serverName}" does not have OAuth configured. Add \`auth: { type: "oauth" }\` to its config in mcp.json.`,
-          "error",
-        );
-        return;
-      }
-
-      const config = server.config;
-      let oauthState: string | undefined;
-
-      try {
-        // Stop the server if running
-        if (server.state !== "stopped") {
-          bridge.deactivateServer(serverName);
-          await manager.stopServer(serverName);
-        }
-
+  async function authorize(serverName: string, ctx: ExtensionContext, signal: AbortSignal, reset: boolean): Promise<void> {
+    const server = manager.getServer(serverName)!;
+    const config = server.config;
+    let oauthState: string | undefined;
+    let latestAuthorizationUrl: URL | undefined;
+    const cancel = () => { if (oauthState) cancelCallback(oauthState); };
+    signal.addEventListener("abort", cancel, { once: true });
+    let unlock: (() => Promise<void>) | undefined;
+    try {
+        if (signal.aborted) throw new AuthCancelledError(serverName);
+        unlock = await acquireAuthLock(serverName, paths.authStorageDir);
+        if (signal.aborted) throw new AuthCancelledError(serverName);
+        if (reset) await manager.resetServerAuth(serverName);
         // Validate that we have a server URL (required for OAuth)
         if (!config.url) {
           throw new McpError(
@@ -282,16 +345,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           );
         }
 
-        // Reset all OAuth credentials (tokens, client info, PKCE, discovery)
-        await manager.resetServerAuth(serverName);
-
         ctx.ui.notify(
           `pi-mcp: Starting OAuth flow for ${serverName}...`,
           "info",
         );
 
+        if (!ctx.hasUI) throw new Error(`Authorization for ${serverName} requires an interactive Pi session`);
+        if (signal.aborted) throw new AuthCancelledError(serverName);
+
         // 1. Start the callback server
-        const port = await ensureCallbackServer();
+        const callbackServerConfig = callbackServerConfigFromRedirectUrl(config.auth?.redirectUrl);
+        const port = await ensureCallbackServer(callbackServerConfig.preferredPort, {
+          host: callbackServerConfig.host,
+          allowPortFallback: callbackServerConfig.allowPortFallback,
+        });
         setCallbackPort(port);
 
         // 2. Generate a cryptographically secure state parameter for CSRF protection
@@ -299,50 +366,112 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           .map((b: number) => b.toString(16).padStart(2, "0"))
           .join("");
 
-        // 3. Register the callback promise BEFORE opening the browser
-        const callbackPromise = waitForCallback(oauthState);
-
-        // 4. Create auth provider and transport
+        // 3. Create the auth provider.
         const authProvider = new McpOAuthProvider(
           serverName,
           config.auth || { type: "oauth" },
           (url: URL) => {
-            console.error(`[pi-mcp] Opening browser for ${serverName}...`);
-            openBrowser(url.toString());
+            latestAuthorizationUrl = new URL(url.toString());
+            if (!signal.aborted) (paths.browserOpen ?? openBrowser)(url.toString());
           },
+          paths.authStorageDir,
+          false,
+          () => signal.aborted,
         );
 
-        // CRITICAL FIX #1: Set the OAuth state on the provider before calling auth()
-        // This ensures the state parameter is included in the authorization URL
+        // Set the state before auth() builds the authorization URL.
         authProvider.setState(oauthState);
 
-        const transport = new StreamableHTTPClientTransport(
-          new URL(config.url),
-          { authProvider },
-        );
+        const authChallenge: ManualAuthChallenge = await discoverManualAuthChallenge(config.url, {
+          headers: config.headers,
+        }).catch((): ManualAuthChallenge => {
+          console.warn(
+            `[pi-mcp] Failed to discover OAuth challenge for "${serverName}"; falling back to standard discovery`,
+          );
+          return {};
+        });
 
-        // 5. Start the auth flow - this will trigger redirectToAuthorization which opens the browser
-        // CRITICAL FIX #2: Check the return value of auth() instead of catching UnauthorizedError
-        // The SDK returns 'REDIRECT' when it needs browser interaction, not an error
-        const authResult = await auth(authProvider, { serverUrl: config.url });
+        // Register the callback immediately before auth() can open the browser.
+        // Attach a catch handler so cancellation after immediate authorization
+        // does not produce an unhandled rejection.
+        const callbackPromise = waitForCallback(oauthState);
+        callbackPromise.catch(() => {});
+
+        const authOptions: {
+          serverUrl: string;
+          resourceMetadataUrl?: URL;
+          scope?: string;
+        } = { serverUrl: config.url };
+        if (authChallenge.resourceMetadataUrl) {
+          authOptions.resourceMetadataUrl = authChallenge.resourceMetadataUrl;
+        }
+        if (authChallenge.scope) {
+          authOptions.scope = authChallenge.scope;
+        }
+
+        // Start the auth flow. REDIRECT means browser interaction is required.
+        const authResult = await auth(authProvider, authOptions);
+        if (signal.aborted) throw new AuthCancelledError(serverName);
 
         if (authResult === "AUTHORIZED") {
-          // Auth succeeded without needing browser interaction (e.g., had valid tokens)
-          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+          // Auth succeeded without needing browser interaction (e.g., had valid tokens).
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
         } else if (authResult === "REDIRECT") {
           // Browser was opened, wait for the callback from the user
           ctx.ui.notify(
-            `pi-mcp: Browser opened for ${serverName}. Complete authorization to continue...`,
+            `pi-mcp: Browser opened for ${serverName}. Complete authorization to continue. Choose Retry to reopen the browser or Cancel to stop authentication.`,
             "info",
           );
 
-          // 6. Wait for the callback (this blocks until the user authorizes)
-          const code = await callbackPromise;
-
+          // 6. Wait for the callback while giving the user an escape hatch.
+          const code = await waitForOAuthCallback(
+            serverName,
+            callbackPromise,
+            () => {
+              if (!latestAuthorizationUrl) {
+                throw new McpError(
+                  `Authorization URL is not available for ${serverName}`,
+                  serverName,
+                  "protocol",
+                );
+              }
+              if (!signal.aborted) (paths.browserOpen ?? openBrowser)(latestAuthorizationUrl.toString());
+            },
+            ctx,
+          );
+          if (signal.aborted) throw new AuthCancelledError(serverName);
+          ctx.ui.notify(
+            `pi-mcp: Authorization callback received for ${serverName}. Exchanging token...`,
+            "info",
+          );
           // 7. Complete the OAuth flow with the authorization code
-          await transport.finishAuth(code);
+          const finishAuthOptions: {
+            serverUrl: string;
+            authorizationCode: string;
+            resourceMetadataUrl?: URL;
+            scope?: string;
+          } = {
+            serverUrl: config.url,
+            authorizationCode: code,
+          };
+          if (authChallenge.resourceMetadataUrl) {
+            finishAuthOptions.resourceMetadataUrl = authChallenge.resourceMetadataUrl;
+          }
+          if (authChallenge.scope) {
+            finishAuthOptions.scope = authChallenge.scope;
+          }
 
-          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully!`, "info");
+          const finishAuthResult = await auth(authProvider, finishAuthOptions);
+
+          if (finishAuthResult !== "AUTHORIZED") {
+            throw new McpError(
+              `Unexpected auth completion result: ${finishAuthResult}`,
+              serverName,
+              "protocol",
+            );
+          }
+
+          ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
         } else {
           throw new McpError(
             `Unexpected auth result: ${authResult}`,
@@ -351,20 +480,145 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           );
         }
 
-        // 8. Close the transport (we'll create a new one when starting the server)
-        await transport.close().catch(() => {});
+      if (signal.aborted) throw new AuthCancelledError(serverName);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      cancel();
+      await stopCallbackServer().catch(() => {});
+      await unlock?.();
+    }
+  }
 
-        // 9. Start the server with fresh auth credentials
-        await manager.startServer(serverName, ctx.cwd);
+  async function connectRequested(serverName: string, ctx: ExtensionContext, signal?: AbortSignal, reset = false): Promise<void> {
+    const server = manager.getServer(serverName);
+    if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
+    if (signal?.aborted) throw new AuthCancelledError(serverName);
+    if (reset && !server.config.auth) throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
+    if (reset && !ctx.hasUI) throw new AuthRequiredError(serverName);
 
+    const existing = connectAttempts.get(serverName);
+    // All requests join an in-flight reset. A reset supersedes a normal connect.
+    if (existing && (!reset || existing.reset)) {
+      const abort = () => { existing.controller.abort(); void manager.stopServer(serverName); };
+      signal?.addEventListener("abort", abort, { once: true });
+      try { return await existing.promise; }
+      finally { signal?.removeEventListener("abort", abort); }
+    }
+
+    const controller = new AbortController();
+    const abort = () => { controller.abort(); void manager.stopServer(serverName); };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (existing) {
+      existing.controller.abort();
+      void manager.stopServer(serverName);
+    }
+    const task = (async () => {
+      // Wait for a superseded connect to release its callback listener and auth lock.
+      if (existing) await existing.promise.catch(() => {});
+      if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+      if (reset) {
+        bridge.deactivateServer(serverName);
+        await manager.stopServer(serverName);
+        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+      }
+      try {
+        if (!reset) await manager.startServer(serverName, ctx.cwd);
+        else throw new AuthRequiredError(serverName);
+        if (controller.signal.aborted) { await manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
+        return;
       } catch (err) {
-        const msg = err instanceof McpError ? err.userMessage : String(err);
-        ctx.ui.notify(`pi-mcp: Authentication failed for ${serverName} — ${msg}`, "error");
+        if (!(err instanceof AuthRequiredError) || !server.config.auth) throw err;
+      }
+      if (!ctx.hasUI) throw new AuthRequiredError(serverName);
+      let release!: () => void;
+      const previous = authQueue;
+      authQueue = new Promise<void>((resolve) => { release = resolve; });
+      try {
+        await previous;
+        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+        await authorize(serverName, ctx, controller.signal, reset);
+        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+        await manager.startServer(serverName, ctx.cwd);
+        if (controller.signal.aborted) { await manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
+      } finally {
+        release();
+      }
+    })().catch((err: unknown) => {
+      if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+      throw err;
+    });
+    const entry = { promise: task, controller, reset };
+    connectAttempts.set(serverName, entry);
+    try { await task; } finally {
+      signal?.removeEventListener("abort", abort);
+      if (connectAttempts.get(serverName) === entry) connectAttempts.delete(serverName);
+    }
+  }
 
-        // Clean up on error
-        if (oauthState) {
-          cancelCallback(oauthState);
-        }
+  pi.registerTool({
+    name: "mcp_status",
+    label: "MCP status",
+    description: "List configured MCP servers, lifecycle, connection and OAuth state. Use mcp_connect to connect one server.",
+    parameters: Type.Object({}),
+    async execute() {
+      const rows = await Promise.all(manager.getAllServers().map(async (server) => {
+        const auth = server.config.auth ? await manager.getServerAuthStatus(server.name) : null;
+        return {
+          name: server.name, lifecycle: server.config.lifecycle, state: server.state,
+          tools: bridge.getToolActivity(server.name),
+          auth: server.config.auth ? auth?.hasTokens ? "credentials stored" : "authorization may be required" : "not configured",
+          error: server.lastError
+            ? server.lastError instanceof AuthRequiredError
+              ? "Authorization required: use mcp_connect in an interactive Pi session"
+              : `Connection ${server.lastError instanceof McpError ? server.lastError.code : "failed"}; use mcp_connect to retry`
+            : undefined,
+        };
+      }));
+      return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "mcp_connect",
+    label: "Connect MCP server",
+    description: "Connect one named configured MCP server and activate its tools. May request interactive OAuth authorization.",
+    parameters: Type.Object({ name: Type.String({ description: "Exact configured MCP server name" }) }),
+    async execute(_id, { name }, signal, _update, ctx) {
+      try {
+        await connectRequested(name, ctx, signal);
+      } catch (err) {
+        const message = signal?.aborted || err instanceof AuthCancelledError
+          ? "MCP connection cancelled. Retry when ready."
+          : !manager.getServer(name)
+            ? "Unknown MCP server name. Use mcp_status to list configured servers."
+            : err instanceof AuthLockError
+              ? "Another Pi process is authorizing this server. Retry after it finishes or check for a stale auth lock."
+              : err instanceof AuthRequiredError
+                ? ctx.hasUI
+                  ? "MCP authorization required. Retry with mcp_connect or /mcp:auth."
+                  : "MCP authorization requires an interactive Pi session."
+                : err instanceof McpError && err.code === "protocol"
+                  ? "MCP tool discovery failed. Check the server and retry."
+                  : "MCP connection failed. Check the server configuration and retry.";
+        throw new Error(message);
+      }
+      const activity = bridge.getToolActivity(name);
+      if (activity.active !== activity.discovered) {
+        throw new Error("MCP server connected, but some discovered tools are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered and active counts.");
+      }
+      return { content: [{ type: "text", text: `MCP server ${name} ready; tools discovered and active.` }], details: {} };
+    },
+  });
+
+  pi.registerCommand("mcp:auth", {
+    description: "Connect with OAuth; use /mcp:auth <name> --reset to discard stored credentials.",
+    handler: async (args, ctx) => {
+      const { name, reset } = parseAuthArguments(args, manager.getAllServers().map((server) => server.name));
+      if (!name) { ctx.ui.notify("Usage: /mcp:auth <name> [--reset]", "error"); return; }
+      if (!manager.getServer(name)?.config.auth) { ctx.ui.notify(`No OAuth server named ${name}`, "error"); return; }
+      try { await connectRequested(name, ctx, undefined, reset); ctx.ui.notify(`pi-mcp: ${name} ready`, "info"); }
+      catch (err) {
+        ctx.ui.notify(`pi-mcp: ${err instanceof Error ? err.message : String(err)}`, err instanceof AuthCancelledError ? "info" : "error");
       }
     },
   });

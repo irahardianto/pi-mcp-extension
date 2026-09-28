@@ -170,8 +170,7 @@ function mergeConfigs(
  * Project config takes precedence over global config.
  * Returns a fully validated, merged config.
  */
-export async function loadConfig(cwd: string): Promise<McpConfig> {
-  const globalPath = join(homedir(), ".pi", "agent", "mcp.json");
+export async function loadConfig(cwd: string, globalPath = join(homedir(), ".pi", "agent", "mcp.json")): Promise<McpConfig> {
   const projectPath = join(cwd, ".pi", "mcp.json");
 
   const [globalRaw, projectRaw] = await Promise.all([

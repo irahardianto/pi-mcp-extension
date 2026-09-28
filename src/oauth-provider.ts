@@ -13,7 +13,7 @@
 
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthClientMetadata, OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, chmod, open, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -83,17 +83,37 @@ interface StoredState {
 
 // ─── File helpers ─────────────────────────────────────────────────────────────
 
-const AUTH_DIR = join(homedir(), ".pi", "agent", "mcp-auth");
-
-function statePath(serverName: string): string {
-  // Hash the server name to avoid filesystem issues with special chars
-  const hash = createHash("sha256").update(serverName).digest("hex").slice(0, 16);
-  return join(AUTH_DIR, `${hash}.json`);
+function authDir(storageDir?: string): string {
+  return storageDir ?? join(homedir(), ".pi", "agent", "mcp-auth");
 }
 
-async function loadState(serverName: string): Promise<StoredState> {
+function statePath(serverName: string, storageDir?: string): string {
+  // Hash the server name to avoid filesystem issues with special chars
+  const hash = createHash("sha256").update(serverName).digest("hex").slice(0, 16);
+  return join(authDir(storageDir), `${hash}.json`);
+}
+
+// Exclusive per-server authorization lock shared by independent Pi processes.
+export async function acquireAuthLock(serverName: string, storageDir?: string): Promise<() => Promise<void>> {
+  const directory = authDir(storageDir);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const path = `${statePath(serverName, storageDir)}.lock`;
   try {
-    const raw = await readFile(statePath(serverName), "utf8");
+    const file = await open(path, "wx", 0o600);
+    try { await file.writeFile(String(process.pid)); }
+    catch (err) { await unlink(path).catch(() => {}); throw err; }
+    finally { await file.close(); }
+    return async () => { await unlink(path).catch(() => {}); };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    throw new AuthLockError(serverName);
+  }
+}
+
+async function loadState(serverName: string, storageDir?: string): Promise<StoredState> {
+  try {
+    const raw = await readFile(statePath(serverName, storageDir), "utf8");
     const parsed = JSON.parse(raw) as StoredState;
     return {
       clientInfo: parsed.clientInfo ?? undefined,
@@ -111,15 +131,20 @@ async function loadState(serverName: string): Promise<StoredState> {
   }
 }
 
-async function saveState(serverName: string, state: StoredState): Promise<void> {
-  await mkdir(AUTH_DIR, { recursive: true });
+async function saveState(serverName: string, state: StoredState, storageDir?: string, isCancelled: () => boolean = () => false): Promise<void> {
+  const directory = authDir(storageDir);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
   // Only write defined fields
   const toWrite: Record<string, unknown> = {};
   if (state.clientInfo !== undefined) toWrite.clientInfo = state.clientInfo;
   if (state.tokens !== undefined) toWrite.tokens = state.tokens;
   if (state.codeVerifier !== undefined) toWrite.codeVerifier = state.codeVerifier;
   if (state.discoveryState !== undefined) toWrite.discoveryState = state.discoveryState;
-  await writeFile(statePath(serverName), JSON.stringify(toWrite, null, 2), "utf8");
+  if (isCancelled()) throw new AuthRequiredError(serverName, "Authorization cancelled");
+  const path = statePath(serverName, storageDir);
+  await writeFile(path, JSON.stringify(toWrite, null, 2), { encoding: "utf8", mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 // ─── OAuthClientProvider Implementation ────────────────────────────────────────
@@ -135,6 +160,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
     serverName: string,
     authConfig: AuthConfig,
     onAuthRequired?: (url: URL) => void | Promise<void>,
+    private readonly storageDir?: string,
+    private readonly silent = false,
+    private readonly isCancelled: () => boolean = () => false,
   ) {
     this.serverName = serverName;
     this.authConfig = authConfig;
@@ -160,6 +188,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: this.authConfig.clientSecret ? "client_secret_basic" : "none",
+      ...(this.authConfig.scope && { scope: this.authConfig.scope }),
     };
   }
 
@@ -174,7 +203,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       };
     }
     // Otherwise load from persisted DCR state
-    const state = await loadState(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     if (state.clientInfo) {
       return {
         client_id: state.clientInfo.client_id,
@@ -187,18 +216,19 @@ export class McpOAuthProvider implements OAuthClientProvider {
   // --- saveClientInformation (DCR) ---
 
   async saveClientInformation(clientInformation: OAuthClientInformationMixed): Promise<void> {
-    const state = await loadState(this.serverName);
+    if (this.silent) throw new AuthRequiredError(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     state.clientInfo = {
       client_id: clientInformation.client_id,
       client_secret: clientInformation.client_secret,
     };
-    await saveState(this.serverName, state);
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 
   // --- tokens ---
 
   async tokens(): Promise<OAuthTokens | undefined> {
-    const state = await loadState(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     if (!state.tokens) return undefined;
 
     // Always return stored tokens — even if expired.
@@ -227,7 +257,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
   // --- saveTokens ---
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
-    const state = await loadState(this.serverName);
+    if (this.silent) await this.checkInteractiveLock();
+    const state = await loadState(this.serverName, this.storageDir);
     state.tokens = {
       access_token: tokens.access_token,
       token_type: tokens.token_type,
@@ -236,7 +267,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
       scope: tokens.scope,
       saved_at: new Date().toISOString(),
     };
-    await saveState(this.serverName, state);
+    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 
   // --- redirectToAuthorization ---
@@ -256,13 +288,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
   // --- PKCE code verifier ---
 
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
-    const state = await loadState(this.serverName);
+    // The SDK saves PKCE before redirecting. Silent attempts must not overwrite an active flow.
+    if (this.silent) throw new AuthRequiredError(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     state.codeVerifier = codeVerifier;
-    await saveState(this.serverName, state);
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 
   async codeVerifier(): Promise<string> {
-    const state = await loadState(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     if (!state.codeVerifier) {
       throw new Error(`[pi-mcp] No PKCE code verifier found for "${this.serverName}"`);
     }
@@ -272,13 +306,14 @@ export class McpOAuthProvider implements OAuthClientProvider {
   // --- Discovery state caching ---
 
   async saveDiscoveryState(discState: OAuthDiscoveryState): Promise<void> {
-    const state = await loadState(this.serverName);
+    if (this.silent) return; // No shared state writes from background discovery.
+    const state = await loadState(this.serverName, this.storageDir);
     state.discoveryState = discState;
-    await saveState(this.serverName, state);
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
-    const state = await loadState(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     return state.discoveryState;
   }
 
@@ -303,8 +338,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   // --- Credential invalidation ---
 
+  private async checkInteractiveLock(): Promise<void> {
+    try { await stat(`${statePath(this.serverName, this.storageDir)}.lock`); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return; throw err; }
+    throw new AuthRequiredError(this.serverName);
+  }
+
   async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
-    const state = await loadState(this.serverName);
+    if (this.silent) throw new AuthRequiredError(this.serverName);
+    const state = await loadState(this.serverName, this.storageDir);
     switch (scope) {
       case "all":
         state.clientInfo = undefined;
@@ -325,7 +367,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         state.discoveryState = undefined;
         break;
     }
-    await saveState(this.serverName, state);
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 }
 
@@ -335,13 +377,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
  * Get auth status info for a server — whether tokens exist, when they were saved, etc.
  * Returns null if no auth state file exists at all.
  */
-export async function getAuthStatus(serverName: string): Promise<{
+export async function getAuthStatus(serverName: string, storageDir?: string): Promise<{
   hasTokens: boolean;
   hasClientInfo: boolean;
   savedAt: string | undefined;
   scope: string | undefined;
 } | null> {
-  const state = await loadState(serverName);
+  const state = await loadState(serverName, storageDir);
   if (
     state.clientInfo === undefined &&
     state.tokens === undefined &&
@@ -362,6 +404,20 @@ export async function getAuthStatus(serverName: string): Promise<{
  * Reset all OAuth state for a server (tokens, client info, PKCE verifier, discovery).
  * Used to force re-authorization on next connection.
  */
-export async function resetAuth(serverName: string): Promise<void> {
-  await unlink(statePath(serverName)).catch(() => {});
+export async function resetAuth(serverName: string, storageDir?: string): Promise<void> {
+  await unlink(statePath(serverName, storageDir)).catch(() => {});
+}
+
+export class AuthRequiredError extends Error {
+  constructor(serverName: string, message = `Authorization required for ${serverName}. Connect in an interactive Pi session or use /mcp:auth ${serverName}.`) {
+    super(message);
+    this.name = "AuthRequiredError";
+  }
+}
+
+export class AuthLockError extends AuthRequiredError {
+  constructor(serverName: string) {
+    super(serverName, `Another Pi process is authorizing ${serverName}; if it exited, remove its stale auth lock before retrying`);
+    this.name = "AuthLockError";
+  }
 }

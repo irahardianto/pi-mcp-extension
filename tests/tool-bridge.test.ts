@@ -285,6 +285,10 @@ describe("ToolBridge", () => {
     // Tools should be activated
     assert.ok(activeTools.includes("mcp_myserver_echo"));
     assert.ok(activeTools.includes("mcp_myserver_count"));
+    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 2 });
+    activeTools = ["mcp_myserver_echo", "unrelated_tool"];
+    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 1 });
+    assert.deepEqual(bridge.getToolActivity("unknown"), { discovered: 0, active: 0 });
   });
 
   it("deactivates server tools on disconnect", async () => {
@@ -311,6 +315,7 @@ describe("ToolBridge", () => {
     assert.ok(!activeTools.includes("mcp_myserver_echo"));
     assert.ok(!activeTools.includes("mcp_myserver_count"));
     assert.ok(activeTools.includes("other_tool"));
+    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 0 });
   });
 
   it("re-registers tools on repeated refresh to capture new client", async () => {

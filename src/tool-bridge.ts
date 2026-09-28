@@ -328,7 +328,7 @@ export class ToolBridge {
    * Deactivates tools that are no longer in the server's list.
    * Note: Pi's registerTool() overwrites by name (Map.set), so re-registration is safe.
    */
-  async refreshTools(serverName: string, client: Client): Promise<void> {
+  async refreshTools(serverName: string, client: Client, isCurrent: () => boolean = () => true): Promise<void> {
     const timeoutMs = this.settings.requestTimeoutMs;
 
     let tools: McpToolDefinition[];
@@ -343,6 +343,7 @@ export class ToolBridge {
       );
     }
 
+    if (!isCurrent()) return;
     const registeredForServer = this.serverToolNames.get(serverName) ?? new Set<string>();
 
     // Build the set of currently valid Pi tool names for this server
@@ -375,6 +376,13 @@ export class ToolBridge {
 
     // Activate all current tools for this server
     this._activateServerTools(serverName);
+  }
+
+  /** Report discovery separately from the tools currently exposed by Pi. */
+  getToolActivity(serverName: string): { discovered: number; active: number } {
+    const names = this.serverToolNames.get(serverName) ?? new Set<string>();
+    const active = new Set(this.pi.getActiveTools());
+    return { discovered: names.size, active: [...names].filter((name) => active.has(name)).length };
   }
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */

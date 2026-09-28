@@ -6,7 +6,7 @@ pi-mcp-extension supports OAuth 2.1 with PKCE for MCP servers that require brows
 
 The extension implements a complete OAuth flow with:
 
-1. **Local Callback Server** - Runs on `localhost:19876` to receive OAuth callbacks
+1. **Local Callback Server** - Uses `http://127.0.0.1:19876/callback` by default
 2. **Automatic Endpoint Discovery** - Uses RFC 9728 to discover OAuth endpoints
 3. **Dynamic Client Registration** - RFC 7591 support for servers that allow it
 4. **PKCE (S256)** - Mandatory for security
@@ -57,24 +57,21 @@ You can provide pre-registered client credentials:
 
 ### Authenticate a Server
 
-Run the `/mcp:auth` command:
-
-```
-/mcp:auth deepsource
-```
-
-This will:
+Use `mcp_connect` with the server name, `/mcp:start deepsource`, or `/mcp:auth deepsource` in an interactive Pi session. Stored credentials are reused. If the server requires browser authorization, the flow will:
 1. Start the callback server (if not already running)
 2. Generate a secure state parameter
-3. Open your browser for authorization
-4. Wait for the OAuth callback
-5. Complete the authentication flow
-6. Store tokens securely
-7. Start the server
+3. Read the resource server's OAuth challenge with a bounded request
+4. Open your browser for authorization
+5. Wait for the OAuth callback
+6. Exchange the authorization code through the MCP SDK
+7. Store tokens securely
+8. Connect the server and activate discovered tools
+
+Interactive sessions show Retry and Cancel while authorization is pending. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser. A stop, cancellation, or shutdown cancels pending callbacks and retries.
 
 ### Token Storage
 
-Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json`:
+Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json`. On systems with POSIX permissions, the directory uses mode `0700` and state files use mode `0600`.
 
 ```json
 {
@@ -94,27 +91,26 @@ Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json`:
 
 ### Reset Authentication
 
-To force re-authentication:
+To discard stored tokens and client registration, run `/mcp:auth deepsource --reset` in an interactive Pi session. The old `/mcp:auth deepsource` reset behavior has changed: it now reuses credentials and requests browser authorization only if needed. Interactive flows for different servers run one at a time in each Pi process. A per-server lock prevents simultaneous interactive flows in different Pi processes. Independent processes can still attempt token refresh at the same time; no cross-process connection or refresh coordinator exists. If Pi exits during browser authorization, verify that no authorization is active before removing the stale `~/.pi/agent/mcp-auth/<hash>.json.lock` file for that server.
 
-```
-/mcp:auth deepsource
-```
-
-This resets credentials and starts a fresh OAuth flow.
+Server names can contain spaces. For example, `/mcp:auth team server --reset` resets `team server`. An exact configured name takes precedence over the reset suffix. To reset a server named `release --reset`, use `/mcp:auth release --reset --reset`.
 
 ## Implementation Details
 
 ### Callback Server
 
 - **File**: `src/callback-server.ts`
-- **Port**: 19876 (auto-increments if busy)
+- **Address**: `127.0.0.1:19876` by default
 - **Path**: `/callback`
 - **Timeout**: 5 minutes
 - **Features**:
   - Simple HTML success/error pages
   - State parameter validation (CSRF protection)
   - Promise-based API (`waitForCallback`)
-  - Automatic port selection
+  - Automatic port selection when `redirectUrl` is omitted
+  - Exact host and port binding for configured local redirect URLs
+
+The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `127.0.0.1`, or `::1`, with the exact path `/callback`. A configured local port must be available because OAuth providers require an exact redirect URI match.
 
 ### OAuth Provider
 
@@ -128,26 +124,25 @@ This resets credentials and starts a fresh OAuth flow.
 
 ### Auth Flow
 
-- **File**: `src/index.ts` (`/mcp:auth` command)
+- **File**: `src/index.ts` (`mcp_connect`, `/mcp:start`, `/mcp:auth`)
 - **Steps**:
-  1. Stop server if running
-  2. Reset credentials
-  3. Start callback server
-  4. Generate OAuth state
+  1. Try the stored credentials and silent refresh during the connection
+  2. If browser authorization is needed in an interactive session, acquire the auth lock and start the callback server
+  3. Generate OAuth state
+  4. Discover protected-resource challenge data
   5. Register callback promise
-  6. Create auth provider and transport
-  7. Call SDK `auth()` → opens browser
-  8. Wait for callback (`await waitForCallback`)
-  9. Call `transport.finishAuth(code)`
-  10. Start server with fresh tokens
+  6. Call SDK `auth()` to open the browser
+  7. Wait for the callback
+  8. Call SDK `auth()` with the authorization code
+  9. Connect the server and activate discovered tools
 
 ## Security Considerations
 
 1. **PKCE S256** - All OAuth flows use PKCE
 2. **State Parameter** - Cryptographically secure, validated on callback
-3. **Localhost Only** - Callback server only listens on localhost
-4. **File Permissions** - Token files saved with appropriate permissions
-5. **URL Validation** - Credentials tied to specific server URL
+3. **Loopback Only** - The callback server listens only on a local loopback address
+4. **File Permissions** - The auth directory uses `0700` and state files use `0600` where POSIX permissions apply
+5. **Secret Handling** - Authorization codes and tokens are not written to logs
 
 ## Troubleshooting
 
@@ -157,15 +152,15 @@ This error is now fixed. The callback server automatically provides the redirect
 
 ### Browser doesn't open
 
-If the browser fails to open (e.g., in SSH sessions), the authorization URL will be logged. Copy it manually to your browser.
+The command reports the browser process error. Run Pi in an environment where `open`, `xdg-open`, or `rundll32` can launch a browser.
 
 ### Callback server port in use
 
-The callback server automatically scans forward for an available port. If you need a specific port, set `MCP_OAUTH_CALLBACK_PORT` environment variable.
+When `redirectUrl` is omitted, the callback server scans forward from port `19876`. A configured local redirect URL uses its exact port and fails if that port is occupied.
 
 ### Token refresh failed
 
-Tokens are automatically refreshed by the MCP SDK. If refresh fails, run `/mcp:auth` again to re-authenticate.
+Tokens are automatically refreshed by the MCP SDK. If refresh fails, use `mcp_connect` or `/mcp:auth <name>` in an interactive Pi session. Use `--reset` only if stored credentials must be discarded.
 
 ## Architecture
 
@@ -175,7 +170,7 @@ Tokens are automatically refreshed by the MCP SDK. If refresh fails, run `/mcp:a
 │                                                         │
 │  ┌────────────┐      ┌──────────────────┐             │
 │  │ /mcp:auth  │─────▶│  Callback Server │◀────────┐   │
-│  └────────────┘      │  (localhost:19876) │         │   │
+│  └────────────┘      │ (127.0.0.1:19876)│         │   │
 │         │            └──────────────────┘         │   │
 │         │                                          │   │
 │         ▼                                          │   │
@@ -183,11 +178,11 @@ Tokens are automatically refreshed by the MCP SDK. If refresh fails, run `/mcp:a
 │  │  OAuth Flow                          │            │   │
 │  │  1. Start callback server          │            │   │
 │  │  2. Generate state                  │            │   │
-│  │  3. Register callback promise       │            │   │
-│  │  4. Create auth provider & transport│            │   │
+│  │  3. Discover auth challenge         │            │   │
+│  │  4. Register callback promise       │            │   │
 │  │  5. Call SDK auth()                 │            │   │
-│  │  6. Wait for callback (blocks)      │            │   │
-│  │  7. Call finishAuth(code)           │            │   │
+│  │  6. Wait for callback               │            │   │
+│  │  7. Exchange code through SDK auth()│            │   │
 │  │  8. Start server with tokens        │            │   │
 │  └──────────────────────────────────────┘            │   │
 │                      │                                 │   │

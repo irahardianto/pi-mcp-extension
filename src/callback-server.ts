@@ -6,6 +6,7 @@
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
+import type { Socket } from "net";
 import { URL } from "url";
 
 interface PendingAuth {
@@ -16,14 +17,30 @@ interface PendingAuth {
 
 let server: Server | null = null;
 let actualServerPort: number | null = null;
+let actualServerHost: string | null = null;
+const serverSockets = new Set<Socket>();
 const pendingAuths = new Map<string, PendingAuth>();
 
 const DEFAULT_PORT = 19876;
+const DEFAULT_HOST = "127.0.0.1";
 const CALLBACK_PATH = "/callback";
+
+export interface CallbackServerOptions {
+  /** Host to bind. Defaults to 127.0.0.1 for local-only callbacks. */
+  host?: string | undefined;
+  /** Whether to scan following ports when the preferred port is busy. */
+  allowPortFallback?: boolean | undefined;
+}
+
+export interface CallbackServerConfig {
+  preferredPort: number;
+  host: string;
+  allowPortFallback: boolean;
+}
 const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 const HTML_SUCCESS = `<!DOCTYPE html>
-<html><head><title>Pi - Authorization Successful</title>
+<html><head><meta charset="utf-8"><title>Pi - Authorization Successful</title>
 <style>body{font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}
 .container{text-align:center;padding:2rem}h1{color:#4ade80;margin-bottom:1rem}p{color:#aaa}</style>
 </head><body>
@@ -32,7 +49,7 @@ const HTML_SUCCESS = `<!DOCTYPE html>
 </body></html>`;
 
 const HTML_ERROR = (error: string) => `<!DOCTYPE html>
-<html><head><title>Pi - Authorization Failed</title>
+<html><head><meta charset="utf-8"><title>Pi - Authorization Failed</title>
 <style>body{font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}
 .container{text-align:center;padding:2rem}h1{color:#f87171;margin-bottom:1rem}p{color:#aaa}
 .error{color:#fca5a5;font-family:monospace;margin-top:1rem;padding:1rem;background:rgba(248,113,113,0.1);border-radius:.5rem;white-space:pre-wrap;word-break:break-word}</style>
@@ -56,11 +73,11 @@ function escapeHtml(text: string): string {
  * Handle incoming HTTP requests to the callback server.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse): void {
-  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  const url = new URL(req.url || "/", "http://localhost");
 
   // Only handle the callback path
   if (url.pathname !== CALLBACK_PATH) {
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404, { "Content-Type": "text/plain", "Connection": "close" });
     res.end("Not found");
     return;
   }
@@ -73,7 +90,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   // Enforce state parameter presence for CSRF protection
   if (!state) {
     const errorMsg = "Missing required state parameter - potential CSRF attack";
-    res.writeHead(400, { "Content-Type": "text/html" });
+    res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
     res.end(HTML_ERROR(errorMsg));
     return;
   }
@@ -81,7 +98,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   // Handle OAuth errors
   if (error) {
     const errorMsg = errorDescription || error;
-    res.writeHead(200, { "Content-Type": "text/html" });
+    res.writeHead(200, { "Content-Type": "text/html", "Connection": "close" });
     res.end(HTML_ERROR(errorMsg));
     if (pendingAuths.has(state)) {
       const pending = pendingAuths.get(state)!;
@@ -94,7 +111,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
 
   // Require authorization code
   if (!code) {
-    res.writeHead(400, { "Content-Type": "text/html" });
+    res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
     res.end(HTML_ERROR("No authorization code provided"));
     return;
   }
@@ -102,7 +119,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   // Validate state parameter
   if (!pendingAuths.has(state)) {
     const errorMsg = "Invalid or expired state parameter - potential CSRF attack";
-    res.writeHead(400, { "Content-Type": "text/html" });
+    res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
     res.end(HTML_ERROR(errorMsg));
     return;
   }
@@ -114,54 +131,137 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   pendingAuths.delete(state);
   pending.resolve(code);
 
-  res.writeHead(200, { "Content-Type": "text/html" });
+  res.writeHead(200, { "Content-Type": "text/html", "Connection": "close" });
   res.end(HTML_SUCCESS);
+}
+
+function isLocalCallbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+}
+
+async function closeCurrentServer(): Promise<void> {
+  if (!server) return;
+
+  const currentServer = server;
+  server = null;
+  actualServerPort = null;
+  actualServerHost = null;
+
+  for (const socket of Array.from(serverSockets)) {
+    socket.destroy();
+  }
+  serverSockets.clear();
+
+  await new Promise<void>((resolve) => {
+    currentServer.close(() => {
+      resolve();
+    });
+  });
+}
+
+/**
+ * Build callback server settings from the configured OAuth redirect URL.
+ *
+ * Local HTTP redirect URLs must use a fixed listener port because OAuth
+ * providers require exact redirect URI registration. When no local redirect URL
+ * is configured, the callback server keeps the historical default behavior and
+ * scans forward from the default port if needed.
+ */
+export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): CallbackServerConfig {
+  if (!redirectUrl) {
+    return {
+      preferredPort: DEFAULT_PORT,
+      host: DEFAULT_HOST,
+      allowPortFallback: true,
+    };
+  }
+
+  const url = new URL(redirectUrl);
+  if (url.protocol !== "http:" || !isLocalCallbackHost(url.hostname)) {
+    throw new Error("Manual OAuth redirect URL must use HTTP with localhost, 127.0.0.1, or ::1");
+  }
+
+  if (url.hash) {
+    throw new Error("Manual OAuth redirect URL must not include a fragment");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("Manual OAuth redirect URL must not include credentials");
+  }
+
+  if (url.pathname !== CALLBACK_PATH) {
+    throw new Error(`Local OAuth redirect URL must use path ${CALLBACK_PATH}`);
+  }
+
+  const preferredPort = Number(url.port || "80");
+  if (preferredPort === 0) {
+    throw new Error("Manual OAuth redirect URL must use a fixed non-zero port");
+  }
+
+  return {
+    preferredPort,
+    host: url.hostname === "[::1]" ? "::1" : url.hostname,
+    allowPortFallback: false,
+  };
 }
 
 /**
  * Ensure the callback server is running.
- * Scans forward for an available local port if the preferred port is busy.
+ * Scans forward for an available local port when port fallback is enabled.
  *
  * @param preferredPort - The preferred port to use (default: 19876)
  * @returns The actual port the server is listening on
  */
-export async function ensureCallbackServer(preferredPort: number = DEFAULT_PORT): Promise<number> {
+export async function ensureCallbackServer(preferredPort: number = DEFAULT_PORT, options: CallbackServerOptions = {}): Promise<number> {
+  const host = options.host ?? DEFAULT_HOST;
+  const allowPortFallback = options.allowPortFallback ?? true;
+
   if (server) {
-    // Already running, return the tracked actual port
-    if (actualServerPort !== null) {
+    const address = server.address();
+    if (actualServerPort === null && address && typeof address === "object" && "port" in address) {
+      actualServerPort = address.port;
+    }
+
+    const serverMatchesRequest = actualServerPort === preferredPort && actualServerHost === host;
+    if (serverMatchesRequest && actualServerPort !== null) {
       return actualServerPort;
     }
-    // Fallback: try to get the port from the server
-    const address = server.address();
-    if (address && typeof address === "object" && "port" in address) {
-      actualServerPort = address.port;
-      return address.port;
+
+    if (pendingAuths.size > 0) {
+      throw new Error(
+        `OAuth callback server is already handling an authorization flow on ${actualServerHost}:${actualServerPort}`
+      );
     }
-    // If we still can't determine the port, return the preferred port
-    // (this shouldn't happen in practice)
-    return preferredPort;
+
+    await closeCurrentServer();
   }
 
-  const maxAttempts = 25; // Try up to 25 ports
+  const maxAttempts = allowPortFallback ? 25 : 1; // Try up to 25 ports unless a fixed redirect URI is configured
 
   for (let offset = 0; offset < maxAttempts; offset++) {
     const candidatePort = preferredPort + offset;
     const candidateServer = createServer(handleRequest);
 
     try {
+      candidateServer.on("connection", (socket: Socket) => {
+        serverSockets.add(socket);
+        socket.once("close", () => {
+          serverSockets.delete(socket);
+        });
+      });
+
       await new Promise<void>((resolve, reject) => {
         candidateServer.once("error", (err: any) => {
           reject(err);
         });
 
-        // Bind to 127.0.0.1 explicitly (IPv4) to avoid issues with IPv6
-        candidateServer.listen(candidatePort, "127.0.0.1", () => {
+        candidateServer.listen(candidatePort, host, () => {
           resolve();
         });
       });
-
       server = candidateServer;
       actualServerPort = candidatePort;
+      actualServerHost = host;
       server.unref(); // Don't block process exit
       return candidatePort;
     } catch (error) {
@@ -173,6 +273,10 @@ export async function ensureCallbackServer(preferredPort: number = DEFAULT_PORT)
       // If not EADDRINUSE, rethrow
       if (nodeError.code !== "EADDRINUSE") {
         throw error;
+      }
+
+      if (!allowPortFallback) {
+        throw new Error(`OAuth callback port ${preferredPort} is already in use, and redirect URL requires this exact port`);
       }
     }
   }
@@ -224,15 +328,7 @@ export function cancelCallback(oauthState: string): void {
  * Stop the callback server and reject all pending authorizations.
  */
 export async function stopCallbackServer(): Promise<void> {
-  if (server) {
-    await new Promise<void>((resolve) => {
-      server!.close(() => {
-        resolve();
-      });
-    });
-    server = null;
-    actualServerPort = null;
-  }
+  await closeCurrentServer();
 
   // Reject all pending auths (defer to allow any pending operations to complete)
   const pendingList = Array.from(pendingAuths.entries());
@@ -260,4 +356,4 @@ export function getPendingAuthCount(): number {
 }
 
 // Export constants for testing/config
-export { DEFAULT_PORT, CALLBACK_PATH, TIMEOUT_MS };
+export { DEFAULT_PORT, DEFAULT_HOST, CALLBACK_PATH, TIMEOUT_MS };

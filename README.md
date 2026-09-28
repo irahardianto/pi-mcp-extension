@@ -21,6 +21,7 @@
 - **Global + project config** — Layered config (project overrides global) with per-server tuning
 - **Tool annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` surfaced in tool descriptions
 - **Structured error handling** — Distinct error codes for config, connection, protocol, and tool-level failures
+- **OAuth 2.1** — Browser authorization with PKCE, protected-resource discovery, token refresh, and secure local persistence
 
 ## Installation
 
@@ -80,6 +81,9 @@ Config files are loaded from two locations. **Project config overrides global co
     "supabase": {
       "transport": "streamable-http",
       "url": "https://mcp.supabase.com/mcp",
+      "auth": {
+        "type": "oauth"
+      },
       "lifecycle": "eager"
     },
     "deepsource": {
@@ -137,9 +141,21 @@ Config files are loaded from two locations. **Project config overrides global co
 | `args` | `string[]` | `[]` | Arguments for the command |
 | `env` | `Record<string, string>` | — | Extra environment variables for the child process |
 | `url` | `string` | — | Server URL (**required** for streamable-http/sse) |
-| `lifecycle` | `"eager" \| "lazy"` | `"lazy"` | `eager` = auto-start on session start, `lazy` = manual via `/mcp:start` |
+| `headers` | `Record<string, string>` | — | Static headers sent with HTTP and SSE requests |
+| `auth` | `object` | — | OAuth configuration described below |
+| `lifecycle` | `"eager" \| "lazy"` | `"lazy"` | `eager` = auto-start on session start, `lazy` = connect on request via `mcp_connect` or `/mcp:start` |
 | `requestTimeoutMs` | `number` | global setting | Per-server timeout override |
 | `healthCheckIntervalMs` | `number` | disabled | Opt-in ping interval for connection health monitoring |
+
+### OAuth Config
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | `"oauth"` | `"oauth"` | Authentication type |
+| `scope` | `string` | discovered | Requested scope when the server does not advertise one |
+| `clientId` | `string` | dynamic registration | Pre-registered OAuth client ID |
+| `clientSecret` | `string` | — | Secret for a pre-registered confidential client |
+| `redirectUrl` | `string` | `http://127.0.0.1:19876/callback` | Local HTTP loopback callback used by `/mcp:auth` |
 
 ## Commands
 
@@ -147,8 +163,18 @@ Config files are loaded from two locations. **Project config overrides global co
 |---|---|
 | `/mcp` | Show status summary of all configured servers |
 | `/mcp <name>` | Show detailed status and stderr log for a specific server |
-| `/mcp:start <name>` | Start a server (resets retry count) |
-| `/mcp:stop <name>` | Stop a running server and deactivate its tools |
+| `/mcp:start <name>` | Connect a server and wait for tool discovery |
+| `/mcp:stop <name>` | Cancel a pending connection or authorization, or stop a running server and deactivate its tools |
+| `/mcp:auth <name>` | Connect with stored OAuth credentials; request browser authorization only if needed |
+| `/mcp:auth <name> --reset` | Discard stored OAuth credentials and request fresh authorization |
+
+Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, credential presence, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text. Repeated credential resets share one pending authorization; stop or shutdown cancels it. Lazy servers remain stopped until requested. An interactive Pi session is required when browser authorization is needed. Eager startup never opens a browser. Retry opens the browser again only when selected in the OAuth prompt.
+
+### Connection readiness and active tools
+
+`mcp_status` reports `tools.discovered` and `tools.active` for each server. Connection state `ready` means the MCP handshake and discovery completed. It does not mean that another Pi extension has kept every discovered tool active.
+
+`mcp_connect` checks current tool activation before reporting success, including when the server is already connected. If discovered tools are inactive, it reports that condition instead of overriding another extension's tool restrictions. Check the active tool policy or conflicting extension. A reconnect is not a substitute for fixing an extension that removes tools at each user turn.
 
 ## How It Works
 
@@ -176,7 +202,7 @@ Config files are loaded from two locations. **Project config overrides global co
 ```
 
 1. **Config is loaded** from global and project files (project overrides global by server name)
-2. **Eager servers connect** at session start; lazy servers wait for `/mcp:start`
+2. **Eager servers connect** at session start without opening browsers; lazy servers wait for `mcp_connect` or `/mcp:start`
 3. **Tools are discovered** via paginated `tools/list` calls (cursor-based, up to 100 pages)
 4. **JSON Schema → TypeBox** conversion registers tools with Pi-compatible parameter schemas
 5. **Pi tools are registered** as `<prefix>_<server>_<tool>` (sanitized, max 64 chars with hash suffix)
@@ -217,7 +243,7 @@ npm install
 # Type check (strict mode)
 npm run typecheck
 
-# Run all tests (47 tests)
+# Run all tests
 npm test
 
 # Run integration tests only (real stdio server)
