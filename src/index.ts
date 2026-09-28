@@ -10,7 +10,8 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig, type McpConfig } from "./config.js";
 import { ServerManager } from "./server-manager.js";
-import { AuthRequiredError } from "./oauth-provider.js";
+import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
+import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError } from "./errors.js";
 import { spawn } from "node:child_process";
@@ -553,6 +554,56 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       if (connectAttempts.get(serverName) === entry) connectAttempts.delete(serverName);
     }
   }
+
+  pi.registerTool({
+    name: "mcp_status",
+    label: "MCP status",
+    description: "List configured MCP servers, lifecycle, connection and OAuth state. Use mcp_connect to connect one server.",
+    parameters: Type.Object({}),
+    async execute() {
+      const rows = await Promise.all(manager.getAllServers().map(async (server) => {
+        const auth = server.config.auth ? await manager.getServerAuthStatus(server.name) : null;
+        return {
+          name: server.name, lifecycle: server.config.lifecycle, state: server.state,
+          auth: server.config.auth ? auth?.hasTokens ? "credentials stored" : "authorization may be required" : "not configured",
+          error: server.lastError
+            ? server.lastError instanceof AuthRequiredError
+              ? "Authorization required: use mcp_connect in an interactive Pi session"
+              : `Connection ${server.lastError instanceof McpError ? server.lastError.code : "failed"}; use mcp_connect to retry`
+            : undefined,
+        };
+      }));
+      return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "mcp_connect",
+    label: "Connect MCP server",
+    description: "Connect one named configured MCP server and activate its tools. May request interactive OAuth authorization.",
+    parameters: Type.Object({ name: Type.String({ description: "Exact configured MCP server name" }) }),
+    async execute(_id, { name }, signal, _update, ctx) {
+      try {
+        await connectRequested(name, ctx, signal);
+      } catch (err) {
+        const message = signal?.aborted || err instanceof AuthCancelledError
+          ? "MCP connection cancelled. Retry when ready."
+          : !manager.getServer(name)
+            ? "Unknown MCP server name. Use mcp_status to list configured servers."
+            : err instanceof AuthLockError
+              ? "Another Pi process is authorizing this server. Retry after it finishes or check for a stale auth lock."
+              : err instanceof AuthRequiredError
+                ? ctx.hasUI
+                  ? "MCP authorization required. Retry with mcp_connect or /mcp:auth."
+                  : "MCP authorization requires an interactive Pi session."
+                : err instanceof McpError && err.code === "protocol"
+                  ? "MCP tool discovery failed. Check the server and retry."
+                  : "MCP connection failed. Check the server configuration and retry.";
+        throw new Error(message);
+      }
+      return { content: [{ type: "text", text: `MCP server ${name} ready; tools discovered and active.` }], details: {} };
+    },
+  });
 
   pi.registerCommand("mcp:auth", {
     description: "Connect with OAuth; use /mcp:auth <name> --reset to discard stored credentials.",

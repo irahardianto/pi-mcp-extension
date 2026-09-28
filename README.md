@@ -143,7 +143,7 @@ Config files are loaded from two locations. **Project config overrides global co
 | `url` | `string` | — | Server URL (**required** for streamable-http/sse) |
 | `headers` | `Record<string, string>` | — | Static headers sent with HTTP and SSE requests |
 | `auth` | `object` | — | OAuth configuration described below |
-| `lifecycle` | `"eager" \| "lazy"` | `"lazy"` | `eager` = auto-start on session start, `lazy` = connect on request via `/mcp:start` |
+| `lifecycle` | `"eager" \| "lazy"` | `"lazy"` | `eager` = auto-start on session start, `lazy` = connect on request via `mcp_connect` or `/mcp:start` |
 | `requestTimeoutMs` | `number` | global setting | Per-server timeout override |
 | `healthCheckIntervalMs` | `number` | disabled | Opt-in ping interval for connection health monitoring |
 
@@ -168,7 +168,7 @@ Config files are loaded from two locations. **Project config overrides global co
 | `/mcp:auth <name>` | Connect with stored OAuth credentials; request browser authorization only if needed |
 | `/mcp:auth <name> --reset` | Discard stored OAuth credentials and request fresh authorization |
 
-Repeated credential resets share one pending authorization; stop or shutdown cancels it. Lazy servers remain stopped until requested. An interactive Pi session is required when browser authorization is needed. Eager startup never opens a browser. Retry opens the browser again only when selected in the OAuth prompt.
+Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, credential presence, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text. Repeated credential resets share one pending authorization; stop or shutdown cancels it. Lazy servers remain stopped until requested. An interactive Pi session is required when browser authorization is needed. Eager startup never opens a browser. Retry opens the browser again only when selected in the OAuth prompt.
 
 ## How It Works
 
@@ -196,7 +196,7 @@ Repeated credential resets share one pending authorization; stop or shutdown can
 ```
 
 1. **Config is loaded** from global and project files (project overrides global by server name)
-2. **Eager servers connect** at session start without opening browsers; lazy servers wait for `/mcp:start`
+2. **Eager servers connect** at session start without opening browsers; lazy servers wait for `mcp_connect` or `/mcp:start`
 3. **Tools are discovered** via paginated `tools/list` calls (cursor-based, up to 100 pages)
 4. **JSON Schema → TypeBox** conversion registers tools with Pi-compatible parameter schemas
 5. **Pi tools are registered** as `<prefix>_<server>_<tool>` (sanitized, max 64 chars with hash suffix)
