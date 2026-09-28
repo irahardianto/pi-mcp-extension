@@ -170,6 +170,12 @@ Config files are loaded from two locations. **Project config overrides global co
 
 Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, credential presence, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text. Repeated credential resets share one pending authorization; stop or shutdown cancels it. Lazy servers remain stopped until requested. An interactive Pi session is required when browser authorization is needed. Eager startup never opens a browser. Retry opens the browser again only when selected in the OAuth prompt.
 
+### Connection readiness and active tools
+
+`mcp_status` reports `tools.discovered` and `tools.active` for each server. Connection state `ready` means the MCP handshake and discovery completed. It does not mean that another Pi extension has kept every discovered tool active.
+
+`mcp_connect` checks current tool activation before reporting success, including when the server is already connected. If discovered tools are inactive, it reports that condition instead of overriding another extension's tool restrictions. Check the active tool policy or conflicting extension. A reconnect is not a substitute for fixing an extension that removes tools at each user turn.
+
 ## How It Works
 
 ```
