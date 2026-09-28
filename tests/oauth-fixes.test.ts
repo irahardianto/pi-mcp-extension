@@ -32,29 +32,19 @@ import { AuthCancelledError, authCancelOption, authRetryOption, browserOpenComma
 describe("OAuth Security Fixes", () => {
   const testServerName = "test-oauth-server";
   let provider: McpOAuthProvider;
-  let testHome: string;
-  let originalHome: string | undefined;
-  let originalUserProfile: string | undefined;
+  let testStorage: string;
 
   before(async () => {
-    originalHome = process.env.HOME;
-    originalUserProfile = process.env.USERPROFILE;
-    testHome = await mkdtemp(join(tmpdir(), "pi-mcp-oauth-test-"));
-    process.env.HOME = testHome;
-    process.env.USERPROFILE = testHome;
+    testStorage = await mkdtemp(join(tmpdir(), "pi-mcp-oauth-test-"));
   });
 
   after(async () => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = originalUserProfile;
-    await rm(testHome, { recursive: true, force: true });
+    await rm(testStorage, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
     // Create a fresh provider for each test
-    provider = new McpOAuthProvider(testServerName, {});
+    provider = new McpOAuthProvider(testServerName, {}, undefined, testStorage);
   });
 
   afterEach(async () => {
@@ -95,7 +85,7 @@ describe("OAuth Security Fixes", () => {
 
   describe("Token Handling", () => {
     it("should expose configured scope through client metadata", () => {
-      provider = new McpOAuthProvider(testServerName, { scope: "read write" });
+      provider = new McpOAuthProvider(testServerName, { scope: "read write" }, undefined, testStorage);
 
       assert.strictEqual(provider.clientMetadata.scope, "read write");
     });
@@ -116,10 +106,9 @@ describe("OAuth Security Fixes", () => {
 
       const { writeFile, mkdir } = await import("node:fs/promises");
       const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
       const { createHash } = await import("node:crypto");
 
-      const authDir = join(homedir(), ".pi", "agent", "mcp-auth");
+      const authDir = testStorage;
       const hash = createHash("sha256")
         .update(testServerName)
         .digest("hex")
@@ -153,10 +142,9 @@ describe("OAuth Security Fixes", () => {
 
       const { writeFile, mkdir } = await import("node:fs/promises");
       const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
       const { createHash } = await import("node:crypto");
 
-      const authDir = join(homedir(), ".pi", "agent", "mcp-auth");
+      const authDir = testStorage;
       const hash = createHash("sha256")
         .update(testServerName)
         .digest("hex")
@@ -195,9 +183,8 @@ describe("OAuth Security Fixes", () => {
 
       const { stat } = await import("node:fs/promises");
       const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
       const { createHash } = await import("node:crypto");
-      const authDir = join(homedir(), ".pi", "agent", "mcp-auth");
+      const authDir = testStorage;
       const hash = createHash("sha256").update(testServerName).digest("hex").slice(0, 16);
       const [directoryStats, fileStats] = await Promise.all([
         stat(authDir),
@@ -479,7 +466,7 @@ describe("OAuth Security Fixes", () => {
 
   describe("IPv4 Binding (Medium Fix #12)", () => {
     it("should use 127.0.0.1 in redirect URL", () => {
-      const provider = new McpOAuthProvider(testServerName, {});
+      const provider = new McpOAuthProvider(testServerName, {}, undefined, testStorage);
       const redirectUrl = String(provider.redirectUrl);
 
       assert.match(redirectUrl, /^http:\/\/127\.0\.0\.1:\d+\/callback$/,
@@ -488,7 +475,7 @@ describe("OAuth Security Fixes", () => {
 
     it("should respect custom redirect URL if provided", () => {
       const customUrl = "https://example.com/callback";
-      const provider = new McpOAuthProvider(testServerName, { redirectUrl: customUrl });
+      const provider = new McpOAuthProvider(testServerName, { redirectUrl: customUrl }, undefined, testStorage);
       const redirectUrl = String(provider.redirectUrl);
 
       assert.strictEqual(redirectUrl, customUrl, "Custom redirect URL should be preserved");
@@ -594,26 +581,13 @@ describe("OAuth Security Fixes", () => {
       );
     });
 
-    it("should wait for the callback without opening a selector when UI is unavailable", async () => {
+    it("fails promptly without a selector when UI is unavailable", async () => {
       const callback = deferred<string>();
-      let selectCalled = false;
-      const ui = {
-        select: async () => {
-          selectCalled = true;
-          return undefined;
-        },
-      };
-
-      const resultPromise = waitForOAuthCallback(
-        "test-server",
-        callback.promise,
-        () => assert.fail("Browser should not reopen without UI"),
-        { hasUI: false, ui },
+      const ui = { select: async () => assert.fail("Headless auth must not open a selector") };
+      await assert.rejects(
+        waitForOAuthCallback("test-server", callback.promise, () => assert.fail("No browser"), { hasUI: false, ui }),
+        /requires an interactive Pi session/,
       );
-      callback.resolve("headless-auth-code");
-
-      assert.strictEqual(await resultPromise, "headless-auth-code");
-      assert.strictEqual(selectCalled, false);
     });
   });
 
@@ -632,14 +606,14 @@ describe("OAuth Security Fixes", () => {
       const tokensBefore = await provider.tokens();
       assert.ok(tokensBefore, "Tokens should exist before reset");
 
-      const statusBefore = await getAuthStatus(testServerName);
+      const statusBefore = await getAuthStatus(testServerName, testStorage);
       assert.ok(statusBefore?.hasTokens, "Auth status should show tokens before reset");
 
       // Reset auth
-      await resetAuth(testServerName);
+      await resetAuth(testServerName, testStorage);
 
       // Verify the state is gone by checking auth status
-      const statusAfter = await getAuthStatus(testServerName);
+      const statusAfter = await getAuthStatus(testServerName, testStorage);
       assert.strictEqual(statusAfter, null, "Auth status should be null after reset");
 
       // Verify tokens are gone

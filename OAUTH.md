@@ -57,13 +57,7 @@ You can provide pre-registered client credentials:
 
 ### Authenticate a Server
 
-Run the `/mcp:auth` command:
-
-```
-/mcp:auth deepsource
-```
-
-This will:
+Use `/mcp:start deepsource` or `/mcp:auth deepsource` in an interactive Pi session. Stored credentials are reused. If the server requires browser authorization, the flow will:
 1. Start the callback server (if not already running)
 2. Generate a secure state parameter
 3. Read the resource server's OAuth challenge with a bounded request
@@ -71,9 +65,9 @@ This will:
 5. Wait for the OAuth callback
 6. Exchange the authorization code through the MCP SDK
 7. Store tokens securely
-8. Start the server
+8. Connect the server and activate discovered tools
 
-Interactive sessions show Retry and Cancel while authorization is pending. Print and RPC sessions wait directly for the callback because they do not provide interactive selectors.
+Interactive sessions show Retry and Cancel while authorization is pending. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser. A stop, cancellation, or shutdown cancels pending callbacks and retries.
 
 ### Token Storage
 
@@ -97,13 +91,9 @@ Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json`. On systems w
 
 ### Reset Authentication
 
-To force re-authentication:
+To discard stored tokens and client registration, run `/mcp:auth deepsource --reset` in an interactive Pi session. The old `/mcp:auth deepsource` reset behavior has changed: it now reuses credentials and requests browser authorization only if needed. Interactive flows for different servers run one at a time in each Pi process. A per-server lock prevents simultaneous interactive flows in different Pi processes. Independent processes can still attempt token refresh at the same time; no cross-process connection or refresh coordinator exists. If Pi exits during browser authorization, verify that no authorization is active before removing the stale `~/.pi/agent/mcp-auth/<hash>.json.lock` file for that server.
 
-```
-/mcp:auth deepsource
-```
-
-This resets credentials and starts a fresh OAuth flow.
+Server names can contain spaces. For example, `/mcp:auth team server --reset` resets `team server`. An exact configured name takes precedence over the reset suffix. To reset a server named `release --reset`, use `/mcp:auth release --reset --reset`.
 
 ## Implementation Details
 
@@ -134,18 +124,17 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### Auth Flow
 
-- **File**: `src/index.ts` (`/mcp:auth` command)
+- **File**: `src/index.ts` (`/mcp:start`, `/mcp:auth`)
 - **Steps**:
-  1. Stop server if running
-  2. Reset credentials
-  3. Start callback server
-  4. Generate OAuth state
-  5. Discover protected-resource challenge data
-  6. Register callback promise
-  7. Call SDK `auth()` to open the browser
-  8. Wait for the callback
-  9. Call SDK `auth()` with the authorization code
-  10. Start the server with fresh tokens
+  1. Try the stored credentials and silent refresh during the connection
+  2. If browser authorization is needed in an interactive session, acquire the auth lock and start the callback server
+  3. Generate OAuth state
+  4. Discover protected-resource challenge data
+  5. Register callback promise
+  6. Call SDK `auth()` to open the browser
+  7. Wait for the callback
+  8. Call SDK `auth()` with the authorization code
+  9. Connect the server and activate discovered tools
 
 ## Security Considerations
 
@@ -171,7 +160,7 @@ When `redirectUrl` is omitted, the callback server scans forward from port `1987
 
 ### Token refresh failed
 
-Tokens are automatically refreshed by the MCP SDK. If refresh fails, run `/mcp:auth` again to re-authenticate.
+Tokens are automatically refreshed by the MCP SDK. If refresh fails, use `/mcp:start <name>` or `/mcp:auth <name>` in an interactive Pi session. Use `--reset` only if stored credentials must be discarded.
 
 ## Architecture
 

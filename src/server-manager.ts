@@ -23,8 +23,8 @@ import {
   LoggingMessageNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "./errors.js";
-import type { McpConfig, ServerConfig, Settings, AuthConfig } from "./config.js";
-import { McpOAuthProvider, getAuthStatus, resetAuth } from "./oauth-provider.js";
+import type { McpConfig, ServerConfig, Settings } from "./config.js";
+import { McpOAuthProvider, AuthRequiredError, getAuthStatus, resetAuth } from "./oauth-provider.js";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -51,13 +51,16 @@ export interface ManagedServer {
   healthCheckTimer: ReturnType<typeof setInterval> | null;
   /** Pending retry timeout — cleared on shutdown to prevent ghost reconnects. */
   retryTimer: ReturnType<typeof setTimeout> | null;
+  attempt?: Promise<void> | undefined;
+  controller?: AbortController | undefined;
+  generation?: number;
 }
 
 /** Called after tool list is refreshed for a server (e.g. on list_changed notification). */
 export type ToolRefreshCallback = (serverName: string, client: Client) => Promise<void>;
 
 export interface TransportAuthCallbacks {
-  /** Called when OAuth authorization is required (browser redirect needed). */
+  /** Legacy callback type. Background transport attempts never invoke this callback. */
   onAuthRequired: (serverName: string, authorizationUrl: URL) => void | Promise<void>;
 }
 
@@ -67,7 +70,7 @@ function createTransport(
   serverName: string,
   config: ServerConfig,
   onStderr: (line: string) => void,
-  authCallbacks?: TransportAuthCallbacks,
+  storageDir?: string,
 ): Transport {
   // Build requestInit for static headers (API keys, etc.)
   const requestInit: RequestInit | undefined = config.headers
@@ -77,13 +80,8 @@ function createTransport(
   // Build OAuth authProvider if auth config is present
   let authProvider: OAuthClientProvider | undefined;
   if (config.auth && config.transport !== "stdio") {
-    authProvider = new McpOAuthProvider(
-      serverName,
-      config.auth,
-      authCallbacks
-        ? (url: URL) => authCallbacks.onAuthRequired(serverName, url)
-        : undefined,
-    );
+    // Silent transport attempts must not write PKCE or launch a browser.
+    authProvider = new McpOAuthProvider(serverName, config.auth, undefined, storageDir, true);
   }
 
   switch (config.transport) {
@@ -133,12 +131,10 @@ export class ServerManager {
   private readonly servers = new Map<string, ManagedServer>();
   private settings: Settings;
   private onToolRefresh: ToolRefreshCallback | null = null;
+  private onServerStopped: ((name: string) => void) | null = null;
 
-  private authCallbacks: TransportAuthCallbacks | undefined;
-
-  constructor(config: McpConfig, authCallbacks?: TransportAuthCallbacks) {
+  constructor(config: McpConfig, _authCallbacks?: TransportAuthCallbacks, private readonly storageDir?: string) {
     this.settings = config.settings;
-    this.authCallbacks = authCallbacks;
     for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
       this.servers.set(name, {
         name,
@@ -158,6 +154,10 @@ export class ServerManager {
   /** Register callback invoked after tool list changes for a server. */
   setToolRefreshCallback(cb: ToolRefreshCallback): void {
     this.onToolRefresh = cb;
+  }
+
+  setServerStoppedCallback(cb: (name: string) => void): void {
+    this.onServerStopped = cb;
   }
 
   getServer(name: string): ManagedServer | undefined {
@@ -187,7 +187,7 @@ export class ServerManager {
 
   /** Reset OAuth credentials for a server, forcing re-authorization on next connect. */
   async resetServerAuth(name: string): Promise<void> {
-    await resetAuth(name);
+    await resetAuth(name, this.storageDir);
   }
 
   /** Get auth status for a server. */
@@ -197,7 +197,7 @@ export class ServerManager {
     savedAt: string | undefined;
     scope: string | undefined;
   } | null> {
-    return getAuthStatus(name);
+    return getAuthStatus(name, this.storageDir);
   }
 
   /** Get recent stderr output for a server. */
@@ -219,15 +219,25 @@ export class ServerManager {
     if (!server) {
       throw new McpError(`Unknown server "${name}"`, name, "config");
     }
-    if (server.state !== "stopped") return; // Already starting or ready
-    // Reset retry count on explicit start — allows /mcp:start after exhaustion
+    if (server.attempt) return server.attempt;
+    if (server.state === "ready") return;
     server.retryCount = 0;
-    await this._connect(server, cwd);
+    const controller = new AbortController();
+    server.controller = controller;
+    server.state = "starting";
+    const attempt = this._connect(server, cwd, controller.signal);
+    server.attempt = attempt;
+    try { await attempt; } finally {
+      if (server.attempt === attempt) {
+        server.attempt = undefined;
+        if (this.getServer(name)?.state !== "ready") server.controller = undefined;
+      }
+    }
   }
 
   async stopServer(name: string): Promise<void> {
     const server = this.servers.get(name);
-    if (!server || server.state === "stopped") return;
+    if (!server) return;
     await this._shutdown(server);
   }
 
@@ -264,8 +274,7 @@ export class ServerManager {
 
   // ─── Internal ───────────────────────────────────────────────────────────────
 
-  private async _connect(server: ManagedServer, cwd: string): Promise<void> {
-    server.state = "starting";
+  private async _connect(server: ManagedServer, cwd: string, signal: AbortSignal): Promise<void> {
     server.lastError = null;
     // Note: retryCount is NOT reset here — it's only reset after successful connect.
     // This ensures the retry limit is respected across reconnection attempts.
@@ -281,7 +290,7 @@ export class ServerManager {
 
     let transport: Transport;
     try {
-      transport = createTransport(server.name, server.config, appendStderr, this.authCallbacks);
+      transport = createTransport(server.name, server.config, appendStderr, this.storageDir);
     } catch (err) {
       server.state = "stopped";
       server.lastError = err instanceof Error ? err : new Error(String(err));
@@ -319,7 +328,7 @@ export class ServerManager {
     client.setNotificationHandler(
       ToolListChangedNotificationSchema,
       async () => {
-        if (this.onToolRefresh && server.client) {
+        if (!signal.aborted && this.onToolRefresh && server.state === "ready" && server.client === client) {
           try {
             await this.onToolRefresh(server.name, server.client);
           } catch (err) {
@@ -343,88 +352,67 @@ export class ServerManager {
       },
     );
 
+    server.client = client;
     try {
       await client.connect(transport);
-    } catch (err) {
-      server.state = "stopped";
-      server.lastError = err instanceof Error ? err : new Error(String(err));
-      // Clean up the transport we created (client.close() also closes transport)
-      try { await client.close(); } catch { /* best effort */ }
-      // Attempt retry if under the limit
-      await this._scheduleRetry(server, cwd);
-      return;
-    }
-
-    // Guard against shutdown being called while we were connecting.
-    // _shutdown sets state to "stopped" but can't close the local client variable.
-    if (server.state !== "starting") {
-      try { await client.close(); } catch { /* best effort */ }
-      return;
-    }
-
-    // Extract PID from stdio transport for safety-net cleanup
-    if (server.config.transport === "stdio") {
-      // StdioClientTransport exposes the underlying process
-      server.childPid = (transport as any).process?.pid ?? null;
-    }
-
-    server.client = client;
-    server.state = "ready";
-    server.retryCount = 0;
-    server.lastError = null;
-
-    // Start opt-in health check
-    if (server.config.healthCheckIntervalMs) {
-      server.healthCheckTimer = setInterval(async () => {
-        try {
-          await client.ping();
-        } catch {
-          clearInterval(server.healthCheckTimer!);
-          server.healthCheckTimer = null;
-          console.error(`[pi-mcp] Health check failed for ${server.name}, reconnecting`);
-          server.state = "stopped";
-          await this._scheduleRetry(server, cwd);
-        }
-      }, server.config.healthCheckIntervalMs);
-    }
-
-    // Trigger initial tool registration
-    if (this.onToolRefresh) {
-      try {
-        await this.onToolRefresh(server.name, client);
-      } catch (err) {
-        console.error(`[pi-mcp] Initial tool registration failed for ${server.name}:`, err);
+      if (signal.aborted) throw new Error("Connection cancelled");
+      if (server.config.transport === "stdio") server.childPid = (transport as any).process?.pid ?? null;
+      // Readiness includes tool discovery, not just the MCP handshake.
+      if (this.onToolRefresh) await this.onToolRefresh(server.name, client);
+      if (signal.aborted) throw new Error("Connection cancelled");
+      server.state = "ready";
+      server.retryCount = 0;
+      server.lastError = null;
+      if (server.config.healthCheckIntervalMs) {
+        server.healthCheckTimer = setInterval(async () => {
+          if (signal.aborted) return;
+          try { await client.ping(); }
+          catch {
+            if (signal.aborted) return;
+            const recoveryGeneration = (server.generation ?? 0) + 1;
+            await this._shutdown(server);
+            if (server.generation === recoveryGeneration) {
+              // An external stop during cleanup increments the generation again.
+              queueMicrotask(() => {
+                if (server.generation !== recoveryGeneration) return;
+                void this.startServer(server.name, cwd).catch((error) => {
+                  server.lastError = error instanceof Error ? error : new Error(String(error));
+                });
+              });
+            }
+          }
+        }, server.config.healthCheckIntervalMs);
       }
+    } catch (err) {
+      try { await client.close(); } catch { /* best effort */ }
+      if (server.client === client) { server.client = null; server.childPid = null; }
+      if (signal.aborted) throw new Error("Connection cancelled");
+      const error = err instanceof Error ? err : new Error(String(err));
+      server.lastError = error;
+      if (error instanceof AuthRequiredError || error instanceof McpError && error.code === "protocol") {
+        server.state = "stopped";
+        throw error;
+      }
+      if (server.retryCount >= this.settings.maxRetries) {
+        server.state = "stopped";
+        throw new McpError(`Connection failed after ${server.retryCount} retries: ${error.message}`, server.name, "connection", err);
+      }
+      const delayMs = RETRY_DELAYS_MS[Math.min(server.retryCount++, RETRY_DELAYS_MS.length - 1)] ?? 30000;
+      await new Promise<void>((resolve) => {
+        server.retryTimer = setTimeout(() => { server.retryTimer = null; resolve(); }, delayMs);
+        signal.addEventListener("abort", () => {
+          if (server.retryTimer) { clearTimeout(server.retryTimer); server.retryTimer = null; }
+          resolve();
+        }, { once: true });
+      });
+      if (signal.aborted) throw new Error("Connection cancelled");
+      return this._connect(server, cwd, signal);
     }
-  }
-
-  private async _scheduleRetry(server: ManagedServer, cwd: string): Promise<void> {
-    const maxRetries = this.settings.maxRetries;
-    if (server.retryCount >= maxRetries) {
-      console.error(
-        `[pi-mcp] Server "${server.name}" failed after ${maxRetries} retries: ${server.lastError?.message}`,
-      );
-      return;
-    }
-
-    const delayMs = RETRY_DELAYS_MS[Math.min(server.retryCount, RETRY_DELAYS_MS.length - 1)] ?? 30000;
-    server.retryCount++;
-    console.error(
-      `[pi-mcp] Retrying "${server.name}" in ${delayMs}ms (attempt ${server.retryCount}/${maxRetries})`,
-    );
-
-    await new Promise<void>((resolve) => {
-      server.retryTimer = setTimeout(() => {
-        server.retryTimer = null;
-        resolve();
-      }, delayMs);
-    });
-    if (server.state !== "stopped") return; // May have been stopped externally
-    await this._connect(server, cwd);
   }
 
   private async _shutdown(server: ManagedServer): Promise<void> {
-    if (server.state === "stopped") return;
+    server.controller?.abort();
+    server.generation = (server.generation ?? 0) + 1;
 
     // Cancel pending retry
     if (server.retryTimer) {
@@ -440,6 +428,7 @@ export class ServerManager {
 
     server.state = "stopped";
     server.lastError = null;
+    this.onServerStopped?.(server.name);
     const client = server.client;
     const pid = server.childPid;
     server.client = null;
