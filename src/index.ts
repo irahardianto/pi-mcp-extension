@@ -10,7 +10,8 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { loadConfig, type McpConfig } from "./config.js";
 import { ServerManager } from "./server-manager.js";
-import { AuthRequiredError } from "./oauth-provider.js";
+import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
+import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError } from "./errors.js";
 import { spawn } from "node:child_process";
@@ -181,7 +182,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // ── 2. Initialize bridge components ──────────────────────────────────────
   const manager = new ServerManager(config, undefined, paths.authStorageDir);
   const bridge = new ToolBridge(config.settings, pi);
-  const connectAttempts = new Map<string, { promise: Promise<void>; controller: AbortController; reset: boolean }>();
+  const connectAttempts = new Map<string, { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }>();
   let authQueue: Promise<void> = Promise.resolve();
 
   manager.setToolRefreshCallback(async (serverName, client) => {
@@ -495,22 +496,58 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     if (reset && !server.config.auth) throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
     if (reset && !ctx.hasUI) throw new AuthRequiredError(serverName);
 
+    const waitForAttempt = async (entry: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }): Promise<void> => {
+      entry.waiters++;
+      let released = false;
+      const releaseWaiter = () => {
+        if (!released) {
+          released = true;
+          entry.waiters--;
+        }
+      };
+      if (!signal) {
+        try {
+          return await entry.promise;
+        } finally {
+          releaseWaiter();
+        }
+      }
+      let stopPromise: Promise<unknown> | undefined;
+      let onAbort!: () => void;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        onAbort = () => {
+          releaseWaiter();
+          if (entry.waiters === 0) {
+            entry.controller.abort();
+            stopPromise = manager.stopServer(serverName);
+            void stopPromise.finally(() => reject(new AuthCancelledError(serverName)));
+          } else {
+            reject(new AuthCancelledError(serverName));
+          }
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        return await Promise.race([entry.promise, aborted]);
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+        releaseWaiter();
+        await stopPromise;
+      }
+    };
+
     const existing = connectAttempts.get(serverName);
     // All requests join an in-flight reset. A reset supersedes a normal connect.
     if (existing && (!reset || existing.reset)) {
-      const abort = () => { existing.controller.abort(); void manager.stopServer(serverName); };
-      signal?.addEventListener("abort", abort, { once: true });
-      try { return await existing.promise; }
-      finally { signal?.removeEventListener("abort", abort); }
+      return await waitForAttempt(existing);
     }
 
     const controller = new AbortController();
-    const abort = () => { controller.abort(); void manager.stopServer(serverName); };
-    signal?.addEventListener("abort", abort, { once: true });
     if (existing) {
       existing.controller.abort();
       void manager.stopServer(serverName);
     }
+    let entry!: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number };
     const task = (async () => {
       // Wait for a superseded connect to release its callback listener and auth lock.
       if (existing) await existing.promise.catch(() => {});
@@ -545,14 +582,64 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     })().catch((err: unknown) => {
       if (controller.signal.aborted) throw new AuthCancelledError(serverName);
       throw err;
-    });
-    const entry = { promise: task, controller, reset };
-    connectAttempts.set(serverName, entry);
-    try { await task; } finally {
-      signal?.removeEventListener("abort", abort);
+    }).finally(() => {
       if (connectAttempts.get(serverName) === entry) connectAttempts.delete(serverName);
-    }
+    });
+    void task.catch(() => {});
+    entry = { promise: task, controller, reset, waiters: 0 };
+    connectAttempts.set(serverName, entry);
+    return await waitForAttempt(entry);
   }
+
+  pi.registerTool({
+    name: "mcp_status",
+    label: "MCP status",
+    description: "List configured MCP servers, lifecycle, connection and OAuth state. Use mcp_connect to connect one server.",
+    parameters: Type.Object({}),
+    async execute() {
+      const rows = await Promise.all(manager.getAllServers().map(async (server) => {
+        const auth = server.config.auth ? await manager.getServerAuthStatus(server.name) : null;
+        return {
+          name: server.name, lifecycle: server.config.lifecycle, state: server.state,
+          auth: server.config.auth ? auth?.hasTokens ? "credentials stored" : "authorization may be required" : "not configured",
+          error: server.lastError
+            ? server.lastError instanceof AuthRequiredError
+              ? "Authorization required: use mcp_connect in an interactive Pi session"
+              : `Connection ${server.lastError instanceof McpError ? server.lastError.code : "failed"}; use mcp_connect to retry`
+            : undefined,
+        };
+      }));
+      return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "mcp_connect",
+    label: "Connect MCP server",
+    description: "Connect one named configured MCP server and activate its tools. May request interactive OAuth authorization.",
+    parameters: Type.Object({ name: Type.String({ description: "Exact configured MCP server name" }) }),
+    async execute(_id, { name }, signal, _update, ctx) {
+      try {
+        await connectRequested(name, ctx, signal);
+      } catch (err) {
+        const message = signal?.aborted || err instanceof AuthCancelledError
+          ? "MCP connection cancelled. Retry when ready."
+          : !manager.getServer(name)
+            ? "Unknown MCP server name. Use mcp_status to list configured servers."
+            : err instanceof AuthLockError
+              ? "Another Pi process is authorizing this server. Retry after it finishes or check for a stale auth lock."
+              : err instanceof AuthRequiredError
+                ? ctx.hasUI
+                  ? "MCP authorization required. Retry with mcp_connect or /mcp:auth."
+                  : "MCP authorization requires an interactive Pi session."
+                : err instanceof McpError && err.code === "protocol"
+                  ? "MCP tool discovery failed. Check the server and retry."
+                  : "MCP connection failed. Check the server configuration and retry.";
+        throw new Error(message);
+      }
+      return { content: [{ type: "text", text: `MCP server ${name} ready; tools discovered and active.` }], details: {} };
+    },
+  });
 
   pi.registerCommand("mcp:auth", {
     description: "Connect with OAuth; use /mcp:auth <name> --reset to discard stored credentials.",

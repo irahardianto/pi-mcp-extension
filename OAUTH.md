@@ -57,7 +57,7 @@ You can provide pre-registered client credentials:
 
 ### Authenticate a Server
 
-Use `/mcp:start deepsource` or `/mcp:auth deepsource` in an interactive Pi session. Stored credentials are reused. If the server requires browser authorization, the flow will:
+Use `mcp_connect` with the server name, `/mcp:start deepsource`, or `/mcp:auth deepsource` in an interactive Pi session. Stored credentials are reused. If the server requires browser authorization, the flow will:
 1. Start the callback server (if not already running)
 2. Generate a secure state parameter
 3. Read the resource server's OAuth challenge with a bounded request
@@ -124,7 +124,7 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### Auth Flow
 
-- **File**: `src/index.ts` (`/mcp:start`, `/mcp:auth`)
+- **File**: `src/index.ts` (`mcp_connect`, `/mcp:start`, `/mcp:auth`)
 - **Steps**:
   1. Try the stored credentials and silent refresh during the connection
   2. If browser authorization is needed in an interactive session, acquire the auth lock and start the callback server
@@ -160,7 +160,7 @@ When `redirectUrl` is omitted, the callback server scans forward from port `1987
 
 ### Token refresh failed
 
-Tokens are automatically refreshed by the MCP SDK. If refresh fails, use `/mcp:start <name>` or `/mcp:auth <name>` in an interactive Pi session. Use `--reset` only if stored credentials must be discarded.
+Tokens are automatically refreshed by the MCP SDK. If refresh fails, use `mcp_connect` or `/mcp:auth <name>` in an interactive Pi session. Use `--reset` only if stored credentials must be discarded.
 
 ## Architecture
 
