@@ -8,10 +8,12 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { loadConfig } from "../src/config.js";
+import { loadConfig as loadConfigFile } from "../src/config.js";
 import { McpError } from "../src/errors.js";
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ─
+
+const loadConfig = (dir: string) => loadConfigFile(dir, join(dir, "isolated-global-mcp.json"));
 
 async function withTempDir(
   fn: (dir: string) => Promise<void>,
@@ -175,7 +177,10 @@ describe("loadConfig", () => {
   it("project config overrides global server entries", async () => {
     // This tests the shallow merge: project server completely replaces global
     await withTempDir(async (dir) => {
-      // Write project config with overridden server
+      await writeFile(join(dir, "isolated-global-mcp.json"), JSON.stringify({
+        settings: { requestTimeoutMs: 1000 },
+        mcpServers: { myserver: { command: "global-version" }, other: { command: "global-only" } },
+      }));
       await writeMcpJson(dir, {
         settings: { requestTimeoutMs: 60000 },
         mcpServers: {
@@ -185,10 +190,9 @@ describe("loadConfig", () => {
           },
         },
       });
-      // We can't write to global without polluting the real ~/.pi/agent/mcp.json,
-      // so we test the merge logic by calling loadConfig with only the project file
       const cfg = await loadConfig(dir);
       assert.equal(cfg.settings.requestTimeoutMs, 60000);
+      assert.equal(cfg.mcpServers["other"]?.command, "global-only");
       const server = cfg.mcpServers["myserver"];
       assert.ok(server);
       assert.equal(server.command, "project-version");
