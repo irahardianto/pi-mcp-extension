@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   publish:
@@ -14,11 +15,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm (required for OIDC Trusted Publishing)
+        run: npm install -g npm@latest
 
       - name: Install dependencies
         run: npm install
@@ -77,12 +81,10 @@ jobs:
             echo "Version ${VERSION} already published — skipping."
             echo "publish=false" >> "$GITHUB_ENV"
           else
-            npm publish --access public
+            npm publish --access public --provenance
             echo "Published ${PACKAGE}@${VERSION}"
             echo "publish=true" >> "$GITHUB_ENV"
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Commit version bump and tag
         if: env.publish == 'true'
@@ -90,7 +92,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION=$(node -p "require('./package.json').version")
-          git add package.json
+          git add package.json package-lock.json
           git commit -m "chore: release v${VERSION}"
           git tag "v${VERSION}"
           git push
