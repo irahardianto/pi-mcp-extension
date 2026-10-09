@@ -9,7 +9,7 @@
  *   - AbortSignal → SDK's built-in cancellation (notifications/cancelled)
  *   - Protocol error vs tool execution error distinction
  *   - Activate/deactivate pattern (register once, toggle on server state change)
- *   - Image/audio/resource content → text description passthrough
+ *   - Image content → ImageContent passthrough; audio/resource → text description
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -224,8 +224,9 @@ export function buildToolName(prefix: string, serverName: string, toolName: stri
 // ─── Content Conversion ───────────────────────────────────────────────────────
 
 type PiTextContent = { type: "text"; text: string };
+type PiImageContent = { type: "image"; data: string; mimeType: string };
 
-function convertMcpContent(items: unknown[]): PiTextContent[] {
+function convertMcpContent(items: unknown[]): (PiTextContent | PiImageContent)[] {
   return items.map((item: any) => {
     if (!item || typeof item !== "object") {
       return { type: "text", text: String(item) };
@@ -235,8 +236,9 @@ function convertMcpContent(items: unknown[]): PiTextContent[] {
         return { type: "text", text: String(item.text ?? "") };
       case "image":
         return {
-          type: "text",
-          text: `[Image: ${item.mimeType ?? "unknown"}, base64 encoded]`,
+          type: "image",
+          data: String(item.data ?? ""),
+          mimeType: String(item.mimeType ?? "image/png"),
         };
       case "audio":
         return {
@@ -445,7 +447,9 @@ export class ToolBridge {
 
           // Tool execution errors (isError: true) — distinct from protocol errors
           if (result.isError) {
-            const errorText = content.map((c) => c.text).join("\n");
+            const errorText = content
+              .map((c) => (c.type === "text" ? c.text : ""))
+              .join("\n");
             throw new McpError(
               errorText || "Tool reported an error",
               serverName,
