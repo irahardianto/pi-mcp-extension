@@ -25,7 +25,16 @@ import {
 import { McpError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { McpOAuthProvider, AuthRequiredError, getAuthStatus, resetAuth } from "./oauth-provider.js";
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+
+export function isOAuthUnauthorizedError(error: unknown): boolean {
+  return (
+    error instanceof AuthRequiredError ||
+    error instanceof UnauthorizedError ||
+    (typeof (error as { code?: unknown })?.code === "number" && (error as { code: number }).code === 401) ||
+    /\b(401|Unauthorized)\b/i.test(error instanceof Error ? error.message : String(error))
+  );
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -356,7 +365,7 @@ export class ServerManager {
     try {
       await client.connect(transport);
       if (signal.aborted) throw new Error("Connection cancelled");
-      if (server.config.transport === "stdio") server.childPid = (transport as any).process?.pid ?? null;
+      server.childPid = transport instanceof StdioClientTransport ? transport.pid : null;
       // Readiness includes tool discovery, not just the MCP handshake.
       if (this.onToolRefresh) await this.onToolRefresh(server.name, client);
       if (signal.aborted) throw new Error("Connection cancelled");
@@ -388,9 +397,15 @@ export class ServerManager {
       if (signal.aborted) throw new Error("Connection cancelled");
       const error = err instanceof Error ? err : new Error(String(err));
       server.lastError = error;
-      if (error instanceof AuthRequiredError || error instanceof McpError && error.code === "protocol") {
+      if (error instanceof AuthRequiredError || (error instanceof McpError && error.code === "protocol")) {
         server.state = "stopped";
         throw error;
+      }
+      if (Boolean(server.config.auth) && server.config.transport !== "stdio" && isOAuthUnauthorizedError(error)) {
+        const authError = new AuthRequiredError(server.name);
+        server.lastError = authError;
+        server.state = "stopped";
+        throw authError;
       }
       if (server.retryCount >= this.settings.maxRetries) {
         server.state = "stopped";

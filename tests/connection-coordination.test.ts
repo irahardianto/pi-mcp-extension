@@ -152,6 +152,242 @@ it("does not retry an OAuth browser challenge or alter stored PKCE during a sile
   }
 });
 
+it("should fail immediately with AuthRequiredError and transition connectRequested into interactive OAuth when an OAuth server returns HTTP 401 after silent auth", async () => {
+  // Arrange
+  const { createServer } = await import("node:http");
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { default: extension } = await import("../src/index.js");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue1-auth-"));
+  const authDir = join(dir, "auth");
+  let base = "";
+  let unauthorizedMcpPosts = 0;
+  let allowNextRefresh = true;
+
+  const listener = createServer((req, res) => {
+    if (req.url === "/.well-known/oauth-protected-resource/mcp" || req.url === "/.well-known/oauth-protected-resource") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ resource: `${base}/mcp`, authorization_servers: [base] }));
+      return;
+    }
+    if (req.url === "/.well-known/oauth-authorization-server") {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          issuer: base,
+          authorization_endpoint: `${base}/authorize`,
+          token_endpoint: `${base}/token`,
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          code_challenge_methods_supported: ["S256"],
+        }),
+      );
+      return;
+    }
+    if (req.url === "/token" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk.toString(); });
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        res.setHeader("content-type", "application/json");
+        if (params.get("grant_type") === "refresh_token") {
+          if (allowNextRefresh) {
+            allowNextRefresh = false;
+            // Silent refresh succeeds at the token endpoint, but the resource server will still reject this token with 401
+            res.end(JSON.stringify({ access_token: "still-rejected-token", token_type: "Bearer" }));
+          } else {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: "invalid_grant" }));
+          }
+        } else {
+          res.end(JSON.stringify({ access_token: "interactive-valid-token", token_type: "Bearer" }));
+        }
+      });
+      return;
+    }
+    if (req.url === "/mcp") {
+      if (req.method === "GET") {
+        res.writeHead(405, { Allow: "POST" });
+        res.end();
+        return;
+      }
+      if (req.headers.authorization !== "Bearer interactive-valid-token") {
+        unauthorizedMcpPosts++;
+        res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+        res.end("Unauthorized");
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk) => { body += chunk.toString(); });
+      req.on("end", () => {
+        const msg = JSON.parse(body);
+        if (msg.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "mock-oauth", version: "1.0.0" },
+              },
+            }),
+          );
+        } else if (msg.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+        } else if (msg.method === "tools/list") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                tools: [
+                  {
+                    name: "ping_tool",
+                    description: "Ping",
+                    inputSchema: { type: "object", properties: {} },
+                  },
+                ],
+              },
+            }),
+          );
+        } else {
+          res.writeHead(400);
+          res.end();
+        }
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const callbackProbe = createServer();
+  await new Promise<void>((resolve) => callbackProbe.listen(0, "127.0.0.1", resolve));
+  const callbackAddress = callbackProbe.address();
+  assert.ok(callbackAddress && typeof callbackAddress === "object");
+  await new Promise<void>((resolve) => callbackProbe.close(() => resolve()));
+
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  base = `http://127.0.0.1:${address.port}`;
+
+  const redirectUrl = `http://127.0.0.1:${callbackAddress.port}/callback`;
+  const manager = new ServerManager(
+    {
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 2000, maxRetries: 2 },
+      mcpServers: {
+        local: {
+          lifecycle: "lazy",
+          transport: "streamable-http",
+          url: `${base}/mcp`,
+          args: [],
+          auth: { type: "oauth", clientId: "local-client", redirectUrl },
+        },
+      },
+    },
+    undefined,
+    authDir,
+  );
+  const provider = new McpOAuthProvider("local", { clientId: "local-client", redirectUrl }, undefined, authDir);
+  const events = new Map<string, any>();
+
+  try {
+    await provider.saveTokens({
+      access_token: "initial-expired-token",
+      refresh_token: "refresh-1",
+      token_type: "Bearer",
+    });
+
+    // Act (Part 1: direct startServer fails fast with AuthRequiredError and retryCount === 0)
+    await assert.rejects(manager.startServer("local", process.cwd()), AuthRequiredError);
+
+    // Assert (Part 1)
+    assert.equal(manager.getServer("local")?.retryCount, 0);
+    assert.equal(manager.getServer("local")?.state, "stopped");
+    assert.ok(manager.getServer("local")?.lastError instanceof AuthRequiredError);
+    assert.equal(unauthorizedMcpPosts, 2);
+
+    // Arrange (Part 2: seed refresh_token again so connectRequested hits the same post-silent-auth 401 and transitions to interactive OAuth)
+    allowNextRefresh = true;
+    await provider.saveTokens({
+      access_token: "initial-expired-token",
+      refresh_token: "refresh-1",
+      token_type: "Bearer",
+    });
+
+    const tools = new Map<string, any>();
+    let activeTools: string[] = [];
+    let browserOpened = 0;
+    const pi = {
+      registerTool: (tool: any) => tools.set(tool.name, tool),
+      registerCommand: () => {},
+      on: (name: string, handler: any) => events.set(name, handler),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const ctx: any = {
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }) =>
+          new Promise<string | undefined>((resolve) => {
+            opts?.signal?.addEventListener("abort", () => resolve(undefined));
+          }),
+      },
+    };
+
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 2 },
+        mcpServers: {
+          local: {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: `${base}/mcp`,
+            auth: { type: "oauth", clientId: "local-client", redirectUrl },
+          },
+        },
+      }),
+    );
+
+    await extension(pi as any, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "no-global.json"),
+      authStorageDir: authDir,
+      browserOpen: (url: string) => {
+        browserOpened++;
+        const authUrl = new URL(url);
+        const state = authUrl.searchParams.get("state");
+        const callbackTarget = authUrl.searchParams.get("redirect_uri");
+        assert.ok(state && callbackTarget);
+        void fetch(`${callbackTarget}?code=interactive-code&state=${encodeURIComponent(state)}`);
+      },
+    });
+    await events.get("session_start")({}, ctx);
+
+    // Act (Part 2: connectRequested transitions into interactive OAuth and completes connection)
+    const connectResult = await tools.get("mcp_connect").execute("", { name: "local" }, undefined, undefined, ctx);
+
+    // Assert (Part 2)
+    assert.equal(browserOpened, 1);
+    assert.match(connectResult.content[0].text, /MCP server local ready/);
+    assert.ok(activeTools.some((name) => name.includes("ping_tool")));
+  } finally {
+    await events.get("session_shutdown")?.({}, { cwd: dir, hasUI: false, ui: { notify: () => {} } });
+    await manager.shutdownAll();
+    listener.closeAllConnections();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it("stop during a pending handshake prevents late readiness", async () => {
   const { createServer } = await import("node:http");
   const entered = gate();

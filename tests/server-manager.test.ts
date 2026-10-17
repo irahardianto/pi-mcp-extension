@@ -84,6 +84,16 @@ describe("ServerManager integration (stdio)", () => {
     assert.equal(server?.state, "ready");
   });
 
+  it("should populate childPid when connected to the stdio mock server", () => {
+    // Arrange & Act
+    const server = manager.getServer("test");
+
+    // Assert
+    assert.ok(server);
+    assert.equal(typeof server.childPid, "number");
+    assert.ok((server.childPid ?? 0) > 0);
+  });
+
   it("discovers tools from mock server", () => {
     assert.ok(mockPi.tools.length >= 4, `Expected ≥4 tools, got ${mockPi.tools.length}`);
     const names = mockPi.tools.map((t) => t.name);

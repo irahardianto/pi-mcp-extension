@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- `auth.redirectUrl` must include an explicit port (e.g. `http://127.0.0.1:19876/callback`). Previously a missing port fell back to 80.
+
+### Fixed
+- The stdio server SIGKILL safety net now captures the child PID from `StdioClientTransport.pid`.
+- `/mcp:auth <name> --reset` reports failures to delete credentials instead of claiming success.
+- OAuth-configured servers that surface `UnauthorizedError` or HTTP 401 transport errors during connection fail fast with `AuthRequiredError` instead of retrying, allowing interactive authorization to proceed (#1).
+
 ## [1.7.1] - 2026-10-17
 
 ### Fixed

@@ -193,7 +193,11 @@ export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): Callb
     throw new Error(`Local OAuth redirect URL must use path ${CALLBACK_PATH}`);
   }
 
-  const preferredPort = Number(url.port || "80");
+  if (!url.port) {
+    throw new Error("Manual OAuth redirect URL must include an explicit port (e.g. http://127.0.0.1:19876/callback)");
+  }
+
+  const preferredPort = Number(url.port);
   if (preferredPort === 0) {
     throw new Error("Manual OAuth redirect URL must use a fixed non-zero port");
   }

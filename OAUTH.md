@@ -112,7 +112,7 @@ Server names can contain spaces. For example, `/mcp:auth team server --reset` re
   - Automatic port selection when `redirectUrl` is omitted
   - Exact host and port binding for configured local redirect URLs
 
-The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `127.0.0.1`, or `::1`, with the exact path `/callback`. A configured local port must be available because OAuth providers require an exact redirect URI match.
+The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `127.0.0.1`, or `::1`, with the exact path `/callback`. A configured `auth.redirectUrl` must include an explicit non-80 port (e.g. `http://127.0.0.1:19876/callback`), and that local port must be available because OAuth providers require an exact redirect URI match.
 
 ### OAuth Provider
 

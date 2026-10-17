@@ -405,7 +405,12 @@ export async function getAuthStatus(serverName: string, storageDir?: string): Pr
  * Used to force re-authorization on next connection.
  */
 export async function resetAuth(serverName: string, storageDir?: string): Promise<void> {
-  await unlink(statePath(serverName, storageDir)).catch(() => {});
+  try {
+    await unlink(statePath(serverName, storageDir));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
 }
 
 export class AuthRequiredError extends Error {

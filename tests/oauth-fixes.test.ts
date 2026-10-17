@@ -291,6 +291,26 @@ describe("OAuth Security Fixes", () => {
 
       assert.deepStrictEqual(challenge, {});
     });
+
+    it("should return an empty challenge when the server responds with 405 Method Not Allowed", async () => {
+      // Arrange
+      const response = new Response("Method Not Allowed", {
+        status: 405,
+        headers: {
+          Allow: "POST",
+          "WWW-Authenticate": 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource" scope="read"',
+        },
+      });
+
+      // Act
+      const challenge = await discoverManualAuthChallenge(
+        "https://example.com/mcp",
+        { fetchFn: async () => response },
+      );
+
+      // Assert
+      assert.deepStrictEqual(challenge, {});
+    });
   });
 
   describe("Medium Fix #5: Port Tracking", () => {
@@ -357,6 +377,22 @@ describe("OAuth Security Fixes", () => {
       assert.throws(
         () => callbackServerConfigFromRedirectUrl("http://localhost:0/callback"),
         /must use a fixed non-zero port/,
+      );
+    });
+
+    it("should reject redirect URLs when no explicit port or port 80 is provided", () => {
+      // Arrange
+      const urlWithoutPort = "http://127.0.0.1/callback";
+      const urlWithPort80 = "http://127.0.0.1:80/callback";
+
+      // Act & Assert
+      assert.throws(
+        () => callbackServerConfigFromRedirectUrl(urlWithoutPort),
+        /Manual OAuth redirect URL must include an explicit port \(e\.g\. http:\/\/127\.0\.0\.1:19876\/callback\)/,
+      );
+      assert.throws(
+        () => callbackServerConfigFromRedirectUrl(urlWithPort80),
+        /Manual OAuth redirect URL must include an explicit port \(e\.g\. http:\/\/127\.0\.0\.1:19876\/callback\)/,
       );
     });
 
@@ -619,6 +655,35 @@ describe("OAuth Security Fixes", () => {
       // Verify tokens are gone
       const tokensAfter = await provider.tokens();
       assert.strictEqual(tokensAfter, undefined, "Tokens should not exist after reset");
+    });
+
+    it("should surface EACCES when resetting auth in a read-only directory on POSIX", async (t) => {
+      if (process.platform === "win32" || process.getuid?.() === 0) {
+        t.skip("POSIX non-root directory permission semantics required");
+        return;
+      }
+
+      // Arrange
+      const { chmod } = await import("node:fs/promises");
+      const { resetAuth } = await import("../src/oauth-provider.js");
+      const roStorage = await mkdtemp(join(tmpdir(), "pi-mcp-oauth-ro-"));
+      const roProvider = new McpOAuthProvider(testServerName, {}, undefined, roStorage);
+      await roProvider.saveTokens({
+        access_token: "test-token",
+        token_type: "Bearer",
+      });
+      await chmod(roStorage, 0o500);
+
+      try {
+        // Act & Assert
+        await assert.rejects(
+          () => resetAuth(testServerName, roStorage),
+          (err: NodeJS.ErrnoException) => err.code === "EACCES" || err.code === "EPERM",
+        );
+      } finally {
+        await chmod(roStorage, 0o700);
+        await rm(roStorage, { recursive: true, force: true });
+      }
     });
   });
 });
