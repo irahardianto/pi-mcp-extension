@@ -140,7 +140,7 @@ In project-level `.pi/mcp.json`, `settings` keys carry no defaults — only the 
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `toolPrefix` | `string` | `"mcp"` | Prefix for registered tools: `<prefix>_<server>_<tool>`. Must match `^[a-zA-Z0-9_]+$`. |
+| `toolPrefix` | `string` | `"mcp"` | Prefix for registered tools: `<prefix>_<server>_<tool>`. Must match `^[a-zA-Z][a-zA-Z0-9_]*$`. |
 | `requestTimeoutMs` | `number` | `30000` | Default per-request timeout in milliseconds |
 | `maxRetries` | `number` | `5` | Max reconnection attempts (0–10) before giving up |
 

@@ -149,7 +149,9 @@ async function closeCurrentServer(): Promise<void> {
  * scans forward from the default port if needed.
  */
 export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): CallbackServerConfig {
-  if (!redirectUrl) {
+  // WHY: Only treat `undefined` (omitted) as default; an explicit empty string `""`
+  // must fall through to `new URL("")` and throw a validation error.
+  if (redirectUrl === undefined) {
     return {
       preferredPort: DEFAULT_PORT,
       host: DEFAULT_HOST,

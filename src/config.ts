@@ -14,31 +14,64 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { callbackServerConfigFromRedirectUrl } from "./callback-server.js";
 import { McpError } from "./errors.js";
 
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
-const AuthConfigSchema = z.object({
-  /** Auth type. Currently only "oauth" is supported. Default: "oauth". */
-  type: z.enum(["oauth"]).default("oauth"),
-  /**
-   * Callback URL for the OAuth redirect.
-   * Default: auto-detected local callback server.
-   */
-  redirectUrl: z.string().optional(),
-  /**
-   * Optional scope to request during authorization.
-   */
-  scope: z.string().optional(),
-  /**
-   * Pre-registered client_id (skip dynamic client registration).
-   */
-  clientId: z.string().optional(),
-  /**
-   * Pre-registered client_secret.
-   */
-  clientSecret: z.string().optional(),
-});
+const AuthConfigSchema = z.preprocess(
+  (raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+    const obj = { ...(raw as Record<string, unknown>) };
+    if (obj.redirectUrl === undefined) {
+      if (typeof obj.callbackUrl === "string") {
+        obj.redirectUrl = obj.callbackUrl;
+      } else if (typeof obj.callbackPort === "number") {
+        obj.redirectUrl = `http://127.0.0.1:${obj.callbackPort}/callback`;
+      } else if (obj.callbackUrl !== undefined) {
+        obj.redirectUrl = obj.callbackUrl;
+      }
+    }
+    delete obj.callbackUrl;
+    delete obj.callbackPort;
+    return obj;
+  },
+  z
+    .object({
+      /** Auth type. Currently only "oauth" is supported. Default: "oauth". */
+      type: z.enum(["oauth"]).default("oauth"),
+      /**
+       * Callback URL for the OAuth redirect.
+       * Default: auto-detected local callback server.
+       */
+      redirectUrl: z.string().optional(),
+      /**
+       * Optional scope to request during authorization.
+       */
+      scope: z.string().optional(),
+      /**
+       * Pre-registered client_id (skip dynamic client registration).
+       */
+      clientId: z.string().optional(),
+      /**
+       * Pre-registered client_secret.
+       */
+      clientSecret: z.string().optional(),
+    })
+    .superRefine((auth, ctx) => {
+      if (auth.redirectUrl !== undefined) {
+        try {
+          callbackServerConfigFromRedirectUrl(auth.redirectUrl);
+        } catch (err) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["redirectUrl"],
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }),
+);
 
 export const ServerConfigSchema = z.preprocess(
   (raw) => {
@@ -53,22 +86,7 @@ export const ServerConfigSchema = z.preprocess(
       obj.transport = "streamable-http";
     }
     if (obj.auth === undefined && obj.oauth && typeof obj.oauth === "object" && !Array.isArray(obj.oauth)) {
-      const oauth = obj.oauth as Record<string, unknown>;
-      const redirectUrl =
-        typeof oauth.redirectUrl === "string"
-          ? oauth.redirectUrl
-          : typeof oauth.callbackUrl === "string"
-            ? oauth.callbackUrl
-            : typeof oauth.callbackPort === "number"
-              ? `http://127.0.0.1:${oauth.callbackPort}/callback`
-              : undefined;
-      obj.auth = {
-        type: "oauth",
-        ...(redirectUrl !== undefined ? { redirectUrl } : {}),
-        ...(typeof oauth.scope === "string" ? { scope: oauth.scope } : {}),
-        ...(typeof oauth.clientId === "string" ? { clientId: oauth.clientId } : {}),
-        ...(typeof oauth.clientSecret === "string" ? { clientSecret: oauth.clientSecret } : {}),
-      };
+      obj.auth = obj.oauth;
     }
     if (obj.requestTimeoutMs === undefined && typeof obj.timeout === "number" && obj.timeout > 0) {
       obj.requestTimeoutMs = obj.timeout * 1000;
@@ -132,17 +150,24 @@ export const ServerConfigSchema = z.preprocess(
             ? `"command" is required for stdio transport`
             : `"url" is required for ${cfg.transport} transport`,
       }),
+    )
+    .refine(
+      (cfg) => !(cfg.transport === "stdio" && cfg.auth !== undefined),
+      {
+        message: "OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'",
+        path: ["auth"],
+      },
     ),
 );
 
 const SettingsSchema = z.object({
   /**
    * Prefix used in Pi tool names: <prefix>_<server>_<tool>.
-   * Must match [a-zA-Z0-9_]. Default: "mcp".
+   * Must match ^[a-zA-Z][a-zA-Z0-9_]*$. Default: "mcp".
    */
   toolPrefix: z
     .string()
-    .regex(/^[a-zA-Z0-9_]+$/, "toolPrefix must match [a-zA-Z0-9_]")
+    .regex(/^[a-zA-Z][a-zA-Z0-9_]*$/, "toolPrefix must start with a letter and contain only alphanumeric characters and underscores")
     .default("mcp"),
   /** Default per-request timeout in ms for all servers. Default: 30000. */
   requestTimeoutMs: z.number().positive().default(30000),
@@ -163,7 +188,7 @@ const McpConfigSchema = z.object({
 const ProjectSettingsSchema = z.object({
   toolPrefix: z
     .string()
-    .regex(/^[a-zA-Z0-9_]+$/, "toolPrefix must match [a-zA-Z0-9_]")
+    .regex(/^[a-zA-Z][a-zA-Z0-9_]*$/, "toolPrefix must start with a letter and contain only alphanumeric characters and underscores")
     .optional(),
   requestTimeoutMs: z.number().positive().optional(),
   maxRetries: z.number().int().min(0).max(10).optional(),
@@ -193,14 +218,105 @@ export interface LoadConfigOptions {
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
 
-async function readJsonFile(path: string): Promise<unknown | null> {
+/**
+ * Strip `//` line comments and `/* ... *\/` block comments outside of double-quoted
+ * JSON strings in a single character-by-character pass.
+ *
+ * Preserves `\n` and `\r` characters so line numbers in `JSON.parse` error messages
+ * remain accurate. Unterminated `/*` block comments are left intact so `JSON.parse`
+ * fails with a syntax error rather than silently truncating the document.
+ */
+export function stripJsonComments(text: string): string {
+  let out = "";
+  let inString = false;
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i]!;
+
+    if (inString) {
+      if (ch === "\\") {
+        out += ch;
+        if (i + 1 < text.length) {
+          out += text[i + 1]!;
+          i += 2;
+        } else {
+          i += 1;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === "/" && text[i + 1] === "/") {
+      i += 2;
+      while (i < text.length && text[i] !== "\n") {
+        if (text[i] === "\r" && text[i + 1] === "\n") break;
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === "/" && text[i + 1] === "*") {
+      const closeIdx = text.indexOf("*/", i + 2);
+      if (closeIdx === -1) {
+        // WHY: Leave unterminated block comments intact so JSON.parse fails with a
+        // SyntaxError rather than silently truncating the rest of the file.
+        out += text.slice(i);
+        break;
+      }
+      for (let j = i; j < closeIdx + 2; j += 1) {
+        const commentCh = text[j]!;
+        out += commentCh === "\n" || commentCh === "\r" ? commentCh : " ";
+      }
+      i = closeIdx + 2;
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
+async function readJsonFile(path: string): Promise<unknown> {
+  let text: string;
   try {
-    const text = await readFile(path, "utf8");
-    return JSON.parse(text) as unknown;
+    text = await readFile(path, "utf-8");
   } catch (err) {
-    // ENOENT → file doesn't exist, silently skip
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new McpError(
+      `Failed to read mcp.json at ${path}: ${detail}`,
+      "<config>",
+      "config",
+      err,
+    );
+  }
+
+  try {
+    return JSON.parse(stripJsonComments(text));
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new McpError(
+      `Invalid JSON in mcp.json at ${path}: ${detail}`,
+      "<config>",
+      "config",
+      err,
+    );
   }
 }
 
@@ -303,19 +419,19 @@ export async function loadConfig(
 
   const [globalRaw, projectRaw] = await Promise.all([
     readJsonFile(globalPath),
-    includeProjectConfig ? readJsonFile(projectPath) : Promise.resolve(null),
+    includeProjectConfig ? readJsonFile(projectPath) : Promise.resolve(undefined),
   ]);
 
   // If neither file exists, return an empty valid config
-  if (globalRaw === null && projectRaw === null) {
+  if (globalRaw === undefined && projectRaw === undefined) {
     return McpConfigSchema.parse({});
   }
 
-  const globalCfg = globalRaw !== null
+  const globalCfg = globalRaw !== undefined
     ? parseConfig(globalRaw, globalPath)
     : McpConfigSchema.parse({});
 
-  if (projectRaw === null) return globalCfg;
+  if (projectRaw === undefined) return globalCfg;
 
   const projectCfg = parseWith(ProjectConfigSchema, projectRaw, projectPath);
   return mergeConfigs(globalCfg, projectCfg);

@@ -9,7 +9,12 @@ import { tmpdir } from "node:os";
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { agentDir, loadConfig as loadConfigFile, parseRegisteredServerConfig } from "../src/config.js";
+import {
+  agentDir,
+  loadConfig as loadConfigFile,
+  parseRegisteredServerConfig,
+  stripJsonComments,
+} from "../src/config.js";
 import { McpError } from "../src/errors.js";
 
 // ── Helpers ─
@@ -498,7 +503,7 @@ describe("Pi 1.x server schema compatibility", () => {
             oauth: {
               clientId: "cid-1",
               clientSecret: "csec-1",
-              callbackUrl: "http://127.0.0.1:8888/cb",
+              callbackUrl: "http://127.0.0.1:8888/callback",
               scope: "read:all",
             },
           },
@@ -518,7 +523,7 @@ describe("Pi 1.x server schema compatibility", () => {
         type: "oauth",
         clientId: "cid-1",
         clientSecret: "csec-1",
-        redirectUrl: "http://127.0.0.1:8888/cb",
+        redirectUrl: "http://127.0.0.1:8888/callback",
         scope: "read:all",
       });
 
@@ -552,4 +557,296 @@ describe("Pi 1.x server schema compatibility", () => {
     assert.equal(explicitLazy.lifecycle, "lazy");
   });
 });
+
+// ── Issue #28: JSONC comments, McpError wrapping, toolPrefix, auth validation ─
+
+describe("stripJsonComments", () => {
+  it("strips // line comments and /* */ block comments while preserving newlines", () => {
+    const input = [
+      "// Leading comment",
+      "{",
+      '  /* multi-line',
+      '     block comment */',
+      '  "key": "value" // trailing comment',
+      "}",
+    ].join("\n");
+
+    const stripped = stripJsonComments(input);
+    assert.equal(stripped.split("\n").length, input.split("\n").length);
+    assert.deepEqual(JSON.parse(stripped), { key: "value" });
+  });
+
+  it("preserves URLs (https://...) and /* */ markers inside JSON string literals", () => {
+    const input = `{
+      // Server URL with // and /* inside strings
+      "url": "https://mcp.supabase.com/mcp",
+      "pattern": "/* not a comment */",
+      "inline": "value /* still string */ // also string"
+    }`;
+
+    const parsed = JSON.parse(stripJsonComments(input));
+    assert.deepEqual(parsed, {
+      url: "https://mcp.supabase.com/mcp",
+      pattern: "/* not a comment */",
+      inline: "value /* still string */ // also string",
+    });
+  });
+
+  it("handles escaped quotes inside strings followed by // and /* */", () => {
+    const input = `{
+      "escaped": "prefix \\" // not a comment \\" /* also not */ suffix", // real comment
+      "backslash": "path\\\\" // comment after escaped backslash at end of string
+    }`;
+
+    const parsed = JSON.parse(stripJsonComments(input));
+    assert.deepEqual(parsed, {
+      escaped: 'prefix " // not a comment " /* also not */ suffix',
+      backslash: "path\\",
+    });
+  });
+
+  it("leaves unterminated /* block comments intact so JSON.parse fails with SyntaxError", () => {
+    const input = `{
+      "a": 1
+      /* unterminated block comment
+    }`;
+
+    const stripped = stripJsonComments(input);
+    assert.ok(stripped.includes("/* unterminated block comment"));
+    assert.throws(() => JSON.parse(stripped), SyntaxError);
+  });
+});
+
+describe("Issue #28: Config validation and error handling", () => {
+  it("loads examples/mcp.json.example directly via loadConfig without error", async () => {
+    await withTempDir(async (dir) => {
+      const examplePath = join(process.cwd(), "examples", "mcp.json.example");
+      const cfg = await loadConfigFile(dir, examplePath);
+      assert.equal(cfg.settings.toolPrefix, "mcp");
+      assert.equal(cfg.settings.requestTimeoutMs, 30000);
+      assert.equal(cfg.settings.maxRetries, 5);
+      assert.ok(cfg.mcpServers["supabase"]);
+      assert.ok(cfg.mcpServers["filesystem"]);
+    });
+  });
+
+  it("loads JSONC config containing both // and /* */ comments", async () => {
+    await withTempDir(async (dir) => {
+      const piDir = join(dir, ".pi");
+      await mkdir(piDir, { recursive: true });
+      await writeFile(
+        join(piDir, "mcp.json"),
+        `{
+          // Global settings override
+          "settings": {
+            /* custom prefix */
+            "toolPrefix": "custom_mcp"
+          },
+          "mcpServers": {
+            "remote": {
+              "url": "https://example.com/mcp" // inline comment after URL
+            }
+          }
+        }`,
+      );
+
+      const cfg = await loadConfig(dir);
+      assert.equal(cfg.settings.toolPrefix, "custom_mcp");
+      assert.equal(cfg.mcpServers["remote"]?.url, "https://example.com/mcp");
+    });
+  });
+
+  it("wraps malformed JSON syntax errors in McpError with code 'config', file path, and SyntaxError cause", async () => {
+    await withTempDir(async (dir) => {
+      const piDir = join(dir, ".pi");
+      await mkdir(piDir, { recursive: true });
+      const filePath = join(piDir, "mcp.json");
+      await writeFile(filePath, "{ invalid json");
+
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.equal(err.server, "<config>");
+          assert.ok(err.message.includes(filePath), `Expected path ${filePath} in message: ${err.message}`);
+          assert.ok(err.cause instanceof SyntaxError);
+          return true;
+        },
+      );
+    });
+  });
+
+  it("wraps non-ENOENT filesystem read errors in McpError with code 'config', file path, and cause", async () => {
+    await withTempDir(async (dir) => {
+      const filePath = join(dir, ".pi", "mcp.json");
+      // Make mcp.json a directory so readFile fails with EISDIR
+      await mkdir(filePath, { recursive: true });
+
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.equal(err.server, "<config>");
+          assert.ok(err.message.includes(filePath), `Expected path ${filePath} in message: ${err.message}`);
+          assert.ok(err.cause instanceof Error);
+          return true;
+        },
+      );
+    });
+  });
+
+  it("rejects toolPrefix starting with a digit or underscore and accepts leading letters", async () => {
+    await withTempDir(async (dir) => {
+      for (const invalidPrefix of ["1mcp_", "_mcp"]) {
+        await writeMcpJson(dir, {
+          settings: { toolPrefix: invalidPrefix },
+        });
+        await assert.rejects(
+          () => loadConfig(dir),
+          (err: unknown) => {
+            assert.ok(err instanceof McpError);
+            assert.equal(err.code, "config");
+            assert.ok(
+              err.message.includes("toolPrefix must start with a letter and contain only alphanumeric characters and underscores"),
+              `Unexpected error message for ${invalidPrefix}: ${err.message}`,
+            );
+            return true;
+          },
+        );
+
+        // Also verify global config SettingsSchema rejects it
+        const globalPath = join(dir, "isolated-global-mcp.json");
+        await writeFile(globalPath, JSON.stringify({ settings: { toolPrefix: invalidPrefix } }));
+        await assert.rejects(
+          () => loadConfig(dir, { includeProjectConfig: false }),
+          (err: unknown) => {
+            assert.ok(err instanceof McpError);
+            assert.equal(err.code, "config");
+            assert.ok(
+              err.message.includes("toolPrefix must start with a letter and contain only alphanumeric characters and underscores"),
+            );
+            return true;
+          },
+        );
+        await rm(globalPath, { force: true });
+      }
+
+      for (const validPrefix of ["a", "mcp_2"]) {
+        await writeMcpJson(dir, {
+          settings: { toolPrefix: validPrefix },
+        });
+        const cfg = await loadConfig(dir);
+        assert.equal(cfg.settings.toolPrefix, validPrefix);
+      }
+    });
+  });
+
+  it("rejects auth configuration on a stdio server with McpError (code === 'config')", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          localStdio: {
+            transport: "stdio",
+            command: "npx",
+            args: ["-y", "some-mcp"],
+            auth: { type: "oauth" },
+          },
+        },
+      });
+
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(
+            err.message.includes("OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'"),
+            `Unexpected error message: ${err.message}`,
+          );
+          return true;
+        },
+      );
+
+      // Also verify global config rejects auth/oauth on stdio servers
+      const globalPath = join(dir, "isolated-global-mcp.json");
+      await writeFile(
+        globalPath,
+        JSON.stringify({
+          mcpServers: {
+            globalStdio: {
+              command: "npx",
+              oauth: { callbackPort: 19876 },
+            },
+          },
+        }),
+      );
+      await assert.rejects(
+        () => loadConfig(dir, { includeProjectConfig: false }),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(
+            err.message.includes("OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'"),
+          );
+          return true;
+        },
+      );
+      await rm(globalPath, { force: true });
+    });
+  });
+
+  it("rejects invalid auth.redirectUrl values (including callbackUrl/callbackPort aliases) at config load time with McpError (code === 'config')", async () => {
+    const invalidRedirectUrls = [
+      "http://example.com:8080/callback", // non-loopback host
+      "http://127.0.0.1/callback",        // missing port
+      "http://127.0.0.1:8080/cb",         // wrong path /cb
+      "",                                 // empty string
+      "ftp://127.0.0.1:8080/callback",    // ftp:// scheme
+    ];
+
+    await withTempDir(async (dir) => {
+      for (const redirectUrl of invalidRedirectUrls) {
+        for (const serverDef of [
+          {
+            transport: "streamable-http",
+            url: "https://example.com/mcp",
+            auth: { type: "oauth", redirectUrl },
+          },
+          {
+            transport: "streamable-http",
+            url: "https://example.com/mcp",
+            auth: { type: "oauth", callbackUrl: redirectUrl },
+          },
+          {
+            transport: "streamable-http",
+            url: "https://example.com/mcp",
+            oauth: { callbackUrl: redirectUrl },
+          },
+        ]) {
+          await writeMcpJson(dir, {
+            mcpServers: {
+              remote: serverDef,
+            },
+          });
+
+          await assert.rejects(
+            () => loadConfig(dir),
+            (err: unknown) => {
+              assert.ok(err instanceof McpError, `Expected McpError for redirectUrl="${redirectUrl}"`);
+              assert.equal(err.code, "config");
+              assert.ok(
+                err.message.includes("auth.redirectUrl"),
+                `Expected 'auth.redirectUrl' path in error message for "${redirectUrl}", got: ${err.message}`,
+              );
+              return true;
+            },
+          );
+        }
+      }
+    });
+  });
+});
+
 
