@@ -94,3 +94,78 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("stops a ready server on /mcp:auth and re-authenticates interactively instead of returning a no-op", async () => {
+  const { startFakeOAuthServer } = await import("./helpers/fake-oauth-server.js");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-auth-ready-"));
+  const authDir = join(dir, "auth");
+  const fakeServer = await startFakeOAuthServer({ serverName: "ready-oauth", toolName: "ready_echo" });
+  const commands = new Map<string, any>();
+  const events = new Map<string, any>();
+  const messages: string[] = [];
+  let activeTools: string[] = [];
+  const ctx: any = {
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (message: string) => messages.push(message),
+      select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }) =>
+        new Promise<string | undefined>((resolve) => {
+          opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+        }),
+    },
+  };
+
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          "ready-oauth": {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: fakeServer.mcpUrl,
+            auth: { type: "oauth" },
+          },
+        },
+      }),
+    );
+
+    await extension(
+      {
+        registerTool: () => {},
+        registerCommand: (name: string, command: any) => commands.set(name, command),
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => { activeTools = names; },
+      } as any,
+      {
+        bootstrapCwd: dir,
+        globalConfigPath: join(dir, "missing.json"),
+        authStorageDir: authDir,
+        browserOpen: fakeServer.browserOpen,
+      },
+    );
+    await events.get("session_start")({}, ctx);
+
+    // Step 1: Initial /mcp:auth connects and reaches ready state
+    await commands.get("mcp:auth").handler("ready-oauth", ctx);
+    assert.equal(fakeServer.browserOpenCount, 1);
+
+    // Step 2: While server is still in "ready" state, expire tokens and fail refresh on the server, then run /mcp:auth again
+    fakeServer.expireAccessTokens();
+    fakeServer.failRefresh = true;
+    await commands.get("mcp:auth").handler("ready-oauth", ctx);
+
+    // Assert: /mcp:auth stopped the ready server, detected the 401/failed refresh, and opened the browser a second time
+    assert.equal(fakeServer.browserOpenCount, 2);
+    assert.ok(activeTools.some((name) => name.includes("ready_echo")));
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    await fakeServer.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+

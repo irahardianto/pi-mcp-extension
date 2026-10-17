@@ -564,67 +564,191 @@ describe("OAuth lock and state integration (real filesystem)", () => {
     }
   });
 
-  it("should persist rotated refresh tokens during silent saveTokens while locked and fall back to in-memory cache when disk write fails", async () => {
+  it("should persist rotated refresh tokens during silent saveTokens when unlocked, avoid clobbering disk when locked, and fall back to in-memory cache when disk write fails", async () => {
     // Arrange
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-silent-refresh-"));
     const serverName = "refresh-server";
     try {
-      const unlock = await acquireAuthLock(serverName, dir);
       const silent = new McpOAuthProvider(serverName, { clientId: "client-1" }, undefined, dir, true);
       const reader = new McpOAuthProvider(serverName, { clientId: "client-1" }, undefined, dir, true);
 
+      // Act (Part 1: silent saveTokens when unlocked persists to disk and preserves expires_in + scope)
+      await silent.saveTokens({
+        access_token: "rotated-access-1",
+        refresh_token: "rotated-refresh-1",
+        token_type: "Bearer",
+        expires_in: 1800,
+        scope: "read:tools",
+      });
+
+      // Assert (Part 1: persisted to disk and readable by any provider with full fidelity)
+      const diskTokens = await reader.tokens();
+      assert.equal(diskTokens?.access_token, "rotated-access-1");
+      assert.equal(diskTokens?.refresh_token, "rotated-refresh-1");
+      assert.equal(diskTokens?.expires_in, 1800);
+      assert.equal(diskTokens?.scope, "read:tools");
+
+      // Act (Part 2: silent saveTokens while an interactive lock is held does NOT clobber disk or log error)
+      const unlock = await acquireAuthLock(serverName, dir);
+      const lockErrors: unknown[][] = [];
+      const origErr = console.error;
+      console.error = (...args: unknown[]) => {
+        lockErrors.push(args);
+      };
       try {
-        // Act (Part 1: silent saveTokens while interactive lock is held)
         await silent.saveTokens({
-          access_token: "rotated-access-1",
-          refresh_token: "rotated-refresh-1",
+          access_token: "in-memory-while-locked",
+          refresh_token: "in-memory-refresh",
           token_type: "Bearer",
         });
-
-        // Assert (Part 1: persisted to disk and readable by any provider)
-        const diskTokens = await reader.tokens();
-        assert.equal(diskTokens?.access_token, "rotated-access-1");
-        assert.equal(diskTokens?.refresh_token, "rotated-refresh-1");
-
-        // Arrange (Part 2: force disk write failure in silent.saveTokens)
-        // Create a provider pointing at a path where a file blocks directory creation
-        const blockedStorageDir = join(dir, "blocked-file-as-dir");
-        await writeFile(blockedStorageDir, "not-a-directory", "utf8");
-        const fallbackSilent = new McpOAuthProvider(
-          serverName,
-          { clientId: "client-1" },
-          undefined,
-          blockedStorageDir,
-          true,
-        );
-
-        const errors: unknown[][] = [];
-        const origConsoleError = console.error;
-        console.error = (...args: unknown[]) => {
-          errors.push(args);
-        };
-        try {
-          // Act (Part 2: silent saveTokens when disk persistence fails)
-          await fallbackSilent.saveTokens({
-            access_token: "cached-access-2",
-            refresh_token: "cached-refresh-2",
-            token_type: "Bearer",
-          });
-        } finally {
-          console.error = origConsoleError;
-        }
-
-        // Assert (Part 2: error logged, and in-memory cache serves rotated tokens)
-        assert.equal(errors.length, 1);
-        const cachedTokens = await fallbackSilent.tokens();
-        assert.equal(cachedTokens?.access_token, "cached-access-2");
-        assert.equal(cachedTokens?.refresh_token, "cached-refresh-2");
       } finally {
+        console.error = origErr;
         await unlock();
       }
+
+      // Assert (Part 2: silent provider serves cached tokens, disk still has rotated-access-1, zero errors logged)
+      assert.equal(lockErrors.length, 0);
+      assert.equal((await silent.tokens())?.access_token, "in-memory-while-locked");
+      assert.equal((await reader.tokens())?.access_token, "rotated-access-1");
+
+      // Arrange (Part 3: force disk write failure in silent.saveTokens)
+      const blockedStorageDir = join(dir, "blocked-file-as-dir");
+      await writeFile(blockedStorageDir, "not-a-directory", "utf8");
+      const fallbackSilent = new McpOAuthProvider(
+        serverName,
+        { clientId: "client-1" },
+        undefined,
+        blockedStorageDir,
+        true,
+      );
+
+      const errors: unknown[][] = [];
+      const origConsoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        errors.push(args);
+      };
+      try {
+        // Act (Part 3: silent saveTokens when disk persistence fails)
+        await fallbackSilent.saveTokens({
+          access_token: "cached-access-2",
+          refresh_token: "cached-refresh-2",
+          token_type: "Bearer",
+        });
+      } finally {
+        console.error = origConsoleError;
+      }
+
+      // Assert (Part 3: error logged, and in-memory cache serves rotated tokens)
+      assert.equal(errors.length, 1);
+      const cachedTokens = await fallbackSilent.tokens();
+      assert.equal(cachedTokens?.access_token, "cached-access-2");
+      assert.equal(cachedTokens?.refresh_token, "cached-refresh-2");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("should reload peer-rotated tokens on silent invalidateCredentials('tokens') and delete genuinely rejected tokens from disk", async () => {
+    // Arrange
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-peer-refresh-"));
+    const serverName = "peer-server";
+    try {
+      const seeder = new McpOAuthProvider(serverName, { clientId: "c1" }, undefined, dir, false);
+      await seeder.saveClientInformation({ client_id: "c1" });
+      await seeder.saveTokens({
+        access_token: "access-1",
+        refresh_token: "refresh-1",
+        token_type: "Bearer",
+      });
+
+      const processA = new McpOAuthProvider(serverName, { clientId: "c1" }, undefined, dir, true);
+      const processB = new McpOAuthProvider(serverName, { clientId: "c1" }, undefined, dir, true);
+
+      // Both processes read initial tokens
+      assert.equal((await processA.tokens())?.refresh_token, "refresh-1");
+      assert.equal((await processB.tokens())?.refresh_token, "refresh-1");
+
+      // Process A wins the refresh race and persists rotated tokens to disk
+      await processA.saveTokens({
+        access_token: "access-2",
+        refresh_token: "refresh-2",
+        token_type: "Bearer",
+      });
+
+      // Act (Part 1: Process B's refresh with refresh-1 fails with InvalidGrantError, triggering invalidateCredentials("tokens"))
+      await processB.invalidateCredentials("tokens");
+
+      // Assert (Part 1: Process B reloaded Process A's rotated tokens instead of throwing or deleting disk state)
+      const reloaded = await processB.tokens();
+      assert.equal(reloaded?.access_token, "access-2");
+      assert.equal(reloaded?.refresh_token, "refresh-2");
+      assert.equal((await getAuthStatus(serverName, dir))?.hasTokens, true);
+
+      // Act (Part 2: If refresh fails again with no further peer rotation on disk, invalidateCredentials("tokens") removes tokens from disk and throws AuthRequiredError)
+      await assert.rejects(
+        () => processB.invalidateCredentials("tokens"),
+        (err: unknown) => err instanceof Error && err.name === "AuthRequiredError",
+      );
+
+      // Assert (Part 2: Stale tokens removed from disk while clientInfo is preserved)
+      const statusAfterReject = await getAuthStatus(serverName, dir);
+      assert.equal(statusAfterReject?.hasTokens, false);
+      assert.equal(statusAfterReject?.hasClientInfo, true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("should retry transient ENOENT during stale-lock inspection and unlink restored lock file on unlock even if marked lost", async () => {
+    // Arrange
+    const fakeClock = createFakeClock(300_000);
+    const { fs, files } = createFakeFs(() => fakeClock.clock.now());
+    const storageDir = "/virtual/mcp-auth-race";
+    const serverName = "race-server";
+    const targetLockPath = lockPath(serverName, storageDir);
+
+    let readCount = 0;
+    const origReadFile = fs.readFile.bind(fs);
+    let simulateTransientRenameWindow = false;
+    fs.readFile = async (path, encoding) => {
+      if (simulateTransientRenameWindow && path === targetLockPath) {
+        readCount++;
+        if (readCount === 1) {
+          throw createErrno("ENOENT", "Transient ENOENT while contender renamed lock file");
+        }
+      }
+      return origReadFile(path, encoding);
+    };
+
+    const holder = await acquireAuthLock(serverName, storageDir, {
+      deps: {
+        fs,
+        clock: fakeClock.clock,
+        pid: 1001,
+        hostname: "host-a",
+        isPidAlive: () => true,
+      },
+    });
+
+    // Act (Part 1: transient ENOENT on first read recovers on microtask retry)
+    simulateTransientRenameWindow = true;
+    await holder.assertHeld();
+    assert.equal(holder.isLost(), false);
+    assert.equal(readCount, 2);
+    simulateTransientRenameWindow = false;
+
+    // Act (Part 2: even if lock was marked lost while temporarily moved, once restored with same nonce, unlock() must unlink it)
+    const savedEntry = files.get(targetLockPath)!;
+    files.delete(targetLockPath);
+    await assert.rejects(() => holder.assertHeld(), /Authorization lock lost/);
+    assert.equal(holder.isLost(), true);
+
+    // Contender restores the holder's lock file via link() after seeing nonce mismatch
+    files.set(targetLockPath, savedEntry);
+    await holder();
+
+    // Assert (Part 2: no zombie lock left behind)
+    assert.equal(files.has(targetLockPath), false);
   });
 
   it("should rename a corrupt state file to *.corrupt-<ts> and throw McpError with code config without overwriting the backup", async () => {

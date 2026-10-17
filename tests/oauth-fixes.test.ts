@@ -1803,5 +1803,511 @@ describe("OAuth Security Fixes", () => {
       }
     });
   });
+
+  describe("Origin-Bound OAuth State, DCR Persistence, and Re-Auth Edge Cases (Issues #22, #23)", () => {
+    it("should canonicalize server URLs and isolate stored OAuth state across different server origins and paths (Issue 22.1)", async () => {
+      const oauthMod = (await import("../src/oauth-provider.js")) as any;
+      assert.strictEqual(typeof oauthMod.canonicalServerUrl, "function");
+      assert.strictEqual(typeof oauthMod.urlsMatch, "function");
+      assert.strictEqual(oauthMod.canonicalServerUrl("https://example.com/mcp///"), "https://example.com/mcp");
+      assert.strictEqual(oauthMod.canonicalServerUrl("https://example.com/"), "https://example.com/");
+      assert.strictEqual(oauthMod.urlsMatch("https://example.com/mcp/", "https://example.com/mcp"), true);
+      assert.strictEqual(oauthMod.urlsMatch("https://example.com/mcp", "https://evil.example.com/mcp"), false);
+
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-origin-bound-"));
+      try {
+        const globalUrl = "https://global.example.com/mcp/";
+        const evilUrl = "https://evil.example.com/mcp";
+
+        const globalProvider = new McpOAuthProvider(
+          "shared-name",
+          { type: "oauth" },
+          undefined,
+          dir,
+          false,
+          () => false,
+          undefined,
+          globalUrl,
+        );
+        await globalProvider.saveClientInformation({ client_id: "global-client" });
+        await globalProvider.saveTokens({ access_token: "global-secret-token", token_type: "Bearer" });
+        await globalProvider.saveDiscoveryState({
+          authorizationServerUrl: "https://global.example.com",
+          resourceMetadata: {
+            resource: "https://global.example.com/mcp",
+            authorization_servers: ["https://global.example.com"],
+          } as any,
+        });
+
+        // Same URL (ignoring trailing slash) sees stored state
+        const sameOriginProvider = new McpOAuthProvider(
+          "shared-name",
+          { type: "oauth" },
+          undefined,
+          dir,
+          false,
+          () => false,
+          undefined,
+          "https://global.example.com/mcp",
+        );
+        assert.strictEqual((await sameOriginProvider.tokens())?.access_token, "global-secret-token");
+        assert.strictEqual((await sameOriginProvider.clientInformation())?.client_id, "global-client");
+        assert.strictEqual((await oauthMod.getAuthStatus("shared-name", dir, "https://global.example.com/mcp"))?.hasTokens, true);
+
+        // Different URL with same serverName must NOT read global tokens, clientInfo, or discoveryState
+        const evilProvider = new McpOAuthProvider(
+          "shared-name",
+          { type: "oauth" },
+          undefined,
+          dir,
+          false,
+          () => false,
+          undefined,
+          evilUrl,
+        );
+        assert.strictEqual(await evilProvider.tokens(), undefined);
+        assert.strictEqual(await evilProvider.clientInformation(), undefined);
+        assert.strictEqual(await evilProvider.discoveryState(), undefined);
+        assert.strictEqual(await oauthMod.getAuthStatus("shared-name", dir, evilUrl), null);
+
+        // Adversarial: evilProvider calling invalidateCredentials("tokens" | "verifier") must NOT clobber globalProvider's disk state
+        await evilProvider.invalidateCredentials("tokens");
+        await evilProvider.invalidateCredentials("verifier");
+        assert.strictEqual((await sameOriginProvider.tokens())?.access_token, "global-secret-token");
+        assert.strictEqual((await sameOriginProvider.clientInformation())?.client_id, "global-client");
+        assert.ok(await sameOriginProvider.discoveryState());
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should discard legacy or mismatched discoveryState resourceMetadata when serverUrl does not match resource (Issue 22.1)", async () => {
+      const { writeFile, mkdir } = await import("node:fs/promises");
+      const { statePath } = await import("../src/auth-lock.js");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-legacy-disc-"));
+      try {
+        await mkdir(dir, { recursive: true });
+        // Legacy state file without top-level serverUrl, bound to old-host in discoveryState
+        await writeFile(
+          statePath("legacy-srv", dir),
+          JSON.stringify({
+            clientInfo: { client_id: "legacy-client" },
+            tokens: { access_token: "legacy-token", token_type: "Bearer" },
+            discoveryState: {
+              authorizationServerUrl: "https://old-host.example.com",
+              resourceMetadata: {
+                resource: "https://old-host.example.com/mcp",
+                authorization_servers: ["https://old-host.example.com"],
+              },
+            },
+          }),
+          "utf8",
+        );
+
+        const newUrlProvider = new McpOAuthProvider(
+          "legacy-srv",
+          { type: "oauth" },
+          undefined,
+          dir,
+          false,
+          () => false,
+          undefined,
+          "https://new-host.example.com/mcp",
+        );
+        assert.strictEqual(await newUrlProvider.tokens(), undefined);
+        assert.strictEqual(await newUrlProvider.clientInformation(), undefined);
+        assert.strictEqual(await newUrlProvider.discoveryState(), undefined);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should preserve DCR metadata fields and invalidate expired client_secret or changed redirect_uris (Issue 22.2)", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-dcr-meta-"));
+      try {
+        const p1 = new McpOAuthProvider(
+          "dcr-srv",
+          { type: "oauth", redirectUrl: "http://127.0.0.1:19876/callback" },
+          undefined,
+          dir,
+        );
+        const futureExpiry = Math.floor(Date.now() / 1000) + 3600;
+        await p1.saveClientInformation({
+          client_id: "dcr-1",
+          client_secret: "secret-1",
+          client_id_issued_at: 1700000000,
+          client_secret_expires_at: futureExpiry,
+          token_endpoint_auth_method: "client_secret_post",
+          redirect_uris: ["http://127.0.0.1:19876/callback"],
+        } as any);
+
+        const loaded = (await p1.clientInformation()) as any;
+        assert.strictEqual(loaded?.client_id, "dcr-1");
+        assert.strictEqual(loaded?.client_secret, "secret-1");
+        assert.strictEqual(loaded?.client_id_issued_at, 1700000000);
+        assert.strictEqual(loaded?.client_secret_expires_at, futureExpiry);
+        assert.strictEqual(loaded?.token_endpoint_auth_method, "client_secret_post");
+        assert.deepStrictEqual(loaded?.redirect_uris, ["http://127.0.0.1:19876/callback"]);
+
+        // Interactive provider with a different redirectUrl (e.g. fallback port) returns undefined to trigger fresh DCR
+        const pChangedRedirect = new McpOAuthProvider(
+          "dcr-srv",
+          { type: "oauth", redirectUrl: "http://127.0.0.1:19877/callback" },
+          undefined,
+          dir,
+          false,
+        );
+        assert.strictEqual(await pChangedRedirect.clientInformation(), undefined);
+
+        // Expired client_secret: returns undefined in interactive mode, throws AuthRequiredError in silent mode
+        const pastExpiry = Math.floor(Date.now() / 1000) - 60;
+        await p1.saveClientInformation({
+          client_id: "dcr-expired",
+          client_secret: "secret-expired",
+          client_secret_expires_at: pastExpiry,
+        } as any);
+        assert.strictEqual(await p1.clientInformation(), undefined);
+
+        const pSilent = new McpOAuthProvider("dcr-srv", { type: "oauth" }, undefined, dir, true);
+        await assert.rejects(() => pSilent.clientInformation(), AuthRequiredError);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should classify 401, 403 insufficient_scope, and wrapped protocol errors accurately without false-positiving on unrelated 401 substrings (Issues 23.3, 23.4)", async () => {
+      const { isOAuthUnauthorizedError } = await import("../src/server-manager.js");
+      const { McpError } = await import("../src/errors.js");
+
+      // True positives
+      assert.strictEqual(isOAuthUnauthorizedError(new AuthRequiredError("srv")), true);
+      assert.strictEqual(isOAuthUnauthorizedError(Object.assign(new Error("Streamable HTTP error"), { code: 401 })), true);
+      assert.strictEqual(
+        isOAuthUnauthorizedError(
+          Object.assign(new Error("Streamable HTTP error: Server returned 403 after trying upscoping"), { code: 403 }),
+        ),
+        true,
+      );
+      assert.strictEqual(isOAuthUnauthorizedError(new Error("Error POSTing to endpoint (HTTP 401): Unauthorized")), true);
+      assert.strictEqual(isOAuthUnauthorizedError(new Error("Streamable HTTP error: Server returned 401 after successful authentication")), true);
+      assert.strictEqual(
+        isOAuthUnauthorizedError(Object.assign(new Error("MCP error -32000: HTTP 401 Unauthorized"), { code: -32000 })),
+        true,
+      );
+      assert.strictEqual(isOAuthUnauthorizedError(new Error("HTTP 403 insufficient_scope")), true);
+      assert.strictEqual(
+        isOAuthUnauthorizedError(
+          new McpError(
+            "Failed to list tools from srv: Streamable HTTP error: Server returned 401",
+            "srv",
+            "protocol",
+            Object.assign(new Error("Server returned 401"), { code: 401 }),
+          ),
+        ),
+        true,
+      );
+
+      // False positives that MUST return false
+      assert.strictEqual(isOAuthUnauthorizedError(new McpError("401 Unauthorized from tool output", "srv", "tool")), false);
+      assert.strictEqual(
+        isOAuthUnauthorizedError(Object.assign(new Error("Error POSTing to endpoint: worker 401 failed"), { code: 500 })),
+        false,
+      );
+      assert.strictEqual(
+        isOAuthUnauthorizedError(Object.assign(new Error("Error POSTing to endpoint: Forbidden"), { code: 403 })),
+        false,
+      );
+      assert.strictEqual(isOAuthUnauthorizedError(new Error("Error POSTing to endpoint (HTTP 500): node 401 error")), false);
+      assert.strictEqual(isOAuthUnauthorizedError(new Error("HTTP 502 Bad Gateway from backend-401")), false);
+      assert.strictEqual(isOAuthUnauthorizedError(new Error("Request 401 timed out after 30000ms")), false);
+
+      // Cyclic cause chain must terminate and return false
+      const cycA: any = new Error("outer");
+      const cycB: any = new Error("inner");
+      cycA.cause = cycB;
+      cycB.cause = cycA;
+      assert.strictEqual(isOAuthUnauthorizedError(cycA), false);
+    });
+
+    it("should fall back to POST on 405 in discoverManualAuthChallenge and forward custom headers via createHeadersFetch (Issue 23.5)", async () => {
+      const challengeMod = (await import("../src/auth-challenge.js")) as any;
+      assert.strictEqual(typeof challengeMod.createHeadersFetch, "function");
+
+      const seenMethods: string[] = [];
+      const seenHeaders: Headers[] = [];
+      const challenge = await discoverManualAuthChallenge("https://example.com/mcp", {
+        headers: { "X-Custom-Tenant": "acme" },
+        fetchFn: async (_url, init) => {
+          seenMethods.push(init?.method ?? "GET");
+          seenHeaders.push(new Headers(init?.headers));
+          if (init?.method === "GET") {
+            return new Response("Method Not Allowed", { status: 405, headers: { Allow: "POST" } });
+          }
+          return new Response("Unauthorized", {
+            status: 401,
+            headers: {
+              "WWW-Authenticate":
+                'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource" scope="mcp:read mcp:write"',
+            },
+          });
+        },
+      });
+
+      assert.deepStrictEqual(seenMethods, ["GET", "POST"]);
+      assert.strictEqual(seenHeaders[1]?.get("x-custom-tenant"), "acme");
+      assert.strictEqual(seenHeaders[1]?.get("content-type"), "application/json");
+      assert.strictEqual(
+        challenge.resourceMetadataUrl?.toString(),
+        "https://example.com/.well-known/oauth-protected-resource",
+      );
+      assert.strictEqual(challenge.scope, "mcp:read mcp:write");
+
+      // Verify createHeadersFetch merges baseHeaders and lets per-request headers override
+      let capturedMerged: Headers | undefined;
+      const wrappedFetch = challengeMod.createHeadersFetch(
+        { "X-Base": "1", "X-Override": "base" },
+        async (_input: any, init?: RequestInit) => {
+          capturedMerged = new Headers(init?.headers);
+          return new Response("ok", { status: 200 });
+        },
+      );
+      await wrappedFetch("https://example.com/token", { headers: { "X-Override": "request" } });
+      assert.strictEqual(capturedMerged?.get("x-base"), "1");
+      assert.strictEqual(capturedMerged?.get("x-override"), "request");
+    });
+
+    it("should invalidate rejected tokens and open browser when AS refresh succeeds but resource server still returns 401, and recover from mid-session 401 on tool execution (Issues 23.1, 23.2)", async () => {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue23-reauth-"));
+      const authDir = join(dir, "auth");
+      let base = "";
+      let refreshGrantCount = 0;
+      let rejectRefreshedTokenOnMcp = true;
+      let expireInteractiveTokenMidSession = false;
+
+      const listener = createServer((req, res) => {
+        if (req.url === "/.well-known/oauth-protected-resource/mcp" || req.url === "/.well-known/oauth-protected-resource") {
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ resource: `${base}/mcp`, authorization_servers: [base] }));
+          return;
+        }
+        if (req.url === "/.well-known/oauth-authorization-server") {
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              issuer: base,
+              authorization_endpoint: `${base}/authorize`,
+              token_endpoint: `${base}/token`,
+              response_types_supported: ["code"],
+              grant_types_supported: ["authorization_code", "refresh_token"],
+              code_challenge_methods_supported: ["S256"],
+            }),
+          );
+          return;
+        }
+        if (req.url === "/token" && req.method === "POST") {
+          let body = "";
+          req.on("data", (chunk) => { body += chunk.toString(); });
+          req.on("end", () => {
+            const params = new URLSearchParams(body);
+            res.setHeader("content-type", "application/json");
+            if (params.get("grant_type") === "refresh_token") {
+              refreshGrantCount++;
+              // AS ALWAYS succeeds on refresh_token (even if called multiple times!), issuing a token that the resource server rejects when rejectRefreshedTokenOnMcp is true
+              res.end(
+                JSON.stringify({
+                  access_token: "as-refreshed-but-rs-rejected",
+                  refresh_token: "refresh-still-valid-at-as",
+                  token_type: "Bearer",
+                }),
+              );
+            } else {
+              res.end(
+                JSON.stringify({
+                  access_token: "fresh-browser-token",
+                  refresh_token: "refresh-still-valid-at-as",
+                  token_type: "Bearer",
+                }),
+              );
+            }
+          });
+          return;
+        }
+        if (req.url === "/mcp") {
+          if (req.method === "GET") {
+            res.writeHead(405, { Allow: "POST" });
+            res.end();
+            return;
+          }
+          const authHeader = req.headers.authorization;
+          const validToken =
+            authHeader === "Bearer fresh-browser-token" && !expireInteractiveTokenMidSession
+              ? true
+              : authHeader === "Bearer as-refreshed-but-rs-rejected" && !rejectRefreshedTokenOnMcp;
+          if (!validToken) {
+            res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+            res.end("Unauthorized");
+            return;
+          }
+          let body = "";
+          req.on("data", (chunk) => { body += chunk.toString(); });
+          req.on("end", () => {
+            const msg = JSON.parse(body);
+            if (msg.method === "initialize") {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: msg.id,
+                  result: {
+                    protocolVersion: "2025-03-26",
+                    capabilities: { tools: {} },
+                    serverInfo: { name: "reauth-srv", version: "1.0.0" },
+                  },
+                }),
+              );
+            } else if (msg.method === "notifications/initialized") {
+              res.writeHead(202);
+              res.end();
+            } else if (msg.method === "tools/list") {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: msg.id,
+                  result: {
+                    tools: [
+                      {
+                        name: "protected_action",
+                        description: "Protected action",
+                        inputSchema: { type: "object", properties: {} },
+                      },
+                    ],
+                  },
+                }),
+              );
+            } else if (msg.method === "tools/call") {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: msg.id,
+                  result: { content: [{ type: "text", text: "ok" }] },
+                }),
+              );
+            }
+          });
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const address = listener.address();
+      assert.ok(address && typeof address === "object");
+      base = `http://127.0.0.1:${address.port}`;
+
+      const tools = new Map<string, any>();
+      const events = new Map<string, any>();
+      let activeTools: string[] = [];
+      let browserOpenCalls = 0;
+
+      const pi = {
+        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerCommand: () => {},
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => { activeTools = names; },
+      };
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: () => {},
+          select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }) =>
+            new Promise<string | undefined>((resolve) => {
+              opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+            }),
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 0 },
+            mcpServers: {
+              reauth: {
+                lifecycle: "lazy",
+                transport: "streamable-http",
+                url: `${base}/mcp`,
+                auth: { type: "oauth", clientId: "reauth-client" },
+              },
+            },
+          }),
+        );
+
+        // Seed initial expired token + refresh token that AS accepts but RS rejects
+        const seeder = new McpOAuthProvider(
+          "reauth",
+          { type: "oauth", clientId: "reauth-client" },
+          undefined,
+          authDir,
+          false,
+          () => false,
+          undefined,
+          `${base}/mcp`,
+        );
+        await seeder.saveTokens({
+          access_token: "initial-expired",
+          refresh_token: "refresh-still-valid-at-as",
+          token_type: "Bearer",
+        });
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: (url: string) => {
+            browserOpenCalls++;
+            const authUrl = new URL(url);
+            const state = authUrl.searchParams.get("state")!;
+            const redirectUri = authUrl.searchParams.get("redirect_uri")!;
+            void fetch(`${redirectUri}?code=browser-code-${browserOpenCalls}&state=${encodeURIComponent(state)}`);
+          },
+        });
+        await events.get("session_start")({}, ctx);
+
+        // Act (Part 1 — Issue 23.1: mcp_connect must invalidate rejected tokens after silent refresh 401 and open the browser)
+        await tools.get("mcp_connect").execute("", { name: "reauth" }, undefined, undefined, ctx);
+
+        // Assert (Part 1)
+        assert.strictEqual(browserOpenCalls, 1, "authorize() must open browser instead of silently refreshing again");
+        assert.ok(activeTools.includes("mcp_reauth_protected_action"));
+
+        // Act (Part 2 — Issue 23.2: Mid-session 401 during tool call transitions server to stopped + AuthRequiredError and deactivates tools)
+        expireInteractiveTokenMidSession = true;
+        await assert.rejects(() =>
+          tools.get("mcp_reauth_protected_action").execute("", {}, undefined, undefined, ctx),
+        );
+
+        // Assert (Part 2: tools deactivated and mcp_status reports Authorization required)
+        assert.strictEqual(activeTools.includes("mcp_reauth_protected_action"), false);
+        const statusRes = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+        const statusRows = JSON.parse(statusRes.content[0].text);
+        assert.strictEqual(statusRows[0].state, "stopped");
+        assert.strictEqual(statusRows[0].auth, "authorization may be required");
+        assert.match(statusRows[0].error, /Authorization required/);
+      } finally {
+        await events.get("session_shutdown")?.({}, ctx);
+        listener.closeAllConnections();
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
+
 

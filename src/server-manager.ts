@@ -24,16 +24,93 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
-import { McpOAuthProvider, AuthRequiredError, getAuthStatus, resetAuth } from "./oauth-provider.js";
+import { McpOAuthProvider, AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } from "./oauth-provider.js";
 import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 
-export function isOAuthUnauthorizedError(error: unknown): boolean {
-  return (
-    error instanceof AuthRequiredError ||
-    error instanceof UnauthorizedError ||
-    (typeof (error as { code?: unknown })?.code === "number" && (error as { code: number }).code === 401) ||
-    /\b(401|Unauthorized)\b/i.test(error instanceof Error ? error.message : String(error))
+export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>()): boolean {
+  if (!error || seen.has(error)) {
+    return false;
+  }
+  if (typeof error === "object") {
+    seen.add(error);
+  }
+
+  if (error instanceof AuthRequiredError || error instanceof UnauthorizedError) {
+    return true;
+  }
+
+  if (error instanceof McpError) {
+    // WHY: Tool-level application errors (`isError: true`) come from tool execution logic
+    // (e.g. "found 401 items in database") and must never trigger MCP OAuth re-authentication.
+    if (error.code === "tool") {
+      return false;
+    }
+    if (error.cause !== undefined && isOAuthUnauthorizedError(error.cause, seen)) {
+      return true;
+    }
+  }
+
+  if (typeof error === "object") {
+    const rec = error as { code?: unknown; status?: unknown; statusCode?: unknown; cause?: unknown };
+    if (rec.cause !== undefined && isOAuthUnauthorizedError(rec.cause, seen)) {
+      return true;
+    }
+    const numericCode =
+      typeof rec.code === "number"
+        ? rec.code
+        : typeof rec.status === "number"
+          ? rec.status
+          : typeof rec.statusCode === "number"
+            ? rec.statusCode
+            : undefined;
+    // WHY: Only treat 100..599 as HTTP status codes so negative JSON-RPC error codes
+    // (e.g. -32000) still inspect the error message for wrapped HTTP 401/403 status text.
+    if (numericCode !== undefined && numericCode >= 100 && numericCode <= 599) {
+      if (numericCode === 401) return true;
+      const msg = error instanceof Error ? error.message : String(error);
+      if (numericCode === 403 && /\b(insufficient_scope|trying upscoping)\b/i.test(msg)) {
+        return true;
+      }
+      return false;
+    }
+  }
+
+  const msg = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (!msg) return false;
+
+  // Reject messages that explicitly report a non-401/403 HTTP status code
+  const httpStatusMatch = msg.match(
+    /\b(?:HTTP\s+|status(?:\s+code)?[:\s]+|(?:POSTing|GETting|connecting)\s+to\s+\S+:\s*|(?:Non-200\s+status\s+code\s*\())(\d{3})\b/i,
   );
+  if (httpStatusMatch) {
+    const status = Number(httpStatusMatch[1]);
+    if (status !== 401 && status !== 403) {
+      return false;
+    }
+  }
+
+  if (
+    /^\s*401\s*$/.test(msg) ||
+    /\bHTTP\s+401\b/i.test(msg) ||
+    /\bstatus(?:\s+code)?[:\s(]+401\b/i.test(msg) ||
+    /\breturned\s+401\b/i.test(msg) ||
+    /\b401\s+Unauthorized\b/i.test(msg) ||
+    /:\s*401\b/.test(msg) ||
+    /\(401\)/.test(msg) ||
+    /\bUnauthorized\b/i.test(msg) ||
+    /\binvalid_token\b/i.test(msg)
+  ) {
+    return true;
+  }
+
+  if (
+    /\b(403|Forbidden)\b/i.test(msg) &&
+    /\b(insufficient_scope|trying upscoping)\b/i.test(msg)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -90,7 +167,16 @@ function createTransport(
   let authProvider: OAuthClientProvider | undefined;
   if (config.auth && config.transport !== "stdio") {
     // Silent transport attempts must not write PKCE or launch a browser.
-    authProvider = new McpOAuthProvider(serverName, config.auth, undefined, storageDir, true);
+    authProvider = new McpOAuthProvider(
+      serverName,
+      config.auth,
+      undefined,
+      storageDir,
+      true,
+      undefined,
+      undefined,
+      config.url,
+    );
   }
 
   switch (config.transport) {
@@ -206,7 +292,25 @@ export class ServerManager {
     savedAt: string | undefined;
     scope: string | undefined;
   } | null> {
-    return getAuthStatus(name, this.storageDir);
+    const serverUrl = this.servers.get(name)?.config.url;
+    return getAuthStatus(name, this.storageDir, serverUrl);
+  }
+
+  /**
+   * Mark an OAuth server as requiring re-authorization when a mid-session
+   * request (tools/list or tools/call) fails with 401/403 insufficient_scope.
+   */
+  async handleUnauthorizedServerError(name: string, _cause?: unknown): Promise<void> {
+    const server = this.servers.get(name);
+    if (!server || !server.config.auth || server.config.transport === "stdio") {
+      return;
+    }
+    await invalidateStoredTokens(name, this.storageDir, server.config.url);
+    const authError = new AuthRequiredError(name);
+    if (server.state === "ready") {
+      await this._shutdown(server);
+    }
+    server.lastError = authError;
   }
 
   /** Get recent stderr output for a server. */
@@ -296,7 +400,12 @@ export class ServerManager {
 
   // ─── Internal ───────────────────────────────────────────────────────────────
 
-  private async _connect(server: ManagedServer, cwd: string, signal: AbortSignal): Promise<void> {
+  private async _connect(
+    server: ManagedServer,
+    cwd: string,
+    signal: AbortSignal,
+    corruptStateRecovered = false,
+  ): Promise<void> {
     server.lastError = null;
     // Note: retryCount is NOT reset here — it's only reset after successful connect.
     // This ensures the retry limit is respected across reconnection attempts.
@@ -409,16 +518,38 @@ export class ServerManager {
       if (server.client === client) { server.client = null; server.childPid = null; }
       if (signal.aborted) throw new Error("Connection cancelled");
       const error = err instanceof Error ? err : new Error(String(err));
+      if (
+        !corruptStateRecovered &&
+        error instanceof McpError &&
+        error.code === "config" &&
+        /Corrupt OAuth state file/i.test(error.message)
+      ) {
+        // WHY: McpOAuthProvider._loadState() already backed up and removed the corrupt
+        // state file before throwing this error. Log the warning and retry once immediately
+        // without consuming retryCount so OAuth can proceed cleanly into AuthRequiredError.
+        console.error(`[pi-mcp] ${error.message}`);
+        if (signal.aborted) throw new Error("Connection cancelled");
+        return this._connect(server, cwd, signal, true);
+      }
       server.lastError = error;
-      if (error instanceof AuthRequiredError || (error instanceof McpError && error.code === "protocol")) {
+      if (error instanceof AuthRequiredError) {
         server.state = "stopped";
         throw error;
       }
       if (Boolean(server.config.auth) && server.config.transport !== "stdio" && isOAuthUnauthorizedError(error)) {
+        // WHY: Check OAuth unauthorized errors BEFORE the generic `error.code === "protocol"`
+        // fast-fail so 401/403 failures during initial tools/list (`onToolRefresh`) are
+        // classified as `AuthRequiredError` rather than raw protocol failures, and stale
+        // tokens on disk are invalidated before interactive re-authorization runs.
+        await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
         const authError = new AuthRequiredError(server.name);
         server.lastError = authError;
         server.state = "stopped";
         throw authError;
+      }
+      if (error instanceof McpError && error.code === "protocol") {
+        server.state = "stopped";
+        throw error;
       }
       if (server.retryCount >= this.settings.maxRetries) {
         server.state = "stopped";
@@ -433,7 +564,7 @@ export class ServerManager {
         }, { once: true });
       });
       if (signal.aborted) throw new Error("Connection cancelled");
-      return this._connect(server, cwd, signal);
+      return this._connect(server, cwd, signal, corruptStateRecovered);
     }
   }
 

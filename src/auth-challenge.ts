@@ -17,6 +17,31 @@ export interface ManualAuthChallengeOptions {
   fetchFn?: AuthChallengeFetch | undefined;
   timeoutMs?: number | undefined;
   headers?: Record<string, string> | undefined;
+  signal?: AbortSignal | undefined;
+}
+
+/**
+ * Wrap a fetch implementation so configured server headers are attached as
+ * defaults on every request (e.g. during SDK OAuth metadata discovery and
+ * token exchange) without overriding explicit per-request headers.
+ */
+export function createHeadersFetch(
+  baseHeaders?: Record<string, string>,
+  baseFetch: typeof fetch = fetch,
+): typeof fetch {
+  if (!baseHeaders || Object.keys(baseHeaders).length === 0) {
+    return baseFetch;
+  }
+  return async (input, init) => {
+    const merged = new Headers(baseHeaders);
+    if (init?.headers) {
+      const incoming = new Headers(init.headers);
+      incoming.forEach((value, key) => {
+        merged.set(key, value);
+      });
+    }
+    return baseFetch(input, { ...init, headers: merged });
+  };
 }
 
 /**
@@ -32,13 +57,32 @@ export async function discoverManualAuthChallenge(
   options: ManualAuthChallengeOptions = {},
 ): Promise<ManualAuthChallenge> {
   const fetchFn = options.fetchFn ?? fetch;
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? AUTH_CHALLENGE_TIMEOUT_MS);
+  const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
   const headers = new Headers(options.headers);
   headers.set("Accept", "application/json, text/event-stream");
-  const response = await fetchFn(serverUrl, {
+  let response = await fetchFn(serverUrl, {
     method: "GET",
     headers,
-    signal: AbortSignal.timeout(options.timeoutMs ?? AUTH_CHALLENGE_TIMEOUT_MS),
+    signal,
   });
+
+  if (response.status === 405) {
+    // WHY: Streamable HTTP MCP servers may only accept POST and return 405 on GET without
+    // a WWW-Authenticate challenge. Probe with a minimal JSON-RPC ping POST to elicit 401/403.
+    await response.body?.cancel().catch(() => {
+      // WHY: Body cancel errors during challenge probe cleanup are non-fatal.
+    });
+    const postHeaders = new Headers(options.headers);
+    postHeaders.set("Accept", "application/json, text/event-stream");
+    postHeaders.set("Content-Type", "application/json");
+    response = await fetchFn(serverUrl, {
+      method: "POST",
+      headers: postHeaders,
+      body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 0 }),
+      signal,
+    });
+  }
 
   try {
     if (response.status !== 401 && response.status !== 403) {
@@ -55,6 +99,8 @@ export async function discoverManualAuthChallenge(
       ...(scope ? { scope } : {}),
     };
   } finally {
-    await response.body?.cancel().catch(() => {});
+    await response.body?.cancel().catch(() => {
+      // WHY: Body cancel errors during challenge probe cleanup are non-fatal.
+    });
   }
 }

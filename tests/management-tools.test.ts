@@ -314,3 +314,103 @@ it("does not expose an echoed Authorization header through connect errors or sta
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("isolates a corrupt OAuth state file in mcp_status and recovers on first connect attempt with maxRetries 0", async () => {
+  const { statePath } = await import("../src/auth-lock.js");
+  const { startFakeOAuthServer } = await import("./helpers/fake-oauth-server.js");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-corrupt-isolation-"));
+  const authDir = join(dir, "auth");
+  const fakeServer = await startFakeOAuthServer({ serverName: "corrupt-oauth", toolName: "recovered_tool" });
+  const tools = new Map<string, any>();
+  const events = new Map<string, any>();
+  let active: string[] = [];
+  const pi = {
+    registerTool: (tool: any) => tools.set(tool.name, tool),
+    registerCommand: () => {},
+    on: (name: string, handler: any) => events.set(name, handler),
+    getActiveTools: () => active,
+    setActiveTools: (names: string[]) => { active = names; },
+  };
+  const ctx = {
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: () => {},
+      select: (_title: string, _opts: string[], opts?: { signal?: AbortSignal }) =>
+        new Promise<string | undefined>((resolve) => {
+          opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+        }),
+    },
+  } as any;
+
+  try {
+    await mkdir(join(dir, ".pi"));
+    await mkdir(authDir, { recursive: true });
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          "corrupt-oauth": {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: fakeServer.mcpUrl,
+            auth: { type: "oauth" },
+          },
+          "healthy-oauth": {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: `${fakeServer.baseUrl}/mcp`,
+            auth: { type: "oauth" },
+          },
+        },
+      }),
+    );
+
+    // Seed valid state for healthy-oauth and corrupt JSON for corrupt-oauth
+    const healthyProvider = new McpOAuthProvider("healthy-oauth", { type: "oauth" }, undefined, authDir);
+    await healthyProvider.saveTokens({ access_token: "healthy-token", token_type: "Bearer" });
+    await writeFile(statePath("corrupt-oauth", authDir), "{corrupt-json-state", "utf8");
+
+    await extension(pi as any, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "no-global.json"),
+      authStorageDir: authDir,
+      browserOpen: fakeServer.browserOpen,
+    });
+    await events.get("session_start")({}, ctx);
+
+    // Part 1: mcp_status isolates the corrupt file for corrupt-oauth without failing for healthy-oauth
+    const origErr = console.error;
+    console.error = () => {};
+    let statusRows: any[];
+    try {
+      const statusRes = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+      statusRows = JSON.parse(statusRes.content[0].text);
+    } finally {
+      console.error = origErr;
+    }
+
+    const corruptRow = statusRows.find((r) => r.name === "corrupt-oauth");
+    const healthyRow = statusRows.find((r) => r.name === "healthy-oauth");
+    assert.equal(corruptRow?.auth, "corrupt state file backed up (re-auth required)");
+    assert.equal(healthyRow?.auth, "credentials stored");
+
+    // Part 2: Write another corrupt state file and verify _connect recovers in a single attempt (maxRetries: 0)
+    await writeFile(statePath("corrupt-oauth", authDir), "{corrupt-on-connect", "utf8");
+    const origErr2 = console.error;
+    console.error = () => {};
+    try {
+      const connectRes = await tools.get("mcp_connect").execute("", { name: "corrupt-oauth" }, undefined, undefined, ctx);
+      assert.match(connectRes.content[0].text, /ready/);
+    } finally {
+      console.error = origErr2;
+    }
+    assert.ok(active.some((t) => t.includes("recovered_tool")));
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    await fakeServer.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+

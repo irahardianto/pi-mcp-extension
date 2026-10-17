@@ -108,6 +108,7 @@ export interface AcquireAuthLockOptions {
 }
 
 export type AuthLockHandle = (() => Promise<void>) & {
+  unlock: () => Promise<void>;
   assertHeld: () => Promise<void>;
   isLost: () => boolean;
 };
@@ -204,6 +205,33 @@ function formatHolderDetails(record: LockRecord | null): string | undefined {
 
 const MAX_ACQUIRE_ATTEMPTS = 3;
 
+async function readLockRecordWithRetry(
+  fs: AuthLockFs,
+  path: string,
+  usingRealFs = false,
+): Promise<LockRecord | null> {
+  for (let i = 0; i < 3; i++) {
+    try {
+      const raw = await fs.readFile(path, "utf8");
+      return parseLockRecord(raw);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" && i < 2) {
+        // WHY: During stale-lock inspection, a contender briefly renames `path` to
+        // `movedPath` and restores it via `link(movedPath, path)` on nonce mismatch.
+        // Yield across microtasks (and a brief macrotask on real fs) before treating ENOENT as genuine lock loss.
+        await Promise.resolve();
+        await Promise.resolve();
+        if (usingRealFs && i === 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        }
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 export async function acquireAuthLock(
   serverName: string,
   storageDir?: string,
@@ -239,8 +267,12 @@ export async function acquireAuthLock(
         await file.writeFile(JSON.stringify(myRecord));
         await file.sync();
       } catch (writeErr) {
-        await file.close().catch(() => {});
-        await deps.fs.unlink(path).catch(() => {});
+        await file.close().catch(() => {
+          // WHY: Best-effort file handle close after write failure.
+        });
+        await deps.fs.unlink(path).catch(() => {
+          // WHY: Best-effort cleanup of partially written lock file before rethrowing writeErr.
+        });
         throw writeErr;
       }
       await file.close();
@@ -257,7 +289,9 @@ export async function acquireAuthLock(
       };
 
       const onExit = () => {
-        if (released || lost || !usingRealFs) return;
+        // WHY: Do not skip cleanup when `lost` is true — if a contender restored our
+        // lock file via `link()` after a transient rename, we must still unlink our own nonce.
+        if (released || !usingRealFs) return;
         try {
           const raw = readFileSync(path, "utf8");
           const current = parseLockRecord(raw);
@@ -265,7 +299,7 @@ export async function acquireAuthLock(
             unlinkSync(path);
           }
         } catch {
-          // Best-effort cleanup on process exit
+          // WHY: Best-effort synchronous cleanup on process exit; lock file may already be unlinked.
         }
       };
 
@@ -273,7 +307,6 @@ export async function acquireAuthLock(
         if (lost || released) return;
         lost = true;
         stopHeartbeat();
-        process.removeListener("exit", onExit);
         options?.onLost?.();
       };
 
@@ -281,13 +314,7 @@ export async function acquireAuthLock(
 
       heartbeatTimer = deps.clock.setInterval(async () => {
         if (released || lost) return;
-        let current: LockRecord | null = null;
-        try {
-          const raw = await deps.fs.readFile(path, "utf8");
-          current = parseLockRecord(raw);
-        } catch {
-          current = null;
-        }
+        const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
         if (released || lost) return;
         if (!current || current.nonce !== myRecord.nonce) {
           markLost();
@@ -298,7 +325,15 @@ export async function acquireAuthLock(
           await deps.fs.utimes(path, nowSec, nowSec);
         } catch {
           if (!released && !lost) {
-            markLost();
+            const after = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
+            if (!after || after.nonce !== myRecord.nonce) {
+              markLost();
+            } else {
+              await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
+                // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
+                if (!released && !lost) markLost();
+              });
+            }
           }
         }
       }, HEARTBEAT_MS);
@@ -308,13 +343,7 @@ export async function acquireAuthLock(
         if (lost || released) {
           throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
         }
-        let current: LockRecord | null = null;
-        try {
-          const raw = await deps.fs.readFile(path, "utf8");
-          current = parseLockRecord(raw);
-        } catch {
-          current = null;
-        }
+        const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
         if (!current || current.nonce !== myRecord.nonce) {
           markLost();
           throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
@@ -326,20 +355,18 @@ export async function acquireAuthLock(
         released = true;
         stopHeartbeat();
         process.removeListener("exit", onExit);
-        if (lost) return;
-        let current: LockRecord | null = null;
-        try {
-          const raw = await deps.fs.readFile(path, "utf8");
-          current = parseLockRecord(raw);
-        } catch {
-          current = null;
-        }
+        // WHY: Always check and unlink if the file on disk still carries our nonce, even if
+        // `lost` was set during a contender's temporary stale-check rename+link window.
+        const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
         if (current && current.nonce === myRecord.nonce) {
-          await deps.fs.unlink(path).catch(() => {});
+          await deps.fs.unlink(path).catch(() => {
+            // WHY: Best-effort lock removal on unlock; ignore ENOENT if concurrently removed.
+          });
         }
       };
 
       return Object.assign(unlock, {
+        unlock,
         assertHeld,
         isLost: () => lost,
       });
@@ -410,12 +437,18 @@ export async function acquireAuthLock(
       }
 
       if (matchesStale) {
-        await deps.fs.unlink(movedPath).catch(() => {});
+        await deps.fs.unlink(movedPath).catch(() => {
+          // WHY: Best-effort removal of reclaimed stale lock file.
+        });
         continue;
       }
 
-      await deps.fs.link(movedPath, path).catch(() => {});
-      await deps.fs.unlink(movedPath).catch(() => {});
+      await deps.fs.link(movedPath, path).catch(() => {
+        // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
+      });
+      await deps.fs.unlink(movedPath).catch(() => {
+        // WHY: Best-effort cleanup of temporary stale-check file.
+      });
       throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
     }
   }

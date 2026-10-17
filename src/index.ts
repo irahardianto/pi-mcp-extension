@@ -33,7 +33,7 @@ import {
 import { CallbackUrlValidationError, isSafeAuthorizationUrl, parseCallbackUrl } from "./callback-url.js";
 import { setCallbackPort, McpOAuthProvider, acquireAuthLock, type AuthLockHandle } from "./oauth-provider.js";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
-import { discoverManualAuthChallenge } from "./auth-challenge.js";
+import { discoverManualAuthChallenge, createHeadersFetch } from "./auth-challenge.js";
 import type { ManualAuthChallenge } from "./auth-challenge.js";
 
 export interface BrowserOpenCommand {
@@ -487,6 +487,9 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     });
   });
   manager.setServerStoppedCallback((name) => bridge.deactivateServer(name));
+  bridge.setAuthErrorCallback(async (serverName, err) => {
+    await manager.handleUnauthorizedServerError(serverName, err);
+  });
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
@@ -731,6 +734,8 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           host: callbackServerConfig.host,
           allowPortFallback: callbackServerConfig.allowPortFallback,
         });
+        if (signal.aborted) throw new AuthCancelledError(serverName);
+        if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
         setCallbackPort(port);
 
         // 2. Generate a cryptographically secure state parameter for CSRF protection
@@ -771,7 +776,27 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           false,
           () => signal.aborted,
           () => unlock!.assertHeld(),
+          config.url,
         );
+
+        if (!reset) {
+          // WHY: authorize() is only entered after silent connect failed with AuthRequiredError.
+          // If a refresh_token remained on disk (e.g. accepted by the Authorization Server
+          // while the Resource Server rejects the refreshed access token), the SDK's auth()
+          // would silently refresh and return "AUTHORIZED" without opening the browser.
+          // Clear stored tokens while preserving clientInfo and discoveryState.
+          try {
+            await authProvider.invalidateCredentials("tokens");
+          } catch (err) {
+            if (err instanceof McpError && err.code === "config" && /Corrupt OAuth state file/i.test(err.message)) {
+              console.error(`[pi-mcp] ${err.message}`);
+            } else {
+              throw err;
+            }
+          }
+          if (signal.aborted) throw new AuthCancelledError(serverName);
+          if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+        }
 
         // Why set state before calling auth(): the SDK reads provider.state() while
         // building the authorization URL inside auth(), and omits the state parameter
@@ -781,23 +806,33 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         // 4. Discover protected-resource challenge metadata from the server.
         const authChallenge: ManualAuthChallenge = await discoverManualAuthChallenge(config.url, {
           headers: config.headers,
+          signal,
         }).catch((): ManualAuthChallenge => {
+          if (signal.aborted) {
+            throw new AuthCancelledError(serverName);
+          }
           console.warn(
             `[pi-mcp] Failed to discover OAuth challenge for "${serverName}"; falling back to standard discovery`,
           );
           return {};
         });
+        if (signal.aborted) throw new AuthCancelledError(serverName);
+        if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
 
         // 5. Register the callback immediately before auth() can open the browser.
         // Attach a catch handler so cancellation after immediate authorization
         // does not produce an unhandled rejection.
         const callbackPromise = waitForCallback(oauthState);
-        callbackPromise.catch(() => {});
+        callbackPromise.catch(() => {
+          // WHY: Suppress unhandled rejection when callbackPromise is cancelled after immediate authorization.
+        });
 
+        const customFetch = config.headers ? createHeadersFetch(config.headers) : undefined;
         const authOptions: {
           serverUrl: string;
           resourceMetadataUrl?: URL;
           scope?: string;
+          fetchFn?: typeof fetch;
         } = { serverUrl: config.url };
         if (authChallenge.resourceMetadataUrl) {
           authOptions.resourceMetadataUrl = authChallenge.resourceMetadataUrl;
@@ -805,13 +840,28 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         if (authChallenge.scope) {
           authOptions.scope = authChallenge.scope;
         }
+        if (customFetch) {
+          authOptions.fetchFn = customFetch;
+        }
 
         // 6. Start the auth flow.
         // Why branch on the return value: the SDK auth() call returns "AUTHORIZED" when
         // stored or refreshed tokens already succeeded without opening a browser, or
         // "REDIRECT" after invoking redirectToAuthorization(), in which case we must
         // wait for the callback code and call auth() a second time with authorizationCode.
-        const authResult = await auth(authProvider, authOptions);
+        let authResult: "AUTHORIZED" | "REDIRECT";
+        try {
+          authResult = await auth(authProvider, authOptions);
+        } catch (err) {
+          if (err instanceof McpError && err.code === "config" && /Corrupt OAuth state file/i.test(err.message)) {
+            // WHY: McpOAuthProvider._loadState() backed up and removed the corrupt state file.
+            // Retry auth() once so interactive authorization proceeds cleanly.
+            console.error(`[pi-mcp] ${err.message}`);
+            authResult = await auth(authProvider, authOptions);
+          } else {
+            throw err;
+          }
+        }
         if (signal.aborted) throw new AuthCancelledError(serverName);
         if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
 
@@ -852,6 +902,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
             authorizationCode: string;
             resourceMetadataUrl?: URL;
             scope?: string;
+            fetchFn?: typeof fetch;
           } = {
             serverUrl: config.url,
             authorizationCode: code,
@@ -862,8 +913,13 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           if (authChallenge.scope) {
             finishAuthOptions.scope = authChallenge.scope;
           }
+          if (customFetch) {
+            finishAuthOptions.fetchFn = customFetch;
+          }
 
           const finishAuthResult = await auth(authProvider, finishAuthOptions);
+          if (signal.aborted) throw new AuthCancelledError(serverName);
+          if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
 
           if (finishAuthResult !== "AUTHORIZED") {
             throw new McpError(
@@ -1027,11 +1083,28 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     parameters: Type.Object({}),
     async execute() {
       const rows = await Promise.all(manager.getAllServers().map(async (server) => {
-        const auth = server.config.auth ? await manager.getServerAuthStatus(server.name) : null;
+        let auth: Awaited<ReturnType<typeof manager.getServerAuthStatus>> = null;
+        let authCorrupt = false;
+        if (server.config.auth) {
+          try {
+            auth = await manager.getServerAuthStatus(server.name);
+          } catch (err) {
+            // WHY: Never let a single server's corrupt state file abort mcp_status for all servers.
+            // getAuthStatus() already backed up and deleted the corrupt file before throwing.
+            console.error(`[pi-mcp] ${err instanceof Error ? err.message : String(err)}`);
+            authCorrupt = true;
+          }
+        }
         return {
           name: server.name, lifecycle: server.config.lifecycle, state: server.state,
           tools: bridge.getToolActivity(server.name),
-          auth: server.config.auth ? auth?.hasTokens ? "credentials stored" : "authorization may be required" : "not configured",
+          auth: server.config.auth
+            ? authCorrupt
+              ? "corrupt state file backed up (re-auth required)"
+              : auth?.hasTokens
+                ? "credentials stored"
+                : "authorization may be required"
+            : "not configured",
           error: server.lastError
             ? server.lastError instanceof AuthRequiredError
               ? "Authorization required: use mcp_connect in an interactive Pi session"
@@ -1082,6 +1155,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       const { name, reset } = parseAuthArguments(args, manager.getAllServers().map((server) => server.name));
       if (!name) { ctx.ui.notify("Usage: /mcp:auth <name> [--reset]", "error"); return; }
       if (!manager.getServer(name)?.config.auth) { ctx.ui.notify(`No OAuth server named ${name}`, "error"); return; }
+      if (!reset && manager.getServer(name)?.state === "ready") {
+        // WHY: Explicit /mcp:auth on an already-ready server must tear down the existing
+        // connection and force a fresh reconnect/auth check rather than returning a no-op.
+        bridge.deactivateServer(name);
+        await manager.stopServer(name);
+      }
       try { await connectRequested(name, ctx, undefined, reset); ctx.ui.notify(`pi-mcp: ${name} ready`, "info"); }
       catch (err) {
         ctx.ui.notify(`pi-mcp: ${err instanceof Error ? err.message : String(err)}`, err instanceof AuthCancelledError ? "info" : "error");

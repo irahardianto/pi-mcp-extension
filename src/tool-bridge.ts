@@ -20,6 +20,7 @@ import type { TSchema } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { McpError } from "./errors.js";
 import type { Settings } from "./config.js";
+import { isOAuthUnauthorizedError } from "./server-manager.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -681,10 +682,16 @@ export class ToolBridge {
   private readonly toolOwners = new Map<string, string>();
   /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
   private readonly refreshGenerations = new Map<string, number>();
+  private onAuthError?: ((serverName: string, error: unknown) => Promise<void> | void) | undefined;
 
   constructor(settings: Settings, pi: PiExtensionAPI) {
     this.settings = settings;
     this.pi = pi;
+  }
+
+  /** Register callback invoked when a mid-session tools/list or tools/call fails with 401/403. */
+  setAuthErrorCallback(cb: (serverName: string, error: unknown) => Promise<void> | void): void {
+    this.onAuthError = cb;
   }
 
   /** Update bridge settings when session config is reloaded on session_start. */
@@ -712,6 +719,9 @@ export class ToolBridge {
     try {
       tools = await listAllTools(client, timeoutMs);
     } catch (err) {
+      if (isOAuthUnauthorizedError(err)) {
+        await this.onAuthError?.(serverName, err);
+      }
       throw new McpError(
         `Failed to list tools from ${serverName}: ${err instanceof Error ? err.message : String(err)}`,
         serverName,
@@ -847,6 +857,7 @@ export class ToolBridge {
 
     const schema = convertJsonSchemaToTypebox(tool.inputSchema);
     const timeoutMs = this.settings.requestTimeoutMs;
+    const notifyAuthError = (err: unknown) => this.onAuthError?.(serverName, err);
 
     this.pi.registerTool({
       name: piName,
@@ -899,6 +910,9 @@ export class ToolBridge {
           return { content, details: {} };
         } catch (err) {
           if (err instanceof McpError) throw err;
+          if (isOAuthUnauthorizedError(err)) {
+            await notifyAuthError(err);
+          }
           // Protocol-level errors (JSON-RPC error response, timeout, etc.)
           throw new McpError(
             err instanceof Error ? err.message : String(err),
