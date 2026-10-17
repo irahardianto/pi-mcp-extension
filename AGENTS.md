@@ -1,127 +1,113 @@
-# AGENTS.md — `pi-mcp-extension` Engineering Standards
+# AGENTS.md — pi-mcp-extension
 
-This file is the authoritative engineering guide for AI coding agents (Pi, Claude Code, OpenCode, Antigravity, Cursor, Codex) and human contributors working on `pi-mcp-extension`.
+Instructions for AI coding agents (Pi, Claude Code, OpenCode, Codex, Cursor, Antigravity, Gemini CLI) and human contributors. Keep this file accurate: if you add or rename a `src/` module, change a verification command, or change the release flow, update this file in the same change.
 
-`pi-mcp-extension` is a lightweight TypeScript CLI extension for the **Pi coding agent** that bridges MCP (Model Context Protocol) servers (`stdio`, `sse`, and `streamable-http`) into Pi tools and slash commands, including OAuth 2.1 + PKCE + Dynamic Client Registration (DCR) and project-level trust verification.
+**What this is:** a TypeScript extension for the Pi coding agent that bridges MCP servers (`stdio`, `sse`, `streamable-http`) into Pi tools and `/mcp*` commands, with OAuth 2.1 (PKCE + DCR) for remote servers. Pi loads `src/index.ts` directly as TypeScript. There is no build step, and the npm tarball ships `src/` as-is (relative imports use `.js` specifiers per `Node16` resolution).
 
----
+## Commands
 
-## 1. Repository Map & Verification Commands
-
-### Source Layout (`src/`)
-Keep `src/` flat and cohesive. Do **not** introduce multi-layer enterprise folder trees (`store_impl.ts`, `business.ts`, 7-file vertical slices). Extract a new file only when isolating a self-contained pure domain module or splitting an oversized file (>400 lines).
-
-- [`src/index.ts`](src/index.ts) — Extension entrypoint (default export loaded by Pi), session lifecycle (`session_start`, `session_shutdown`), connection coordination (`connectRequested`, `authQueue`, startup prompts), interactive OAuth orchestration (`authorize`), `/mcp*` slash commands, and `mcp_status` / `mcp_connect` tools.
-- [`src/server-manager.ts`](src/server-manager.ts) — MCP client lifecycle (`stopped | starting | ready | failed`), transport creation (`stdio`, `sse`, `streamable-http`), exponential backoff retries, health checks, `roots/list`, and child process cleanup.
-- [`src/tool-bridge.ts`](src/tool-bridge.ts) — MCP `tools/list` discovery, JSON Schema $\rightarrow$ TypeBox conversion, tool name sanitization/hashing, collision handling, and Pi tool registration/execution.
-- [`src/config.ts`](src/config.ts) — Zod configuration schemas, global (`~/.pi/agent/mcp.json`) + project (`.pi/mcp.json`) merging, `${ENV_VAR}` interpolation, and SHA-256 project trust verification (`trusted-projects.json`).
-- [`src/oauth-provider.ts`](src/oauth-provider.ts) — `OAuthClientProvider` implementation for the MCP SDK (silent vs. interactive modes, token/DCR/discovery persistence, PKCE state, refresh token rotation).
-- [`src/auth-lock.ts`](src/auth-lock.ts) — Cross-process file lock (`<hash>.json.lock`) with heartbeat `mtime` and atomic stale-lock reclamation.
-- [`src/callback-server.ts`](src/callback-server.ts) & [`src/callback-url.ts`](src/callback-url.ts) — Loopback HTTP OAuth callback listener (`127.0.0.1`) and pure redirect/callback URL validation & parsing for local and headless/SSH paste-back flows.
-- [`src/auth-challenge.ts`](src/auth-challenge.ts) — `WWW-Authenticate` (`RFC 9728` `resource_metadata` & `scope`) pre-flight discovery.
-- [`src/errors.ts`](src/errors.ts) — `McpError` (`config | connection | auth | timeout | protocol`) and OAuth error subclasses (`AuthRequiredError`, `AuthLockError`, `AuthCancelledError`).
-
-### Test Suite (`tests/`)
-Tests use Node's built-in test runner (`node:test` + `node:assert/strict`) executed via `tsx`:
-- Unit & pure-policy suites: [`tests/config.test.ts`](tests/config.test.ts), [`tests/tool-bridge.test.ts`](tests/tool-bridge.test.ts), [`tests/auth-lock.test.ts`](tests/auth-lock.test.ts), [`tests/auth-arguments.test.ts`](tests/auth-arguments.test.ts), [`tests/completions.test.ts`](tests/completions.test.ts).
-- Lifecycle, coordination & end-to-end suites: [`tests/server-manager.test.ts`](tests/server-manager.test.ts), [`tests/connection-coordination.test.ts`](tests/connection-coordination.test.ts), [`tests/oauth-fixes.test.ts`](tests/oauth-fixes.test.ts), [`tests/auth-commands.test.ts`](tests/auth-commands.test.ts), [`tests/management-tools.test.ts`](tests/management-tools.test.ts), [`tests/pi-1x-compat.test.ts`](tests/pi-1x-compat.test.ts).
-- Shared test fixtures: [`tests/mock-server.ts`](tests/mock-server.ts) and [`tests/helpers/`](tests/helpers/).
-
-### Mandatory Verification Commands
-Run all three gates before concluding any code change:
 ```bash
-npm run typecheck      # tsc --noEmit
-npm test               # node --import tsx/esm --test ./tests/*.test.ts
-npm pack --dry-run     # Verify published tarball only ships src/, README.md, LICENSE
+npm run typecheck                                    # tsc --noEmit (strict, exactOptionalPropertyTypes, noUncheckedIndexedAccess)
+npm test                                             # all suites: node --import tsx/esm --test ./tests/*.test.ts
+node --import tsx/esm --test tests/config.test.ts    # one suite
+node --import tsx/esm --test --test-name-pattern="collision" tests/tool-bridge.test.ts   # matching tests
+npm pack --dry-run                                   # tarball must contain only src/, README.md, LICENSE, package.json
 ```
 
----
+Node 22+ (CI runs 22 and 24). A change is done only when typecheck, test, and pack all pass.
 
-## 2. Architecture Rule: I/O Isolation, Pure Core & Testability
+## Hard rules
 
-1. **Separate Pure Policy/Transform Logic from I/O**:
-   - Keep state transitions, retry/timeout calculations, lock staleness policies, JSON Schema $\rightarrow$ TypeBox conversion, tool-name formatting & collision resolution, URL/argument parsing, and config merging as **pure, deterministic functions** with zero direct I/O.
-   - Keep I/O adapters thin: MCP SDK transports, `node:fs`, `node:child_process`, ephemeral `node:http` servers, OS browser openers, and timers.
-2. **Injectable Boundaries for Deterministic Testing**:
-   - When a module touches external state (filesystem, wall clock, PID checks, network/transports, browser spawning), accept an optional dependency struct with production defaults (e.g., `{ fs, clock, pid, hostname, isPidAlive }` in [`src/auth-lock.ts`](src/auth-lock.ts)) so unit tests use deterministic fakes instead of real `setTimeout` sleeps, network sockets, or OS processes.
-3. **Minimal Runtime Dependencies**:
-   - Do **not** add heavyweight runtime packages (e.g., web logging frameworks like `pino`) to `dependencies` in [`package.json`](package.json). Every runtime dependency slows down Pi extension installation for all users.
+1. **Never write to `stdout`** (`console.log`, `process.stdout`). It belongs to Pi's TUI/RPC stream. User-facing output goes through `ctx.ui.notify(...)` / `ctx.ui.setStatus("pi-mcp", ...)`; use `console.error("[pi-mcp] ...")` only when no UI context exists.
+2. **Pushing to `main` is a manual override only.** Always work on a branch and open a PR. Never push to `main`, publish, or tag unless the user explicitly instructs it for that change; every push to `main` can publish to npm (see [Commits & release](#commits--release)). Never run `npm publish` / `npm version`, edit `version` in `package.json`, or hand-write a versioned `CHANGELOG.md` heading.
+3. **No silent error swallowing.** No empty `catch {}` or `.catch(() => {})`. Handle expected codes (`ENOENT`, `ESRCH`, `EEXIST`) explicitly; an intentional best-effort teardown ignore needs a `// WHY:` comment.
+4. **Never log or surface secrets**: access/refresh tokens, `client_secret`, authorization codes, PKCE verifiers, `Authorization` headers.
+5. **No new runtime dependencies without asking.** Runtime deps are only `@modelcontextprotocol/sdk` and `zod`. Pi packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`) and `typebox` are **peer** deps; never move them into `dependencies`, and never import the deprecated `@mariozechner/*` names.
+6. **No `any`.** Use `unknown` + narrowing or Zod. Preserve existing `// WHY:` comments; add one whenever you work around an MCP SDK, TypeBox, or Pi quirk.
 
----
+## Repository map
 
-## 3. Process, TUI, Subprocess & Security Rule (Rugged Constitution)
+`src/` is intentionally flat. Don't create folder hierarchies or layer files (`*_impl.ts`, `business.ts`).
 
-1. **TUI & `stdout` Sanctity**:
-   - **Never write to `stdout`**. `stdout` belongs exclusively to Pi's TUI / RPC stream and stdio MCP framing.
-   - Surface user-facing messages through `ctx.ui.notify(...)` and `ctx.ui.setStatus("pi-mcp", ...)`. Use `console.error("[pi-mcp] ...")` only as a fallback when no Pi UI context exists.
-   - Buffer server `stderr` lines using `StringDecoder` (to avoid corrupting split multi-byte UTF-8 chunks) and strip unsafe terminal control sequences before rendering.
-2. **No Silent Error Swallowing**:
-   - Never write bare `.catch(() => {})` or empty `catch {}` blocks that hide unexpected failures.
-   - Handle expected error codes explicitly (e.g., `ENOENT`, `ESRCH`, `EEXIST`). If ignoring a best-effort cleanup error on teardown is intentional, document why with an explicit `// WHY:` comment.
-3. **Deterministic Resource, Subprocess & Lifecycle Cleanup**:
-   - **Subprocesses**: Pass the active session `cwd` to `StdioClientTransport`. Track child PIDs as soon as the transport spawns, and ensure `_shutdown()` terminates children cleanly (`SIGTERM` $\rightarrow$ bounded wait $\rightarrow$ `SIGKILL`) before retrying a failed handshake or stopping a server.
-   - **In-Flight Promises & Controllers**: Always clear `server.attempt` and `connectAttempts` entries in `finally` / `_shutdown()` blocks so cancelled or failed connections never leave permanent deadlocks or zombie aborted promises.
-   - **Session Reload (`session_start`) & Shutdown (`session_shutdown`)**: Always register `session_start`, `session_shutdown`, `/mcp*` commands, and management tools even if bootstrap `loadConfig(process.cwd())` fails or finds zero servers (cross-directory sessions may load a valid `.pi/mcp.json` on `session_start`). On config reload, abort in-flight connection attempts, stop the callback server, update `ToolBridge` settings, and refresh `roots/list` `cwd`.
-   - **Timeouts & Cancellation**: Always resolve effective timeouts as `server.config.requestTimeoutMs ?? settings.requestTimeoutMs`. Pass `{ timeout, signal }` to `client.connect`, `client.ping`, `client.listTools`, `client.callTool`, and OAuth discovery requests. Check `signal.aborted` between async handshake/auth steps.
-   - **Health Checks & Recovery**: Never allow background health checks to stack overlapping `ping()` calls; bound each ping with a timeout and wire transport `onclose` handlers so unexpected `stdio`, `sse`, and `streamable-http` disconnects trigger recovery.
-4. **Atomic `0600` Credential & Lock Persistence**:
-   - Write all sensitive state files (OAuth tokens `<hash>.json`, locks `<hash>.json.lock`, and `trusted-projects.json`) with file mode `0o600` inside `0o700` directories using atomic temp-file + `fsync` + `rename` writes.
-   - Coordinate multi-process silent token refreshes with active lock files and OAuth 2.1 single-use refresh token rotation (`InvalidGrantError` reload-before-invalidate). Isolate corrupt state file errors per server so one broken `<hash>.json` never crashes `mcp_status` for other servers.
-5. **Security Boundaries**:
-   - **Project Trust Boundary**: Never execute project-local `.pi/mcp.json` servers or allow project configs to override global servers until the project path + `.pi/mcp.json` SHA-256 fingerprint is verified in `trusted-projects.json` or confirmed via `ctx.ui.confirm`.
-   - **Origin-Bound OAuth State**: Bind OAuth credential files, DCR client registrations (`token_endpoint_auth_method`, `redirect_uris`), and discovery metadata to both `serverName` and the canonical `server.config.url` so a project config with the same server name cannot leak global Bearer tokens to a different host (Confused Deputy) or break when a server URL changes.
-   - **Strict URL & URI Validation**: Validate redirect URLs (`http:`/`https:` loopback with an explicit port), validate callback `state` on both success and `?error=` responses, and validate server-supplied authorization URLs (`http:`/`https:` only) before passing them to OS browser launchers (`open`, `xdg-open`, `cmd`). Always encode workspace roots with `pathToFileURL(cwd).href`. Never pass unvalidated strings to a shell.
+| File | Owns |
+|---|---|
+| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; connection coordination (`connectRequested`, `connectAttempts`, `authQueue`, startup auth prompts); interactive `authorize()`; `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`; `mcp_status` / `mcp_connect` tools |
+| `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), transport creation, retry/backoff, health checks, `onclose` recovery, `roots/list`, stdio child cleanup, `sanitizeStderrLine` |
+| `src/tool-bridge.ts` | `tools/list` discovery, JSON Schema → TypeBox conversion, tool naming/hashing/collisions, Pi tool registration and `callTool` |
+| `src/config.ts` | Zod schemas, JSONC parsing, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases |
+| `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, token/DCR/discovery persistence, refresh rotation |
+| `src/auth-lock.ts` | Cross-process `<hash>.json.lock` with heartbeat and stale-lock reclaim; injectable `AuthLockDeps` |
+| `src/callback-server.ts`, `src/callback-url.ts` | Loopback OAuth callback listener; pure redirect/callback URL validation and headless paste-back parsing |
+| `src/auth-challenge.ts` | `WWW-Authenticate` discovery (RFC 9728 `resource_metadata`, `scope`) |
+| `src/errors.ts` | `McpError` kinds `config \| connection \| auth \| timeout \| protocol`; `AuthRequiredError`, `AuthLockError`, `AuthCancelledError` |
 
----
+Tests live in `tests/*.test.ts` (`node:test` + `node:assert/strict`, run through `tsx`). Fixtures: `tests/mock-server.ts`, `tests/helpers/`. Keep tests out of `src/`.
 
-## 4. TypeScript, Schema & Protocol Idioms
+User-facing docs to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`.
 
-1. **Zod Validation at Every External Boundary**:
-   - Parse and validate all external data (`mcp.json`, stored OAuth JSON, lock records, DCR metadata) with Zod schemas. Never trust raw `JSON.parse(...) as SomeType`.
-   - Wrap config file parse/read errors in `McpError(..., "config")` including the offending file path. Validate `toolPrefix` (`^[a-zA-Z][a-zA-Z0-9_]*$`) and reject invalid `auth` combinations (such as `oauth` on `stdio` servers) at config load time.
-2. **TypeBox & LLM Tool Schema Compatibility**:
-   - When converting MCP JSON Schemas to TypeBox in [`src/tool-bridge.ts`](src/tool-bridge.ts):
-     - Account for Pi's `Value.Convert(schema, args)` coercion semantics: never emit union ordering where `Type.String()`, `Type.Number()`, `Type.Integer()`, or `Type.Boolean()` precedes `Type.Null()`, as `Value.Convert` will coerce `null` into `""`, `0`, or `false`.
-     - Preserve object `properties` when top-level `anyOf` / `oneOf` / `allOf` constraints are present, and emit `{ type: "object", properties: {} }` (not `patternProperties`) for empty object schemas so Gemini and OpenAI accept them.
-     - Track visited `$ref` pointers (`seenRefs`) along the active resolution path to prevent exponential blowup on recursive schemas, and preserve `integer`, `enum`, `const`, tuple `items`, and numeric/string constraints.
-3. **Accurate Error & OAuth Classification**:
-   - Classify errors using `McpError` (`config | connection | auth | timeout | protocol`) and OAuth subclasses (`AuthRequiredError`, `AuthLockError`, `AuthCancelledError`).
-   - Trigger OAuth on genuine HTTP `401` (both during `initialize` and `tools/list`) and `403` with `insufficient_scope`, without false-positiving on unrelated error messages that happen to contain the substring `"401"`.
-4. **No `any` & Preserve `// WHY:` Comments**:
-   - Use `unknown` with type narrowing or Zod schemas instead of `any`.
-   - Preserve existing `// WHY:` comments explaining protocol edge cases, and add `// WHY:` comments whenever working around MCP SDK, TypeBox, or Pi runtime quirks.
+> [!NOTE]
+> `index.ts`, `server-manager.ts`, `tool-bridge.ts`, and `oauth-provider.ts` exceed the ~400-line target. Do **not** split them opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change. Put substantial new pure logic in a focused module instead of growing these files.
 
----
+## Architecture
 
-## 5. Debugging, Testing & Code Review Protocol
+- **Pure core, thin I/O.** Keep policy and transforms as pure functions: state transitions, retry/timeout math, lock staleness, schema conversion, tool naming, URL/argument parsing, config merging. Keep SDK transports, `node:fs`, `node:child_process`, `node:http`, browser launching, and timers in thin adapters.
+- **Inject boundaries.** A module that touches the filesystem, clock, PIDs, network, or browser takes an optional deps object with production defaults (pattern: `AuthLockDeps` in `src/auth-lock.ts`), so tests use fakes instead of real sleeps, sockets, or processes.
+- **Validate every external input with Zod**: `mcp.json`, stored OAuth state, lock records, DCR/discovery metadata. Never `JSON.parse(x) as T`. Config errors are `McpError(..., "config")` and include the file path.
+- **Timeouts and cancellation.** The effective timeout is `server.config.requestTimeoutMs ?? settings.requestTimeoutMs`. Pass `{ timeout, signal }` to SDK calls (`connect`, `ping`, `listTools`, `callTool`) and to OAuth discovery fetches, and check `signal.aborted` between async steps.
 
-1. **4-Step Debugging Protocol**:
-   - **Step 1 — Reproduce**: Write a deterministic failing test in `tests/` that reproduces the exact bug before editing `src/`.
-   - **Step 2 — Trace**: Trace the full state machine (`stopped` $\rightarrow$ `starting` $\rightarrow$ `ready` $\rightarrow$ `failed`, plus abort, reload, and multi-process interleavings) rather than patching surface symptoms.
-   - **Step 3 — Fix at the Root**: Implement the fix with clean separation between pure policy and I/O adapter.
-   - **Step 4 — Verify**: Run the new regression test plus the full test suite and typechecker.
-2. **Test Structure**:
-   - Name tests descriptively (`should <expected behavior> when <condition>`).
-   - Follow Arrange–Act–Assert (AAA).
-   - Prefer deterministic fake clocks/promises/transports over wall-clock `setTimeout` delays.
-3. **Pre-Commit Code Review Checklist**:
-   - [ ] **Lifecycle & Concurrency**: Are all in-flight promises (`server.attempt`, `connectAttempts`), timers, child processes, and abort listeners cleaned up on error, reload, and cancellation paths?
-   - [ ] **TUI & Error Handling**: Does any code path write to `stdout` or swallow errors with a bare `.catch(() => {})`?
-   - [ ] **Security & Credentials**: Are external inputs validated with Zod, URLs scheme-checked, and credentials/locks origin-bound and written atomically with `0o600`?
-   - [ ] **Verification Gates**: Do `npm run typecheck`, `npm test`, and `npm pack --dry-run` all pass with zero errors?
+## Invariants: don't regress
 
----
+Each of these was a real bug, and the listed suites guard it. If you touch the area, run those suites first.
 
-## 6. Git Commit & Automated Release Rules
+**Lifecycle & processes** (`server-manager.test.ts`, `connection-coordination.test.ts`, `management-tools.test.ts`)
+- `server.attempt` and `connectAttempts` entries are cleared in `finally` / `_shutdown()` on every path: success, failure, abort, reload.
+- stdio: pass the session `cwd` to `StdioClientTransport`, track the child PID as soon as it spawns, and have `_shutdown()` do SIGTERM → bounded wait → SIGKILL, including before retrying a failed handshake.
+- Health checks never overlap, each ping is time-bounded, and transport `onclose` triggers recovery for all three transports.
+- Decode child `stderr` with `StringDecoder` and pass every line through `sanitizeStderrLine` before storing or displaying it.
+- `session_start` / `session_shutdown`, `/mcp*` commands, and management tools are registered even if bootstrap config loading fails or finds no servers. On reload, abort in-flight attempts, stop the callback server, call `ToolBridge.updateSettings`, and refresh the roots `cwd`. Root URIs use `pathToFileURL(cwd).href`.
 
-**CRITICAL — Publish-on-Push is Active on `main`:**
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml) runs automatically on every push to `main` and publishes to npm based on Conventional Commit prefixes since the last git tag:
+**Security & OAuth** (`oauth-fixes.test.ts`, `auth-lock.test.ts`, `auth-commands.test.ts`, `pi-1x-compat.test.ts`)
+- Project trust: never read `<cwd>/.pi/mcp.json` during bootstrap or when `ctx.isProjectTrusted()` is false (`loadConfig` with `includeProjectConfig: false`).
+- OAuth state is origin-bound. The state file records `serverUrl` and is rejected on load if it doesn't match the configured URL (`urlsMatch`), so a project server that reuses a global server's name can't receive its tokens. Preserve DCR `token_endpoint_auth_method` and `redirect_uris`.
+- Sensitive files (`<hash>.json`, `<hash>.json.lock`) are written `0o600` inside `0o700` directories via temp file + `rename`. Corrupt state for one server must not break `mcp_status` for the others.
+- Refresh tokens are single-use. Before invalidating tokens, reload them from disk once in case a peer process already rotated them, and coordinate interactive writes through the auth lock.
+- Trigger OAuth only on a genuine HTTP 401 (during `initialize` **and** `tools/list`) or a 403 with `insufficient_scope`. Never substring-match `"401"` in error messages.
+- Redirect URLs are loopback `http:`/`https:` with an explicit port. Validate callback `state` on success **and** on `?error=` responses. Only `http:`/`https:` authorization URLs reach the OS browser opener, and unvalidated strings never reach a shell.
 
-| Commit Prefix | npm Version Bump | Requirement |
-|---|---|---|
-| `fix:` or `perf:` | **Patch** (`1.9.x`) | Must leave `main` releasable + update `## [Unreleased]` in `CHANGELOG.md` |
-| `feat:` | **Minor** (`1.x.0`) | Must leave `main` releasable + update `## [Unreleased]` in `CHANGELOG.md` |
-| `<type>!:` or `BREAKING CHANGE:` | **Major** (`x.0.0`) | Must leave `main` releasable + update `## [Unreleased]` in `CHANGELOG.md` |
-| `docs:`, `chore:`, `refactor:`, `test:`, `ci:` | **None** (`bump=none`) | Use for non-release commits (e.g., `AGENTS.md`, test-only, internal refactors) |
+**Schema conversion** (`tool-bridge.test.ts`): Pi runs `Value.Convert(schema, args)` before validating.
+- In unions, `Type.Null()` must come before `String` / `Number` / `Integer` / `Boolean`, or `null` gets coerced to `""` / `0` / `false`.
+- Keep object `properties` when `anyOf` / `oneOf` / `allOf` are present, and emit `{ type: "object", properties: {} }` (not `patternProperties`) for empty objects, because Gemini and OpenAI reject the latter.
+- Track `$ref`s on the active resolution path (`seenRefs`) to stop recursive blow-up. Preserve `integer`, `enum`, `const`, tuple `items`, and numeric/string constraints.
 
-When preparing a `feat:`, `fix:`, or `perf:` commit/PR, always add a concise user-facing entry under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md); the release workflow automatically stamps `## [Unreleased]` with the new version number and date during publishing.
+## Bug-fix workflow
+
+1. **Reproduce:** write a deterministic failing test in `tests/` (fake clocks, transports, or deps; no wall-clock sleeps) before editing `src/`.
+2. **Trace:** follow the whole state machine, including abort, reload, and multi-process interleavings, not just the symptom.
+3. **Fix at the root**, keeping pure policy separate from I/O.
+4. **Verify:** run the new test, the full suite, typecheck, and pack.
+
+Self-review before finishing:
+- Are promises, timers, child processes, and abort listeners cleaned up on error, abort, and reload?
+- Does anything write to stdout or swallow errors?
+- Is external input Zod-validated and are URLs scheme-checked?
+- Are credentials origin-bound and written `0o600`?
+
+## Commits & release
+
+Work on a branch and open a PR. Use Conventional Commits; scopes are fine (e.g. `fix(oauth): ...`).
+
+- **Regular PRs are squash-merged**, so **the PR title becomes the commit that decides the release**.
+- **Stacked PRs are the exception**: their commits can land on `main` individually, so every commit subject in a stack must be a correct Conventional Commit.
+
+`.github/workflows/publish.yml` runs on every push to `main`, scans **all commit subjects since the last tag**, and publishes automatically:
+
+| Prefix | Release |
+|---|---|
+| `type!:`, or `BREAKING CHANGE:` in a body | major |
+| `feat:` | minor |
+| `fix:`, `perf:` | patch |
+| anything else (`docs:`, `chore:`, `refactor:`, `test:`, `ci:`, …) | none |
+
+- For `feat` / `fix` / `perf` / breaking changes, add a user-facing entry under `## [Unreleased]` in `CHANGELOG.md`. The workflow stamps the version and date.
+- Because the scan covers everything since the last tag, a `docs:` push still publishes if unreleased `fix:` / `feat:` commits are already on `main`.
+- The bot creates the `chore: release vX.Y.Z` commit and the tag. Don't create them by hand.
