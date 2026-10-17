@@ -53,6 +53,7 @@ User-facing docs to keep in sync with behavior changes: `README.md` (config, com
 - **Pure core, thin I/O.** Keep policy and transforms as pure functions: state transitions, retry/timeout math, lock staleness, schema conversion, tool naming, URL/argument parsing, config merging. Keep SDK transports, `node:fs`, `node:child_process`, `node:http`, browser launching, and timers in thin adapters.
 - **Inject boundaries.** A module that touches the filesystem, clock, PIDs, network, or browser takes an optional deps object with production defaults (pattern: `AuthLockDeps` in `src/auth-lock.ts`), so tests use fakes instead of real sleeps, sockets, or processes.
 - **Validate every external input with Zod**: `mcp.json`, stored OAuth state, lock records, DCR/discovery metadata. Never `JSON.parse(x) as T`. Config errors are `McpError(..., "config")` and include the file path.
+- **Classify errors.** New user-facing failures use an `McpError` kind (`config | connection | auth | timeout | protocol`) or an auth subclass (`AuthRequiredError`, `AuthLockError`, `AuthCancelledError`), not a bare `Error`, so callers and `mcp_status` can tell them apart.
 - **Timeouts and cancellation.** The effective timeout is `server.config.requestTimeoutMs ?? settings.requestTimeoutMs`. Pass `{ timeout, signal }` to SDK calls (`connect`, `ping`, `listTools`, `callTool`) and to OAuth discovery fetches, and check `signal.aborted` between async steps.
 
 ## Invariants: don't regress
@@ -64,7 +65,7 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - stdio: pass the session `cwd` to `StdioClientTransport`, track the child PID as soon as it spawns, and have `_shutdown()` do SIGTERM → bounded wait → SIGKILL, including before retrying a failed handshake.
 - Health checks never overlap, each ping is time-bounded, and transport `onclose` triggers recovery for all three transports.
 - Decode child `stderr` with `StringDecoder` and pass every line through `sanitizeStderrLine` before storing or displaying it.
-- `session_start` / `session_shutdown`, `/mcp*` commands, and management tools are registered even if bootstrap config loading fails or finds no servers. On reload, abort in-flight attempts, stop the callback server, call `ToolBridge.updateSettings`, and refresh the roots `cwd`. Root URIs use `pathToFileURL(cwd).href`.
+- `session_start` / `session_shutdown`, `/mcp*` commands, and management tools are registered even if bootstrap config loading fails or finds no servers, because a later `session_start` in another directory may load a valid `.pi/mcp.json`. On reload, abort in-flight attempts, stop the callback server, call `ToolBridge.updateSettings`, and refresh the roots `cwd`. Root URIs use `pathToFileURL(cwd).href`.
 
 **Security & OAuth** (`oauth-fixes.test.ts`, `auth-lock.test.ts`, `auth-commands.test.ts`, `pi-1x-compat.test.ts`)
 - Project trust: never read `<cwd>/.pi/mcp.json` during bootstrap or when `ctx.isProjectTrusted()` is false (`loadConfig` with `includeProjectConfig: false`).
@@ -78,6 +79,10 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - In unions, `Type.Null()` must come before `String` / `Number` / `Integer` / `Boolean`, or `null` gets coerced to `""` / `0` / `false`.
 - Keep object `properties` when `anyOf` / `oneOf` / `allOf` are present, and emit `{ type: "object", properties: {} }` (not `patternProperties`) for empty objects, because Gemini and OpenAI reject the latter.
 - Track `$ref`s on the active resolution path (`seenRefs`) to stop recursive blow-up. Preserve `integer`, `enum`, `const`, tuple `items`, and numeric/string constraints.
+
+**Config validation** (`config.test.ts`): reject bad config at load time, not at connect time.
+- `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`.
+- `auth` is rejected on `stdio` servers, and `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated when the config loads.
 
 ## Bug-fix workflow
 
