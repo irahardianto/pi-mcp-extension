@@ -12,6 +12,9 @@
  *   - PID tracking for safety-net SIGKILL on shutdown failure
  */
 
+import { basename } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -22,10 +25,18 @@ import {
   ToolListChangedNotificationSchema,
   LoggingMessageNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { McpError } from "./errors.js";
+import { McpError, AuthCancelledError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { McpOAuthProvider, AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } from "./oauth-provider.js";
 import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  setClientDefaultOptions,
+  getClientDefaultOptions,
+  type ToolRefreshOptions,
+} from "./tool-bridge.js";
+
+export { setClientDefaultOptions, getClientDefaultOptions, type ToolRefreshOptions, AuthCancelledError };
+
 
 export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>()): boolean {
   if (!error || seen.has(error)) {
@@ -113,6 +124,33 @@ export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>
   return false;
 }
 
+/**
+ * Strip carriage returns, ANSI CSI/OSC/DCS/PM/APC escape sequences, and C0/C1
+ * control characters from a single server stderr line before storing or logging.
+ */
+export function sanitizeStderrLine(line: string): string {
+  return line
+    .replace(/\r$/, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, "")
+    .replace(/\x1b[@-Z\\-_]/g, "")
+    .replace(/\x1b|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
+function resolveEnv(extra?: Record<string, string>): Record<string, string> {
+  // Build clean env: process.env may contain undefined values,
+  // child_process.spawn silently drops them, but let's be explicit
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
+  if (extra) {
+    Object.assign(env, extra);
+  }
+  return env;
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type ServerState = "stopped" | "starting" | "ready";
@@ -128,6 +166,8 @@ export interface ManagedServer {
   config: ServerConfig;
   state: ServerState;
   client: Client | null;
+  transport?: Transport | undefined;
+  cwd?: string | undefined;
   /** PID of the child process (stdio transport only). Used for safety-net cleanup. */
   childPid: number | null;
   retryCount: number;
@@ -143,7 +183,14 @@ export interface ManagedServer {
 }
 
 /** Called after tool list is refreshed for a server (e.g. on list_changed notification). */
-export type ToolRefreshCallback = (serverName: string, client: Client) => Promise<void>;
+export type ToolRefreshCallback = (
+  serverName: string,
+  client: Client,
+  options?: ToolRefreshOptions,
+) => Promise<void>;
+
+/** Called when background auto-recovery after a disconnect or health check fails. */
+export type RecoveryFailedCallback = (serverName: string, error: Error) => void;
 
 export interface TransportAuthCallbacks {
   /** Legacy callback type. Background transport attempts never invoke this callback. */
@@ -152,12 +199,16 @@ export interface TransportAuthCallbacks {
 
 // ─── Transport Factory ────────────────────────────────────────────────────────
 
-function createTransport(
+export function createTransport(
   serverName: string,
   config: ServerConfig,
-  onStderr: (line: string) => void,
+  cwdOrOnStderr?: string | ((line: string) => void),
   storageDir?: string,
+  cwdArg?: string,
 ): Transport {
+  const cwd = typeof cwdOrOnStderr === "string" ? cwdOrOnStderr : cwdArg;
+  const onStderr = typeof cwdOrOnStderr === "function" ? cwdOrOnStderr : undefined;
+
   // Build requestInit for static headers (API keys, etc.)
   const requestInit: RequestInit | undefined = config.headers
     ? { headers: config.headers }
@@ -181,24 +232,42 @@ function createTransport(
 
   switch (config.transport) {
     case "stdio": {
-      // Build clean env: process.env may contain undefined values,
-      // child_process.spawn silently drops them, but let's be explicit
-      const env: Record<string, string> = {};
-      for (const [key, value] of Object.entries(process.env)) {
-        if (value !== undefined) env[key] = value;
+      if (!config.command) {
+        throw new McpError("stdio transport requires 'command'", serverName, "config");
       }
-      Object.assign(env, config.env ?? {});
       const transport = new StdioClientTransport({
-        command: config.command!,
+        command: config.command,
         args: config.args,
-        env,
+        env: resolveEnv(config.env),
+        ...(cwd !== undefined ? { cwd } : {}),
         stderr: "pipe",
       });
-      // Capture stderr lines into the circular buffer
-      transport.stderr?.on("data", (chunk: Buffer) => {
-        const lines = chunk.toString().split("\n").filter(Boolean);
-        for (const line of lines) onStderr(line);
-      });
+      if (onStderr && transport.stderr) {
+        const decoder = new StringDecoder("utf8");
+        let remainder = "";
+        let flushed = false;
+        transport.stderr.on("data", (chunk: Buffer) => {
+          remainder += decoder.write(chunk);
+          const lines = remainder.split("\n");
+          remainder = lines.pop() ?? "";
+          for (const rawLine of lines) {
+            const clean = sanitizeStderrLine(rawLine);
+            if (clean) onStderr(clean);
+          }
+        });
+        const flush = (): void => {
+          if (flushed) return;
+          flushed = true;
+          remainder += decoder.end();
+          if (remainder) {
+            const clean = sanitizeStderrLine(remainder);
+            remainder = "";
+            if (clean) onStderr(clean);
+          }
+        };
+        transport.stderr.on("end", flush);
+        transport.stderr.on("close", flush);
+      }
       return transport;
     }
     case "streamable-http":
@@ -207,16 +276,56 @@ function createTransport(
         {
           ...(requestInit && { requestInit }),
           ...(authProvider && { authProvider }),
+          // WHY: Disable internal SDK SSE stream retries so unexpected disconnects
+          // immediately surface to ServerManager._recover() for deterministic backoff.
+          reconnectionOptions: {
+            maxRetries: 0,
+            initialReconnectionDelay: 0,
+            maxReconnectionDelay: 0,
+            reconnectionDelayGrowFactor: 1,
+          },
         },
       ) as unknown as Transport;
-    case "sse":
-      return new SSEClientTransport(
+    case "sse": {
+      const transport = new SSEClientTransport(
         new URL(config.url!),
         {
           ...(requestInit && { requestInit }),
           ...(authProvider && { authProvider }),
         },
       );
+      // WHY: SSEClientTransport.start() awaits the initial `event: endpoint` SSE frame,
+      // while SSEClientTransport.close() aborts _abortController and closes _eventSource
+      // without firing _eventSource.onerror, leaving start() pending forever (which would
+      // deadlock `await client.close()`). Wrap start() and close() so closing the transport
+      // immediately rejects any pending start() promise.
+      const origStart = transport.start.bind(transport);
+      const origClose = transport.close.bind(transport);
+      let rejectPendingStart: ((err: Error) => void) | null = null;
+      transport.start = () =>
+        new Promise<void>((resolve, reject) => {
+          rejectPendingStart = reject;
+          origStart().then(
+            () => {
+              rejectPendingStart = null;
+              resolve();
+            },
+            (err) => {
+              rejectPendingStart = null;
+              reject(err);
+            },
+          );
+        });
+      transport.close = async () => {
+        if (rejectPendingStart) {
+          const reject = rejectPendingStart;
+          rejectPendingStart = null;
+          reject(new Error("SSE transport closed before endpoint event"));
+        }
+        await origClose();
+      };
+      return transport;
+    }
   }
 }
 
@@ -227,6 +336,7 @@ export class ServerManager {
   private settings: Settings;
   private onToolRefresh: ToolRefreshCallback | null = null;
   private onServerStopped: ((name: string) => void) | null = null;
+  private onRecoveryFailed: RecoveryFailedCallback | null = null;
 
   constructor(config: McpConfig, _authCallbacks?: TransportAuthCallbacks, private readonly storageDir?: string) {
     this.settings = config.settings;
@@ -253,6 +363,18 @@ export class ServerManager {
 
   setServerStoppedCallback(cb: (name: string) => void): void {
     this.onServerStopped = cb;
+  }
+
+  setRecoveryFailedCallback(cb: RecoveryFailedCallback): void {
+    this.onRecoveryFailed = cb;
+  }
+
+  private _resolveTimeoutMs(server: ManagedServer): number {
+    return server.config.requestTimeoutMs ?? this.settings.requestTimeoutMs;
+  }
+
+  createTransport(name: string, config: ServerConfig, cwd?: string): Transport {
+    return createTransport(name, config, cwd, this.storageDir, cwd);
   }
 
   getServer(name: string): ManagedServer | undefined {
@@ -297,19 +419,20 @@ export class ServerManager {
   }
 
   /**
-   * Mark an OAuth server as requiring re-authorization when a mid-session
-   * request (tools/list or tools/call) fails with 401/403 insufficient_scope.
-   */
+    * Mark an OAuth server as requiring re-authorization when a mid-session
+    * request (tools/list or tools/call) fails with 401/403 insufficient_scope.
+    */
   async handleUnauthorizedServerError(name: string, _cause?: unknown): Promise<void> {
     const server = this.servers.get(name);
     if (!server || !server.config.auth || server.config.transport === "stdio") {
       return;
     }
-    await invalidateStoredTokens(name, this.storageDir, server.config.url);
     const authError = new AuthRequiredError(name);
-    if (server.state === "ready") {
-      await this._shutdown(server);
-    }
+    // WHY: Shut down immediately before async disk I/O so server.generation increments
+    // synchronously and cancels any concurrent _recover() microtask queued by client.onerror.
+    await this._shutdown(server);
+    server.lastError = authError;
+    await invalidateStoredTokens(name, this.storageDir, server.config.url);
     server.lastError = authError;
   }
 
@@ -332,7 +455,8 @@ export class ServerManager {
     if (!server) {
       throw new McpError(`Unknown server "${name}"`, name, "config");
     }
-    if (server.attempt) return server.attempt;
+    server.cwd = cwd;
+    if (server.attempt && !server.controller?.signal.aborted) return server.attempt;
     if (server.state === "ready") return;
     server.retryCount = 0;
     const controller = new AbortController();
@@ -340,10 +464,14 @@ export class ServerManager {
     server.state = "starting";
     const attempt = this._connect(server, cwd, controller.signal);
     server.attempt = attempt;
-    try { await attempt; } finally {
+    try {
+      await attempt;
+    } finally {
       if (server.attempt === attempt) {
         server.attempt = undefined;
-        if (this.getServer(name)?.state !== "ready") server.controller = undefined;
+      }
+      if (server.controller === controller && (server.state as ServerState) !== "ready") {
+        server.controller = undefined;
       }
     }
   }
@@ -400,6 +528,132 @@ export class ServerManager {
 
   // ─── Internal ───────────────────────────────────────────────────────────────
 
+  private async _connectWithTimeoutAndSignal(
+    client: Client,
+    transport: Transport,
+    timeoutMs: number,
+    signal: AbortSignal,
+    serverName: string,
+  ): Promise<void> {
+    if (signal.aborted) {
+      throw new AuthCancelledError(serverName);
+    }
+
+    const connectPromise = client.connect(transport, { timeout: timeoutMs, signal });
+    // WHY: Attach a no-op catch handler so if the outer timeout or abort wins the race
+    // while transport.start() is still in flight, a late rejection from connect() never
+    // triggers an unhandledRejection.
+    connectPromise.catch(() => {
+      // WHY: Handled via Promise.race below.
+    });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+
+    const raceOutcome = new Promise<never>((_resolve, reject) => {
+      if (signal.aborted) {
+        reject(new AuthCancelledError(serverName));
+        return;
+      }
+      onAbort = () => {
+        reject(new AuthCancelledError(serverName));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+
+      timer = setTimeout(() => {
+        reject(
+          new McpError(
+            `Connection timed out after ${timeoutMs}ms`,
+            serverName,
+            "timeout",
+          ),
+        );
+      }, timeoutMs);
+    });
+
+    try {
+      await Promise.race([connectPromise, raceOutcome]);
+    } catch (err) {
+      if (signal.aborted || err instanceof AuthCancelledError) {
+        throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
+      }
+      if (
+        !(err instanceof McpError) &&
+        ((err as { code?: unknown })?.code === -32001 ||
+          /Request timed out|timed out/i.test(err instanceof Error ? err.message : String(err)))
+      ) {
+        throw new McpError(
+          `Connection timed out after ${timeoutMs}ms`,
+          serverName,
+          "timeout",
+          err,
+        );
+      }
+      throw err;
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      if (onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+  }
+
+  private _isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+        return false;
+      }
+      return true;
+    }
+  }
+
+  private async _ensurePidTerminated(pid: number | null | undefined): Promise<void> {
+    if (!pid || !this._isPidAlive(pid)) {
+      return;
+    }
+
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+        return;
+      }
+    }
+
+    const sigtermDeadline = Date.now() + 500;
+    while (Date.now() < sigtermDeadline) {
+      if (!this._isPidAlive(pid)) {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+
+    if (!this._isPidAlive(pid)) {
+      return;
+    }
+
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+        return;
+      }
+    }
+
+    const sigkillDeadline = Date.now() + 200;
+    while (Date.now() < sigkillDeadline) {
+      if (!this._isPidAlive(pid)) {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   private async _connect(
     server: ManagedServer,
     cwd: string,
@@ -407,6 +661,8 @@ export class ServerManager {
     corruptStateRecovered = false,
   ): Promise<void> {
     server.lastError = null;
+    server.cwd = cwd;
+    const timeoutMs = this._resolveTimeoutMs(server);
     // Note: retryCount is NOT reset here — it's only reset after successful connect.
     // This ensures the retry limit is respected across reconnection attempts.
     // It IS reset when startServer() is called explicitly (e.g. /mcp:start)
@@ -421,7 +677,7 @@ export class ServerManager {
 
     let transport: Transport;
     try {
-      transport = createTransport(server.name, server.config, appendStderr, this.storageDir);
+      transport = this.createTransport(server.name, server.config, cwd);
     } catch (err) {
       server.state = "stopped";
       server.lastError = err instanceof Error ? err : new Error(String(err));
@@ -431,6 +687,72 @@ export class ServerManager {
         "connection",
         err,
       );
+    }
+
+    server.transport = transport;
+
+    if (transport instanceof StdioClientTransport) {
+      // WHY: Capture child PID immediately when StdioClientTransport spawns the process
+      // (before `initialize` is sent), so a timeout or cancellation during `initialize`
+      // can still terminate the child process deterministically before retrying.
+      const origStart = transport.start.bind(transport);
+      transport.start = async () => {
+        const startPromise = origStart();
+        const earlyProc = (transport as unknown as { _process?: { pid?: number } })._process;
+        if (earlyProc?.pid) {
+          server.childPid = earlyProc.pid;
+        }
+        await startPromise;
+        const proc = (transport as unknown as { _process?: { pid?: number } })._process;
+        if (proc?.pid) {
+          server.childPid = proc.pid;
+        } else if (transport.pid) {
+          server.childPid = transport.pid;
+        }
+      };
+
+      // WHY: Client.connect's catch block fires `void this.close()` without awaiting it,
+      // which clears `this._process = undefined` synchronously on the first call. Memoize
+      // transport.close() so our `await client.close()` awaits the actual close completion.
+      let closePromise: Promise<void> | null = null;
+      const origClose = transport.close.bind(transport);
+      transport.close = () => {
+        if (!closePromise) {
+          closePromise = origClose();
+        }
+        return closePromise;
+      };
+
+      if (transport.stderr) {
+        const decoder = new StringDecoder("utf8");
+        let stderrRemainder = "";
+        let stderrFlushed = false;
+        const emitLine = (rawLine: string): void => {
+          const clean = sanitizeStderrLine(rawLine);
+          if (!clean) return;
+          appendStderr(clean);
+          console.error(`[pi-mcp] [${server.name}] ${clean}`);
+        };
+        transport.stderr.on("data", (chunk: Buffer) => {
+          stderrRemainder += decoder.write(chunk);
+          const lines = stderrRemainder.split("\n");
+          stderrRemainder = lines.pop() ?? "";
+          for (const rawLine of lines) {
+            emitLine(rawLine);
+          }
+        });
+        const flushStderr = (): void => {
+          if (stderrFlushed) return;
+          stderrFlushed = true;
+          stderrRemainder += decoder.end();
+          if (stderrRemainder) {
+            emitLine(stderrRemainder);
+            stderrRemainder = "";
+          }
+        };
+        transport.stderr.on("end", flushStderr);
+        transport.stderr.on("close", flushStderr);
+      }
     }
 
     const client = new Client(
@@ -447,12 +769,17 @@ export class ServerManager {
     // Handle roots/list requests from the server
     client.setRequestHandler(
       ListRootsRequestSchema,
-      async () => ({
-        // file:// URI for the workspace root. On Windows this produces
-        // file://C:\... which is technically non-standard but functional
-        // for the common case (MCP servers use roots as hints, not strict paths).
-        roots: [{ uri: `file://${cwd}`, name: "workspace" }],
-      }),
+      async () => {
+        const effectiveCwd = server.cwd ?? cwd;
+        return {
+          roots: [
+            {
+              uri: pathToFileURL(effectiveCwd).href,
+              name: basename(effectiveCwd) || "workspace",
+            },
+          ],
+        };
+      },
     );
 
     // tools/list_changed: re-discover tools and update Pi registrations
@@ -461,7 +788,15 @@ export class ServerManager {
       async () => {
         if (!signal.aborted && this.onToolRefresh && server.state === "ready" && server.client === client) {
           try {
-            await this.onToolRefresh(server.name, server.client);
+            const refreshTimeoutMs = this._resolveTimeoutMs(server);
+            setClientDefaultOptions(server.client, {
+              requestTimeoutMs: refreshTimeoutMs,
+              signal,
+            });
+            await this.onToolRefresh(server.name, server.client, {
+              requestTimeoutMs: refreshTimeoutMs,
+              signal,
+            });
           } catch (err) {
             console.error(
               `[pi-mcp] Failed to refresh tools for ${server.name}:`,
@@ -485,22 +820,70 @@ export class ServerManager {
 
     server.client = client;
     try {
-      await client.connect(transport);
-      if (signal.aborted) throw new Error("Connection cancelled");
-      server.childPid = transport instanceof StdioClientTransport ? transport.pid : null;
+      await this._connectWithTimeoutAndSignal(client, transport, timeoutMs, signal, server.name);
+      if (signal.aborted) throw new AuthCancelledError(server.name);
+      if (transport instanceof StdioClientTransport && !server.childPid) {
+        server.childPid = transport.pid;
+      }
       // Readiness includes tool discovery, not just the MCP handshake.
-      if (this.onToolRefresh) await this.onToolRefresh(server.name, client);
-      if (signal.aborted) throw new Error("Connection cancelled");
+      setClientDefaultOptions(client, { requestTimeoutMs: timeoutMs, signal });
+      if (this.onToolRefresh) {
+        await this.onToolRefresh(server.name, client, {
+          requestTimeoutMs: timeoutMs,
+          signal,
+        });
+      }
+      if (signal.aborted) throw new AuthCancelledError(server.name);
       server.state = "ready";
       server.retryCount = 0;
       server.lastError = null;
       if (server.config.healthCheckIntervalMs) {
+        let pingInFlight = false;
         server.healthCheckTimer = setInterval(async () => {
-          if (signal.aborted) return;
-          try { await client.ping(); }
-          catch {
-            if (signal.aborted) return;
-            await this._recover(server, cwd);
+          if (pingInFlight || server.state !== "ready" || !server.client || signal.aborted) {
+            return;
+          }
+          pingInFlight = true;
+          let pingTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const pingOptions = {
+              timeout: timeoutMs,
+              signal,
+            };
+            const pingCall = (
+              server.client.ping as (
+                opts?: { timeout?: number; signal?: AbortSignal },
+                extraOpts?: { timeout?: number; signal?: AbortSignal },
+              ) => Promise<unknown>
+            )(pingOptions, pingOptions);
+            pingCall.catch(() => {
+              // WHY: Handled via Promise.race below.
+            });
+            await Promise.race([
+              pingCall,
+              new Promise<never>((_resolve, reject) => {
+                pingTimer = setTimeout(
+                  () =>
+                    reject(
+                      new McpError(
+                        `Health check ping timed out after ${timeoutMs}ms`,
+                        server.name,
+                        "timeout",
+                      ),
+                    ),
+                  timeoutMs,
+                );
+              }),
+            ]);
+          } catch {
+            if (server.state === "ready" && !signal.aborted) {
+              void this._recover(server, server.cwd ?? cwd);
+            }
+          } finally {
+            if (pingTimer !== undefined) {
+              clearTimeout(pingTimer);
+            }
+            pingInFlight = false;
           }
         }, server.config.healthCheckIntervalMs);
       }
@@ -511,12 +894,85 @@ export class ServerManager {
       client.onclose = () => {
         if (signal.aborted || server.client !== client) return;
         console.error(`[pi-mcp] Server ${server.name} closed unexpectedly, reconnecting`);
-        void this._recover(server, cwd);
+        void this._recover(server, server.cwd ?? cwd);
+      };
+      // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
+      // stream drops via transport.onerror (forwarded to client.onerror) rather than
+      // transport.onclose. Crucially, StreamableHTTPClientTransport.send() invokes
+      // this.onerror(error) synchronously BEFORE `throw error` rejects the send()
+      // promise; deferring _recover() via setImmediate lets Protocol.request() and
+      // ToolBridge.execute() observe the original transport/401 error (and run
+      // handleUnauthorizedServerError if applicable) before client.close() rejects
+      // pending requests with "Connection closed".
+      const scheduleErrorRecovery = () => {
+        const errorGeneration = server.generation ?? 0;
+        setImmediate(() => {
+          if (
+            (server.generation ?? 0) !== errorGeneration ||
+            server.state !== "ready" ||
+            signal.aborted ||
+            server.client !== client
+          ) {
+            return;
+          }
+          void this._recover(server, server.cwd ?? cwd);
+        });
+      };
+      client.onerror = (err) => {
+        if (server.state !== "ready" || signal.aborted || server.client !== client) {
+          return;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+          /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
+            msg,
+          )
+        ) {
+          return;
+        }
+        if (server.config.transport === "sse") {
+          console.error(`[pi-mcp] Server ${server.name} SSE stream error, reconnecting: ${msg}`);
+          scheduleErrorRecovery();
+          return;
+        }
+        if (server.config.transport === "streamable-http") {
+          if (isOAuthUnauthorizedError(err)) {
+            console.error(`[pi-mcp] Server ${server.name} HTTP auth error, recovering: ${msg}`);
+            scheduleErrorRecovery();
+            return;
+          }
+          // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
+          // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
+          // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
+          // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
+          // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
+          // stream drops on established streams report "SSE stream disconnected" or
+          // "Maximum reconnection attempts (0) exceeded." instead.
+          if (/Failed to open SSE stream:/i.test(msg)) {
+            return;
+          }
+          console.error(`[pi-mcp] Server ${server.name} HTTP stream error, reconnecting: ${msg}`);
+          scheduleErrorRecovery();
+        }
       };
     } catch (err) {
-      try { await client.close(); } catch { /* best effort */ }
-      if (server.client === client) { server.client = null; server.childPid = null; }
-      if (signal.aborted) throw new Error("Connection cancelled");
+      const pid =
+        server.childPid ??
+        (transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
+        (transport instanceof StdioClientTransport ? transport.pid : null);
+      server.childPid = null;
+      await Promise.allSettled([
+        client.close(),
+        this._ensurePidTerminated(pid),
+      ]);
+      await this._ensurePidTerminated(pid);
+      if (server.client === client) {
+        server.client = null;
+        server.transport = undefined;
+      }
+      if (signal.aborted || err instanceof AuthCancelledError) {
+        throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
+      }
       const error = err instanceof Error ? err : new Error(String(err));
       if (
         !corruptStateRecovered &&
@@ -528,7 +984,7 @@ export class ServerManager {
         // state file before throwing this error. Log the warning and retry once immediately
         // without consuming retryCount so OAuth can proceed cleanly into AuthRequiredError.
         console.error(`[pi-mcp] ${error.message}`);
-        if (signal.aborted) throw new Error("Connection cancelled");
+        if (signal.aborted) throw new AuthCancelledError(server.name);
         return this._connect(server, cwd, signal, true);
       }
       server.lastError = error;
@@ -553,7 +1009,13 @@ export class ServerManager {
       }
       if (server.retryCount >= this.settings.maxRetries) {
         server.state = "stopped";
-        throw new McpError(`Connection failed after ${server.retryCount} retries: ${error.message}`, server.name, "connection", err);
+        const code = error instanceof McpError && error.code === "timeout" ? "timeout" : "connection";
+        throw new McpError(
+          `Connection failed after ${server.retryCount} retries: ${error.message}`,
+          server.name,
+          code,
+          err,
+        );
       }
       const delayMs = RETRY_DELAYS_MS[Math.min(server.retryCount++, RETRY_DELAYS_MS.length - 1)] ?? 30000;
       await new Promise<void>((resolve) => {
@@ -563,7 +1025,7 @@ export class ServerManager {
           resolve();
         }, { once: true });
       });
-      if (signal.aborted) throw new Error("Connection cancelled");
+      if (signal.aborted) throw new AuthCancelledError(server.name);
       return this._connect(server, cwd, signal, corruptStateRecovered);
     }
   }
@@ -576,8 +1038,12 @@ export class ServerManager {
       // An external stop during cleanup increments the generation again.
       queueMicrotask(() => {
         if (server.generation !== recoveryGeneration) return;
-        void this.startServer(server.name, cwd).catch((error) => {
-          server.lastError = error instanceof Error ? error : new Error(String(error));
+        void this.startServer(server.name, cwd).catch((err) => {
+          if (err instanceof AuthCancelledError) return;
+          const error = err instanceof Error ? err : new Error(String(err));
+          server.lastError = error;
+          console.error(`[pi-mcp] [${server.name}] Background recovery failed: ${error.message}`);
+          this.onRecoveryFailed?.(server.name, error);
         });
       });
     }
@@ -585,6 +1051,8 @@ export class ServerManager {
 
   private async _shutdown(server: ManagedServer): Promise<void> {
     server.controller?.abort();
+    server.controller = undefined;
+    server.attempt = undefined;
     server.generation = (server.generation ?? 0) + 1;
 
     // Cancel pending retry
@@ -603,24 +1071,19 @@ export class ServerManager {
     server.lastError = null;
     this.onServerStopped?.(server.name);
     const client = server.client;
-    const pid = server.childPid;
+    const pid =
+      server.childPid ??
+      (server.transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
+      null;
     server.client = null;
+    server.transport = undefined;
     server.childPid = null;
 
-    try {
-      // SDK handles transport-specific cleanup:
-      // - stdio: closes stdin, waits for process exit, sends SIGTERM/SIGKILL
-      // - streamable-http/sse: closes HTTP connections
-      await client?.close();
-    } catch {
-      // If SDK cleanup fails, force kill the subprocess as a safety net
-      if (pid !== null) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Process may already be dead
-        }
-      }
-    }
+    await Promise.allSettled([
+      client?.close(),
+      this._ensurePidTerminated(pid),
+    ]);
+    await this._ensurePidTerminated(pid);
   }
 }
+

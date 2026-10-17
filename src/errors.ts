@@ -7,6 +7,8 @@
 export type McpErrorCode =
   | "config"      // Configuration loading or validation failed
   | "connection"  // Transport/connection failed
+  | "auth"        // Authentication/authorization failed
+  | "timeout"     // Request or connection timed out
   | "protocol"    // JSON-RPC protocol violation (server error response, timeout, etc.)
   | "tool";       // Tool execution error (isError: true from server)
 
@@ -33,3 +35,11 @@ export class McpError extends Error {
     return `[${this.server}] ${this.message}`;
   }
 }
+
+export class AuthCancelledError extends Error {
+  constructor(serverName: string) {
+    super(`Authentication cancelled for ${serverName}`);
+    this.name = "AuthCancelledError";
+  }
+}
+

@@ -10,6 +10,7 @@ import { acquireAuthLock, getAuthStatus, McpOAuthProvider } from "../src/oauth-p
 it("registers agent-visible status and connect tools without eagerly starting a lazy server", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-management-"));
   const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
   const tools = new Map<string, any>();
   const events = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -26,7 +27,7 @@ it("registers agent-visible status and connect tools without eagerly starting a 
     await mkdir(join(dir, ".pi"));
     await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
       settings: { maxRetries: 0 },
-      mcpServers: { lazy: { command: "node", args: ["--import", "tsx/esm", mock], lifecycle: "lazy" } },
+      mcpServers: { lazy: { command: "node", args: ["--import", tsxEsmLoader, mock], lifecycle: "lazy" } },
     }));
     await extension(pi as any, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
     assert.ok(tools.has("mcp_status"));

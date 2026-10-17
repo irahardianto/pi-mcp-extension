@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
 
 const mockServerPath = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+const tsxEsmLoader = import.meta.resolve("tsx/esm");
 
 async function fileExists(path: string): Promise<boolean> {
   try {
@@ -54,7 +55,7 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
           mcpServers: {
             trusted_global: {
               command: "node",
-              args: ["--import", "tsx/esm", mockServerPath],
+              args: ["--import", tsxEsmLoader, mockServerPath],
               lifecycle: "eager",
             },
           },
@@ -140,7 +141,7 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
           mcpServers: {
             local_srv: {
               command: "node",
-              args: ["--import", "tsx/esm", mockServerPath],
+              args: ["--import", tsxEsmLoader, mockServerPath],
               lifecycle: "eager",
             },
           },
@@ -184,18 +185,18 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
     let registeredServers: Array<{ name: string; config: any; extensionPath: string }> = [
       {
         name: "ext_eager",
-        config: { command: "node", args: ["--import", "tsx/esm", mockServerPath] },
+        config: { command: "node", args: ["--import", tsxEsmLoader, mockServerPath] },
         extensionPath: "/ext/a.ts",
       },
       {
         name: "ext_disabled",
-        config: { command: "node", args: ["--import", "tsx/esm", mockServerPath], enabled: false },
+        config: { command: "node", args: ["--import", tsxEsmLoader, mockServerPath], enabled: false },
         extensionPath: "/ext/a.ts",
       },
       {
         // Same name as mcp.json server below; mcp.json (lazy) must win over extension (eager)
         name: "collision",
-        config: { command: "node", args: ["--import", "tsx/esm", mockServerPath] },
+        config: { command: "node", args: ["--import", tsxEsmLoader, mockServerPath] },
         extensionPath: "/ext/a.ts",
       },
     ];
@@ -227,7 +228,7 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
           mcpServers: {
             collision: {
               command: "node",
-              args: ["--import", "tsx/esm", mockServerPath],
+              args: ["--import", tsxEsmLoader, mockServerPath],
               lifecycle: "lazy",
             },
           },
@@ -258,7 +259,7 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
       registeredServers = [
         {
           name: "ext_dynamic",
-          config: { command: "node", args: ["--import", "tsx/esm", mockServerPath] },
+          config: { command: "node", args: ["--import", tsxEsmLoader, mockServerPath] },
           extensionPath: "/ext/b.ts",
         },
       ];

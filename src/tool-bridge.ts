@@ -18,7 +18,7 @@ import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotoc
 import * as Type from "typebox";
 import type { TSchema } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { McpError } from "./errors.js";
+import { McpError, AuthCancelledError } from "./errors.js";
 import type { Settings } from "./config.js";
 import { isOAuthUnauthorizedError } from "./server-manager.js";
 
@@ -26,6 +26,30 @@ import { isOAuthUnauthorizedError } from "./server-manager.js";
 
 /** Subset of Pi's ExtensionAPI used by the bridge. */
 export type PiExtensionAPI = Pick<ExtensionAPI, "registerTool" | "getActiveTools" | "setActiveTools">;
+
+export type ToolRefreshOptions = {
+  requestTimeoutMs?: number | undefined;
+  signal?: AbortSignal | undefined;
+};
+
+// WHY: Store per-client default { requestTimeoutMs, signal } in a WeakMap so 2-argument
+// onToolRefresh callbacks ((name, client) => bridge.refreshTools(name, client)) still
+// inherit the server's configured requestTimeoutMs and handshake AbortSignal.
+const clientRefreshDefaults = new WeakMap<Client, ToolRefreshOptions>();
+
+export function setClientDefaultOptions(client: Client, options: ToolRefreshOptions): void {
+  if (client && typeof client === "object") {
+    clientRefreshDefaults.set(client, options);
+  }
+}
+
+export function getClientDefaultOptions(client: Client): ToolRefreshOptions | undefined {
+  if (client && typeof client === "object") {
+    return clientRefreshDefaults.get(client);
+  }
+  return undefined;
+}
+
 
 
 // ─── Schema Conversion ────────────────────────────────────────────────────────
@@ -641,6 +665,8 @@ export interface McpToolDefinition {
 export async function listAllTools(
   client: Client,
   requestTimeoutMs: number,
+  signal?: AbortSignal,
+  serverName = "<unknown>",
 ): Promise<McpToolDefinition[]> {
   const tools: McpToolDefinition[] = [];
   let cursor: string | undefined;
@@ -648,17 +674,53 @@ export async function listAllTools(
   let pageCount = 0;
 
   do {
+    if (signal?.aborted) {
+      throw new AuthCancelledError(serverName);
+    }
     if (pageCount >= MAX_PAGES) {
       console.warn(
         `[pi-mcp] tools/list pagination exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
       );
       break;
     }
-    const result = await client.request(
-      { method: "tools/list", params: cursor ? { cursor } : {} },
-      ListToolsResultSchema,
-      { timeout: requestTimeoutMs },
-    );
+    const requestOptions = {
+      timeout: requestTimeoutMs,
+      ...(signal ? { signal } : {}),
+    };
+    const callPromise =
+      typeof client.listTools === "function"
+        ? client.listTools(cursor ? { cursor } : undefined, requestOptions)
+        : client.request(
+            { method: "tools/list", params: cursor ? { cursor } : {} },
+            ListToolsResultSchema,
+            requestOptions,
+          );
+
+    let result: Awaited<typeof callPromise>;
+    if (signal) {
+      callPromise.catch(() => {
+        // WHY: Suppress unhandled rejection if in-flight listTools rejects after abort wins the race.
+      });
+      let onAbort: (() => void) | undefined;
+      const abortPromise = new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) {
+          reject(new AuthCancelledError(serverName));
+          return;
+        }
+        onAbort = () => reject(new AuthCancelledError(serverName));
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        result = await Promise.race([callPromise, abortPromise]);
+      } finally {
+        if (onAbort) {
+          signal.removeEventListener("abort", onAbort);
+        }
+      }
+    } else {
+      result = await callPromise;
+    }
+
     tools.push(...(result.tools as McpToolDefinition[]));
     cursor = result.nextCursor;
     pageCount++;
@@ -682,6 +744,8 @@ export class ToolBridge {
   private readonly toolOwners = new Map<string, string>();
   /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
   private readonly refreshGenerations = new Map<string, number>();
+  /** Per-server request timeout overrides resolved during refreshTools. */
+  private readonly serverTimeouts = new Map<string, number>();
   private onAuthError?: ((serverName: string, error: unknown) => Promise<void> | void) | undefined;
 
   constructor(settings: Settings, pi: PiExtensionAPI) {
@@ -709,16 +773,31 @@ export class ToolBridge {
   async refreshTools(
     serverName: string,
     client: Client,
-    isCurrent: () => boolean = () => true,
+    isCurrentOrOptions?: (() => boolean) | ToolRefreshOptions,
+    maybeOptions?: ToolRefreshOptions,
   ): Promise<void> {
+    const isCurrent = typeof isCurrentOrOptions === "function" ? isCurrentOrOptions : () => true;
+    const options = typeof isCurrentOrOptions === "object" ? isCurrentOrOptions : maybeOptions;
+    const defaults = getClientDefaultOptions(client);
+    const effectiveTimeoutMs =
+      options?.requestTimeoutMs ?? defaults?.requestTimeoutMs ?? this.settings.requestTimeoutMs;
+    const effectiveSignal = options?.signal ?? defaults?.signal;
+    this.serverTimeouts.set(serverName, effectiveTimeoutMs);
+
     const gen = (this.refreshGenerations.get(serverName) ?? 0) + 1;
     this.refreshGenerations.set(serverName, gen);
-    const timeoutMs = this.settings.requestTimeoutMs;
 
     let tools: McpToolDefinition[];
     try {
-      tools = await listAllTools(client, timeoutMs);
+      tools = await listAllTools(client, effectiveTimeoutMs, effectiveSignal, serverName);
     } catch (err) {
+      if (
+        err instanceof AuthCancelledError ||
+        effectiveSignal?.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
+      }
       if (isOAuthUnauthorizedError(err)) {
         await this.onAuthError?.(serverName, err);
       }
@@ -786,6 +865,7 @@ export class ToolBridge {
   removeServerTools(serverName: string): void {
     const gen = (this.refreshGenerations.get(serverName) ?? 0) + 1;
     this.refreshGenerations.set(serverName, gen);
+    this.serverTimeouts.delete(serverName);
     this._deactivateServerTools(serverName);
     const existing = this.serverToolNames.get(serverName);
     if (existing) {
@@ -856,7 +936,8 @@ export class ToolBridge {
     }
 
     const schema = convertJsonSchemaToTypebox(tool.inputSchema);
-    const timeoutMs = this.settings.requestTimeoutMs;
+    const getEffectiveTimeoutMs = () =>
+      this.serverTimeouts.get(serverName) ?? this.settings.requestTimeoutMs;
     const notifyAuthError = (err: unknown) => this.onAuthError?.(serverName, err);
 
     this.pi.registerTool({
@@ -871,17 +952,30 @@ export class ToolBridge {
           throw new McpError("Tool execution cancelled", serverName, "protocol");
         }
 
+        const effectiveTimeoutMs = getEffectiveTimeoutMs();
+        const requestOptions = {
+          timeout: effectiveTimeoutMs,
+          ...(signal ? { signal } : {}),
+        };
+
         try {
-          const result = await client.request(
-            {
-              method: "tools/call",
-              params: { name: tool.name, arguments: params },
-            },
-            CallToolResultSchema,
-            // Pass AbortSignal to SDK — it will automatically send
-            // notifications/cancelled when the signal fires
-            { timeout: timeoutMs, ...(signal ? { signal } : {}) },
-          );
+          const result =
+            typeof client.callTool === "function"
+              ? await client.callTool(
+                  { name: tool.name, arguments: params as Record<string, unknown> },
+                  CallToolResultSchema,
+                  requestOptions,
+                )
+              : await client.request(
+                  {
+                    method: "tools/call",
+                    params: { name: tool.name, arguments: params },
+                  },
+                  CallToolResultSchema,
+                  // Pass AbortSignal to SDK — it will automatically send
+                  // notifications/cancelled when the signal fires
+                  requestOptions,
+                );
 
           const content = convertMcpContent(
             (result.content ?? []) as Array<Record<string, unknown>>,
@@ -924,6 +1018,7 @@ export class ToolBridge {
       },
     });
   }
+
 
   private _activateServerTools(serverName: string): void {
     const serverTools = this.serverToolNames.get(serverName);

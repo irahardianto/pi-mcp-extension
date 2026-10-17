@@ -517,3 +517,323 @@ it("does not reconnect after a deliberate stop", async () => {
     assert.equal(manager.getServer("lazy")?.state, "stopped");
   } finally { await manager.shutdownAll(); }
 });
+
+it("should clear server.attempt and server.controller on stopServer and unblock pending SSE start() so subsequent startServer does not reuse aborted attempt (Issues 19.2, 20.1)", async () => {
+  const { createServer } = await import("node:http");
+  let allowEndpoint = false;
+  const sockets = new Set<any>();
+
+  const listener = createServer((req, res) => {
+    if (req.url === "/sse" && req.method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      if (allowEndpoint) {
+        res.write("event: endpoint\ndata: /messages\n\n");
+      } else {
+        res.write(": waiting\n\n");
+      }
+      return;
+    }
+    if (req.url === "/messages" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => { body += c.toString(); });
+      req.on("end", () => {
+        const msg = JSON.parse(body);
+        res.writeHead(202);
+        res.end();
+        // Send response over SSE stream if needed — or we can test stop during start()
+        void msg;
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  listener.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+
+  const manager = new ServerManager({
+    settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 },
+    mcpServers: {
+      sse: {
+        lifecycle: "lazy",
+        transport: "sse",
+        url: `http://127.0.0.1:${address.port}/sse`,
+        args: [],
+      },
+    },
+  });
+
+  try {
+    const firstAttempt = manager.startServer("sse", process.cwd());
+    const rejection = assert.rejects(firstAttempt, /cancelled/i);
+
+    // Wait briefly for SSE request to connect
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await manager.stopServer("sse");
+    await rejection;
+
+    const srv = manager.getServer("sse");
+    assert.equal(srv?.attempt, undefined);
+    assert.equal(srv?.controller, undefined);
+    assert.equal(srv?.state, "stopped");
+  } finally {
+    await manager.shutdownAll();
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+  }
+});
+
+it("should cancel listAllTools and refreshTools with AuthCancelledError instead of wrapping in McpError('protocol') (Issue 19.2)", async () => {
+  const { AuthCancelledError } = await import("../src/index.js");
+  const mockPi = {
+    registerTool: () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => {},
+  };
+  const bridge = new ToolBridge({ toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 }, mockPi);
+  const controller = new AbortController();
+  const listToolsEntered = gate();
+
+  const slowClient = {
+    listTools: (_params?: any, options?: { signal?: AbortSignal; timeout?: number }) =>
+      new Promise((_resolve, reject) => {
+        listToolsEntered.release();
+        options?.signal?.addEventListener("abort", () => {
+          const abortErr = new Error("This operation was aborted");
+          abortErr.name = "AbortError";
+          reject(abortErr);
+        });
+      }),
+  } as any;
+
+  const refreshPromise = bridge.refreshTools("cancel-srv", slowClient, {
+    requestTimeoutMs: 1234,
+    signal: controller.signal,
+  });
+  await listToolsEntered.promise;
+  controller.abort();
+
+  await assert.rejects(
+    refreshPromise,
+    (err: unknown) => err instanceof AuthCancelledError,
+  );
+});
+
+it("should recover SSE and StreamableHTTP servers on unexpected transport errors while ignoring benign protocol warnings, and surface recovery failures via callback and UI notifications (Issue 20.2)", async () => {
+  const { createServer } = await import("node:http");
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { default: extension } = await import("../src/index.js");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue20-2-"));
+
+  let shouldFailConnect = false;
+  let shouldRequireAuth = false;
+
+  const listener = createServer((req, res) => {
+    if (req.url === "/mcp") {
+      if (req.method === "GET") {
+        // Simulate a POST-only HTTP server (e.g. Express/Fastify app.post('/mcp')) returning 404 on GET
+        res.writeHead(404);
+        res.end("Not Found");
+        return;
+      }
+      if (shouldRequireAuth) {
+        res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+        res.end("Unauthorized");
+        return;
+      }
+      if (shouldFailConnect) {
+        res.writeHead(500);
+        res.end("Internal Server Error");
+        return;
+      }
+      let body = "";
+      req.on("data", (c) => { body += c.toString(); });
+      req.on("end", () => {
+        const msg = JSON.parse(body);
+        if (msg.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "http-srv", version: "1.0.0" },
+              },
+            }),
+          );
+        } else if (msg.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+        } else if (msg.method === "tools/list") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                tools: [{ name: "http_ping", inputSchema: { type: "object", properties: {} } }],
+              },
+            }),
+          );
+        } else if (msg.method === "ping") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }));
+        } else {
+          res.writeHead(400);
+          res.end();
+        }
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/mcp`;
+
+  const manager = new ServerManager({
+    settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 },
+    mcpServers: {
+      httpSrv: {
+        lifecycle: "lazy",
+        transport: "streamable-http",
+        url: baseUrl,
+        args: [],
+        auth: { type: "oauth", clientId: "cid" },
+      },
+    },
+  }, undefined, join(dir, "auth"));
+
+  try {
+    await manager.startServer("httpSrv", dir);
+    assert.equal(manager.getServer("httpSrv")?.state, "ready");
+    const firstClient = manager.getServer("httpSrv")!.client!;
+
+    // 1. Benign protocol errors and optional GET SSE probe failures must NOT trigger recovery
+    let recoveryStarts = 0;
+    const origStart = manager.startServer.bind(manager);
+    const reconnected = gate();
+    manager.startServer = async (...args) => {
+      recoveryStarts++;
+      const res = await origStart(...args);
+      reconnected.release();
+      return res;
+    };
+
+    firstClient.onerror?.(new Error("Received a response for an unknown message ID: 99"));
+    firstClient.onerror?.(new Error("Failed to open SSE stream: Method Not Allowed"));
+    firstClient.onerror?.(new Error("Streamable HTTP error: Failed to open SSE stream: Bad Request"));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(recoveryStarts, 0, "Benign errors must not trigger recovery");
+    assert.equal(manager.getServer("httpSrv")?.client, firstClient);
+
+    // 2. Real stream disconnect error on ready streamable-http server triggers recovery
+    firstClient.onerror?.(new Error("SSE stream disconnected: TypeError: terminated"));
+    await reconnected.promise;
+    assert.equal(recoveryStarts, 1);
+    assert.equal(manager.getServer("httpSrv")?.state, "ready");
+
+    // 3. Recovery failure invokes setRecoveryFailedCallback
+    const recoveryFailedGate = gate();
+    let failedServer = "";
+    let failedErr: Error | undefined;
+    manager.setRecoveryFailedCallback((srvName: string, err: Error) => {
+      failedServer = srvName;
+      failedErr = err;
+      recoveryFailedGate.release();
+    });
+
+    shouldFailConnect = true;
+    const secondClient = manager.getServer("httpSrv")!.client!;
+    secondClient.onerror?.(new Error("Maximum reconnection attempts (0) exceeded."));
+    await recoveryFailedGate.promise;
+    assert.equal(failedServer, "httpSrv");
+    assert.ok(failedErr);
+
+    // 4. Verify src/index.ts wires setRecoveryFailedCallback to notify on auth vs connection errors
+    shouldFailConnect = false;
+    shouldRequireAuth = false;
+    const events = new Map<string, any>();
+    const notifications: Array<{ msg: string; level?: string | undefined }> = [];
+    const statuses: Array<string | undefined> = [];
+    const authNotified = gate();
+    const connNotified = gate();
+    const pi = {
+      registerTool: () => {},
+      registerCommand: () => {},
+      on: (name: string, fn: any) => events.set(name, fn),
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    };
+    const ctx: any = {
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: (msg: string, level?: string) => {
+          notifications.push({ msg, level });
+          if (msg.includes("requires re-authorization")) authNotified.release();
+          if (msg.includes("Lost connection to")) connNotified.release();
+        },
+        setStatus: (_key: string, text?: string) => statuses.push(text),
+        select: async () => "Not now",
+      },
+    };
+    await mkdir(join(dir, ".pi"), { recursive: true });
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0, requestTimeoutMs: 1000 },
+        mcpServers: {
+          httpSrv: {
+            lifecycle: "eager",
+            transport: "streamable-http",
+            url: baseUrl,
+            healthCheckIntervalMs: 25,
+            auth: { type: "oauth", clientId: "cid" },
+          },
+        },
+      }),
+    );
+
+    await extension(pi as any, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "no-global.json"),
+      authStorageDir: join(dir, "auth2"),
+    });
+    await events.get("session_start")({}, ctx);
+
+    // Trigger background 401 failure on health check -> _recover -> AuthRequiredError
+    shouldRequireAuth = true;
+    await authNotified.promise;
+    assert.ok(
+      notifications.some(
+        (n) =>
+          n.msg === "pi-mcp: httpSrv requires re-authorization — run /mcp:auth httpSrv" &&
+          n.level === "warning",
+      ),
+    );
+    assert.ok(statuses.includes("run /mcp:auth httpSrv"));
+
+    await events.get("session_shutdown")({}, ctx);
+  } finally {
+    await manager.shutdownAll();
+    listener.closeAllConnections();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+

@@ -19,7 +19,7 @@ import { ServerManager } from "./server-manager.js";
 import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
-import { McpError } from "./errors.js";
+import { McpError, AuthCancelledError } from "./errors.js";
 import { spawn } from "node:child_process";
 
 // OAuth imports
@@ -76,12 +76,7 @@ function openBrowser(url: string): Promise<void> {
   });
 }
 
-export class AuthCancelledError extends Error {
-  constructor(serverName: string) {
-    super(`Authentication cancelled for ${serverName}`);
-    this.name = "AuthCancelledError";
-  }
-}
+export { AuthCancelledError } from "./errors.js";
 
 export const authRetryOption = "Retry: open browser again";
 export const authPasteOption = "Paste redirect URL";
@@ -480,19 +475,41 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
   }
 
-  manager.setToolRefreshCallback(async (serverName, client) => {
-    await bridge.refreshTools(serverName, client, () => {
-      const server = manager.getServer(serverName);
-      return server?.client === client && server.state !== "stopped";
-    });
+  let activeCtx: ExtensionContext | undefined;
+
+  manager.setToolRefreshCallback(async (serverName, client, options) => {
+    await bridge.refreshTools(
+      serverName,
+      client,
+      () => {
+        const server = manager.getServer(serverName);
+        return server?.client === client && server.state !== "stopped";
+      },
+      options,
+    );
   });
   manager.setServerStoppedCallback((name) => bridge.deactivateServer(name));
+  manager.setRecoveryFailedCallback((serverName, error) => {
+    if (error instanceof AuthRequiredError) {
+      activeCtx?.ui.notify(
+        `pi-mcp: ${serverName} requires re-authorization — run /mcp:auth ${serverName}`,
+        "warning",
+      );
+      activeCtx?.ui.setStatus?.("pi-mcp", `run /mcp:auth ${serverName}`);
+    } else {
+      activeCtx?.ui.notify(
+        `pi-mcp: Lost connection to ${serverName} — ${formatErrorMessage(error)}`,
+        "error",
+      );
+    }
+  });
   bridge.setAuthErrorCallback(async (serverName, err) => {
     await manager.handleUnauthorizedServerError(serverName, err);
   });
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+    activeCtx = ctx;
     // Only load project-level <cwd>/.pi/mcp.json when the project is trusted.
     const includeProjectConfig =
       typeof (ctx as { isProjectTrusted?: () => boolean }).isProjectTrusted === "function"
@@ -548,6 +565,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
 
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
   pi.on("mcp_servers_change", async (event, ctx: ExtensionContext) => {
+    activeCtx = ctx;
     const entries = Array.isArray((event as { servers?: unknown })?.servers)
       ? ((event as { servers: RegisteredMcpServer[] }).servers)
       : getRegisteredEntries();
@@ -597,6 +615,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   });
 
   pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
+    activeCtx = undefined;
     for (const controller of startupPromptControllers.values()) controller.abort();
     startupPromptControllers.clear();
     for (const attempt of connectAttempts.values()) attempt.controller.abort();
@@ -960,6 +979,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     reset = false,
     alreadyQueued = false,
   ): Promise<void> {
+    activeCtx = ctx;
     const server = manager.getServer(serverName);
     if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
     if (signal?.aborted) throw new AuthCancelledError(serverName);
