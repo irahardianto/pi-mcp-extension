@@ -24,7 +24,7 @@ import {
   stopCallbackServer,
   callbackServerConfigFromRedirectUrl,
 } from "./callback-server.js";
-import { setCallbackPort, McpOAuthProvider, acquireAuthLock } from "./oauth-provider.js";
+import { setCallbackPort, McpOAuthProvider, acquireAuthLock, type AuthLockHandle } from "./oauth-provider.js";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { discoverManualAuthChallenge } from "./auth-challenge.js";
 import type { ManualAuthChallenge } from "./auth-challenge.js";
@@ -367,14 +367,23 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     const config = server.config;
     let oauthState: string | undefined;
     let latestAuthorizationUrl: URL | undefined;
+    let lockLost = false;
     const cancel = () => { if (oauthState) cancelCallback(oauthState); };
     signal.addEventListener("abort", cancel, { once: true });
-    let unlock: (() => Promise<void>) | undefined;
+    let unlock: AuthLockHandle | undefined;
     try {
         if (signal.aborted) throw new AuthCancelledError(serverName);
-        unlock = await acquireAuthLock(serverName, paths.authStorageDir);
+        unlock = await acquireAuthLock(serverName, paths.authStorageDir, {
+          onLost: () => {
+            lockLost = true;
+            cancel();
+          },
+        });
         if (signal.aborted) throw new AuthCancelledError(serverName);
-        if (reset) await manager.resetServerAuth(serverName);
+        if (reset) {
+          await unlock.assertHeld();
+          await manager.resetServerAuth(serverName);
+        }
         // Validate that we have a server URL (required for OAuth)
         if (!config.url) {
           throw new McpError(
@@ -411,11 +420,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           config.auth || { type: "oauth" },
           (url: URL) => {
             latestAuthorizationUrl = new URL(url.toString());
-            if (!signal.aborted) (paths.browserOpen ?? openBrowser)(url.toString());
+            if (!signal.aborted && !lockLost) (paths.browserOpen ?? openBrowser)(url.toString());
           },
           paths.authStorageDir,
           false,
           () => signal.aborted,
+          () => unlock!.assertHeld(),
         );
 
         // Why set state before calling auth(): the SDK reads provider.state() while
@@ -458,6 +468,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         // wait for the callback code and call auth() a second time with authorizationCode.
         const authResult = await auth(authProvider, authOptions);
         if (signal.aborted) throw new AuthCancelledError(serverName);
+        if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
 
         if (authResult === "AUTHORIZED") {
           // Auth succeeded without needing browser interaction (e.g., had valid tokens).
@@ -481,11 +492,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
                   "protocol",
                 );
               }
-              if (!signal.aborted) (paths.browserOpen ?? openBrowser)(latestAuthorizationUrl.toString());
+              if (!signal.aborted && !lockLost) (paths.browserOpen ?? openBrowser)(latestAuthorizationUrl.toString());
             },
             ctx,
           );
           if (signal.aborted) throw new AuthCancelledError(serverName);
+          if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
           ctx.ui.notify(
             `pi-mcp: Authorization callback received for ${serverName}. Exchanging token...`,
             "info",
@@ -527,6 +539,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         }
 
       if (signal.aborted) throw new AuthCancelledError(serverName);
+      if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+    } catch (err) {
+      if (lockLost && !signal.aborted) {
+        throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+      }
+      throw err;
     } finally {
       signal.removeEventListener("abort", cancel);
       cancel();
@@ -674,7 +692,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           : !manager.getServer(name)
             ? "Unknown MCP server name. Use mcp_status to list configured servers."
             : err instanceof AuthLockError
-              ? "Another Pi process is authorizing this server. Retry after it finishes or check for a stale auth lock."
+              ? "Another Pi process is authorizing this server. Retry after it finishes."
               : err instanceof AuthRequiredError
                 ? ctx.hasUI
                   ? "MCP authorization required. Retry with mcp_connect or /mcp:auth."

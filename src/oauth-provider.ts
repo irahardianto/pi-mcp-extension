@@ -13,10 +13,21 @@
 
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthClientMetadata, OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { readFile, writeFile, mkdir, unlink, chmod, open, stat } from "node:fs/promises";
-import { join } from "node:path";
-import { createHash } from "node:crypto";
-import { agentDir } from "./config.js";
+import { readFile, writeFile, mkdir, unlink, chmod, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import { McpError } from "./errors.js";
+import {
+  acquireAuthLock,
+  AuthLockError,
+  AuthRequiredError,
+  authDir,
+  statePath,
+  type AcquireAuthLockOptions,
+  type AuthLockHandle,
+} from "./auth-lock.js";
+
+export { acquireAuthLock, AuthLockError, AuthRequiredError, type AcquireAuthLockOptions, type AuthLockHandle };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -57,7 +68,7 @@ export function getCallbackPort(): number {
   return callbackPort;
 }
 
-// ─── Persistent State Types ───────────────────────────────────────────────────
+// ─── Persistent State Types & Schema ──────────────────────────────────────────
 
 interface StoredClientInfo {
   client_id: string;
@@ -77,74 +88,113 @@ interface StoredTokens {
 interface StoredState {
   clientInfo: StoredClientInfo | undefined;
   tokens: StoredTokens | undefined;
-  codeVerifier: string | undefined;
   discoveryState: OAuthDiscoveryState | undefined;
 }
 
+const StoredClientInfoSchema = z.object({
+  client_id: z.string(),
+  client_secret: z.string().optional(),
+});
+
+const StoredTokensSchema = z.object({
+  access_token: z.string(),
+  token_type: z.string().optional(),
+  refresh_token: z.string().optional(),
+  expires_in: z.number().optional(),
+  scope: z.string().optional(),
+  saved_at: z.string().optional(),
+});
+
+export const StoredStateSchema = z.object({
+  clientInfo: StoredClientInfoSchema.optional(),
+  tokens: StoredTokensSchema.optional(),
+  discoveryState: z.record(z.unknown()).optional(),
+});
+
 // ─── File helpers ─────────────────────────────────────────────────────────────
 
-function authDir(storageDir?: string): string {
-  return storageDir ?? join(agentDir(), "mcp-auth");
-}
-
-function statePath(serverName: string, storageDir?: string): string {
-  // Hash the server name to avoid filesystem issues with special chars
-  const hash = createHash("sha256").update(serverName).digest("hex").slice(0, 16);
-  return join(authDir(storageDir), `${hash}.json`);
-}
-
-// Exclusive per-server authorization lock shared by independent Pi processes.
-export async function acquireAuthLock(serverName: string, storageDir?: string): Promise<() => Promise<void>> {
-  const directory = authDir(storageDir);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
-  const path = `${statePath(serverName, storageDir)}.lock`;
-  try {
-    const file = await open(path, "wx", 0o600);
-    try { await file.writeFile(String(process.pid)); }
-    catch (err) { await unlink(path).catch(() => {}); throw err; }
-    finally { await file.close(); }
-    return async () => { await unlink(path).catch(() => {}); };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    throw new AuthLockError(serverName);
-  }
-}
-
 async function loadState(serverName: string, storageDir?: string): Promise<StoredState> {
+  const path = statePath(serverName, storageDir);
+  let raw: string;
   try {
-    const raw = await readFile(statePath(serverName, storageDir), "utf8");
-    const parsed = JSON.parse(raw) as StoredState;
-    return {
-      clientInfo: parsed.clientInfo ?? undefined,
-      tokens: parsed.tokens ?? undefined,
-      codeVerifier: parsed.codeVerifier ?? undefined,
-      discoveryState: parsed.discoveryState ?? undefined,
-    };
-  } catch {
-    return {
-      clientInfo: undefined,
-      tokens: undefined,
-      codeVerifier: undefined,
-      discoveryState: undefined,
-    };
+    raw = await readFile(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        clientInfo: undefined,
+        tokens: undefined,
+        discoveryState: undefined,
+      };
+    }
+    throw err;
   }
+
+  let parsed: z.output<typeof StoredStateSchema>;
+  try {
+    const json: unknown = JSON.parse(raw);
+    parsed = StoredStateSchema.parse(json);
+  } catch (err) {
+    const backupPath = `${path}.corrupt-${Date.now()}`;
+    await rename(path, backupPath);
+    throw new McpError(
+      `Corrupt OAuth state file for "${serverName}" backed up to ${backupPath}`,
+      serverName,
+      "config",
+      err,
+    );
+  }
+
+  return {
+    clientInfo: parsed.clientInfo
+      ? {
+          client_id: parsed.clientInfo.client_id,
+          client_secret: parsed.clientInfo.client_secret,
+        }
+      : undefined,
+    tokens: parsed.tokens
+      ? {
+          access_token: parsed.tokens.access_token,
+          token_type: parsed.tokens.token_type,
+          refresh_token: parsed.tokens.refresh_token,
+          expires_in: parsed.tokens.expires_in,
+          scope: parsed.tokens.scope,
+          saved_at: parsed.tokens.saved_at,
+        }
+      : undefined,
+    discoveryState: parsed.discoveryState as OAuthDiscoveryState | undefined,
+  };
 }
 
-async function saveState(serverName: string, state: StoredState, storageDir?: string, isCancelled: () => boolean = () => false): Promise<void> {
+async function saveState(
+  serverName: string,
+  state: StoredState,
+  storageDir?: string,
+  isCancelled: () => boolean = () => false,
+): Promise<void> {
   const directory = authDir(storageDir);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await chmod(directory, 0o700);
-  // Only write defined fields
+  // Only write defined fields (never write codeVerifier to shared state)
   const toWrite: Record<string, unknown> = {};
   if (state.clientInfo !== undefined) toWrite.clientInfo = state.clientInfo;
   if (state.tokens !== undefined) toWrite.tokens = state.tokens;
-  if (state.codeVerifier !== undefined) toWrite.codeVerifier = state.codeVerifier;
   if (state.discoveryState !== undefined) toWrite.discoveryState = state.discoveryState;
   if (isCancelled()) throw new AuthRequiredError(serverName, "Authorization cancelled");
   const path = statePath(serverName, storageDir);
-  await writeFile(path, JSON.stringify(toWrite, null, 2), { encoding: "utf8", mode: 0o600 });
-  await chmod(path, 0o600);
+  const tmpPath = `${path}.tmp-${randomUUID()}`;
+  try {
+    await writeFile(tmpPath, JSON.stringify(toWrite, null, 2), { encoding: "utf8", mode: 0o600 });
+    await chmod(tmpPath, 0o600);
+    if (isCancelled()) {
+      await unlink(tmpPath).catch(() => {});
+      throw new AuthRequiredError(serverName, "Authorization cancelled");
+    }
+    await rename(tmpPath, path);
+    await chmod(path, 0o600);
+  } catch (err) {
+    await unlink(tmpPath).catch(() => {});
+    throw err;
+  }
 }
 
 // ─── OAuthClientProvider Implementation ────────────────────────────────────────
@@ -155,6 +205,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private _redirectUrl: string | undefined;
   private _onAuthRequired: ((url: URL) => void | Promise<void>) | undefined;
   private _oauthState: string | undefined;
+  private _codeVerifier: string | undefined;
+  private _cachedTokens: StoredTokens | undefined;
 
   constructor(
     serverName: string,
@@ -163,6 +215,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     private readonly storageDir?: string,
     private readonly silent = false,
     private readonly isCancelled: () => boolean = () => false,
+    private readonly assertLockHeld?: (() => Promise<void>) | undefined,
   ) {
     this.serverName = serverName;
     this.authConfig = authConfig;
@@ -217,19 +270,21 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   async saveClientInformation(clientInformation: OAuthClientInformationMixed): Promise<void> {
     if (this.silent) throw new AuthRequiredError(this.serverName);
+    await this.assertLockHeld?.();
     const state = await loadState(this.serverName, this.storageDir);
     state.clientInfo = {
       client_id: clientInformation.client_id,
       client_secret: clientInformation.client_secret,
     };
+    await this.assertLockHeld?.();
     await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 
   // --- tokens ---
 
   async tokens(): Promise<OAuthTokens | undefined> {
-    const state = await loadState(this.serverName, this.storageDir);
-    if (!state.tokens) return undefined;
+    const storedTokens = this._cachedTokens ?? (await loadState(this.serverName, this.storageDir)).tokens;
+    if (!storedTokens) return undefined;
 
     // Always return stored tokens — even if expired.
     // The SDK's auth() function checks tokens?.refresh_token and attempts
@@ -247,19 +302,17 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
     // Build OAuthTokens — only include defined fields
     const tokens: Record<string, string> = {
-      access_token: state.tokens.access_token,
+      access_token: storedTokens.access_token,
     };
-    if (state.tokens.token_type !== undefined) tokens.token_type = state.tokens.token_type;
-    if (state.tokens.refresh_token !== undefined) tokens.refresh_token = state.tokens.refresh_token;
+    if (storedTokens.token_type !== undefined) tokens.token_type = storedTokens.token_type;
+    if (storedTokens.refresh_token !== undefined) tokens.refresh_token = storedTokens.refresh_token;
     return tokens as unknown as OAuthTokens;
   }
 
   // --- saveTokens ---
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
-    if (this.silent) await this.checkInteractiveLock();
-    const state = await loadState(this.serverName, this.storageDir);
-    state.tokens = {
+    const storedTokens: StoredTokens = {
       access_token: tokens.access_token,
       token_type: tokens.token_type,
       refresh_token: tokens.refresh_token,
@@ -267,8 +320,28 @@ export class McpOAuthProvider implements OAuthClientProvider {
       scope: tokens.scope,
       saved_at: new Date().toISOString(),
     };
+
+    if (this.silent) {
+      try {
+        const state = await loadState(this.serverName, this.storageDir);
+        state.tokens = storedTokens;
+        await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+        this._cachedTokens = undefined;
+      } catch (err) {
+        this._cachedTokens = storedTokens;
+        console.error(`[pi-mcp] Failed to persist refreshed OAuth tokens for "${this.serverName}":`, err);
+      }
+      return;
+    }
+
     if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
+    await this.assertLockHeld?.();
+    const state = await loadState(this.serverName, this.storageDir);
+    state.tokens = storedTokens;
+    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
+    await this.assertLockHeld?.();
     await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+    this._cachedTokens = undefined;
   }
 
   // --- redirectToAuthorization ---
@@ -285,30 +358,30 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
   }
 
-  // --- PKCE code verifier ---
+  // --- PKCE code verifier (in-memory per provider instance) ---
 
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
-    // The SDK saves PKCE before redirecting. Silent attempts must not overwrite an active flow.
+    // The SDK saves PKCE before redirecting. Silent attempts must not start a browser flow.
     if (this.silent) throw new AuthRequiredError(this.serverName);
-    const state = await loadState(this.serverName, this.storageDir);
-    state.codeVerifier = codeVerifier;
-    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
+    this._codeVerifier = codeVerifier;
   }
 
   async codeVerifier(): Promise<string> {
-    const state = await loadState(this.serverName, this.storageDir);
-    if (!state.codeVerifier) {
+    if (!this._codeVerifier) {
       throw new Error(`[pi-mcp] No PKCE code verifier found for "${this.serverName}"`);
     }
-    return state.codeVerifier;
+    return this._codeVerifier;
   }
 
   // --- Discovery state caching ---
 
   async saveDiscoveryState(discState: OAuthDiscoveryState): Promise<void> {
     if (this.silent) return; // No shared state writes from background discovery.
+    await this.assertLockHeld?.();
     const state = await loadState(this.serverName, this.storageDir);
     state.discoveryState = discState;
+    await this.assertLockHeld?.();
     await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 
@@ -338,35 +411,33 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   // --- Credential invalidation ---
 
-  private async checkInteractiveLock(): Promise<void> {
-    try { await stat(`${statePath(this.serverName, this.storageDir)}.lock`); }
-    catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return; throw err; }
-    throw new AuthRequiredError(this.serverName);
-  }
-
   async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
     if (this.silent) throw new AuthRequiredError(this.serverName);
+    await this.assertLockHeld?.();
     const state = await loadState(this.serverName, this.storageDir);
     switch (scope) {
       case "all":
         state.clientInfo = undefined;
         state.tokens = undefined;
-        state.codeVerifier = undefined;
         state.discoveryState = undefined;
+        this._codeVerifier = undefined;
+        this._cachedTokens = undefined;
         break;
       case "client":
         state.clientInfo = undefined;
         break;
       case "tokens":
         state.tokens = undefined;
+        this._cachedTokens = undefined;
         break;
       case "verifier":
-        state.codeVerifier = undefined;
+        this._codeVerifier = undefined;
         break;
       case "discovery":
         state.discoveryState = undefined;
         break;
     }
+    await this.assertLockHeld?.();
     await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
 }
@@ -387,7 +458,6 @@ export async function getAuthStatus(serverName: string, storageDir?: string): Pr
   if (
     state.clientInfo === undefined &&
     state.tokens === undefined &&
-    state.codeVerifier === undefined &&
     state.discoveryState === undefined
   ) {
     return null;
@@ -410,19 +480,5 @@ export async function resetAuth(serverName: string, storageDir?: string): Promis
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
     throw err;
-  }
-}
-
-export class AuthRequiredError extends Error {
-  constructor(serverName: string, message = `Authorization required for ${serverName}. Connect in an interactive Pi session or use /mcp:auth ${serverName}.`) {
-    super(message);
-    this.name = "AuthRequiredError";
-  }
-}
-
-export class AuthLockError extends AuthRequiredError {
-  constructor(serverName: string) {
-    super(serverName, `Another Pi process is authorizing ${serverName}; if it exited, remove its stale auth lock before retrying`);
-    this.name = "AuthLockError";
   }
 }

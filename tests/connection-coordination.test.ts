@@ -99,11 +99,13 @@ describe("isolated OAuth storage", () => {
       await interactive.saveCodeVerifier("original");
       await interactive.saveTokens({ access_token: "stored", token_type: "Bearer" });
       await assert.rejects(silent.saveCodeVerifier("other"), AuthRequiredError);
-      assert.equal(await silent.codeVerifier(), "original");
+      assert.equal(await interactive.codeVerifier(), "original");
+      await assert.rejects(silent.codeVerifier(), /No PKCE code verifier/);
       assert.equal((await silent.tokens())?.access_token, "stored");
       const unlock = await acquireAuthLock("test", dir);
       await assert.rejects(acquireAuthLock("test", dir), /Another Pi process/);
-      await assert.rejects(silent.saveTokens({ access_token: "other", token_type: "Bearer" }), AuthRequiredError);
+      await silent.saveTokens({ access_token: "other", token_type: "Bearer" });
+      assert.equal((await silent.tokens())?.access_token, "other");
       await unlock();
       assert.equal((await getAuthStatus("test", dir))?.hasTokens, true);
       await resetAuth("test", dir);
