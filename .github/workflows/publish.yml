@@ -22,10 +22,10 @@ jobs:
           node-version: 22
 
       - name: Upgrade npm (required for OIDC Trusted Publishing)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Typecheck
         run: npm run typecheck
@@ -42,21 +42,23 @@ jobs:
 
           if [ -n "$PREV_TAG" ]; then
             LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%s")
+            BODIES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%B")
           else
             LOG=$(git log -1 --pretty=format:"%s")
+            BODIES=$(git log -1 --pretty=format:"%B")
           fi
 
-          # Default to patch
-          BUMP="patch"
+          # Default to none
+          BUMP="none"
 
-          # Check for breaking change indicator
-          if echo "$LOG" | grep -qE "^[a-z]+(\(.+\))?!:|BREAKING CHANGE:"; then
+          # Check for breaking change indicator in subject or commit body
+          if echo "$LOG" | grep -qE "^[a-z]+(\(.+\))?!:" || echo "$BODIES" | grep -qE "^BREAKING[ -]CHANGE:"; then
             BUMP="major"
           # Check for feature commits
           elif echo "$LOG" | grep -qE "^feat(\(.+\))?:"; then
             BUMP="minor"
-          # Check for fix commits
-          elif echo "$LOG" | grep -qE "^fix(\(.+\))?:"; then
+          # Check for fix or perf commits
+          elif echo "$LOG" | grep -qE "^(fix|perf)(\(.+\))?:"; then
             BUMP="patch"
           fi
 
@@ -64,16 +66,21 @@ jobs:
           echo "Detected bump level: ${BUMP}"
 
       - name: Bump version
+        if: steps.bump.outputs.bump != 'none'
         id: version
         run: |
           # Bump the version in package.json (no commit, no tag yet)
           OLD_VERSION=$(node -p "require('./package.json').version")
           npm version ${{ steps.bump.outputs.bump }} --no-git-tag-version --allow-same-version
           NEW_VERSION=$(node -p "require('./package.json').version")
+          if [ -f CHANGELOG.md ]; then
+            sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [${NEW_VERSION}] - $(date -u +%Y-%m-%d)/" CHANGELOG.md
+          fi
           echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Bumped ${OLD_VERSION} → ${NEW_VERSION}"
 
       - name: Publish to npm
+        if: steps.bump.outputs.bump != 'none'
         run: |
           PACKAGE=$(node -p "require('./package.json').name")
           VERSION=$(node -p "require('./package.json').version")
@@ -87,11 +94,14 @@ jobs:
           fi
 
       - name: Commit version bump and tag
-        if: env.publish == 'true'
+        if: steps.bump.outputs.bump != 'none' && env.publish == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION=$(node -p "require('./package.json').version")
+          if [ -f CHANGELOG.md ]; then
+            git add CHANGELOG.md
+          fi
           git add package.json package-lock.json
           git commit -m "chore: release v${VERSION}"
           git tag "v${VERSION}"
