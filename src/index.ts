@@ -418,9 +418,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           () => signal.aborted,
         );
 
-        // Set the state before auth() builds the authorization URL.
+        // Why set state before calling auth(): the SDK reads provider.state() while
+        // building the authorization URL inside auth(), and omits the state parameter
+        // if empty, which the callback server then rejects as a CSRF error.
         authProvider.setState(oauthState);
 
+        // 4. Discover protected-resource challenge metadata from the server.
         const authChallenge: ManualAuthChallenge = await discoverManualAuthChallenge(config.url, {
           headers: config.headers,
         }).catch((): ManualAuthChallenge => {
@@ -430,7 +433,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           return {};
         });
 
-        // Register the callback immediately before auth() can open the browser.
+        // 5. Register the callback immediately before auth() can open the browser.
         // Attach a catch handler so cancellation after immediate authorization
         // does not produce an unhandled rejection.
         const callbackPromise = waitForCallback(oauthState);
@@ -448,7 +451,11 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           authOptions.scope = authChallenge.scope;
         }
 
-        // Start the auth flow. REDIRECT means browser interaction is required.
+        // 6. Start the auth flow.
+        // Why branch on the return value: the SDK auth() call returns "AUTHORIZED" when
+        // stored or refreshed tokens already succeeded without opening a browser, or
+        // "REDIRECT" after invoking redirectToAuthorization(), in which case we must
+        // wait for the callback code and call auth() a second time with authorizationCode.
         const authResult = await auth(authProvider, authOptions);
         if (signal.aborted) throw new AuthCancelledError(serverName);
 
@@ -462,7 +469,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
             "info",
           );
 
-          // 6. Wait for the callback while giving the user an escape hatch.
+          // 7. Wait for the callback while giving the user an escape hatch.
           const code = await waitForOAuthCallback(
             serverName,
             callbackPromise,
@@ -483,7 +490,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
             `pi-mcp: Authorization callback received for ${serverName}. Exchanging token...`,
             "info",
           );
-          // 7. Complete the OAuth flow with the authorization code
+          // 8. Complete the OAuth flow with the authorization code
           const finishAuthOptions: {
             serverUrl: string;
             authorizationCode: string;

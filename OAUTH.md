@@ -71,7 +71,7 @@ Interactive sessions show Retry and Cancel while authorization is pending. The b
 
 ### Token Storage
 
-Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json`. On systems with POSIX permissions, the directory uses mode `0700` and state files use mode `0600`.
+Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json` (or `<agent dir>/mcp-auth/<hash>.json` when `$PI_CODING_AGENT_DIR` is set). On systems with POSIX permissions, the directory uses mode `0700` and state files use mode `0600`.
 
 ```json
 {
@@ -91,7 +91,9 @@ Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json`. On systems w
 
 ### Reset Authentication
 
-To discard stored tokens and client registration, run `/mcp:auth deepsource --reset` in an interactive Pi session. The old `/mcp:auth deepsource` reset behavior has changed: it now reuses credentials and requests browser authorization only if needed. Interactive flows for different servers run one at a time in each Pi process. A per-server lock prevents simultaneous interactive flows in different Pi processes. Independent processes can still attempt token refresh at the same time; no cross-process connection or refresh coordinator exists. If Pi exits during browser authorization, verify that no authorization is active before removing the stale `~/.pi/agent/mcp-auth/<hash>.json.lock` file for that server.
+To discard stored tokens and client registration, run `/mcp:auth deepsource --reset` in an interactive Pi session. The old `/mcp:auth deepsource` reset behavior has changed: like `mcp_connect` and `/mcp:start`, it now reuses stored credentials and requests browser authorization only if needed.
+
+Interactive flows for different servers run one at a time in each Pi process, and a per-server lock prevents simultaneous interactive flows in different Pi processes. Independent processes can still attempt token refresh at the same time; no cross-process connection or refresh coordinator exists. If Pi exits during browser authorization, verify that no authorization is active before removing the stale `~/.pi/agent/mcp-auth/<hash>.json.lock` file (or `<agent dir>/mcp-auth/<hash>.json.lock` when `$PI_CODING_AGENT_DIR` is set) for that server.
 
 Server names can contain spaces. For example, `/mcp:auth team server --reset` resets `team server`. An exact configured name takes precedence over the reset suffix. To reset a server named `release --reset`, use `/mcp:auth release --reset --reset`.
 
@@ -164,43 +166,27 @@ Tokens are automatically refreshed by the MCP SDK. If refresh fails, use `mcp_co
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Pi Agent                                               │
-│                                                         │
-│  ┌────────────┐      ┌──────────────────┐             │
-│  │ /mcp:auth  │─────▶│  Callback Server │◀────────┐   │
-│  └────────────┘      │ (127.0.0.1:19876)│         │   │
-│         │            └──────────────────┘         │   │
-│         │                                          │   │
-│         ▼                                          │   │
-│  ┌──────────────────────────────────────┐            │   │
-│  │  OAuth Flow                          │            │   │
-│  │  1. Start callback server          │            │   │
-│  │  2. Generate state                  │            │   │
-│  │  3. Discover auth challenge         │            │   │
-│  │  4. Register callback promise       │            │   │
-│  │  5. Call SDK auth()                 │            │   │
-│  │  6. Wait for callback               │            │   │
-│  │  7. Exchange code through SDK auth()│            │   │
-│  │  8. Start server with tokens        │            │   │
-│  └──────────────────────────────────────┘            │   │
-│                      │                                 │   │
-└──────────────────────┼─────────────────────────────────┘
-                       │
-                       ▼
-              ┌────────────────┐
-              │ OAuth Server   │
-              │ (Authorization)│
-              └────────────────┘
-                       │
-         ┌─────────────┴─────────────┐
-         │                           │
-         ▼                           ▼
-   ┌─────────┐                  ┌─────────┐
-   │ Browser │                  │  Callback│
-   │ (User)  │─── code ────────▶│  Server │
-   └─────────┘                  └─────────┘
+```mermaid
+sequenceDiagram
+    participant Agent as User / Pi Agent
+    participant Callback as Callback Server
+    participant Resource as MCP Resource Server
+    participant Auth as Authorization Server
+    participant Browser as Browser
+
+    Agent->>Resource: Connect with stored tokens (if any)
+    Resource-->>Agent: 401 Unauthorized (WWW-Authenticate)
+    Agent->>Callback: Start loopback listener & register CSRF state
+    Agent->>Resource: Discover protected-resource challenge (RFC 9728)
+    Agent->>Auth: Metadata discovery & Dynamic Client Registration (RFC 7591)
+    Agent->>Browser: Open authorization URL (PKCE S256 + state)
+    Browser->>Auth: User authenticates & approves access
+    Auth-->>Browser: Redirect to loopback callback with code & state
+    Browser->>Callback: GET /callback?code=...&state=...
+    Callback-->>Agent: Validate state & deliver authorization code
+    Agent->>Auth: Exchange code + PKCE verifier for tokens
+    Auth-->>Agent: Access & refresh tokens (saved to disk)
+    Agent->>Resource: Connect MCP server with Bearer token & activate tools
 ```
 
 ## References

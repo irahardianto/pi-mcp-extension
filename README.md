@@ -63,7 +63,7 @@ Config files are loaded from two locations. **Project config overrides global co
 
 | Location | Scope |
 |---|---|
-| `~/.pi/agent/mcp.json` | Global — applies to all projects |
+| `~/.pi/agent/mcp.json` | Global — applies to all projects (honors `$PI_CODING_AGENT_DIR` when set: `<agent dir>/mcp.json`) |
 | `.pi/mcp.json` | Project — overrides global per-server |
 
 ### Full Example
