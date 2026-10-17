@@ -1023,6 +1023,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     name: "mcp_status",
     label: "MCP status",
     description: "List configured MCP servers, lifecycle, connection and OAuth state. Use mcp_connect to connect one server.",
+    promptSnippet: "Inspect configured MCP servers, their connection state, discovered tools, and authentication status.",
     parameters: Type.Object({}),
     async execute() {
       const rows = await Promise.all(manager.getAllServers().map(async (server) => {
@@ -1046,6 +1047,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     name: "mcp_connect",
     label: "Connect MCP server",
     description: "Connect one named configured MCP server and activate its tools. May request interactive OAuth authorization.",
+    promptSnippet: "Connect or reconnect to a configured MCP server by name and register its tools.",
     parameters: Type.Object({ name: Type.String({ description: "Exact configured MCP server name" }) }),
     async execute(_id, { name }, signal, _update, ctx) {
       try {

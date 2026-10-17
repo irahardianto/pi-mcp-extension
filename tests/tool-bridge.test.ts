@@ -46,9 +46,9 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.equal(schema.type, "number");
   });
 
-  it("converts integer as Number", () => {
+  it("converts integer as Integer", () => {
     const schema = convertJsonSchemaToTypebox({ type: "integer" }) as any;
-    assert.equal(schema.type, "number");
+    assert.equal(schema.type, "integer");
   });
 
   it("converts boolean type", () => {
@@ -74,7 +74,6 @@ describe("convertJsonSchemaToTypebox", () => {
       required: ["name"],
     }) as any;
     assert.ok(schema.properties, "Should have properties");
-    const props = schema.properties;
     // TypeBox (Pi's version) expresses optionality via the `required` array,
     // not via Symbol modifiers. 'name' is required, 'age' is optional.
     assert.ok(schema.required?.includes("name"), "'name' should be in required[]");
@@ -114,12 +113,14 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.equal(schema.anyOf[1].type, "number");
   });
 
-  it("converts anyOf to Union", () => {
+  it("converts anyOf to Union with Null ordered first", () => {
     const schema = convertJsonSchemaToTypebox({
       anyOf: [{ type: "boolean" }, { type: "null" }],
     }) as any;
     assert.ok(schema.anyOf, "anyOf should produce a Union");
     assert.equal(schema.anyOf.length, 2);
+    assert.equal(schema.anyOf[0].type, "null");
+    assert.equal(schema.anyOf[1].type, "boolean");
   });
 
   it("converts allOf to Intersect", () => {
@@ -169,28 +170,368 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.ok(typeof schema === "object");
   });
 
-  it("handles nullable types: {type: ['string', 'null']}", () => {
-    const schema = convertJsonSchemaToTypebox({ type: ["string", "null"] }) as any;
-    // Should be Union [String, Null] — has anyOf
-    assert.ok(schema.anyOf, "Nullable should produce a Union");
+  it("handles nullable types: {type: ['string', 'null']} with Null first to prevent Value.Convert coercion", async () => {
+    const { Value } = await import("typebox/value");
+    const schema = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        str: { type: ["string", "null"] },
+        num: { type: ["number", "null"] },
+        int: { type: ["integer", "null"] },
+        bool: { type: ["boolean", "null"] },
+        anyOfStr: { anyOf: [{ type: "string" }, { type: "null" }] },
+        oneOfInt: { oneOf: [{ type: "integer" }, { type: "null" }] },
+        filter: { anyOf: [{ $ref: "#/$defs/Filter" }, { type: "null" }] },
+        mode: { enum: ["a", "b", null] },
+      },
+      required: ["str", "num", "int", "bool", "anyOfStr", "oneOfInt", "filter", "mode"],
+      $defs: {
+        Filter: {
+          type: "object",
+          properties: { tag: { type: "string" } },
+        },
+      },
+    }) as any;
+
+    assert.equal(schema.properties.str.anyOf[0].type, "null");
+    assert.equal(schema.properties.str.anyOf[1].type, "string");
+    assert.equal(schema.properties.num.anyOf[0].type, "null");
+    assert.equal(schema.properties.num.anyOf[1].type, "number");
+    assert.equal(schema.properties.int.anyOf[0].type, "null");
+    assert.equal(schema.properties.int.anyOf[1].type, "integer");
+    assert.equal(schema.properties.bool.anyOf[0].type, "null");
+    assert.equal(schema.properties.bool.anyOf[1].type, "boolean");
+    assert.equal(schema.properties.anyOfStr.anyOf[0].type, "null");
+    assert.equal(schema.properties.oneOfInt.anyOf[0].type, "null");
+    assert.equal(schema.properties.filter.anyOf[0].type, "null");
+    assert.equal(schema.properties.mode.anyOf[0].type, "null");
+
+    const convertedNulls = Value.Convert(schema, {
+      str: null,
+      num: null,
+      int: null,
+      bool: null,
+      anyOfStr: null,
+      oneOfInt: null,
+      filter: null,
+      mode: null,
+    });
+    assert.deepEqual(convertedNulls, {
+      str: null,
+      num: null,
+      int: null,
+      bool: null,
+      anyOfStr: null,
+      oneOfInt: null,
+      filter: null,
+      mode: null,
+    });
+  });
+
+  it("handles multi-type arrays such as ['string', 'number'] and ['string', 'number', 'null']", () => {
+    const twoTypes = convertJsonSchemaToTypebox({
+      type: ["string", "number"],
+      description: "String or number ID",
+    }) as any;
+    assert.ok(Array.isArray(twoTypes.anyOf));
+    assert.equal(twoTypes.anyOf.length, 2);
+    assert.equal(twoTypes.anyOf[0].type, "string");
+    assert.equal(twoTypes.anyOf[1].type, "number");
+    assert.equal(twoTypes.description, "String or number ID");
+
+    const withNull = convertJsonSchemaToTypebox({
+      type: ["string", "number", "null"],
+    }) as any;
+    assert.equal(withNull.anyOf.length, 3);
+    assert.equal(withNull.anyOf[0].type, "null");
+    assert.equal(withNull.anyOf[1].type, "string");
+    assert.equal(withNull.anyOf[2].type, "number");
+
+    const onlyNull = convertJsonSchemaToTypebox({
+      type: ["null"],
+      description: "Null only",
+    }) as any;
+    assert.equal(onlyNull.type, "null");
+    assert.equal(onlyNull.description, "Null only");
   });
 
   it("handles null input gracefully", () => {
-    const schema = convertJsonSchemaToTypebox(null) as any;
+    const schema = convertJsonSchemaToTypebox(null as unknown as Record<string, unknown>) as any;
     assert.ok(typeof schema === "object");
   });
 
   it("handles empty object schema (no properties)", () => {
-    const schema = convertJsonSchemaToTypebox({ type: "object" }) as any;
-    assert.ok(typeof schema === "object");
+    const result = convertJsonSchemaToTypebox({ type: "object" }) as any;
+    assert.equal(result.type, "object");
+    assert.deepEqual(result.properties, {});
+    assert.equal(result.patternProperties, undefined);
   });
 
-  it("prevents infinite recursion on deeply nested schemas", () => {
-    let schema: any = { type: "string" };
+  it("preserves object properties when top-level anyOf/oneOf/allOf is present and infers implicit objects/arrays", () => {
+    const objWithAnyOf = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        email: { type: "string" },
+      },
+      anyOf: [{ required: ["id"] }, { required: ["email"] }],
+    }) as any;
+    assert.equal(objWithAnyOf.type, "object");
+    assert.equal(objWithAnyOf.properties.id.type, "string");
+    assert.equal(objWithAnyOf.properties.email.type, "string");
+    assert.ok(Array.isArray(objWithAnyOf.anyOf));
+    assert.deepEqual(objWithAnyOf.anyOf[0].required, ["id"]);
+    assert.deepEqual(objWithAnyOf.anyOf[1].required, ["email"]);
+
+    const objWithOneOf = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        email: { type: "string" },
+      },
+      oneOf: [{ required: ["id"] }, { required: ["email"] }],
+    }) as any;
+    assert.equal(objWithOneOf.type, "object");
+    assert.equal(objWithOneOf.properties.id.type, "string");
+    assert.equal(objWithOneOf.properties.email.type, "string");
+    assert.ok(Array.isArray(objWithOneOf.oneOf));
+
+    const objWithAllOf = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      allOf: [
+        {
+          properties: { email: { type: "string" } },
+          required: ["email"],
+        },
+        { $ref: "#/$defs/Audit" },
+      ],
+      $defs: {
+        Audit: {
+          type: "object",
+          properties: { actor: { type: "string" } },
+          required: ["actor"],
+        },
+      },
+    }) as any;
+    assert.equal(objWithAllOf.type, "object");
+    assert.equal(objWithAllOf.properties.id.type, "string");
+    assert.equal(objWithAllOf.properties.email.type, "string");
+    assert.equal(objWithAllOf.properties.actor.type, "string");
+    assert.deepEqual(objWithAllOf.required, ["id", "email", "actor"]);
+    assert.ok(Array.isArray(objWithAllOf.allOf));
+
+    const implicitObj = convertJsonSchemaToTypebox({
+      properties: { host: { type: "string" } },
+      required: ["host"],
+      additionalProperties: { type: "integer" },
+      minProperties: 1,
+      maxProperties: 5,
+    }) as any;
+    assert.equal(implicitObj.type, "object");
+    assert.equal(implicitObj.properties.host.type, "string");
+    assert.deepEqual(implicitObj.required, ["host"]);
+    assert.equal(implicitObj.additionalProperties.type, "integer");
+    assert.equal(implicitObj.minProperties, 1);
+    assert.equal(implicitObj.maxProperties, 5);
+
+    const implicitArray = convertJsonSchemaToTypebox({
+      items: { type: "boolean" },
+    }) as any;
+    assert.equal(implicitArray.type, "array");
+    assert.equal(implicitArray.items.type, "boolean");
+  });
+
+  it("prevents infinite recursion on deeply nested schemas and cyclic $ref while resolving shared DAG $refs and RFC 6901 pointers", () => {
+    let deepSchema: any = { type: "string" };
     for (let i = 0; i < 15; i++) {
-      schema = { type: "object", properties: { nested: schema }, required: [] };
+      deepSchema = { type: "object", properties: { nested: deepSchema }, required: [] };
     }
-    assert.doesNotThrow(() => convertJsonSchemaToTypebox(schema));
+    assert.doesNotThrow(() => convertJsonSchemaToTypebox(deepSchema));
+
+    // Self-recursive $ref cycle
+    const cyclic = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        value: { type: "string" },
+        next: { $ref: "#/$defs/Node" },
+      },
+      $defs: {
+        Node: {
+          type: "object",
+          properties: {
+            value: { type: "string" },
+            next: { $ref: "#/$defs/Node" },
+          },
+        },
+      },
+    }) as any;
+    assert.equal(cyclic.type, "object");
+    assert.equal(cyclic.properties.next.type, "object");
+    assert.equal(cyclic.properties.next.properties.value.type, "string");
+
+    // Mutually recursive $ref cycle (A -> B -> A)
+    const mutualCyclic = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        start: { $ref: "#/$defs/A" },
+      },
+      $defs: {
+        A: {
+          type: "object",
+          properties: {
+            label: { type: "string" },
+            b: { $ref: "#/$defs/B" },
+          },
+        },
+        B: {
+          type: "object",
+          properties: {
+            count: { type: "integer" },
+            a: { $ref: "#/$defs/A" },
+          },
+        },
+      },
+    }) as any;
+    assert.equal(mutualCyclic.properties.start.type, "object");
+    assert.equal(mutualCyclic.properties.start.properties.b.type, "object");
+    assert.equal(mutualCyclic.properties.start.properties.b.properties.count.type, "integer");
+
+    // Root "#" reference cycle
+    const rootCyclic = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        self: { $ref: "#" },
+      },
+    }) as any;
+    assert.equal(rootCyclic.type, "object");
+    assert.equal(rootCyclic.properties.self.type, "object");
+
+    // Shared non-cyclic DAG $ref (must resolve both branches, not treat second as cycle)
+    const dag = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        left: { $ref: "#/$defs/Leaf" },
+        right: { $ref: "#/$defs/Leaf" },
+      },
+      $defs: {
+        Leaf: { type: "integer" },
+      },
+    }) as any;
+    assert.equal(dag.properties.left.type, "integer");
+    assert.equal(dag.properties.right.type, "integer");
+
+    // Multi-segment JSON Pointer (#/$defs/Container/properties/child), array index, & RFC 6901 ~0 / ~1 unescaping
+    const multiSegment = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        source: {
+          type: "object",
+          properties: {
+            nestedId: { type: "integer" },
+          },
+        },
+        mirrorId: { $ref: "#/properties/source/properties/nestedId" },
+        containerChild: { $ref: "#/$defs/Container/properties/child" },
+        escapedRef: { $ref: "#/$defs/a~1b~0c" },
+        protoRef: { $ref: "#/__proto__" },
+      },
+      $defs: {
+        Container: {
+          type: "object",
+          properties: {
+            child: { type: "string" },
+          },
+        },
+        "a/b~c": { type: "boolean" },
+      },
+    }) as any;
+    assert.equal(multiSegment.properties.mirrorId.type, "integer");
+    assert.equal(multiSegment.properties.containerChild.type, "string");
+    assert.equal(multiSegment.properties.escapedRef.type, "boolean");
+    assert.equal(multiSegment.properties.protoRef.type, undefined);
+  });
+
+  it("supports const, untyped/numeric/nullable enum, tuple items/prefixItems, and validation constraints", () => {
+    const constStr = convertJsonSchemaToTypebox({ const: "fixed", description: "Fixed literal" }) as any;
+    assert.equal(constStr.const, "fixed");
+    assert.equal(constStr.description, "Fixed literal");
+
+    const constNull = convertJsonSchemaToTypebox({ const: null }) as any;
+    assert.equal(constNull.type, "null");
+
+    const untypedEnum = convertJsonSchemaToTypebox({
+      enum: ["alpha", 2, true, null],
+      description: "Mixed nullable enum",
+    }) as any;
+    assert.equal(untypedEnum.description, "Mixed nullable enum");
+    assert.equal(untypedEnum.anyOf.length, 4);
+    assert.equal(untypedEnum.anyOf[0].type, "null");
+    assert.equal(untypedEnum.anyOf[1].const, "alpha");
+    assert.equal(untypedEnum.anyOf[2].const, 2);
+    assert.equal(untypedEnum.anyOf[3].const, true);
+
+    const tuplePrefix = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }, { type: "integer" }],
+    }) as any;
+    assert.equal(tuplePrefix.type, "array");
+    assert.equal(Array.isArray(tuplePrefix.items), true);
+    assert.equal(tuplePrefix.items[0].type, "string");
+    assert.equal(tuplePrefix.items[1].type, "integer");
+
+    const tupleItems = convertJsonSchemaToTypebox({
+      type: "array",
+      items: [{ type: "boolean" }, { type: "number" }],
+    }) as any;
+    assert.equal(tupleItems.type, "array");
+    assert.equal(Array.isArray(tupleItems.items), true);
+    assert.equal(tupleItems.items[0].type, "boolean");
+    assert.equal(tupleItems.items[1].type, "number");
+
+    const constrainedString = convertJsonSchemaToTypebox({
+      type: "string",
+      title: "Username",
+      default: "anon",
+      format: "slug",
+      pattern: "^[a-z]+$",
+      minLength: 2,
+      maxLength: 16,
+    }) as any;
+    assert.equal(constrainedString.title, "Username");
+    assert.equal(constrainedString.default, "anon");
+    assert.equal(constrainedString.format, "slug");
+    assert.equal(constrainedString.pattern, "^[a-z]+$");
+    assert.equal(constrainedString.minLength, 2);
+    assert.equal(constrainedString.maxLength, 16);
+
+    const constrainedNum = convertJsonSchemaToTypebox({
+      type: "number",
+      minimum: 1,
+      maximum: 100,
+      exclusiveMinimum: 0,
+      exclusiveMaximum: 101,
+      multipleOf: 5,
+    }) as any;
+    assert.equal(constrainedNum.minimum, 1);
+    assert.equal(constrainedNum.maximum, 100);
+    assert.equal(constrainedNum.exclusiveMinimum, 0);
+    assert.equal(constrainedNum.exclusiveMaximum, 101);
+    assert.equal(constrainedNum.multipleOf, 5);
+
+    const constrainedArr = convertJsonSchemaToTypebox({
+      type: "array",
+      items: { type: "string" },
+      minItems: 1,
+      maxItems: 10,
+      uniqueItems: true,
+    }) as any;
+    assert.equal(constrainedArr.minItems, 1);
+    assert.equal(constrainedArr.maxItems, 10);
+    assert.equal(constrainedArr.uniqueItems, true);
   });
 });
 
@@ -214,18 +555,26 @@ describe("buildToolName", () => {
     assert.match(name, /^[a-zA-Z0-9_]+$/);
   });
 
-  it("truncates names exceeding 64 chars and appends hash", () => {
+  it("truncates names exceeding 64 chars and appends hash over raw unsanitized input", () => {
     const longServer = "a".repeat(30);
-    const longTool = "b".repeat(30);
-    const name = buildToolName("mcp", longServer, longTool);
-    assert.ok(name.length <= 64, `Expected ≤64 chars, got ${name.length}`);
-    assert.match(name, /^[a-zA-Z0-9_]+$/);
+    const longToolA = "b-c" + "d".repeat(30);
+    const longToolB = "b_c" + "d".repeat(30);
+    const nameA = buildToolName("mcp", longServer, longToolA);
+    const nameB = buildToolName("mcp", longServer, longToolB);
+    assert.ok(nameA.length <= 64, `Expected ≤64 chars, got ${nameA.length}`);
+    assert.ok(nameB.length <= 64, `Expected ≤64 chars, got ${nameB.length}`);
+    assert.match(nameA, /^[a-zA-Z0-9_]+$/);
+    assert.notEqual(nameA, nameB, "Raw inputs that sanitize identically must produce distinct hashes");
   });
 
-  it("short names are not truncated or hashed", () => {
+  it("short names are not truncated or hashed unless forceHash is true", () => {
     const name = buildToolName("mcp", "foo", "bar");
     assert.equal(name, "mcp_foo_bar");
-    assert.ok(!name.includes("_" + name.split("_").pop()?.match(/[a-z0-9]{8}/)));
+    const forcedA = buildToolName("mcp", "a_b", "c", true);
+    const forcedB = buildToolName("mcp", "a", "b_c", true);
+    assert.match(forcedA, /^mcp_a_b_c_[0-9a-f]{8}$/);
+    assert.match(forcedB, /^mcp_a_b_c_[0-9a-f]{8}$/);
+    assert.notEqual(forcedA, forcedB);
   });
 });
 
@@ -459,6 +808,170 @@ describe("ToolBridge", () => {
       },
     );
   });
+
+  it("disambiguates intra-server and cross-server tool name collisions and isolates server deactivation", async () => {
+    const registeredTools = new Map<string, any>();
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: (t: any) => registeredTools.set(t.name, t),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi as any);
+
+    // Intra-server collision: "my-tool" and "my_tool" on server "alpha"
+    const clientAlpha = {
+      request: async () => ({
+        tools: [
+          { name: "my-tool", inputSchema: { type: "object" } },
+          { name: "my_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as any;
+    await bridge.refreshTools("alpha", clientAlpha);
+    assert.equal(activeTools.length, 2, "Both colliding intra-server tools must be active");
+    assert.ok(activeTools.includes("mcp_alpha_my_tool"));
+    assert.ok(activeTools.some((n) => /^mcp_alpha_my_tool_[0-9a-f]{8}$/.test(n)));
+
+    // Cross-server collision: server "a_b" tool "c" vs server "a" tool "b_c"
+    const clientAB = {
+      request: async () => ({
+        tools: [{ name: "c", inputSchema: { type: "object" } }],
+      }),
+    } as any;
+    const clientA = {
+      request: async () => ({
+        tools: [{ name: "b_c", inputSchema: { type: "object" } }],
+      }),
+    } as any;
+
+    await bridge.refreshTools("a_b", clientAB);
+    await bridge.refreshTools("a", clientA);
+
+    assert.ok(activeTools.includes("mcp_a_b_c"), "First server keeps canonical name");
+    const hashedName = buildToolName("mcp", "a", "b_c", true);
+    assert.ok(activeTools.includes(hashedName), "Second server gets disambiguated hashed name");
+
+    // Deactivating server "a" must NOT deactivate server "a_b"'s tool
+    bridge.deactivateServer("a");
+    assert.ok(activeTools.includes("mcp_a_b_c"), "Server a_b tool must remain active");
+    assert.ok(!activeTools.includes(hashedName), "Server a tool must be deactivated");
+
+    // Removing server "a_b" must release ownership of "mcp_a_b_c"
+    bridge.removeServer("a_b");
+    assert.ok(!activeTools.includes("mcp_a_b_c"));
+    await bridge.refreshTools("a", clientA);
+    assert.ok(activeTools.includes("mcp_a_b_c"), "Server a claims canonical name once a_b is removed");
+  });
+
+  it("discards stale out-of-order refreshTools responses via monotonic generation guard", async () => {
+    const registeredTools = new Map<string, any>();
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: (t: any) => registeredTools.set(t.name, t),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi as any);
+
+    let resolveSlow!: (val: any) => void;
+    const slowClient = {
+      request: () =>
+        new Promise((resolve) => {
+          resolveSlow = resolve;
+        }),
+    } as any;
+    const fastClient = {
+      request: async () => ({
+        tools: [{ name: "fresh_tool", inputSchema: { type: "object" } }],
+      }),
+    } as any;
+
+    const slowRefresh = bridge.refreshTools("srv", slowClient);
+    const fastRefresh = bridge.refreshTools("srv", fastClient);
+    await fastRefresh;
+    assert.deepEqual(activeTools, ["mcp_srv_fresh_tool"]);
+
+    // Now resolve the earlier slow refresh with stale tools
+    resolveSlow({
+      tools: [{ name: "stale_tool", inputSchema: { type: "object" } }],
+    });
+    await slowRefresh;
+
+    // Stale tool must NOT overwrite or activate
+    assert.deepEqual(activeTools, ["mcp_srv_fresh_tool"]);
+    assert.equal(registeredTools.has("mcp_srv_stale_tool"), false);
+
+    // Also test in-flight refresh discarded when deactivateServer is called
+    let resolveBeforeDeactivate!: (val: any) => void;
+    const clientBeforeDeactivate = {
+      request: () =>
+        new Promise((resolve) => {
+          resolveBeforeDeactivate = resolve;
+        }),
+    } as any;
+    const pendingRefresh = bridge.refreshTools("srv", clientBeforeDeactivate);
+    bridge.deactivateServer("srv");
+    assert.deepEqual(activeTools, []);
+    resolveBeforeDeactivate({
+      tools: [{ name: "zombie_tool", inputSchema: { type: "object" } }],
+    });
+    await pendingRefresh;
+    assert.deepEqual(activeTools, []);
+  });
+
+  it("throws McpError on pre-aborted signal and falls back to structuredContent when content is empty", async () => {
+    const registeredTools: any[] = [];
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: (t: any) => registeredTools.push(t),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    let callCount = 0;
+    const mockClient = {
+      request: async (req: any) => {
+        if (req.method === "tools/list") {
+          return {
+            tools: [{ name: "structured", inputSchema: { type: "object" } }],
+          };
+        }
+        callCount++;
+        return {
+          content: [],
+          structuredContent: { ok: true, count: 42 },
+        };
+      },
+    } as any;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi as any);
+    await bridge.refreshTools("myserver", mockClient);
+
+    const tool = registeredTools[0];
+    const abortController = new AbortController();
+    abortController.abort();
+
+    await assert.rejects(
+      () => tool.execute("call-aborted", {}, abortController.signal, undefined, undefined),
+      (err: any) => {
+        assert.equal(err.name, "McpError");
+        assert.equal(err.message, "Tool execution cancelled");
+        assert.equal(err.code, "protocol");
+        return true;
+      },
+    );
+    assert.equal(callCount, 0, "Must not call client.request when signal is already aborted");
+
+    const structuredRes = await tool.execute("call-ok", {}, undefined, undefined, undefined);
+    assert.equal(callCount, 1);
+    assert.deepEqual(structuredRes.content, [
+      { type: "text", text: JSON.stringify({ ok: true, count: 42 }, null, 2) },
+    ]);
+  });
 });
 
 // ── Content Conversion ────────────────────────────────────────────────────────
@@ -475,17 +988,19 @@ describe("convertMcpContent", () => {
     ]);
   });
 
-  it("converts text, audio, and resource blocks to PiTextContent", () => {
+  it("converts text, audio, and resource blocks to PiTextContent including empty resource text", () => {
     const out = convertMcpContent([
       { type: "text", text: "hello" },
       { type: "audio", mimeType: "audio/wav", data: "AAA=" },
       { type: "resource", resource: { uri: "file:///a.txt", text: "file body" } },
+      { type: "resource", resource: { uri: "file:///empty.txt", text: "" } },
       { type: "resource", resource: { uri: "file:///b.bin", blob: "BBB=" } },
     ]);
     assert.deepEqual(out, [
       { type: "text", text: "hello" },
       { type: "text", text: "[Audio: audio/wav, base64 encoded]" },
       { type: "text", text: "file body" },
+      { type: "text", text: "" },
       { type: "text", text: "[Resource blob: file:///b.bin]" },
     ]);
   });
@@ -517,3 +1032,4 @@ describe("listAllTools pagination", () => {
     assert.equal(pageIndex, 3); // exactly 3 requests made
   });
 });
+

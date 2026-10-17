@@ -12,6 +12,7 @@
  *   - Image content → ImageContent passthrough; audio/resource → text description
  */
 
+import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as Type from "typebox";
@@ -28,174 +29,521 @@ export type PiExtensionAPI = Pick<ExtensionAPI, "registerTool" | "getActiveTools
 
 // ─── Schema Conversion ────────────────────────────────────────────────────────
 
+const KIND_SYMBOL = Symbol.for("TypeBox.Kind");
+
+function isNullSchema(m: TSchema): boolean {
+  const rec = m as Record<string | symbol, unknown>;
+  return (
+    Type.IsNull(m) ||
+    rec["~kind"] === "Null" ||
+    rec[KIND_SYMBOL] === "Null" ||
+    rec["type"] === "null"
+  );
+}
+
+/**
+ * Place Type.Null() members before non-null union members.
+ * WHY: Pi's validateToolArguments runs TypeBox's Value.Convert(schema, args).
+ * When Type.String(), Type.Number(), Type.Integer(), or Type.Boolean() precedes
+ * Type.Null() in Type.Union([...]), Value.Convert coerces `null` into `""`, `0`,
+ * or `false` before reaching the Null branch.
+ */
+export function orderUnionMembers(members: TSchema[]): TSchema[] {
+  const nulls: TSchema[] = [];
+  const nonNulls: TSchema[] = [];
+  for (const m of members) {
+    if (isNullSchema(m)) {
+      nulls.push(m);
+    } else {
+      nonNulls.push(m);
+    }
+  }
+  return [...nulls, ...nonNulls];
+}
+
+function extractSchemaOptions(schema: Record<string, unknown>): Record<string, unknown> {
+  const opts: Record<string, unknown> = {};
+  if (typeof schema["description"] === "string") opts["description"] = schema["description"];
+  if (typeof schema["title"] === "string") opts["title"] = schema["title"];
+  if ("default" in schema && schema["default"] !== undefined) opts["default"] = schema["default"];
+  if (typeof schema["format"] === "string") opts["format"] = schema["format"];
+  if (typeof schema["pattern"] === "string") opts["pattern"] = schema["pattern"];
+  if (typeof schema["minLength"] === "number") opts["minLength"] = schema["minLength"];
+  if (typeof schema["maxLength"] === "number") opts["maxLength"] = schema["maxLength"];
+  if (typeof schema["minimum"] === "number") opts["minimum"] = schema["minimum"];
+  if (typeof schema["maximum"] === "number") opts["maximum"] = schema["maximum"];
+  if (typeof schema["exclusiveMinimum"] === "number") opts["exclusiveMinimum"] = schema["exclusiveMinimum"];
+  if (typeof schema["exclusiveMaximum"] === "number") opts["exclusiveMaximum"] = schema["exclusiveMaximum"];
+  if (typeof schema["multipleOf"] === "number") opts["multipleOf"] = schema["multipleOf"];
+  if (typeof schema["minItems"] === "number") opts["minItems"] = schema["minItems"];
+  if (typeof schema["maxItems"] === "number") opts["maxItems"] = schema["maxItems"];
+  if (typeof schema["uniqueItems"] === "boolean") opts["uniqueItems"] = schema["uniqueItems"];
+  if (typeof schema["minProperties"] === "number") opts["minProperties"] = schema["minProperties"];
+  if (typeof schema["maxProperties"] === "number") opts["maxProperties"] = schema["maxProperties"];
+  return opts;
+}
+
+function withSchemaOptions(schema: TSchema, opts: Record<string, unknown>): TSchema {
+  if (Object.keys(opts).length === 0) return schema;
+  const clone = Object.defineProperties({}, Object.getOwnPropertyDescriptors(schema)) as TSchema;
+  return Object.assign(clone, opts);
+}
+
+function unescapeJsonPointer(segment: string): string {
+  // WHY: RFC 6901 §4 requires unescaping "~1" to "/" before "~0" to "~" so "~01" becomes "~1".
+  return segment.replace(/~1/g, "/").replace(/~0/g, "~");
+}
+
+function stepJsonPointer(curr: unknown, part: string): unknown {
+  if (!curr || typeof curr !== "object") {
+    return undefined;
+  }
+  if (Array.isArray(curr)) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(part)) {
+      return undefined;
+    }
+    const idx = Number(part);
+    return idx >= 0 && idx < curr.length ? curr[idx] : undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(curr, part)) {
+    return undefined;
+  }
+  return (curr as Record<string, unknown>)[part];
+}
+
+export function resolveRefTarget(
+  ref: string,
+  rootDefs: Record<string, Record<string, unknown>> | undefined,
+  rootSchema: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (ref === "#") {
+    return rootSchema;
+  }
+  if (!ref.startsWith("#/")) {
+    return undefined;
+  }
+
+  const parts = ref.slice(2).split("/").map(unescapeJsonPointer);
+
+  if (
+    (parts[0] === "$defs" || parts[0] === "definitions") &&
+    parts.length >= 2 &&
+    rootDefs &&
+    Object.prototype.hasOwnProperty.call(rootDefs, parts[1]!)
+  ) {
+    const defEntry = rootDefs[parts[1]!];
+    if (defEntry && typeof defEntry === "object" && !Array.isArray(defEntry)) {
+      if (parts.length === 2) {
+        return defEntry;
+      }
+      let curr: unknown = defEntry;
+      for (let i = 2; i < parts.length; i++) {
+        curr = stepJsonPointer(curr, parts[i]!);
+        if (curr === undefined) break;
+      }
+      if (curr && typeof curr === "object" && !Array.isArray(curr)) {
+        return curr as Record<string, unknown>;
+      }
+    }
+  }
+
+  let curr: unknown = rootSchema;
+  for (const part of parts) {
+    curr = stepJsonPointer(curr, part);
+    if (curr === undefined) {
+      return undefined;
+    }
+  }
+  if (curr && typeof curr === "object" && !Array.isArray(curr)) {
+    return curr as Record<string, unknown>;
+  }
+  return undefined;
+}
+
 /**
  * Convert a JSON Schema object to a TypeBox schema.
  * Handles the common subset used by real-world MCP servers:
  *   - Primitives (string, number, integer, boolean, null)
- *   - Arrays, objects (with required/optional/additionalProperties)
- *   - Enums (string enums → Union of Literals)
- *   - Nullable types ("type": ["string", "null"])
- *   - $ref (local #/$defs/ and #/definitions/ references)
+ *   - Arrays, tuples (prefixItems / array items), objects (with required/optional/additionalProperties)
+ *   - Enums and const (string, numeric, boolean, and nullable enums → Union of Literals)
+ *   - Nullable and multi-type arrays ("type": ["string", "null"]) with Type.Null() ordered first
+ *   - Cycle-safe $ref (#, #/$defs/, #/definitions/, and arbitrary RFC 6901 JSON Pointers)
  *   - oneOf / anyOf → TypeBox Union
  *   - allOf → TypeBox Intersect
- * Falls back to Type.Any() for unresolvable $ref or missing type.
+ * Falls back to Type.Any() for unresolvable $ref, recursive cycles, or missing type.
  */
 export function convertJsonSchemaToTypebox(
-  schema: unknown,
-  depth = 0,
-  defs?: Record<string, unknown>,
+  schema: Record<string, unknown>,
+  defs?: Record<string, Record<string, unknown>>,
+  rootSchema?: Record<string, unknown>,
+  seenRefs: ReadonlySet<string> = new Set(),
 ): TSchema {
-  // Guard against infinite recursion and malformed schemas
-  if (!schema || typeof schema !== "object" || Array.isArray(schema) || depth > 10) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
     return Type.Any();
   }
 
-  const s = schema as Record<string, unknown>;
-  const description = typeof s["description"] === "string" ? s["description"] : undefined;
-  const opts = description ? { description } : {};
+  const effectiveRoot = rootSchema ?? schema;
+  const opts = extractSchemaOptions(schema);
 
   // Extract $defs / definitions for $ref resolution (carried through recursive calls)
-  const resolvedDefs: Record<string, unknown> = {
-    ...((s["$defs"] ?? s["definitions"]) as Record<string, unknown> | undefined),
+  const localDefs = (schema["$defs"] ?? schema["definitions"]) as
+    | Record<string, Record<string, unknown>>
+    | undefined;
+  const rootDefs: Record<string, Record<string, unknown>> = {
+    ...(localDefs && typeof localDefs === "object" && !Array.isArray(localDefs) ? localDefs : {}),
     ...defs,
   };
 
   // ── Handle $ref ──────────────────────────────────────────────────────────
-  if (typeof s["$ref"] === "string") {
-    const ref = s["$ref"] as string;
-    let resolved: unknown;
-
-    // Local references: #/$defs/Foo, #/definitions/Foo
-    if (ref.startsWith("#/")) {
-      const parts = ref.slice(2).split("/");
-      if (parts[0] === "$defs" || parts[0] === "definitions") {
-        const key = parts.slice(1).join("/");
-        resolved = resolvedDefs[key];
-      } else {
-        // Fallback: try walking the defs map by the last part
-        const key = parts[parts.length - 1]!;
-        resolved = resolvedDefs[key];
-      }
-    } else {
-      // External $ref — cannot resolve, fall back
-      console.warn(
-        `[pi-mcp] Cannot resolve external $ref "${ref}", using Type.Any()`,
-      );
+  if (typeof schema["$ref"] === "string") {
+    const ref = schema["$ref"];
+    if (seenRefs.has(ref)) {
+      // WHY: Break recursive $ref cycles along the active resolution path to prevent
+      // stack overflow or exponential blowup on self-referential schemas.
       return Type.Any(opts);
     }
 
+    const resolved = resolveRefTarget(ref, rootDefs, effectiveRoot);
     if (!resolved) {
-      console.warn(
-        `[pi-mcp] Could not resolve $ref "${ref}", using Type.Any()`,
-      );
       return Type.Any(opts);
     }
 
-    // Merge description from referencing schema into resolved schema
-    const merged = { ...(resolved as Record<string, unknown>) };
-    if (description && !merged["description"]) {
-      merged["description"] = description;
+    // Merge sibling metadata from the $ref site into the resolved schema
+    const merged: Record<string, unknown> = { ...resolved };
+    if (typeof schema["description"] === "string") {
+      merged["description"] = schema["description"];
     }
-    return convertJsonSchemaToTypebox(merged, depth + 1, resolvedDefs);
+    if (typeof schema["title"] === "string") {
+      merged["title"] = schema["title"];
+    }
+    if ("default" in schema && schema["default"] !== undefined) {
+      merged["default"] = schema["default"];
+    }
+
+    const nextSeen = new Set(seenRefs);
+    nextSeen.add(ref);
+    return convertJsonSchemaToTypebox(merged, rootDefs, effectiveRoot, nextSeen);
   }
 
-  // ── Handle oneOf / anyOf → TypeBox Union ─────────────────────────────────
-  if (Array.isArray(s["oneOf"])) {
-    const members = (s["oneOf"] as unknown[])
-      .map((sub) => convertJsonSchemaToTypebox(sub, depth + 1, resolvedDefs));
-    return members.length === 1 ? members[0]! : Type.Union(members, opts);
+  // ── Handle const ─────────────────────────────────────────────────────────
+  if ("const" in schema && schema["const"] !== undefined) {
+    const val = schema["const"];
+    if (val === null) {
+      return Type.Null(opts);
+    }
+    if (typeof val === "string" || typeof val === "number" || typeof val === "boolean") {
+      return Type.Literal(val, opts);
+    }
+    return Type.Any(opts);
   }
 
-  if (Array.isArray(s["anyOf"])) {
-    const members = (s["anyOf"] as unknown[])
-      .map((sub) => convertJsonSchemaToTypebox(sub, depth + 1, resolvedDefs));
-    return members.length === 1 ? members[0]! : Type.Union(members, opts);
+  // ── Handle enum (untyped, string, number, boolean, or nullable) ──────────
+  if (Array.isArray(schema["enum"])) {
+    const enumVals = schema["enum"] as unknown[];
+    const members: TSchema[] = [];
+    let hasNullMember = false;
+    for (const v of enumVals) {
+      if (v === null) {
+        members.push(Type.Null());
+        hasNullMember = true;
+      } else if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+        members.push(Type.Literal(v));
+      }
+    }
+    if (Array.isArray(schema["type"]) && schema["type"].includes("null") && !hasNullMember) {
+      members.push(Type.Null());
+    }
+    if (members.length === 0) {
+      return Type.Any(opts);
+    }
+    const ordered = orderUnionMembers(members);
+    if (ordered.length === 1) {
+      return withSchemaOptions(ordered[0]!, opts);
+    }
+    return Type.Union(ordered, opts);
   }
 
-  // ── Handle allOf → TypeBox Intersect ─────────────────────────────────────
-  if (Array.isArray(s["allOf"])) {
-    const members = (s["allOf"] as unknown[])
-      .map((sub) => convertJsonSchemaToTypebox(sub, depth + 1, resolvedDefs));
-    return members.length === 1 ? members[0]! : Type.Intersect(members, opts);
+  const hasObjectKeywords =
+    (typeof schema["properties"] === "object" &&
+      schema["properties"] !== null &&
+      !Array.isArray(schema["properties"])) ||
+    Array.isArray(schema["required"]) ||
+    schema["additionalProperties"] !== undefined ||
+    typeof schema["minProperties"] === "number" ||
+    typeof schema["maxProperties"] === "number";
+
+  const hasArrayKeywords =
+    schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
+
+  const rawType = schema["type"];
+
+  // ── Handle non-object combinators (oneOf / anyOf / allOf) ────────────────
+  if (
+    !hasObjectKeywords &&
+    !hasArrayKeywords &&
+    rawType !== "object" &&
+    rawType !== "array" &&
+    !Array.isArray(rawType)
+  ) {
+    const inheritType = (sub: unknown): Record<string, unknown> => {
+      if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+        return sub as Record<string, unknown>;
+      }
+      const subObj = sub as Record<string, unknown>;
+      if (
+        typeof rawType === "string" &&
+        subObj["type"] === undefined &&
+        subObj["$ref"] === undefined &&
+        subObj["const"] === undefined &&
+        subObj["enum"] === undefined &&
+        subObj["oneOf"] === undefined &&
+        subObj["anyOf"] === undefined &&
+        subObj["allOf"] === undefined
+      ) {
+        return { type: rawType, ...subObj };
+      }
+      return subObj;
+    };
+
+    if (Array.isArray(schema["oneOf"])) {
+      const members = orderUnionMembers(
+        (schema["oneOf"] as unknown[]).map((sub) =>
+          convertJsonSchemaToTypebox(inheritType(sub), rootDefs, effectiveRoot, seenRefs),
+        ),
+      );
+      if (members.length === 0) return Type.Any(opts);
+      return members.length === 1
+        ? withSchemaOptions(members[0]!, opts)
+        : Type.Union(members, opts);
+    }
+
+    if (Array.isArray(schema["anyOf"])) {
+      const members = orderUnionMembers(
+        (schema["anyOf"] as unknown[]).map((sub) =>
+          convertJsonSchemaToTypebox(inheritType(sub), rootDefs, effectiveRoot, seenRefs),
+        ),
+      );
+      if (members.length === 0) return Type.Any(opts);
+      return members.length === 1
+        ? withSchemaOptions(members[0]!, opts)
+        : Type.Union(members, opts);
+    }
+
+    if (Array.isArray(schema["allOf"])) {
+      const members = (schema["allOf"] as unknown[]).map((sub) =>
+        convertJsonSchemaToTypebox(inheritType(sub), rootDefs, effectiveRoot, seenRefs),
+      );
+      if (members.length === 0) return Type.Any(opts);
+      return members.length === 1
+        ? withSchemaOptions(members[0]!, opts)
+        : Type.Intersect(members, opts);
+    }
   }
 
-  // Handle nullable types: { "type": ["string", "null"] }
-  const rawType = s["type"];
-  const type = Array.isArray(rawType)
-    ? rawType.find((t) => t !== "null") as string | undefined
-    : typeof rawType === "string" ? rawType : undefined;
+  // ── Handle multi-type arrays: { "type": ["string", "null"] } ─────────────
+  if (Array.isArray(rawType)) {
+    const typeList = rawType.filter((t): t is string => typeof t === "string");
+    const hasNull = typeList.includes("null");
+    const nonNull = typeList.filter((t) => t !== "null");
 
-  const isNullable = Array.isArray(rawType) && rawType.includes("null");
+    if (nonNull.length === 0) {
+      return hasNull ? Type.Null(opts) : Type.Any(opts);
+    }
+    if (nonNull.length === 1) {
+      const inner = convertJsonSchemaToTypebox(
+        { ...schema, type: nonNull[0] },
+        rootDefs,
+        effectiveRoot,
+        seenRefs,
+      );
+      return hasNull ? Type.Union(orderUnionMembers([Type.Null(), inner]), opts) : inner;
+    }
+    const members: TSchema[] = nonNull.map((t) =>
+      convertJsonSchemaToTypebox(
+        { ...schema, type: t },
+        rootDefs,
+        effectiveRoot,
+        seenRefs,
+      ),
+    );
+    if (hasNull) {
+      members.unshift(Type.Null());
+    }
+    return Type.Union(orderUnionMembers(members), opts);
+  }
 
-  let base: TSchema;
+  const type =
+    typeof rawType === "string"
+      ? rawType
+      : hasObjectKeywords
+        ? "object"
+        : hasArrayKeywords
+          ? "array"
+          : undefined;
 
   switch (type) {
-    case "string": {
-      const enumVals = s["enum"];
-      if (Array.isArray(enumVals) && enumVals.every((v) => typeof v === "string")) {
-        // TypeBox doesn't have a built-in StringEnum — use Union of Literals
-        base = Type.Union(
-          (enumVals as string[]).map((v) => Type.Literal(v)),
+    case "string":
+      return Type.String(opts);
+    case "number":
+      return Type.Number(opts);
+    case "integer":
+      return Type.Integer(opts);
+    case "boolean":
+      return Type.Boolean(opts);
+    case "null":
+      return Type.Null(opts);
+    case "array": {
+      const tupleItems = Array.isArray(schema["prefixItems"])
+        ? (schema["prefixItems"] as unknown[])
+        : Array.isArray(schema["items"])
+          ? (schema["items"] as unknown[])
+          : undefined;
+      if (tupleItems) {
+        return Type.Tuple(
+          tupleItems.map((item) =>
+            convertJsonSchemaToTypebox(
+              item as Record<string, unknown>,
+              rootDefs,
+              effectiveRoot,
+              seenRefs,
+            ),
+          ),
           opts,
         );
-      } else {
-        base = Type.String(opts);
       }
-      break;
-    }
-    case "number":
-    case "integer":
-      base = Type.Number(opts);
-      break;
-    case "boolean":
-      base = Type.Boolean(opts);
-      break;
-    case "null":
-      base = Type.Null(opts);
-      break;
-    case "array": {
-      const items = s["items"];
-      base = Type.Array(
-        items ? convertJsonSchemaToTypebox(items, depth + 1, resolvedDefs) : Type.Unknown(),
+      const items = schema["items"];
+      return Type.Array(
+        items && typeof items === "object" && !Array.isArray(items)
+          ? convertJsonSchemaToTypebox(
+              items as Record<string, unknown>,
+              rootDefs,
+              effectiveRoot,
+              seenRefs,
+            )
+          : Type.Unknown(),
         opts,
       );
-      break;
     }
     case "object": {
-      const properties = s["properties"] as Record<string, unknown> | undefined;
+      const rawProperties: Record<string, unknown> =
+        typeof schema["properties"] === "object" &&
+        schema["properties"] !== null &&
+        !Array.isArray(schema["properties"])
+          ? { ...(schema["properties"] as Record<string, unknown>) }
+          : {};
       const required = new Set<string>(
-        Array.isArray(s["required"]) ? (s["required"] as string[]) : [],
+        Array.isArray(schema["required"])
+          ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
+          : [],
       );
-      const additionalProperties = s["additionalProperties"];
+      const additionalProperties = schema["additionalProperties"];
 
-      if (!properties) {
-        // Open object — passthrough as Any to avoid over-constraining
-        base = Type.Record(Type.String(), Type.Unknown(), opts);
-        break;
+      let allOfSchemas: TSchema[] | undefined;
+      if (Array.isArray(schema["allOf"])) {
+        allOfSchemas = (schema["allOf"] as unknown[]).map((sub) =>
+          convertJsonSchemaToTypebox(
+            sub as Record<string, unknown>,
+            rootDefs,
+            effectiveRoot,
+            seenRefs,
+          ),
+        );
+        for (const sub of schema["allOf"] as unknown[]) {
+          if (sub && typeof sub === "object" && !Array.isArray(sub)) {
+            const subObj = sub as Record<string, unknown>;
+            const resolvedSub =
+              typeof subObj["$ref"] === "string" && !seenRefs.has(subObj["$ref"])
+                ? (resolveRefTarget(subObj["$ref"], rootDefs, effectiveRoot) ?? subObj)
+                : subObj;
+            if (
+              typeof resolvedSub["properties"] === "object" &&
+              resolvedSub["properties"] !== null &&
+              !Array.isArray(resolvedSub["properties"])
+            ) {
+              for (const [k, v] of Object.entries(resolvedSub["properties"] as Record<string, unknown>)) {
+                if (!(k in rawProperties)) {
+                  rawProperties[k] = v;
+                }
+              }
+            }
+            if (Array.isArray(resolvedSub["required"])) {
+              for (const reqKey of resolvedSub["required"]) {
+                if (typeof reqKey === "string") {
+                  required.add(reqKey);
+                }
+              }
+            }
+          }
+        }
       }
 
       const props: Record<string, TSchema> = {};
-      for (const [key, value] of Object.entries(properties)) {
-        const converted = convertJsonSchemaToTypebox(value, depth + 1, resolvedDefs);
+      for (const [key, value] of Object.entries(rawProperties)) {
+        const converted = convertJsonSchemaToTypebox(
+          value as Record<string, unknown>,
+          rootDefs,
+          effectiveRoot,
+          seenRefs,
+        );
         props[key] = required.has(key) ? converted : Type.Optional(converted);
       }
 
       const objOpts: Record<string, unknown> = { ...opts };
-      if (additionalProperties === false) {
-        objOpts["additionalProperties"] = false;
+      if (typeof additionalProperties === "boolean") {
+        objOpts["additionalProperties"] = additionalProperties;
+      } else if (
+        typeof additionalProperties === "object" &&
+        additionalProperties !== null &&
+        !Array.isArray(additionalProperties)
+      ) {
+        objOpts["additionalProperties"] = convertJsonSchemaToTypebox(
+          additionalProperties as Record<string, unknown>,
+          rootDefs,
+          effectiveRoot,
+          seenRefs,
+        );
       }
 
-      base = Type.Object(props, objOpts as any);
-      break;
-    }
-    default: {
-      // Truly unsupported or missing type field
-      base = Type.Any(opts);
-      break;
-    }
-  }
+      if (required.size > 0) {
+        objOpts["required"] = Array.from(required);
+      }
 
-  return isNullable ? Type.Union([base, Type.Null()]) : base;
+      if (Array.isArray(schema["oneOf"])) {
+        objOpts["oneOf"] = orderUnionMembers(
+          (schema["oneOf"] as unknown[]).map((sub) =>
+            convertJsonSchemaToTypebox(
+              sub as Record<string, unknown>,
+              rootDefs,
+              effectiveRoot,
+              seenRefs,
+            ),
+          ),
+        );
+      }
+      if (Array.isArray(schema["anyOf"])) {
+        objOpts["anyOf"] = orderUnionMembers(
+          (schema["anyOf"] as unknown[]).map((sub) =>
+            convertJsonSchemaToTypebox(
+              sub as Record<string, unknown>,
+              rootDefs,
+              effectiveRoot,
+              seenRefs,
+            ),
+          ),
+        );
+      }
+      if (allOfSchemas) {
+        objOpts["allOf"] = allOfSchemas;
+      }
+
+      // WHY: Always emit Type.Object(props, objOpts) even when `props` is empty (`{}`)
+      // so empty object schemas serialize as `{ type: "object", properties: {} }`
+      // rather than `Type.Record` (`patternProperties`), which Gemini and OpenAI reject.
+      return Type.Object(props, objOpts);
+    }
+    default:
+      return Type.Any(opts);
+  }
 }
 
 // ─── Tool Name Sanitization ───────────────────────────────────────────────────
@@ -206,19 +554,28 @@ const MAX_TOOL_NAME_LEN = 64;
  * Build a Pi-compatible tool name.
  * Format: <prefix>_<server>_<tool>
  * Rules: [a-zA-Z0-9_], max 64 chars.
- * If truncation is needed, the last 8 chars are replaced with a hash to avoid collisions.
+ * If truncation or collision disambiguation (`forceHash`) is needed, appends an
+ * 8-char SHA-256 hex digest computed over the raw unsanitized input components.
  */
-export function buildToolName(prefix: string, serverName: string, toolName: string): string {
+export function buildToolName(
+  prefix: string,
+  serverName: string,
+  toolName: string,
+  forceHash = false,
+): string {
+  // WHY: Hash the raw unsanitized components separated by NUL bytes so distinct
+  // server/tool pairs that sanitize to the same "_" sequence (e.g. "my-tool" vs
+  // "my_tool", or server "a_b" + tool "c" vs server "a" + tool "b_c") never collide.
+  const hash = createHash("sha256")
+    .update(`${prefix}\0${serverName}\0${toolName}`)
+    .digest("hex")
+    .slice(0, 8);
   const raw = `${prefix}_${serverName}_${toolName}`;
   const safe = raw.replace(/[^a-zA-Z0-9_]/g, "_");
-  if (safe.length <= MAX_TOOL_NAME_LEN) return safe;
-  // Truncate with hash suffix to prevent collisions on long names
-  const hash = Math.abs(
-    safe.split("").reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0),
-  )
-    .toString(36)
-    .slice(0, 8);
-  return safe.slice(0, MAX_TOOL_NAME_LEN - 9) + "_" + hash;
+  if (!forceHash && safe.length <= MAX_TOOL_NAME_LEN) {
+    return safe;
+  }
+  return `${safe.slice(0, MAX_TOOL_NAME_LEN - 9)}_${hash}`;
 }
 
 // ─── Content Conversion ───────────────────────────────────────────────────────
@@ -227,29 +584,32 @@ type PiTextContent = { type: "text"; text: string };
 type PiImageContent = { type: "image"; data: string; mimeType: string };
 
 export function convertMcpContent(items: unknown[]): (PiTextContent | PiImageContent)[] {
-  return items.map((item: any) => {
+  return items.map((item: unknown) => {
     if (!item || typeof item !== "object") {
       return { type: "text", text: String(item) };
     }
-    switch (item.type) {
+    const obj = item as Record<string, unknown>;
+    switch (obj["type"]) {
       case "text":
-        return { type: "text", text: String(item.text ?? "") };
+        return { type: "text", text: String(obj["text"] ?? "") };
       case "image":
         return {
           type: "image",
-          data: String(item.data ?? ""),
-          mimeType: String(item.mimeType ?? "image/png"),
+          data: String(obj["data"] ?? ""),
+          mimeType: String(obj["mimeType"] ?? "image/png"),
         };
       case "audio":
         return {
           type: "text",
-          text: `[Audio: ${item.mimeType ?? "unknown"}, base64 encoded]`,
+          text: `[Audio: ${String(obj["mimeType"] ?? "unknown")}, base64 encoded]`,
         };
       case "resource": {
-        const r = item.resource;
-        if (r?.text) return { type: "text", text: r.text };
-        if (r?.blob) return { type: "text", text: `[Resource blob: ${r.uri}]` };
-        return { type: "text", text: `[Resource: ${r?.uri ?? "unknown"}]` };
+        const r = obj["resource"] as Record<string, unknown> | undefined;
+        // WHY: Check `typeof r?.["text"] === "string"` rather than truthiness so
+        // empty text resources (`text: ""`) are preserved as `""` instead of `[Resource: uri]`.
+        if (typeof r?.["text"] === "string") return { type: "text", text: r["text"] };
+        if (r?.["blob"]) return { type: "text", text: `[Resource blob: ${String(r["uri"])}]` };
+        return { type: "text", text: `[Resource: ${String(r?.["uri"] ?? "unknown")}]` };
       }
       default:
         return { type: "text", text: JSON.stringify(item) };
@@ -317,6 +677,10 @@ export class ToolBridge {
   private readonly pi: PiExtensionAPI;
   /** Tracks which Pi tool names belong to which MCP server. */
   private readonly serverToolNames = new Map<string, Set<string>>();
+  /** Tracks which MCP server owns each registered Pi tool name. */
+  private readonly toolOwners = new Map<string, string>();
+  /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
+  private readonly refreshGenerations = new Map<string, number>();
 
   constructor(settings: Settings, pi: PiExtensionAPI) {
     this.settings = settings;
@@ -335,7 +699,13 @@ export class ToolBridge {
    * Deactivates tools that are no longer in the server's list.
    * Note: Pi's registerTool() overwrites by name (Map.set), so re-registration is safe.
    */
-  async refreshTools(serverName: string, client: Client, isCurrent: () => boolean = () => true): Promise<void> {
+  async refreshTools(
+    serverName: string,
+    client: Client,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    const gen = (this.refreshGenerations.get(serverName) ?? 0) + 1;
+    this.refreshGenerations.set(serverName, gen);
     const timeoutMs = this.settings.requestTimeoutMs;
 
     let tools: McpToolDefinition[];
@@ -350,23 +720,18 @@ export class ToolBridge {
       );
     }
 
-    if (!isCurrent()) return;
+    // WHY: Discard stale tools/list responses if a newer refreshTools(),
+    // deactivateServer(), or removeServerTools() occurred while listAllTools() was in flight.
+    if (this.refreshGenerations.get(serverName) !== gen || !isCurrent()) return;
     const registeredForServer = this.serverToolNames.get(serverName) ?? new Set<string>();
 
     // Build the set of currently valid Pi tool names for this server
     const currentToolNames = new Set<string>();
 
     for (const tool of tools) {
-      const piName = buildToolName(this.settings.toolPrefix, serverName, tool.name);
-      // Detect collision: two different MCP tools mapping to the same Pi name
-      // (e.g. "my-tool" and "my_tool" both sanitize to "my_tool")
-      if (currentToolNames.has(piName)) {
-        console.warn(
-          `[pi-mcp] Tool name collision: "${tool.name}" maps to "${piName}" which is already taken. ` +
-          `The later tool definition will overwrite the earlier one.`,
-        );
-      }
+      const piName = this._resolveUniqueToolName(serverName, tool.name, currentToolNames);
       currentToolNames.add(piName);
+      this.toolOwners.set(piName, serverName);
       // Always re-register — on reconnect the client reference changes and
       // Pi's registerTool overwrites by name, so this is idempotent.
       this._registerTool(piName, serverName, tool, client);
@@ -375,7 +740,10 @@ export class ToolBridge {
     // Deactivate tools that were removed from the server (no longer in tools/list)
     for (const existingName of registeredForServer) {
       if (!currentToolNames.has(existingName)) {
-        this._deactivateServerTool(existingName);
+        this._deactivateServerTool(serverName, existingName);
+        if (this.toolOwners.get(existingName) === serverName) {
+          this.toolOwners.delete(existingName);
+        }
       }
     }
 
@@ -394,13 +762,30 @@ export class ToolBridge {
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */
   deactivateServer(serverName: string): void {
+    const gen = (this.refreshGenerations.get(serverName) ?? 0) + 1;
+    this.refreshGenerations.set(serverName, gen);
     this._deactivateServerTools(serverName);
   }
 
   /** Remove all tracking data for a server (called when config changes remove a server). */
   removeServer(serverName: string): void {
+    this.removeServerTools(serverName);
+  }
+
+  /** Remove all tools and ownership tracking for a server. */
+  removeServerTools(serverName: string): void {
+    const gen = (this.refreshGenerations.get(serverName) ?? 0) + 1;
+    this.refreshGenerations.set(serverName, gen);
     this._deactivateServerTools(serverName);
-    this.serverToolNames.delete(serverName);
+    const existing = this.serverToolNames.get(serverName);
+    if (existing) {
+      for (const toolName of existing) {
+        if (this.toolOwners.get(toolName) === serverName) {
+          this.toolOwners.delete(toolName);
+        }
+      }
+      this.serverToolNames.delete(serverName);
+    }
   }
 
   /** Re-activate all Pi tools belonging to a server (called on reconnect). */
@@ -409,6 +794,38 @@ export class ToolBridge {
   }
 
   // ─── Internal ───────────────────────────────────────────────────────────────
+
+  private _resolveUniqueToolName(
+    serverName: string,
+    rawToolName: string,
+    seenInBatch: ReadonlySet<string>,
+  ): string {
+    const isTaken = (name: string): boolean => {
+      if (seenInBatch.has(name)) return true;
+      const owner = this.toolOwners.get(name);
+      return owner !== undefined && owner !== serverName;
+    };
+
+    const baseCandidate = buildToolName(this.settings.toolPrefix, serverName, rawToolName, false);
+    if (!isTaken(baseCandidate)) {
+      return baseCandidate;
+    }
+
+    const hashedCandidate = buildToolName(this.settings.toolPrefix, serverName, rawToolName, true);
+    if (!isTaken(hashedCandidate)) {
+      return hashedCandidate;
+    }
+
+    let suffix = 2;
+    while (true) {
+      const tag = `_${suffix}`;
+      const candidate = `${hashedCandidate.slice(0, MAX_TOOL_NAME_LEN - tag.length)}${tag}`;
+      if (!isTaken(candidate)) {
+        return candidate;
+      }
+      suffix++;
+    }
+  }
 
   private _registerTool(
     piName: string,
@@ -440,7 +857,7 @@ export class ToolBridge {
 
       async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
         if (signal?.aborted) {
-          return { content: [{ type: "text", text: "Cancelled" }], details: {} };
+          throw new McpError("Tool execution cancelled", serverName, "protocol");
         }
 
         try {
@@ -455,7 +872,16 @@ export class ToolBridge {
             { timeout: timeoutMs, ...(signal ? { signal } : {}) },
           );
 
-          const content = convertMcpContent(result.content as unknown[]);
+          const content = convertMcpContent(
+            (result.content ?? []) as Array<Record<string, unknown>>,
+          );
+          if (content.length === 0 && result.structuredContent !== undefined) {
+            const serialized =
+              typeof result.structuredContent === "string"
+                ? result.structuredContent
+                : JSON.stringify(result.structuredContent, null, 2);
+            content.push({ type: "text", text: serialized });
+          }
 
           // Tool execution errors (isError: true) — distinct from protocol errors
           if (result.isError) {
@@ -498,13 +924,24 @@ export class ToolBridge {
     const serverTools = this.serverToolNames.get(serverName);
     if (!serverTools || serverTools.size === 0) return;
 
+    const ownedByServer = new Set<string>();
+    for (const toolName of serverTools) {
+      const owner = this.toolOwners.get(toolName);
+      if (owner !== undefined && owner !== serverName) continue;
+      ownedByServer.add(toolName);
+    }
+    if (ownedByServer.size === 0) return;
+
     const currentActive = this.pi.getActiveTools();
-    const remaining = currentActive.filter((n) => !serverTools.has(n));
+    const remaining = currentActive.filter((n) => !ownedByServer.has(n));
     this.pi.setActiveTools(remaining);
   }
 
   /** Deactivate a single tool by Pi name (used when a tool is removed on list_changed). */
-  private _deactivateServerTool(piName: string): void {
+  private _deactivateServerTool(serverName: string, piName: string): void {
+    const owner = this.toolOwners.get(piName);
+    if (owner !== undefined && owner !== serverName) return;
+
     const currentActive = this.pi.getActiveTools();
     const remaining = currentActive.filter((n) => n !== piName);
     this.pi.setActiveTools(remaining);

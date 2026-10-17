@@ -31,6 +31,14 @@ it("registers agent-visible status and connect tools without eagerly starting a 
     await extension(pi as any, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
     assert.ok(tools.has("mcp_status"));
     assert.ok(tools.has("mcp_connect"));
+    assert.equal(
+      tools.get("mcp_status").promptSnippet,
+      "Inspect configured MCP servers, their connection state, discovered tools, and authentication status.",
+    );
+    assert.equal(
+      tools.get("mcp_connect").promptSnippet,
+      "Connect or reconnect to a configured MCP server by name and register its tools.",
+    );
     await events.get("session_start")({}, ctx);
     assert.equal(active.length, 0);
     const status = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
