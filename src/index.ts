@@ -24,6 +24,7 @@ import {
   stopCallbackServer,
   callbackServerConfigFromRedirectUrl,
 } from "./callback-server.js";
+import { CallbackUrlValidationError, isSafeAuthorizationUrl, parseCallbackUrl } from "./callback-url.js";
 import { setCallbackPort, McpOAuthProvider, acquireAuthLock, type AuthLockHandle } from "./oauth-provider.js";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { discoverManualAuthChallenge } from "./auth-challenge.js";
@@ -48,19 +49,25 @@ export function browserOpenCommand(url: string): BrowserOpenCommand {
  * Open a URL in the user's default browser.
  * Works on macOS, Linux, and Windows.
  */
-function openBrowser(url: string): void {
-  const { command, args } = browserOpenCommand(url);
-  const child = spawn(command, args, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  });
+function openBrowser(url: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const { command, args } = browserOpenCommand(url);
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
 
-  child.once("error", (err) => {
-    console.error(`[pi-mcp] Failed to open browser: ${err.message}`);
-  });
+    child.once("error", (err) => {
+      console.error(`[pi-mcp] Failed to open browser: ${err.message}`);
+      reject(err);
+    });
 
-  child.unref();
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 export class AuthCancelledError extends Error {
@@ -71,6 +78,7 @@ export class AuthCancelledError extends Error {
 }
 
 export const authRetryOption = "Retry: open browser again";
+export const authPasteOption = "Paste redirect URL";
 export const authCancelOption = "Cancel authentication";
 
 interface OAuthCallbackResult {
@@ -92,19 +100,35 @@ interface OAuthDialogAbortedResult {
   type: "dialogAborted";
 }
 
+interface OAuthUserInputResult {
+  type: "input";
+  value: string | undefined;
+}
+
 type OAuthWaitResult = OAuthCallbackResult | OAuthCallbackErrorResult | OAuthUserChoiceResult | OAuthDialogAbortedResult;
+type OAuthInputWaitResult = OAuthCallbackResult | OAuthCallbackErrorResult | OAuthUserInputResult | OAuthDialogAbortedResult;
+
+export interface OAuthPasteOptions {
+  redirectUrl?: string | URL | undefined;
+  expectedState?: string | undefined;
+  onPasteResolved?: (() => void) | undefined;
+}
 
 export async function waitForOAuthCallback(
   serverName: string,
   callbackPromise: Promise<string>,
-  reopenBrowser: () => void,
-  context: { hasUI: boolean; ui: Pick<ExtensionUIContext, "select"> },
+  reopenBrowser: () => void | Promise<void>,
+  context: {
+    hasUI: boolean;
+    ui: Pick<ExtensionUIContext, "select"> & Partial<Pick<ExtensionUIContext, "input" | "notify">>;
+  },
+  pasteOptions?: OAuthPasteOptions,
 ): Promise<string> {
   if (!context.hasUI) {
     throw new Error(`Authorization for ${serverName} requires an interactive Pi session`);
   }
 
-  const callbackResultPromise: Promise<OAuthWaitResult> = callbackPromise
+  const callbackResultPromise: Promise<OAuthCallbackResult | OAuthCallbackErrorResult> = callbackPromise
     .then((code): OAuthCallbackResult => ({ type: "callback", code }))
     .catch((error): OAuthCallbackErrorResult => ({ type: "callbackError", error }));
 
@@ -113,7 +137,7 @@ export async function waitForOAuthCallback(
     const choicePromise: Promise<OAuthWaitResult> = context.ui
       .select(
         `OAuth pending for ${serverName}`,
-        [authRetryOption, authCancelOption],
+        [authRetryOption, authPasteOption, authCancelOption],
         { signal: dialogAbortController.signal },
       )
       .then((choice): OAuthUserChoiceResult => ({ type: "choice", choice }))
@@ -141,8 +165,64 @@ export async function waitForOAuthCallback(
     }
 
     if (result.choice === authRetryOption) {
-      reopenBrowser();
+      await reopenBrowser();
       continue;
+    }
+
+    if (result.choice === authPasteOption) {
+      if (!context.ui.input) {
+        continue;
+      }
+      const inputAbortController = new AbortController();
+      const inputPromise: Promise<OAuthInputWaitResult> = context.ui
+        .input(
+          `Paste redirect URL for ${serverName}`,
+          "http://127.0.0.1:19876/callback?code=...&state=...",
+          { signal: inputAbortController.signal },
+        )
+        .then((value): OAuthUserInputResult => ({ type: "input", value }))
+        .catch((error): OAuthDialogAbortedResult => {
+          if (inputAbortController.signal.aborted) {
+            return { type: "dialogAborted" };
+          }
+          throw error;
+        });
+
+      const inputResult = await Promise.race([callbackResultPromise, inputPromise]);
+
+      if (inputResult.type === "callback") {
+        inputAbortController.abort();
+        return inputResult.code;
+      }
+
+      if (inputResult.type === "callbackError") {
+        inputAbortController.abort();
+        throw inputResult.error;
+      }
+
+      if (inputResult.type === "dialogAborted" || !inputResult.value?.trim()) {
+        continue;
+      }
+
+      let parsed: ReturnType<typeof parseCallbackUrl>;
+      try {
+        parsed = parseCallbackUrl(inputResult.value, {
+          redirectUrl: pasteOptions?.redirectUrl,
+          expectedState: pasteOptions?.expectedState,
+        });
+      } catch (err) {
+        if (err instanceof CallbackUrlValidationError) {
+          context.ui.notify?.(`pi-mcp: Invalid redirect URL — ${err.message}`, "error");
+          continue;
+        }
+        throw err;
+      }
+
+      pasteOptions?.onPasteResolved?.();
+      if ("error" in parsed) {
+        throw new Error(parsed.error);
+      }
+      return parsed.code;
     }
 
     dialogAbortController.abort();
@@ -194,7 +274,7 @@ export function serverNameCompletions(
   return completions.length > 0 ? completions : null;
 }
 
-export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string; globalConfigPath?: string; authStorageDir?: string; browserOpen?: (url: string) => void } = {}): Promise<void> {
+export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string; globalConfigPath?: string; authStorageDir?: string; browserOpen?: (url: string) => void | Promise<void> } = {}): Promise<void> {
   // ── 1. Load and validate config ──────────────────────────────────────────
   // cwd is available on the ExtensionContext passed to event handlers.
   // We load config lazily on session_start to get the correct per-session cwd.
@@ -415,13 +495,34 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           .join("");
 
         // 3. Create the auth provider.
+        const launchAuthorizationBrowser = async (url: URL): Promise<void> => {
+          if (!isSafeAuthorizationUrl(url)) {
+            throw new McpError(
+              `Refusing to open unsafe authorization URL for "${serverName}": only HTTPS (or loopback HTTP) URLs are allowed`,
+              serverName,
+              "protocol",
+            );
+          }
+          latestAuthorizationUrl = new URL(url.toString());
+          if (signal.aborted || lockLost) return;
+          try {
+            await (paths.browserOpen ?? openBrowser)(url.toString());
+            ctx.ui.notify(
+              `pi-mcp: Authorize ${serverName}: ${url.toString()} (On SSH, forward the callback with ssh -L ${port}:127.0.0.1:${port}, or choose "${authPasteOption}".)`,
+              "info",
+            );
+          } catch (err) {
+            ctx.ui.notify(
+              `pi-mcp: Failed to open browser for ${serverName} (${err instanceof Error ? err.message : String(err)}). Open ${url.toString()} manually or choose "${authPasteOption}".`,
+              "error",
+            );
+          }
+        };
+
         const authProvider = new McpOAuthProvider(
           serverName,
           config.auth || { type: "oauth" },
-          (url: URL) => {
-            latestAuthorizationUrl = new URL(url.toString());
-            if (!signal.aborted && !lockLost) (paths.browserOpen ?? openBrowser)(url.toString());
-          },
+          launchAuthorizationBrowser,
           paths.authStorageDir,
           false,
           () => signal.aborted,
@@ -474,12 +575,6 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           // Auth succeeded without needing browser interaction (e.g., had valid tokens).
           ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
         } else if (authResult === "REDIRECT") {
-          // Browser was opened, wait for the callback from the user
-          ctx.ui.notify(
-            `pi-mcp: Browser opened for ${serverName}. Complete authorization to continue. Choose Retry to reopen the browser or Cancel to stop authentication.`,
-            "info",
-          );
-
           // 7. Wait for the callback while giving the user an escape hatch.
           const code = await waitForOAuthCallback(
             serverName,
@@ -492,9 +587,14 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
                   "protocol",
                 );
               }
-              if (!signal.aborted && !lockLost) (paths.browserOpen ?? openBrowser)(latestAuthorizationUrl.toString());
+              return launchAuthorizationBrowser(latestAuthorizationUrl);
             },
             ctx,
+            {
+              redirectUrl: authProvider.redirectUrl,
+              expectedState: oauthState,
+              onPasteResolved: cancel,
+            },
           );
           if (signal.aborted) throw new AuthCancelledError(serverName);
           if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);

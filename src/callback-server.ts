@@ -8,6 +8,7 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
 import type { Socket } from "net";
 import { URL } from "url";
+import { CallbackUrlValidationError, isLocalCallbackHost, parseCallbackUrl } from "./callback-url.js";
 
 interface PendingAuth {
   resolve: (code: string) => void;
@@ -73,70 +74,50 @@ function escapeHtml(text: string): string {
  * Handle incoming HTTP requests to the callback server.
  */
 function handleRequest(req: IncomingMessage, res: ServerResponse): void {
-  const url = new URL(req.url || "/", "http://localhost");
-
-  // Only handle the callback path
-  if (url.pathname !== CALLBACK_PATH) {
-    res.writeHead(404, { "Content-Type": "text/plain", "Connection": "close" });
-    res.end("Not found");
-    return;
-  }
-
-  const code = url.searchParams.get("code");
-  const state = url.searchParams.get("state");
-  const error = url.searchParams.get("error");
-  const errorDescription = url.searchParams.get("error_description");
-
-  // Enforce state parameter presence for CSRF protection
-  if (!state) {
-    const errorMsg = "Missing required state parameter - potential CSRF attack";
+  let parsed: ReturnType<typeof parseCallbackUrl>;
+  try {
+    const requestUrl = new URL(req.url || "/", "http://localhost").toString();
+    parsed = parseCallbackUrl(requestUrl, {
+      expectedState: (state) => pendingAuths.has(state),
+    });
+  } catch (err) {
+    if (err instanceof CallbackUrlValidationError) {
+      if (err.reason === "wrong_path") {
+        res.writeHead(404, { "Content-Type": "text/plain", "Connection": "close" });
+        res.end("Not found");
+        return;
+      }
+      res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
+      res.end(HTML_ERROR(err.message));
+      return;
+    }
     res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
-    res.end(HTML_ERROR(errorMsg));
+    res.end(HTML_ERROR("Invalid callback request"));
     return;
   }
 
   // Handle OAuth errors
-  if (error) {
-    const errorMsg = errorDescription || error;
+  if ("error" in parsed) {
     res.writeHead(200, { "Content-Type": "text/html", "Connection": "close" });
-    res.end(HTML_ERROR(errorMsg));
-    if (pendingAuths.has(state)) {
-      const pending = pendingAuths.get(state)!;
+    res.end(HTML_ERROR(parsed.error));
+    if (pendingAuths.has(parsed.state)) {
+      const pending = pendingAuths.get(parsed.state)!;
       clearTimeout(pending.timeout);
-      pendingAuths.delete(state);
-      setTimeout(() => pending.reject(new Error(errorMsg)), 0);
+      pendingAuths.delete(parsed.state);
+      setTimeout(() => pending.reject(new Error(parsed.error)), 0);
     }
     return;
   }
 
-  // Require authorization code
-  if (!code) {
-    res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
-    res.end(HTML_ERROR("No authorization code provided"));
-    return;
-  }
-
-  // Validate state parameter
-  if (!pendingAuths.has(state)) {
-    const errorMsg = "Invalid or expired state parameter - potential CSRF attack";
-    res.writeHead(400, { "Content-Type": "text/html", "Connection": "close" });
-    res.end(HTML_ERROR(errorMsg));
-    return;
-  }
-
-  const pending = pendingAuths.get(state)!;
+  const pending = pendingAuths.get(parsed.state)!;
 
   // Clear timeout and resolve the pending promise
   clearTimeout(pending.timeout);
-  pendingAuths.delete(state);
-  pending.resolve(code);
+  pendingAuths.delete(parsed.state);
+  pending.resolve(parsed.code);
 
   res.writeHead(200, { "Content-Type": "text/html", "Connection": "close" });
   res.end(HTML_SUCCESS);
-}
-
-function isLocalCallbackHost(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 async function closeCurrentServer(): Promise<void> {

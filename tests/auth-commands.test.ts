@@ -36,7 +36,7 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
     cwd: dir, hasUI: true,
     ui: {
       notify: (message: string) => messages.push(message),
-      select: async (_title: string, options: string[]) => options[choices++ === 0 ? 0 : 1],
+      select: async (_title: string, options: string[]) => options.at(choices++ === 0 ? 0 : -1),
     },
   };
   const waitForOpen = async (expected: number) => {

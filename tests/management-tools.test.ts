@@ -194,7 +194,7 @@ it("opens an interactive browser only once, reopens on Retry, and cancels withou
   };
   const ctx = {
     cwd: dir, hasUI: true,
-    ui: { notify: () => {}, select: async (_title: string, options: string[]) => options[choices++ === 0 ? 0 : 1] },
+    ui: { notify: () => {}, select: async (_title: string, options: string[]) => options.at(choices++ === 0 ? 0 : -1) },
   } as any;
   try {
     await mkdir(join(dir, ".pi"));

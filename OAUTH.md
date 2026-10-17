@@ -67,7 +67,16 @@ Use `mcp_connect` with the server name, `/mcp:start deepsource`, or `/mcp:auth d
 7. Store tokens securely
 8. Connect the server and activate discovered tools
 
-Interactive sessions show Retry and Cancel while authorization is pending. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser. A stop, cancellation, or shutdown cancels pending callbacks and retries.
+Interactive sessions show `Retry: open browser again`, `Paste redirect URL`, and `Cancel authentication` while authorization is pending, and display the authorization URL directly in Pi. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser. A stop, cancellation, or shutdown cancels pending callbacks and retries.
+
+### Headless and SSH Sessions
+
+When running Pi on a remote server over SSH, in a container, or in a headless environment where a local browser cannot reach the callback server directly:
+
+1. **Copy the authorization URL** shown in the Pi notification and open it in a browser on your local machine.
+2. Complete the callback using either method:
+   - **SSH Port Forwarding**: Forward the callback port from your local machine to the remote host (e.g. `ssh -L 19876:127.0.0.1:19876 user@remote-host`) before approving access so your local browser can reach the loopback callback listener directly.
+   - **Paste Redirect URL**: If port forwarding is not active, your browser will redirect to `http://127.0.0.1:<port>/callback?code=...&state=...` and show a connection error. Copy that full URL from your browser's address bar, select **Paste redirect URL** in Pi, and paste the URL to complete authorization. Pi validates the redirect origin, `/callback` path, and CSRF `state` parameter before exchanging the authorization code.
 
 ### Token Storage
 
@@ -141,10 +150,11 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 ## Security Considerations
 
 1. **PKCE S256** - All OAuth flows use PKCE
-2. **State Parameter** - Cryptographically secure, validated on callback
-3. **Loopback Only** - The callback server listens only on a local loopback address
-4. **File Permissions** - The auth directory uses `0700` and state files use `0600` where POSIX permissions apply
-5. **Secret Handling** - Authorization codes and tokens are not written to logs
+2. **State Parameter** - Cryptographically secure, validated on callback and paste-back
+3. **Authorization URL Scheme Validation** - Only `https:` (or loopback `http:`) authorization URLs are passed to the system browser opener
+4. **Loopback Only** - The callback server listens only on a local loopback address
+5. **File Permissions** - The auth directory uses `0700` and state files use `0600` where POSIX permissions apply
+6. **Secret Handling** - Authorization codes and tokens are not written to logs
 
 ## Troubleshooting
 
@@ -154,7 +164,7 @@ This error is now fixed. The callback server automatically provides the redirect
 
 ### Browser doesn't open
 
-The command reports the browser process error. Run Pi in an environment where `open`, `xdg-open`, or `rundll32` can launch a browser.
+If `open`, `xdg-open`, or `rundll32` fails to launch a browser (for example on a headless server or over SSH), Pi notifies the error along with the authorization URL and keeps the flow waiting. Open the URL manually in any browser and use SSH port forwarding or choose **Paste redirect URL** to finish authorization.
 
 ### Callback server port in use
 
