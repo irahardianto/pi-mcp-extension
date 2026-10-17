@@ -693,6 +693,68 @@ await server.connect(new StdioServerTransport());
       await rm(baseTmp, { recursive: true, force: true });
     }
   });
+
+  it("detaches the retry-backoff abort listener when the timer fires so listeners do not accumulate across retries (#67)", async (t) => {
+    const { EventEmitter } = await import("node:events");
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    const maxRetries = 12;
+    const config = makeMockConfig({
+      settings: {
+        toolPrefix: "mcp",
+        requestTimeoutMs: 5000,
+        maxRetries,
+      },
+      mcpServers: {
+        failing: {
+          url: "http://127.0.0.1:1/mcp",
+          args: [],
+          transport: "streamable-http",
+          lifecycle: "lazy",
+        },
+      },
+    });
+
+    const manager = new ServerManager(config);
+    let capturedSignal: AbortSignal | undefined;
+
+    t.mock.method(
+      manager as any,
+      "_connectWithTimeoutAndSignal",
+      async (_client: unknown, _transport: unknown, _timeoutMs: number, signal: AbortSignal) => {
+        capturedSignal = signal;
+        throw new Error("simulated transport connection failure");
+      },
+    );
+
+    const startPromise = manager.startServer("failing", process.cwd());
+    const assertionPromise = assert.rejects(startPromise, (err: unknown) => {
+      assert.ok(err instanceof McpError);
+      assert.match(err.message, /Connection failed after 12 retries/);
+      return true;
+    });
+
+    for (let i = 0; i < maxRetries; i++) {
+      for (let tick = 0; tick < 10; tick++) {
+        await Promise.resolve();
+      }
+      assert.ok(capturedSignal, "Expected connection AbortSignal to be captured");
+      assert.equal(
+        EventEmitter.getEventListeners(capturedSignal, "abort").length,
+        1,
+        `Expected 1 abort listener while retry #${i + 1} timer is pending`,
+      );
+      t.mock.timers.tick(60000);
+    }
+
+    await assertionPromise;
+    assert.ok(capturedSignal);
+    assert.equal(
+      EventEmitter.getEventListeners(capturedSignal, "abort").length,
+      0,
+      "Expected 0 lingering abort listeners after all retry timers fired",
+    );
+  });
 });
 
 

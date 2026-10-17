@@ -1051,11 +1051,24 @@ export class ServerManager {
       }
       const delayMs = RETRY_DELAYS_MS[Math.min(server.retryCount++, RETRY_DELAYS_MS.length - 1)] ?? 30000;
       await new Promise<void>((resolve) => {
-        server.retryTimer = setTimeout(() => { server.retryTimer = null; resolve(); }, delayMs);
-        signal.addEventListener("abort", () => {
-          if (server.retryTimer) { clearTimeout(server.retryTimer); server.retryTimer = null; }
+        if (signal.aborted) {
           resolve();
-        }, { once: true });
+          return;
+        }
+        const onAbort = () => {
+          if (server.retryTimer) {
+            clearTimeout(server.retryTimer);
+            server.retryTimer = null;
+          }
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          server.retryTimer = null;
+          resolve();
+        }, delayMs);
+        server.retryTimer = timer;
+        signal.addEventListener("abort", onAbort, { once: true });
       });
       if (signal.aborted) throw new AuthCancelledError(server.name);
       return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
