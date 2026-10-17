@@ -26,4 +26,13 @@ describe("parseAuthArguments", () => {
     assert.deepEqual(parseAuthArguments("team server --unknown", names), { name: "team server --unknown", reset: false });
     assert.deepEqual(parseAuthArguments(" ", names), { name: "", reset: false });
   });
+
+  it("should parse standalone --reset and leading --reset <name> arguments (Issue 24.4)", () => {
+    assert.deepEqual(parseAuthArguments("--reset", names), { name: "", reset: true });
+    assert.deepEqual(parseAuthArguments("  --reset  ", names), { name: "", reset: true });
+    assert.deepEqual(parseAuthArguments("--reset local", names), { name: "local", reset: true });
+    assert.deepEqual(parseAuthArguments("--reset team server", names), { name: "team server", reset: true });
+    assert.deepEqual(parseAuthArguments("  --reset\tteam  server  ", names), { name: "team  server", reset: true });
+  });
 });
+

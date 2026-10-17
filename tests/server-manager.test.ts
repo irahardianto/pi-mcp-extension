@@ -546,5 +546,153 @@ await server.connect(new StdioServerTransport());
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("should dynamically update roots/list cwd and emit notifications/roots/list_changed when updateCwd, startServer, or session_start switches directories with identical config (Issue 18.5)", async () => {
+    const { mkdtemp, rm, writeFile, mkdir } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { pathToFileURL } = await import("node:url");
+    const { default: extension } = await import("../src/index.js");
+
+    const baseTmp = await mkdtemp(join(tmpdir(), "pi-mcp-roots-cwd-"));
+    const cwd1 = join(baseTmp, "workspace-alpha");
+    const cwd2 = join(baseTmp, "workspace-beta");
+    const cwd3 = join(baseTmp, "workspace-gamma");
+    await mkdir(cwd1, { recursive: true });
+    await mkdir(cwd2, { recursive: true });
+    await mkdir(cwd3, { recursive: true });
+
+    const sdkServerUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/index.js");
+    const sdkStdioUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js");
+    const sdkTypesUrl = import.meta.resolve("@modelcontextprotocol/sdk/types.js");
+
+    const probeScript = join(baseTmp, "roots-probe-server.mjs");
+    await writeFile(
+      probeScript,
+      `
+import { Server } from ${JSON.stringify(sdkServerUrl)};
+import { StdioServerTransport } from ${JSON.stringify(sdkStdioUrl)};
+import { CallToolRequestSchema, ListToolsRequestSchema, RootsListChangedNotificationSchema } from ${JSON.stringify(sdkTypesUrl)};
+
+let rootsChangedNotifications = 0;
+const server = new Server(
+  { name: "roots-probe", version: "1.0.0" },
+  { capabilities: { tools: {} } },
+);
+
+server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
+  rootsChangedNotifications++;
 });
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [{ name: "get_roots", inputSchema: { type: "object", properties: {} } }],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async () => {
+  const rootsResult = await server.listRoots();
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify({ roots: rootsResult.roots, notifications: rootsChangedNotifications }),
+    }],
+  };
+});
+
+await server.connect(new StdioServerTransport());
+`,
+    );
+
+    const globalConfigPath = join(baseTmp, "global-mcp.json");
+    await writeFile(
+      globalConfigPath,
+      JSON.stringify({
+        settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 },
+        mcpServers: {
+          rootsSrv: {
+            command: "node",
+            args: [probeScript],
+            transport: "stdio",
+            lifecycle: "lazy",
+          },
+        },
+      }),
+    );
+
+    const tools = new Map<string, any>();
+    const events = new Map<string, any>();
+    let active: string[] = [];
+    const pi = {
+      registerTool: (t: any) => tools.set(t.name, t),
+      registerCommand: () => {},
+      on: (n: string, h: any) => events.set(n, h),
+      getActiveTools: () => active,
+      setActiveTools: (names: string[]) => {
+        active = names;
+      },
+    };
+    const makeCtx = (cwd: string): any => ({
+      cwd,
+      hasUI: false,
+      ui: { notify: () => {} },
+    });
+
+    try {
+      await extension(pi as any, { bootstrapCwd: cwd1, globalConfigPath });
+      const ctx1 = makeCtx(cwd1);
+      await events.get("session_start")({}, ctx1);
+
+      // Connect lazy server in cwd1
+      await tools.get("mcp_connect").execute("", { name: "rootsSrv" }, undefined, undefined, ctx1);
+      const getRootsTool = tools.get("mcp_rootsSrv_get_roots");
+      assert.ok(getRootsTool);
+
+      const res1 = JSON.parse((await getRootsTool.execute("1", {}, undefined, () => {}, ctx1)).content[0].text);
+      assert.deepEqual(res1.roots, [{ uri: pathToFileURL(cwd1).href, name: "workspace-alpha" }]);
+      assert.equal(res1.notifications, 0);
+
+      // Switch session to cwd2 (identical global McpConfig, server already ready!)
+      const ctx2 = makeCtx(cwd2);
+      await events.get("session_start")({}, ctx2);
+      // Allow notification frame to be processed by child server
+      await new Promise((r) => setTimeout(r, 25));
+
+      const res2 = JSON.parse((await getRootsTool.execute("2", {}, undefined, () => {}, ctx2)).content[0].text);
+      assert.deepEqual(res2.roots, [{ uri: pathToFileURL(cwd2).href, name: "workspace-beta" }]);
+      assert.equal(res2.notifications, 1, "Expected 1 notifications/roots/list_changed when session_start switches to cwd2");
+
+      // Also verify ServerManager.startServer(name, cwd3) on an already-ready server updates cwd and emits roots/list_changed
+      const config: McpConfig = {
+        settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 },
+        mcpServers: {
+          directProbe: {
+            command: "node",
+            args: [probeScript],
+            transport: "stdio",
+            lifecycle: "lazy",
+          },
+        },
+      };
+      const manager = new ServerManager(config);
+      const mockPi = makeMockPi();
+      const bridge = new ToolBridge(config.settings, mockPi as any);
+      manager.setToolRefreshCallback(async (name, client, opts) => {
+        await bridge.refreshTools(name, client, opts);
+      });
+      try {
+        await manager.startServer("directProbe", cwd1);
+        await manager.startServer("directProbe", cwd3);
+        await new Promise((r) => setTimeout(r, 25));
+        const directTool = mockPi.tools.find((t) => t.name.includes("get_roots"));
+        const res3 = JSON.parse((await directTool.execute("3", {}, undefined, () => {}, {})).content[0].text);
+        assert.deepEqual(res3.roots, [{ uri: pathToFileURL(cwd3).href, name: "workspace-gamma" }]);
+        assert.equal(res3.notifications, 1);
+      } finally {
+        await manager.shutdownAll();
+      }
+    } finally {
+      await events.get("session_shutdown")?.({}, makeCtx(baseTmp));
+      await rm(baseTmp, { recursive: true, force: true });
+    }
+  });
+});
+
 

@@ -381,12 +381,33 @@ export class ServerManager {
     return this.servers.get(name);
   }
 
+  getServerStatus(name: string): ManagedServer | undefined {
+    return this.servers.get(name);
+  }
+
   getAllServers(): ManagedServer[] {
     return Array.from(this.servers.values());
   }
 
   getReadyServers(): ManagedServer[] {
     return this.getAllServers().filter((s) => s.state === "ready");
+  }
+
+  private _updateServerCwd(server: ManagedServer, cwd: string): void {
+    const prevCwd = server.cwd;
+    server.cwd = cwd;
+    if (prevCwd !== undefined && prevCwd !== cwd && server.state === "ready" && server.client) {
+      void server.client.sendRootsListChanged().catch(() => {
+        // WHY: Best-effort notification; some MCP servers ignore or do not support roots/list_changed.
+      });
+    }
+  }
+
+  /** Update workspace cwd for all managed servers and notify ready servers if cwd changed. */
+  updateCwd(cwd: string): void {
+    for (const server of this.servers.values()) {
+      this._updateServerCwd(server, cwd);
+    }
   }
 
   /** Status summary for /mcp command. */
@@ -455,7 +476,7 @@ export class ServerManager {
     if (!server) {
       throw new McpError(`Unknown server "${name}"`, name, "config");
     }
-    server.cwd = cwd;
+    this._updateServerCwd(server, cwd);
     if (server.attempt && !server.controller?.signal.aborted) return server.attempt;
     if (server.state === "ready") return;
     server.retryCount = 0;
@@ -524,6 +545,11 @@ export class ServerManager {
     for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
       this.setServer(name, serverConfig);
     }
+  }
+
+  /** Alias for rebuildServers when replacing configuration on session_start. */
+  replaceConfig(config: McpConfig): void {
+    this.rebuildServers(config);
   }
 
   // ─── Internal ───────────────────────────────────────────────────────────────
@@ -661,7 +687,8 @@ export class ServerManager {
     corruptStateRecovered = false,
   ): Promise<void> {
     server.lastError = null;
-    server.cwd = cwd;
+    const currentCwd = server.cwd ?? cwd;
+    server.cwd = currentCwd;
     const timeoutMs = this._resolveTimeoutMs(server);
     // Note: retryCount is NOT reset here — it's only reset after successful connect.
     // This ensures the retry limit is respected across reconnection attempts.
@@ -677,7 +704,7 @@ export class ServerManager {
 
     let transport: Transport;
     try {
-      transport = this.createTransport(server.name, server.config, cwd);
+      transport = this.createTransport(server.name, server.config, currentCwd);
     } catch (err) {
       server.state = "stopped";
       server.lastError = err instanceof Error ? err : new Error(String(err));
@@ -837,6 +864,11 @@ export class ServerManager {
       server.state = "ready";
       server.retryCount = 0;
       server.lastError = null;
+      if (server.cwd && server.cwd !== currentCwd) {
+        void client.sendRootsListChanged().catch(() => {
+          // WHY: Best-effort notification if cwd was updated while handshake was in flight.
+        });
+      }
       if (server.config.healthCheckIntervalMs) {
         let pingInFlight = false;
         server.healthCheckTimer = setInterval(async () => {
@@ -985,7 +1017,7 @@ export class ServerManager {
         // without consuming retryCount so OAuth can proceed cleanly into AuthRequiredError.
         console.error(`[pi-mcp] ${error.message}`);
         if (signal.aborted) throw new AuthCancelledError(server.name);
-        return this._connect(server, cwd, signal, true);
+        return this._connect(server, server.cwd ?? cwd, signal, true);
       }
       server.lastError = error;
       if (error instanceof AuthRequiredError) {
@@ -1026,7 +1058,7 @@ export class ServerManager {
         }, { once: true });
       });
       if (signal.aborted) throw new AuthCancelledError(server.name);
-      return this._connect(server, cwd, signal, corruptStateRecovered);
+      return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
     }
   }
 

@@ -760,7 +760,13 @@ export class ToolBridge {
 
   /** Update bridge settings when session config is reloaded on session_start. */
   updateSettings(settings: Settings): void {
+    const prevDefaultTimeoutMs = this.settings.requestTimeoutMs;
     this.settings = settings;
+    for (const [serverName, timeoutMs] of this.serverTimeouts.entries()) {
+      if (timeoutMs === prevDefaultTimeoutMs) {
+        this.serverTimeouts.delete(serverName);
+      }
+    }
   }
 
   /**
@@ -779,10 +785,14 @@ export class ToolBridge {
     const isCurrent = typeof isCurrentOrOptions === "function" ? isCurrentOrOptions : () => true;
     const options = typeof isCurrentOrOptions === "object" ? isCurrentOrOptions : maybeOptions;
     const defaults = getClientDefaultOptions(client);
-    const effectiveTimeoutMs =
-      options?.requestTimeoutMs ?? defaults?.requestTimeoutMs ?? this.settings.requestTimeoutMs;
+    const explicitTimeoutMs = options?.requestTimeoutMs ?? defaults?.requestTimeoutMs;
+    const effectiveTimeoutMs = explicitTimeoutMs ?? this.settings.requestTimeoutMs;
     const effectiveSignal = options?.signal ?? defaults?.signal;
-    this.serverTimeouts.set(serverName, effectiveTimeoutMs);
+    if (explicitTimeoutMs !== undefined) {
+      this.serverTimeouts.set(serverName, explicitTimeoutMs);
+    } else {
+      this.serverTimeouts.delete(serverName);
+    }
 
     const gen = (this.refreshGenerations.get(serverName) ?? 0) + 1;
     this.refreshGenerations.set(serverName, gen);

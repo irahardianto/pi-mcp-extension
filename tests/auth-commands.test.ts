@@ -169,3 +169,130 @@ it("stops a ready server on /mcp:auth and re-authenticates interactively instead
   }
 });
 
+it("should report usage on bare /mcp:auth --reset, support leading /mcp:auth --reset <name>, and suppress false error notification when /mcp:start is cancelled via /mcp:stop (Issue 24.4)", async () => {
+  const { startFakeOAuthServer } = await import("./helpers/fake-oauth-server.js");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-auth-cmd-24-4-"));
+  const authDir = join(dir, "auth");
+  const fakeServer = await startFakeOAuthServer({ serverName: "oauth-srv", toolName: "oauth_echo" });
+
+  let holdHttpConnect = true;
+  let releaseHttpConnect!: () => void;
+  const httpEntered = new Promise<void>((resolve) => {
+    releaseHttpConnect = resolve;
+  });
+  let markHttpEntered!: () => void;
+  const httpReached = new Promise<void>((resolve) => {
+    markHttpEntered = resolve;
+  });
+  const slowListener = createServer(async (_req, res) => {
+    markHttpEntered();
+    if (holdHttpConnect) {
+      await httpEntered;
+    }
+    if (!res.destroyed) {
+      res.writeHead(500);
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => slowListener.listen(0, "127.0.0.1", resolve));
+  const slowAddr = slowListener.address();
+  assert.ok(slowAddr && typeof slowAddr === "object");
+
+  const commands = new Map<string, any>();
+  const events = new Map<string, any>();
+  const notifications: Array<{ msg: string; level?: string | undefined }> = [];
+  const ctx: any = {
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (msg: string, level?: string) => notifications.push({ msg, level }),
+      select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }) =>
+        new Promise<string | undefined>((resolve) => {
+          opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+        }),
+    },
+  };
+
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0, requestTimeoutMs: 5000 },
+        mcpServers: {
+          "oauth-srv": {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: fakeServer.mcpUrl,
+            auth: { type: "oauth" },
+          },
+          "slow-plain": {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: `http://127.0.0.1:${slowAddr.port}/mcp`,
+          },
+        },
+      }),
+    );
+
+    await extension(
+      {
+        registerTool: () => {},
+        registerCommand: (name: string, command: any) => commands.set(name, command),
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => [],
+        setActiveTools: () => {},
+      } as any,
+      {
+        bootstrapCwd: dir,
+        globalConfigPath: join(dir, "missing.json"),
+        authStorageDir: authDir,
+        browserOpen: fakeServer.browserOpen,
+      },
+    );
+    await events.get("session_start")({}, ctx);
+
+    // 1. Bare `/mcp:auth --reset` must notify Usage error, NOT "No OAuth server named --reset"
+    notifications.length = 0;
+    await commands.get("mcp:auth").handler("--reset", ctx);
+    assert.deepEqual(notifications, [{ msg: "Usage: /mcp:auth <name> [--reset]", level: "error" }]);
+
+    // 2. Leading `/mcp:auth --reset oauth-srv` must reset stored tokens and run interactive OAuth
+    const provider = new McpOAuthProvider(
+      "oauth-srv",
+      { type: "oauth" },
+      undefined,
+      authDir,
+      false,
+      () => false,
+      undefined,
+      fakeServer.mcpUrl,
+    );
+    await provider.saveTokens({ access_token: "stale-valid-token", token_type: "Bearer" });
+    await commands.get("mcp:auth").handler("--reset oauth-srv", ctx);
+    assert.equal(fakeServer.browserOpenCount, 1, "Leading --reset must discard stored tokens and open browser");
+
+    // 3. Cancelling `/mcp:start slow-plain` via `/mcp:stop slow-plain` must NOT emit a false error notification
+    notifications.length = 0;
+    const startPromise = commands.get("mcp:start").handler("slow-plain", ctx);
+    await httpReached;
+    await commands.get("mcp:stop").handler("slow-plain", ctx);
+    releaseHttpConnect();
+    await startPromise;
+
+    assert.equal(
+      notifications.some((n) => n.level === "error" || /Failed to start slow-plain/.test(n.msg)),
+      false,
+      `Expected no error notification when /mcp:start is cancelled by /mcp:stop, got: ${JSON.stringify(notifications)}`,
+    );
+    assert.ok(notifications.some((n) => n.msg === "pi-mcp: Stopped slow-plain" && n.level === "info"));
+  } finally {
+    releaseHttpConnect();
+    await events.get("session_shutdown")?.({}, ctx);
+    slowListener.closeAllConnections();
+    await new Promise<void>((resolve) => slowListener.close(() => resolve()));
+    await fakeServer.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+

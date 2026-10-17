@@ -911,6 +911,41 @@ describe("OAuth Security Fixes", () => {
         error: "User rejected request",
       });
     });
+
+    it("should reject error=access_denied with invalid_state when expectedState is a predicate function and return HTTP 400 from callback server (Issue 24.4)", async () => {
+      // Arrange
+      const input =
+        "http://127.0.0.1:19876/callback?error=access_denied&error_description=User%20rejected%20request&state=wrong-state";
+
+      // Act & Assert (pure parseCallbackUrl)
+      assert.throws(
+        () =>
+          parseCallbackUrl(input, {
+            redirectUrl: "http://127.0.0.1:19876/callback",
+            expectedState: (state) => state === "expected-state",
+          }),
+        (err: unknown) =>
+          err instanceof CallbackUrlValidationError &&
+          err.reason === "invalid_state" &&
+          /Invalid or expired state parameter/.test(err.message),
+      );
+
+      // Act & Assert (callback HTTP server integration)
+      await stopCallbackServer().catch(() => {});
+      const probe = createServer();
+      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+      const addr = probe.address();
+      assert.ok(addr && typeof addr === "object");
+      await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+      const port = await ensureCallbackServer(addr.port, { host: "127.0.0.1", allowPortFallback: false });
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/callback?error=access_denied&state=wrong-state`);
+        assert.strictEqual(res.status, 400);
+      } finally {
+        await stopCallbackServer().catch(() => {});
+      }
+    });
   });
 
   describe("Headless, SSH, and Safe Browser Launch Integration", () => {
@@ -2307,7 +2342,291 @@ describe("OAuth Security Fixes", () => {
         await rm(dir, { recursive: true, force: true });
       }
     });
+
+    it("should hand off active startup prompt authQueue turn to /mcp:auth, cancel queued startup prompts on /mcp:stop, deduplicate prompts across session_start, and sync declined status bar (Issues 24.2, 24.3)", async () => {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue24-3-"));
+      const authDir = join(dir, "auth");
+      const fakeAlpha = await startFakeOAuthServer({ serverName: "alpha", toolName: "alpha_echo" });
+      const fakeBeta = await startFakeOAuthServer({ serverName: "beta", toolName: "beta_echo" });
+      const fakeGamma = await startFakeOAuthServer({ serverName: "gamma", toolName: "gamma_echo" });
+
+      const tools = new Map<string, any>();
+      const commands = new Map<string, any>();
+      const events = new Map<string, any>();
+      let activeTools: string[] = [];
+      const timeline: string[] = [];
+      const statuses: Array<string | undefined> = [];
+
+      let markAlphaPromptOpen!: () => void;
+      const alphaPromptOpen = new Promise<void>((resolve) => {
+        markAlphaPromptOpen = resolve;
+      });
+      let markGammaPromptOpen!: () => void;
+      const gammaPromptOpen = new Promise<void>((resolve) => {
+        markGammaPromptOpen = resolve;
+      });
+      let resolveGammaPrompt!: (choice: string) => void;
+
+      const pi = {
+        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => {
+          activeTools = names;
+          if (names.some((n) => n.includes("alpha_echo")) && !timeline.includes("alpha:tools_active")) {
+            timeline.push("alpha:tools_active");
+          }
+        },
+      };
+
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: () => {},
+          setStatus: (_key: string, val?: string) => {
+            statuses.push(val);
+          },
+          select: async (title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
+            if (title === "alpha needs authorization") {
+              timeline.push("alpha:prompt");
+              markAlphaPromptOpen();
+              return new Promise<string | undefined>((resolve) => {
+                opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+              });
+            }
+            if (title === "beta needs authorization") {
+              timeline.push("beta:prompt");
+              return startupAuthLaterOption;
+            }
+            if (title === "gamma needs authorization") {
+              timeline.push("gamma:prompt");
+              markGammaPromptOpen();
+              return new Promise<string | undefined>((resolve) => {
+                resolveGammaPrompt = resolve;
+                opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+              });
+            }
+            return new Promise<string | undefined>((resolve) => {
+              opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+            });
+          },
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 0 },
+            mcpServers: {
+              alpha: {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeAlpha.mcpUrl,
+                auth: { type: "oauth" },
+              },
+              beta: {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeBeta.mcpUrl,
+                auth: { type: "oauth" },
+              },
+              gamma: {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeGamma.mcpUrl,
+                auth: { type: "oauth" },
+              },
+            },
+          }),
+        );
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: async (url: string) => {
+            timeline.push("browser_open");
+            if (url.startsWith(fakeAlpha.baseUrl)) {
+              await fakeAlpha.browserOpen(url);
+            } else if (url.startsWith(fakeBeta.baseUrl)) {
+              await fakeBeta.browserOpen(url);
+            } else {
+              await fakeGamma.browserOpen(url);
+            }
+          },
+        });
+
+        await events.get("session_start")({}, ctx);
+        await alphaPromptOpen;
+
+        // 1. Trigger a duplicate session_start while alpha's prompt is open and beta/gamma are queued:
+        // must NOT enqueue duplicate startup prompts for alpha, beta, or gamma.
+        await events.get("session_start")({}, ctx);
+
+        // 2. Cancel beta's queued startup prompt via `/mcp:stop beta` while alpha's prompt is still open
+        await commands.get("mcp:stop").handler("beta", ctx);
+
+        // 3. Run `/mcp:auth alpha` while alpha's startup prompt is open:
+        // alpha's interactive OAuth must execute IMMEDIATELY inside alpha's current authQueue turn
+        // BEFORE gamma's startup prompt opens!
+        const authAlphaPromise = commands.get("mcp:auth").handler("alpha", ctx);
+        await gammaPromptOpen;
+        await authAlphaPromise;
+
+        assert.deepStrictEqual(
+          timeline,
+          ["alpha:prompt", "browser_open", "alpha:tools_active", "gamma:prompt"],
+          "Expected /mcp:auth alpha to complete in alpha's current turn, beta's stopped prompt to be skipped, and gamma's prompt to open only after alpha finishes",
+        );
+
+        // 4. Decline gamma, then also decline beta on a fresh session_start to test multi-server declined status bar sync
+        resolveGammaPrompt(startupAuthLaterOption);
+        for (let i = 0; i < 50 && statuses.at(-1) !== "run /mcp:auth gamma"; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.strictEqual(statuses.at(-1), "run /mcp:auth gamma");
+
+        // Now trigger session_start again so stopped beta fails silent auth and prompts -> decline beta too
+        await events.get("session_start")({}, ctx);
+        for (let i = 0; i < 50 && statuses.at(-1) !== "run /mcp:auth beta"; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.strictEqual(statuses.at(-1), "run /mcp:auth beta");
+
+        // Connect beta via /mcp:auth beta -> status bar must update from beta back to remaining declined server gamma!
+        await commands.get("mcp:auth").handler("beta", ctx);
+        assert.strictEqual(
+          statuses.at(-1),
+          "run /mcp:auth gamma",
+          "Connecting one declined server must update status bar to remaining declined server",
+        );
+
+        // Connect gamma via /mcp:auth gamma -> status bar must clear to undefined!
+        await commands.get("mcp:auth").handler("gamma", ctx);
+        assert.strictEqual(statuses.at(-1), undefined);
+      } finally {
+        await events.get("session_shutdown")?.({}, ctx);
+        await fakeAlpha.close();
+        await fakeBeta.close();
+        await fakeGamma.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should forward AbortSignal into discoverManualAuthChallenge and abort authorize() before calling SDK auth() when cancelled during challenge discovery (Issue 24.2)", async () => {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue24-2-"));
+      const authDir = join(dir, "auth");
+
+      let mcpRequests = 0;
+      let metadataRequests = 0;
+      let browserOpenCount = 0;
+      let releaseChallenge!: () => void;
+      const challengeGate = new Promise<void>((resolve) => {
+        releaseChallenge = resolve;
+      });
+      let markChallengeEntered!: () => void;
+      const challengeEntered = new Promise<void>((resolve) => {
+        markChallengeEntered = resolve;
+      });
+
+      const listener = createServer(async (req, res) => {
+        if (req.url === "/mcp") {
+          mcpRequests++;
+          // First request is silent startServer() -> 401 immediately so authorize() is entered.
+          // Second request is discoverManualAuthChallenge() inside authorize() -> hold until aborted!
+          if (mcpRequests >= 2) {
+            markChallengeEntered();
+            await challengeGate;
+          }
+          if (!res.destroyed) {
+            res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+            res.end("Unauthorized");
+          }
+          return;
+        }
+        if (req.url?.includes(".well-known") && mcpRequests >= 2) {
+          metadataRequests++;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const addr = listener.address();
+      assert.ok(addr && typeof addr === "object");
+
+      const tools = new Map<string, any>();
+      const events = new Map<string, any>();
+      const pi = {
+        registerTool: (t: any) => tools.set(t.name, t),
+        registerCommand: () => {},
+        on: (n: string, h: any) => events.set(n, h),
+        getActiveTools: () => [],
+        setActiveTools: () => {},
+      };
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: () => {},
+          select: async () => authCancelOption,
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"), { recursive: true });
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 0 },
+            mcpServers: {
+              challengeSrv: {
+                lifecycle: "lazy",
+                transport: "streamable-http",
+                url: `http://127.0.0.1:${addr.port}/mcp`,
+                auth: { type: "oauth", clientId: "cid" },
+              },
+            },
+          }),
+        );
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: () => {
+            browserOpenCount++;
+          },
+        });
+        await events.get("session_start")({}, ctx);
+
+        const controller = new AbortController();
+        const connectPromise = tools
+          .get("mcp_connect")
+          .execute("", { name: "challengeSrv" }, controller.signal, undefined, ctx);
+
+        await challengeEntered;
+        controller.abort();
+        releaseChallenge();
+
+        await assert.rejects(connectPromise, /cancelled/i);
+        assert.strictEqual(metadataRequests, 0, "SDK auth() metadata discovery must not run after abort during challenge discovery");
+        assert.strictEqual(browserOpenCount, 0, "Browser must not open after abort during challenge discovery");
+      } finally {
+        releaseChallenge();
+        await events.get("session_shutdown")?.({}, ctx);
+        listener.closeAllConnections();
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
+
 
 

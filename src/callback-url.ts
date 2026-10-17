@@ -115,6 +115,11 @@ export function parseCallbackUrl(
       "invalid_state",
       "Invalid or expired state parameter - potential CSRF attack",
     );
+  } else if (typeof options.expectedState === "function" && !options.expectedState(state)) {
+    throw new CallbackUrlValidationError(
+      "invalid_state",
+      "Invalid or expired state parameter - potential CSRF attack",
+    );
   }
 
   if (error) {
@@ -123,13 +128,6 @@ export function parseCallbackUrl(
 
   if (!code) {
     throw new CallbackUrlValidationError("missing_code", "No authorization code provided");
-  }
-
-  if (typeof options.expectedState === "function" && !options.expectedState(state)) {
-    throw new CallbackUrlValidationError(
-      "invalid_state",
-      "Invalid or expired state parameter - potential CSRF attack",
-    );
   }
 
   return { state, code };
