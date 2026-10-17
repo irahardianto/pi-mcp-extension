@@ -91,7 +91,7 @@ export interface AuthLockTimer {
 export interface AuthLockClock {
   now(): number;
   setInterval(callback: () => void, ms: number): ReturnType<typeof setInterval> | AuthLockTimer;
-  clearInterval(timer: any): void;
+  clearInterval(timer: ReturnType<typeof setInterval> | AuthLockTimer): void;
 }
 
 export interface AuthLockDeps {
@@ -154,7 +154,7 @@ export function createDefaultAuthLockDeps(): AuthLockDeps {
     clock: {
       now: () => Date.now(),
       setInterval: (cb, ms) => setInterval(cb, ms),
-      clearInterval: (timer) => clearInterval(timer),
+      clearInterval: (timer) => clearInterval(timer as ReturnType<typeof setInterval>),
     },
     pid: process.pid,
     hostname: osHostname(),

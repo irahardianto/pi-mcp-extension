@@ -238,7 +238,7 @@ export async function ensureCallbackServer(preferredPort: number = DEFAULT_PORT,
       });
 
       await new Promise<void>((resolve, reject) => {
-        candidateServer.once("error", (err: any) => {
+        candidateServer.once("error", (err: Error) => {
           reject(err);
         });
 
