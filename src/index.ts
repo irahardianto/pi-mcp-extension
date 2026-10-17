@@ -80,6 +80,13 @@ export class AuthCancelledError extends Error {
 export const authRetryOption = "Retry: open browser again";
 export const authPasteOption = "Paste redirect URL";
 export const authCancelOption = "Cancel authentication";
+export const startupAuthNowOption = "Authorize now";
+export const startupAuthLaterOption = "Not now";
+
+function formatErrorMessage(err: unknown): string {
+  const msg = err instanceof McpError ? err.userMessage : err instanceof Error ? err.message : String(err);
+  return msg.replace(/^AuthRequiredError:\s*/, "");
+}
 
 interface OAuthCallbackResult {
   type: "callback";
@@ -299,7 +306,90 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   const manager = new ServerManager(config, undefined, paths.authStorageDir);
   const bridge = new ToolBridge(config.settings, pi);
   const connectAttempts = new Map<string, { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }>();
+  const declinedStartupAuth = new Set<string>();
+  const startupPromptControllers = new Map<string, AbortController>();
   let authQueue: Promise<void> = Promise.resolve();
+
+  function enqueueStartupAuthPrompt(name: string, ctx: ExtensionContext): void {
+    let release!: () => void;
+    const previous = authQueue;
+    authQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    void (async () => {
+      try {
+        await previous;
+        if (
+          declinedStartupAuth.has(name) ||
+          manager.getServer(name)?.state === "ready" ||
+          connectAttempts.has(name)
+        ) {
+          return;
+        }
+        const promptController = new AbortController();
+        startupPromptControllers.set(name, promptController);
+        let choice: string | undefined;
+        try {
+          choice = await new Promise<string | undefined>((resolve, reject) => {
+            if (promptController.signal.aborted) {
+              resolve(undefined);
+              return;
+            }
+            const onAbort = () => resolve(undefined);
+            promptController.signal.addEventListener("abort", onAbort, { once: true });
+            ctx.ui
+              .select(
+                `${name} needs authorization`,
+                [startupAuthNowOption, startupAuthLaterOption],
+                { signal: promptController.signal },
+              )
+              .then(
+                (value) => {
+                  promptController.signal.removeEventListener("abort", onAbort);
+                  resolve(value);
+                },
+                (err) => {
+                  promptController.signal.removeEventListener("abort", onAbort);
+                  if (promptController.signal.aborted) resolve(undefined);
+                  else reject(err);
+                },
+              );
+          });
+        } finally {
+          if (startupPromptControllers.get(name) === promptController) {
+            startupPromptControllers.delete(name);
+          }
+        }
+        if (
+          promptController.signal.aborted ||
+          manager.getServer(name)?.state === "ready" ||
+          connectAttempts.has(name)
+        ) {
+          return;
+        }
+        if (choice === startupAuthNowOption) {
+          try {
+            await connectRequested(name, ctx, undefined, false, true);
+          } catch (err) {
+            if (!(err instanceof AuthCancelledError)) {
+              const msg = formatErrorMessage(err);
+              ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
+            }
+          }
+        } else {
+          declinedStartupAuth.add(name);
+          ctx.ui.setStatus?.("pi-mcp", `run /mcp:auth ${name}`);
+        }
+      } catch (err) {
+        if (!(err instanceof AuthCancelledError)) {
+          const msg = formatErrorMessage(err);
+          ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
+        }
+      } finally {
+        release();
+      }
+    })();
+  }
 
   manager.setToolRefreshCallback(async (serverName, client) => {
     await bridge.refreshTools(serverName, client, () => {
@@ -316,7 +406,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     try {
       sessionConfig = await loadConfig(ctx.cwd, paths.globalConfigPath);
     } catch (err) {
-      const msg = err instanceof McpError ? err.userMessage : String(err);
+      const msg = formatErrorMessage(err);
       ctx.ui.notify(`pi-mcp: Config error — ${msg}`, "error");
       return;
     }
@@ -324,6 +414,11 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     // If config changed (different cwd with project-level overrides),
     // shut down old servers and rebuild the manager's server list
     if (JSON.stringify(sessionConfig) !== JSON.stringify(config)) {
+      declinedStartupAuth.clear();
+      for (const controller of startupPromptControllers.values()) {
+        controller.abort();
+      }
+      startupPromptControllers.clear();
       // Deactivate and remove all tools from old config
       for (const server of manager.getAllServers()) {
         bridge.removeServer(server.name);
@@ -339,20 +434,41 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       ([, cfg]) => cfg.lifecycle === "eager",
     );
 
+    const authRequiredServers = new Set<string>();
+
     // Start all eager servers concurrently
     await Promise.allSettled(
-      eagerServers.map(async ([name]) => {
+      eagerServers.map(async ([name, cfg]) => {
         try {
           await manager.startServer(name, ctx.cwd);
         } catch (err) {
-          const msg = err instanceof McpError ? err.userMessage : String(err);
+          if (err instanceof AuthRequiredError && cfg.auth && ctx.hasUI) {
+            authRequiredServers.add(name);
+            return;
+          }
+          const msg = formatErrorMessage(err);
           ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
         }
       }),
     );
+
+    for (const [name] of eagerServers) {
+      if (!authRequiredServers.has(name)) continue;
+      if (declinedStartupAuth.has(name)) {
+        ctx.ui.setStatus?.("pi-mcp", `run /mcp:auth ${name}`);
+        continue;
+      }
+      enqueueStartupAuthPrompt(name, ctx);
+    }
+
+    for (let i = 0; i < 4 * authRequiredServers.size; i++) {
+      await Promise.resolve();
+    }
   });
 
   pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
+    for (const controller of startupPromptControllers.values()) controller.abort();
+    startupPromptControllers.clear();
     for (const attempt of connectAttempts.values()) attempt.controller.abort();
     await stopCallbackServer().catch(() => {});
 
@@ -410,6 +526,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
         return;
       }
+      startupPromptControllers.get(serverName)?.abort();
       connectAttempts.get(serverName)?.controller.abort();
       bridge.deactivateServer(serverName);
       await manager.stopServer(serverName);
@@ -435,7 +552,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         await connectRequested(serverName, ctx);
         ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
       } catch (err) {
-        const msg = err instanceof McpError ? err.userMessage : String(err);
+        const msg = formatErrorMessage(err);
         ctx.ui.notify(`pi-mcp: Failed to start ${serverName} — ${msg}`, "error");
       }
     },
@@ -653,12 +770,21 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
   }
 
-  async function connectRequested(serverName: string, ctx: ExtensionContext, signal?: AbortSignal, reset = false): Promise<void> {
+  async function connectRequested(
+    serverName: string,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+    reset = false,
+    alreadyQueued = false,
+  ): Promise<void> {
     const server = manager.getServer(serverName);
     if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
     if (signal?.aborted) throw new AuthCancelledError(serverName);
     if (reset && !server.config.auth) throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
     if (reset && !ctx.hasUI) throw new AuthRequiredError(serverName);
+    if (!alreadyQueued) {
+      startupPromptControllers.get(serverName)?.abort();
+    }
 
     const waitForAttempt = async (entry: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }): Promise<void> => {
       entry.waiters++;
@@ -725,24 +851,35 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         if (!reset) await manager.startServer(serverName, ctx.cwd);
         else throw new AuthRequiredError(serverName);
         if (controller.signal.aborted) { await manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
+        declinedStartupAuth.delete(serverName);
+        if (declinedStartupAuth.size === 0) ctx.ui.setStatus?.("pi-mcp", undefined);
         return;
       } catch (err) {
         if (!(err instanceof AuthRequiredError) || !server.config.auth) throw err;
       }
       if (!ctx.hasUI) throw new AuthRequiredError(serverName);
-      let release!: () => void;
-      const previous = authQueue;
-      authQueue = new Promise<void>((resolve) => { release = resolve; });
-      try {
-        await previous;
+      const runInteractiveAuth = async (): Promise<void> => {
         if (controller.signal.aborted) throw new AuthCancelledError(serverName);
         await authorize(serverName, ctx, controller.signal, reset);
         if (controller.signal.aborted) throw new AuthCancelledError(serverName);
         await manager.startServer(serverName, ctx.cwd);
         if (controller.signal.aborted) { await manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
-      } finally {
-        release();
+      };
+      if (alreadyQueued) {
+        await runInteractiveAuth();
+      } else {
+        let release!: () => void;
+        const previous = authQueue;
+        authQueue = new Promise<void>((resolve) => { release = resolve; });
+        try {
+          await previous;
+          await runInteractiveAuth();
+        } finally {
+          release();
+        }
       }
+      declinedStartupAuth.delete(serverName);
+      if (declinedStartupAuth.size === 0) ctx.ui.setStatus?.("pi-mcp", undefined);
     })().catch((err: unknown) => {
       if (controller.signal.aborted) throw new AuthCancelledError(serverName);
       throw err;

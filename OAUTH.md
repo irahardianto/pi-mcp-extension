@@ -67,7 +67,7 @@ Use `mcp_connect` with the server name, `/mcp:start deepsource`, or `/mcp:auth d
 7. Store tokens securely
 8. Connect the server and activate discovered tools
 
-Interactive sessions show `Retry: open browser again`, `Paste redirect URL`, and `Cancel authentication` while authorization is pending, and display the authorization URL directly in Pi. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser. A stop, cancellation, or shutdown cancels pending callbacks and retries.
+Interactive sessions show `Retry: open browser again`, `Paste redirect URL`, and `Cancel authentication` while authorization is pending, and display the authorization URL directly in Pi. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser automatically or perform Dynamic Client Registration silently; when an eager OAuth server requires interactive authorization at startup in an interactive Pi session, Pi offers a non-blocking sequential `<name> needs authorization` prompt (`Authorize now` / `Not now`). Choosing `Authorize now` runs the interactive OAuth flow for that server before prompting for the next eager server, while choosing `Not now` leaves the server stopped, displays a `run /mcp:auth <name>` footer hint, and remembers the decline for the rest of the session. A stop, cancellation, or shutdown cancels pending callbacks and retries.
 
 ### Headless and SSH Sessions
 

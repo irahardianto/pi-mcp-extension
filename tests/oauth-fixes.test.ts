@@ -16,7 +16,7 @@ import assert from "node:assert";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { McpOAuthProvider } from "../src/oauth-provider.js";
+import { AuthRequiredError, McpOAuthProvider } from "../src/oauth-provider.js";
 import type { AuthConfig } from "../src/oauth-provider.js";
 import { Agent, createServer, request } from "node:http";
 import {
@@ -28,7 +28,17 @@ import {
 } from "../src/callback-server.js";
 import { discoverManualAuthChallenge } from "../src/auth-challenge.js";
 import { CallbackUrlValidationError, isSafeAuthorizationUrl, parseCallbackUrl } from "../src/callback-url.js";
-import extension, { AuthCancelledError, authCancelOption, authPasteOption, authRetryOption, browserOpenCommand, waitForOAuthCallback } from "../src/index.js";
+import extension, {
+  AuthCancelledError,
+  authCancelOption,
+  authPasteOption,
+  authRetryOption,
+  browserOpenCommand,
+  startupAuthLaterOption,
+  startupAuthNowOption,
+  waitForOAuthCallback,
+} from "../src/index.js";
+import { startFakeOAuthServer } from "./helpers/fake-oauth-server.js";
 
 describe("OAuth Security Fixes", () => {
   const testServerName = "test-oauth-server";
@@ -1334,4 +1344,464 @@ describe("OAuth Security Fixes", () => {
       }
     });
   });
+
+  describe("Startup OAuth Offer, Silent DCR Guard, and Real HTTP OAuth Fixture (Issue #7, N1, N8)", () => {
+    it("should throw AuthRequiredError when clientInformation is called on a silent provider without clientId or stored clientInfo", async () => {
+      // Arrange
+      const silentProvider = new McpOAuthProvider(testServerName, {}, undefined, testStorage, true);
+
+      // Act & Assert
+      await assert.rejects(
+        () => silentProvider.clientInformation(),
+        AuthRequiredError,
+      );
+    });
+
+    it("should not retry, launch a browser, or trigger DCR on session_start and should remember Not now for the session when an eager OAuth server has no client info or has an expired token with failing refresh", async () => {
+      // Arrange
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue7-decline-"));
+      const authDir = join(dir, "auth");
+      const fakeServer = await startFakeOAuthServer({
+        serverName: "eager-oauth",
+        failRefresh: true,
+      });
+
+      const tools = new Map<string, any>();
+      const commands = new Map<string, any>();
+      const events = new Map<string, any>();
+      const notifications: Array<{ message: string; type?: string }> = [];
+      const selectPrompts: string[] = [];
+      const statuses: Array<{ key: string; value: string | undefined }> = [];
+
+      const pi = {
+        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => [],
+        setActiveTools: () => {},
+      };
+
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: (message: string, type?: string) => {
+            notifications.push({ message, ...(type ? { type } : {}) });
+          },
+          select: async (title: string) => {
+            selectPrompts.push(title);
+            return startupAuthLaterOption;
+          },
+          setStatus: (key: string, value: string | undefined) => {
+            statuses.push({ key, value });
+          },
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 2 },
+            mcpServers: {
+              "eager-oauth": {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeServer.mcpUrl,
+                auth: { type: "oauth" },
+              },
+            },
+          }),
+        );
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: fakeServer.browserOpen,
+        });
+
+        // Act (Part 1: No stored client info — silent startup must hit N1 guard before DCR)
+        await events.get("session_start")({}, ctx);
+
+        // Assert (Part 1)
+        assert.strictEqual(fakeServer.dcrCount, 0, "Silent startup must never trigger Dynamic Client Registration");
+        assert.strictEqual(fakeServer.browserOpenCount, 0, "Silent startup must not open a browser when Not now is chosen");
+        assert.deepStrictEqual(selectPrompts, ["eager-oauth needs authorization"]);
+        assert.deepStrictEqual(statuses.at(-1), { key: "pi-mcp", value: "run /mcp:auth eager-oauth" });
+        await commands.get("mcp").handler("eager-oauth", ctx);
+        const detailAfterNoClient = notifications.at(-1)?.message ?? "";
+        assert.match(detailAfterNoClient, /State:\s+stopped/);
+        assert.match(detailAfterNoClient, /Retries:\s+0/);
+
+        // Act (Part 2: Seed clientInfo + expired token with failing refresh, and verify session remembers decline without re-prompting)
+        const seededProvider = new McpOAuthProvider("eager-oauth", { type: "oauth" }, undefined, authDir);
+        await seededProvider.saveClientInformation({ client_id: "seeded-client" });
+        await seededProvider.saveTokens({
+          access_token: "expired-access-token",
+          refresh_token: "expired-refresh-token",
+          token_type: "Bearer",
+        });
+        await events.get("session_start")({}, ctx);
+
+        // Assert (Part 2: Declined server is not prompted again during the same session)
+        assert.strictEqual(selectPrompts.length, 1, "Declined server must not re-prompt on subsequent session_start with unchanged config");
+        assert.strictEqual(fakeServer.refreshCount, 1, "Silent startup should attempt refresh once with stored clientInfo + refresh_token");
+        assert.strictEqual(fakeServer.dcrCount, 0, "Failed refresh must not trigger DCR");
+        assert.strictEqual(fakeServer.browserOpenCount, 0, "Failed refresh must not open a browser");
+        assert.deepStrictEqual(statuses.at(-1), { key: "pi-mcp", value: "run /mcp:auth eager-oauth" });
+
+        // Act (Part 3: Headless session_start notifies cleanly without duplicate AuthRequiredError: prefix)
+        notifications.length = 0;
+        await events.get("session_start")({}, { ...ctx, hasUI: false });
+
+        // Assert (Part 3)
+        const errorNotification = notifications.find((n) => n.type === "error");
+        assert.ok(errorNotification, "Expected error notification when hasUI is false");
+        assert.doesNotMatch(errorNotification.message, /AuthRequiredError:/);
+        assert.match(errorNotification.message, /^pi-mcp: Failed to start eager-oauth — Authorization required for eager-oauth/);
+      } finally {
+        await events.get("session_shutdown")?.({}, ctx);
+        await fakeServer.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should complete full OAuth flow with single DCR registration, persist tokens, and activate tools when user chooses Authorize now at the startup prompt", async () => {
+      // Arrange
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { getAuthStatus } = await import("../src/oauth-provider.js");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue7-authnow-"));
+      const authDir = join(dir, "auth");
+      const fakeServer = await startFakeOAuthServer({
+        serverName: "eager-dcr",
+        toolName: "oauth_echo",
+      });
+
+      const tools = new Map<string, any>();
+      const commands = new Map<string, any>();
+      const events = new Map<string, any>();
+      let activeTools: string[] = [];
+      const selectPrompts: string[] = [];
+
+      const pi = {
+        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => {
+          activeTools = names;
+        },
+      };
+
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: () => {},
+          select: async (title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
+            selectPrompts.push(title);
+            if (title === "eager-dcr needs authorization") {
+              return startupAuthNowOption;
+            }
+            return new Promise<string | undefined>((resolve) => {
+              opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+            });
+          },
+          setStatus: () => {},
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 2 },
+            mcpServers: {
+              "eager-dcr": {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeServer.mcpUrl,
+                auth: { type: "oauth" },
+              },
+            },
+          }),
+        );
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: fakeServer.browserOpen,
+        });
+
+        // Act
+        await events.get("session_start")({}, ctx);
+        for (let i = 0; i < 200 && !activeTools.some((name) => name.includes("oauth_echo")); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+
+        // Assert
+        assert.ok(selectPrompts.includes("eager-dcr needs authorization"));
+        assert.strictEqual(fakeServer.dcrCount, 1, "Expected exactly 1 Dynamic Client Registration during interactive Authorize now");
+        assert.strictEqual(fakeServer.browserOpenCount, 1, "Expected browserOpen to be called once");
+        assert.strictEqual(fakeServer.codeExchangeCount, 1, "Expected authorization code to be exchanged once");
+
+        const authStatus = await getAuthStatus("eager-dcr", authDir);
+        assert.strictEqual(authStatus?.hasClientInfo, true);
+        assert.strictEqual(authStatus?.hasTokens, true);
+
+        const statusResult = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+        const statusRows = JSON.parse(statusResult.content[0].text);
+        assert.strictEqual(statusRows[0].state, "ready");
+        assert.deepStrictEqual(statusRows[0].tools, { discovered: 1, active: 1 });
+        assert.ok(activeTools.some((name) => name.includes("oauth_echo")));
+      } finally {
+        await events.get("session_shutdown")?.({}, ctx);
+        await fakeServer.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should show the second eager server startup prompt only after the first eager server prompt and authorization complete when two eager OAuth servers require authorization", async () => {
+      // Arrange
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue7-sequential-"));
+      const authDir = join(dir, "auth");
+      const fakeServer1 = await startFakeOAuthServer({
+        serverName: "alpha",
+        toolName: "alpha_echo",
+      });
+      const fakeServer2 = await startFakeOAuthServer({
+        serverName: "beta",
+        toolName: "beta_echo",
+      });
+
+      const tools = new Map<string, any>();
+      const events = new Map<string, any>();
+      let activeTools: string[] = [];
+      const timeline: string[] = [];
+
+      let releaseFirstPrompt!: (choice: string) => void;
+      const firstPromptShown = new Promise<void>((resolve) => {
+        // resolved when alpha prompt appears
+        releaseFirstPrompt = (choice: string) => {
+          firstChoiceResolve(choice);
+        };
+        void resolve;
+      });
+      let markFirstPromptShown!: () => void;
+      const firstPromptVisible = new Promise<void>((resolve) => {
+        markFirstPromptShown = resolve;
+      });
+      let firstChoiceResolve!: (choice: string) => void;
+      const firstChoicePromise = new Promise<string>((resolve) => {
+        firstChoiceResolve = resolve;
+      });
+      void firstPromptShown;
+
+      let markSecondPromptShown!: () => void;
+      const secondPromptVisible = new Promise<void>((resolve) => {
+        markSecondPromptShown = resolve;
+      });
+
+      const pi = {
+        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerCommand: () => {},
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => {
+          activeTools = names;
+          if (names.some((n) => n.includes("alpha_echo")) && !timeline.includes("alpha:tools_active")) {
+            timeline.push("alpha:tools_active");
+          }
+        },
+      };
+
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: () => {},
+          select: async (title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
+            if (title === "alpha needs authorization") {
+              timeline.push("alpha:prompt");
+              markFirstPromptShown();
+              return await firstChoicePromise;
+            }
+            if (title === "beta needs authorization") {
+              timeline.push("beta:prompt");
+              markSecondPromptShown();
+              return startupAuthLaterOption;
+            }
+            return new Promise<string | undefined>((resolve) => {
+              opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+            });
+          },
+          setStatus: () => {},
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 0 },
+            mcpServers: {
+              alpha: {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeServer1.mcpUrl,
+                auth: { type: "oauth" },
+              },
+              beta: {
+                lifecycle: "eager",
+                transport: "streamable-http",
+                url: fakeServer2.mcpUrl,
+                auth: { type: "oauth" },
+              },
+            },
+          }),
+        );
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: async (url: string) => {
+            timeline.push("alpha:browser_open");
+            await fakeServer1.browserOpen(url);
+          },
+        });
+
+        // Act
+        await events.get("session_start")({}, ctx);
+        await firstPromptVisible;
+
+        // Assert that beta has NOT prompted while alpha's prompt is still waiting
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.deepStrictEqual(timeline, ["alpha:prompt"], "Second server must not prompt while first server prompt is open");
+
+        // Now choose Authorize now for alpha and wait for beta's prompt
+        releaseFirstPrompt(startupAuthNowOption);
+        await secondPromptVisible;
+
+        // Assert that alpha completed browser open and tool activation BEFORE beta's prompt appeared
+        assert.deepStrictEqual(timeline, [
+          "alpha:prompt",
+          "alpha:browser_open",
+          "alpha:tools_active",
+          "beta:prompt",
+        ]);
+      } finally {
+        await events.get("session_shutdown")?.({}, ctx);
+        await fakeServer1.close();
+        await fakeServer2.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("should complete /mcp:auth and silently refresh with token rotation on reconnect without opening a browser or performing DCR again when the access token expires", async () => {
+      // Arrange
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-n8-refresh-"));
+      const authDir = join(dir, "auth");
+      const fakeServer = await startFakeOAuthServer({
+        serverName: "rotatable",
+        toolName: "oauth_echo",
+      });
+
+      const tools = new Map<string, any>();
+      const commands = new Map<string, any>();
+      const events = new Map<string, any>();
+      let activeTools: string[] = [];
+
+      const pi = {
+        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
+        on: (name: string, handler: any) => events.set(name, handler),
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => {
+          activeTools = names;
+        },
+      };
+
+      const ctx: any = {
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: () => {},
+          select: async (_title: string, _options: string[], opts?: { signal?: AbortSignal }) =>
+            new Promise<string | undefined>((resolve) => {
+              opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+            }),
+          setStatus: () => {},
+        },
+      };
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 0 },
+            mcpServers: {
+              rotatable: {
+                lifecycle: "lazy",
+                transport: "streamable-http",
+                url: fakeServer.mcpUrl,
+                auth: { type: "oauth" },
+              },
+            },
+          }),
+        );
+
+        await extension(pi as any, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "no-global.json"),
+          authStorageDir: authDir,
+          browserOpen: fakeServer.browserOpen,
+        });
+        await events.get("session_start")({}, ctx);
+
+        // Act (Step 1: Interactive /mcp:auth)
+        await commands.get("mcp:auth").handler("rotatable", ctx);
+
+        // Assert (Step 1)
+        assert.strictEqual(fakeServer.dcrCount, 1);
+        assert.strictEqual(fakeServer.browserOpenCount, 1);
+        assert.strictEqual(fakeServer.codeExchangeCount, 1);
+        assert.strictEqual(fakeServer.refreshCount, 0);
+
+        const inspectProvider = new McpOAuthProvider("rotatable", { type: "oauth" }, undefined, authDir);
+        const initialTokens = await inspectProvider.tokens();
+        assert.strictEqual(initialTokens?.access_token, "access-token-1");
+        assert.strictEqual(initialTokens?.refresh_token, "refresh-token-1");
+
+        // Act (Step 2: Stop server, expire access token on fake OAuth server, and reconnect silently via /mcp:start)
+        await commands.get("mcp:stop").handler("rotatable", ctx);
+        fakeServer.expireAccessTokens();
+        await commands.get("mcp:start").handler("rotatable", ctx);
+
+        // Assert (Step 2: Silent refresh succeeded and rotated tokens on disk without opening browser or calling DCR)
+        assert.strictEqual(fakeServer.dcrCount, 1, "Reconnect must reuse stored client_id and not call DCR again");
+        assert.strictEqual(fakeServer.browserOpenCount, 1, "Silent refresh must not open a browser");
+        assert.strictEqual(fakeServer.refreshCount, 1, "Expected 1 refresh_token grant request");
+
+        const rotatedTokens = await inspectProvider.tokens();
+        assert.strictEqual(rotatedTokens?.access_token, "access-token-2");
+        assert.strictEqual(rotatedTokens?.refresh_token, "refresh-token-2");
+        assert.ok(activeTools.some((name) => name.includes("oauth_echo")));
+      } finally {
+        await events.get("session_shutdown")?.({}, ctx);
+        await fakeServer.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
+

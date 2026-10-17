@@ -263,6 +263,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         ...(state.clientInfo.client_secret && { client_secret: state.clientInfo.client_secret }),
       };
     }
+    if (this.silent) throw new AuthRequiredError(this.serverName);
     return undefined;
   }
 
