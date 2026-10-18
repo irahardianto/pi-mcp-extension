@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Upgrade the `zod` runtime dependency from 3.x to `^4.6.5` (#95). Existing `mcp.json` configs load and validate exactly as before. Some config validation messages that come from Zod's built-in errors now use Zod 4 wording (e.g. `Invalid url` → `Invalid URL`, `Number must be greater than 0` → `Too small: expected number to be >0`). Messages that pi-mcp defines itself are unchanged.
+
 ## [1.9.10] - 2026-10-19
 
 ### Fixed
