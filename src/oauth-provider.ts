@@ -164,7 +164,7 @@ export const StoredStateSchema = z.object({
   serverUrl: z.string().optional(),
   clientInfo: StoredClientInfoSchema.optional(),
   tokens: StoredTokensSchema.optional(),
-  discoveryState: z.record(z.unknown()).optional(),
+  discoveryState: z.record(z.string(), z.unknown()).optional(),
 });
 
 // ─── File helpers ─────────────────────────────────────────────────────────────

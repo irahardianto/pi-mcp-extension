@@ -847,6 +847,111 @@ describe("Issue #28: Config validation and error handling", () => {
       }
     });
   });
+
+  it("reports both missing command and invalid auth on stdio server simultaneously", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          badStdio: {
+            transport: "stdio",
+            // missing command
+            auth: { type: "oauth" },
+          },
+        },
+      });
+
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(
+            err.message.includes('"command" is required for stdio transport'),
+            `Expected missing command message, got: ${err.message}`,
+          );
+          assert.ok(
+            err.message.includes("OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'"),
+            `Expected invalid auth message, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  });
+
+  it("yields default settings when settings omitted, with independent object identity across loads", async () => {
+    await withTempDir(async (dir) => {
+      await writeMcpJson(dir, {
+        mcpServers: {
+          serverA: {
+            command: "echo",
+            transport: "stdio",
+          },
+        },
+      });
+
+      const cfg1 = await loadConfig(dir);
+      const cfg2 = await loadConfig(dir);
+
+      assert.equal(cfg1.settings.toolPrefix, "mcp");
+      assert.equal(cfg1.settings.requestTimeoutMs, 30000);
+      assert.equal(cfg1.settings.maxRetries, 5);
+
+      assert.notEqual(cfg1.settings, cfg2.settings);
+
+      (cfg1.settings as { toolPrefix: string }).toolPrefix = "mutated";
+      assert.equal(cfg2.settings.toolPrefix, "mcp");
+    });
+  });
+
+  it("rejects non-string values in env and headers with McpError (code === 'config')", async () => {
+    await withTempDir(async (dir) => {
+      // Non-string env value
+      await writeMcpJson(dir, {
+        mcpServers: {
+          badEnv: {
+            command: "echo",
+            env: { FOO: 123 },
+          },
+        },
+      });
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(
+            err.message.includes("env.FOO"),
+            `Expected env.FOO issue in error message, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+
+      // Non-string headers value
+      await writeMcpJson(dir, {
+        mcpServers: {
+          badHeaders: {
+            transport: "streamable-http",
+            url: "https://example.com/mcp",
+            headers: { Authorization: 123 },
+          },
+        },
+      });
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(
+            err.message.includes("headers.Authorization"),
+            `Expected headers.Authorization issue in error message, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  });
 });
 
 

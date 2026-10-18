@@ -64,7 +64,7 @@ const AuthConfigSchema = z.preprocess(
           callbackServerConfigFromRedirectUrl(auth.redirectUrl);
         } catch (err) {
           ctx.addIssue({
-            code: z.ZodIssueCode.custom,
+            code: "custom",
             path: ["redirectUrl"],
             message: err instanceof Error ? err.message : String(err),
           });
@@ -104,7 +104,7 @@ export const ServerConfigSchema = z.preprocess(
        * These merge with process.env; project env overrides parent env.
        * No ${VAR} interpolation — set vars in your shell environment instead.
        */
-      env: z.record(z.string()).optional(),
+      env: z.record(z.string(), z.string()).optional(),
       /** Transport protocol. Default: "stdio" (or "streamable-http" when "url" is provided). */
       transport: z.enum(["stdio", "streamable-http", "sse"]).default("stdio"),
       /**
@@ -117,7 +117,7 @@ export const ServerConfigSchema = z.preprocess(
        * Useful for API-key-based auth (e.g. { "Authorization": "Bearer <key>" }).
        * For OAuth2, use the "auth" field instead.
        */
-      headers: z.record(z.string()).optional(),
+      headers: z.record(z.string(), z.string()).optional(),
       /**
        * OAuth2 configuration for servers that require authorization.
        * When set, the transport will use the SDK's OAuth flow (discovery,
@@ -139,26 +139,35 @@ export const ServerConfigSchema = z.preprocess(
        */
       healthCheckIntervalMs: z.number().positive().optional(),
     })
-    .refine(
-      (cfg) => {
-        if (cfg.transport === "stdio") return cfg.command !== undefined;
-        return cfg.url !== undefined;
-      },
-      (cfg) => ({
-        message:
-          cfg.transport === "stdio"
-            ? `"command" is required for stdio transport`
-            : `"url" is required for ${cfg.transport} transport`,
-      }),
-    )
-    .refine(
-      (cfg) => !(cfg.transport === "stdio" && cfg.auth !== undefined),
-      {
-        message: "OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'",
-        path: ["auth"],
-      },
-    ),
+    .superRefine((cfg, ctx) => {
+      if (cfg.transport === "stdio") {
+        if (cfg.command === undefined) {
+          ctx.addIssue({
+            code: "custom",
+            message: '"command" is required for stdio transport',
+          });
+        }
+        if (cfg.auth !== undefined) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["auth"],
+            message: "OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'",
+          });
+        }
+      } else if (cfg.url === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: `"url" is required for ${cfg.transport} transport`,
+        });
+      }
+    }),
 );
+
+const DEFAULT_SETTINGS = {
+  toolPrefix: "mcp",
+  requestTimeoutMs: 30000,
+  maxRetries: 5,
+} as const;
 
 const SettingsSchema = z.object({
   /**
@@ -168,16 +177,16 @@ const SettingsSchema = z.object({
   toolPrefix: z
     .string()
     .regex(/^[a-zA-Z][a-zA-Z0-9_]*$/, "toolPrefix must start with a letter and contain only alphanumeric characters and underscores")
-    .default("mcp"),
+    .default(DEFAULT_SETTINGS.toolPrefix),
   /** Default per-request timeout in ms for all servers. Default: 30000. */
-  requestTimeoutMs: z.number().positive().default(30000),
+  requestTimeoutMs: z.number().positive().default(DEFAULT_SETTINGS.requestTimeoutMs),
   /** Maximum retry attempts when a server fails to connect. Default: 5. */
-  maxRetries: z.number().int().min(0).max(10).default(5),
+  maxRetries: z.number().int().min(0).max(10).default(DEFAULT_SETTINGS.maxRetries),
 });
 
 const McpConfigSchema = z.object({
-  settings: SettingsSchema.default({}),
-  mcpServers: z.record(ServerConfigSchema).default({}),
+  settings: SettingsSchema.default(() => ({ ...DEFAULT_SETTINGS })),
+  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
 });
 
 /**
@@ -195,7 +204,7 @@ const ProjectSettingsSchema = z.object({
 });
 const ProjectConfigSchema = z.object({
   settings: ProjectSettingsSchema.default({}),
-  mcpServers: z.record(ServerConfigSchema).default({}),
+  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
 });
 type ProjectConfig = z.output<typeof ProjectConfigSchema>;
 
