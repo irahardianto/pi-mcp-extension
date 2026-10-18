@@ -37,7 +37,16 @@ import extension, {
   startupAuthNowOption,
   waitForOAuthCallback,
 } from "../src/index.js";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createMockContext, type MockCommand } from "./helpers/mock-extension.js";
 import { startFakeOAuthServer } from "./helpers/fake-oauth-server.js";
+
+function getText(block: unknown): string {
+  if (block && typeof block === "object" && "text" in block && typeof block.text === "string") {
+    return block.text;
+  }
+  return "";
+}
 
 describe("OAuth Security Fixes", () => {
   const testServerName = "test-oauth-server";
@@ -1074,8 +1083,8 @@ describe("OAuth Security Fixes", () => {
       const { mkdir, writeFile } = await import("node:fs/promises");
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-paste-e2e-"));
       const mock = await createMockOAuthMcpServer();
-      const commands = new Map<string, any>();
-      const events = new Map<string, any>();
+      const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       const notifications: Array<{ message: string; type?: string }> = [];
       let capturedAuthUrl: URL | undefined;
       const inputs = [
@@ -1088,7 +1097,7 @@ describe("OAuth Security Fixes", () => {
         },
       ];
       let inputCalls = 0;
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -1099,7 +1108,7 @@ describe("OAuth Security Fixes", () => {
             return typeof entry === "function" ? entry() : entry;
           },
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -1121,11 +1130,11 @@ describe("OAuth Security Fixes", () => {
         await extension(
           {
             registerTool: () => {},
-            registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-            on: (name: string, handler: any) => events.set(name, handler),
+            registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => commands.set(name, cmd),
+            on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
             getActiveTools: () => [],
             setActiveTools: () => {},
-          } as any,
+          } as unknown as ExtensionAPI,
           {
             bootstrapCwd: dir,
             globalConfigPath: join(dir, "no-global.json"),
@@ -1135,10 +1144,10 @@ describe("OAuth Security Fixes", () => {
             },
           },
         );
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // Act
-        await commands.get("mcp:auth").handler("remote", ctx);
+        await commands.get("mcp:auth")?.handler("remote", ctx);
 
         // Assert
         assert.strictEqual(inputCalls, 2);
@@ -1167,18 +1176,18 @@ describe("OAuth Security Fixes", () => {
       for (const maliciousAuthEndpoint of ["file:///etc/passwd", "smb://attacker.example.com/share"]) {
         const dir = await mkdtemp(join(tmpdir(), "pi-mcp-unsafe-scheme-"));
         const mock = await createMockOAuthMcpServer({ authorizationEndpoint: maliciousAuthEndpoint });
-        const commands = new Map<string, any>();
-        const events = new Map<string, any>();
+        const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+        const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
         const notifications: Array<{ message: string; type?: string }> = [];
         let browserOpenCalled = false;
-        const ctx: any = {
+        const ctx = createMockContext({
           cwd: dir,
           hasUI: true,
           ui: {
             notify: (message: string, type?: string) => notifications.push({ message, ...(type ? { type } : {}) }),
             select: async () => authCancelOption,
           },
-        };
+        });
 
         try {
           await mkdir(join(dir, ".pi"));
@@ -1200,11 +1209,11 @@ describe("OAuth Security Fixes", () => {
           await extension(
             {
               registerTool: () => {},
-              registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-              on: (name: string, handler: any) => events.set(name, handler),
+              registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => commands.set(name, cmd),
+              on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
               getActiveTools: () => [],
               setActiveTools: () => {},
-            } as any,
+            } as unknown as ExtensionAPI,
             {
               bootstrapCwd: dir,
               globalConfigPath: join(dir, "no-global.json"),
@@ -1214,10 +1223,10 @@ describe("OAuth Security Fixes", () => {
               },
             },
           );
-          await events.get("session_start")({}, ctx);
+          await events.get("session_start")?.({}, ctx);
 
           // Act
-          await commands.get("mcp:auth").handler("malicious", ctx);
+          await commands.get("mcp:auth")?.handler("malicious", ctx);
 
           // Assert
           assert.strictEqual(browserOpenCalled, false, `browserOpen must not be called for ${maliciousAuthEndpoint}`);
@@ -1238,11 +1247,11 @@ describe("OAuth Security Fixes", () => {
       const { mkdir, writeFile } = await import("node:fs/promises");
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-browser-fail-"));
       const mock = await createMockOAuthMcpServer();
-      const commands = new Map<string, any>();
-      const events = new Map<string, any>();
+      const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       const notifications: Array<{ message: string; type?: string }> = [];
       let capturedAuthUrl: URL | undefined;
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -1255,7 +1264,7 @@ describe("OAuth Security Fixes", () => {
             return `${redirectUri}?code=headless-code&state=${encodeURIComponent(state)}`;
           },
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -1277,11 +1286,11 @@ describe("OAuth Security Fixes", () => {
         await extension(
           {
             registerTool: () => {},
-            registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-            on: (name: string, handler: any) => events.set(name, handler),
+            registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => commands.set(name, cmd),
+            on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
             getActiveTools: () => [],
             setActiveTools: () => {},
-          } as any,
+          } as unknown as ExtensionAPI,
           {
             bootstrapCwd: dir,
             globalConfigPath: join(dir, "no-global.json"),
@@ -1292,10 +1301,10 @@ describe("OAuth Security Fixes", () => {
             },
           },
         );
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // Act
-        await commands.get("mcp:auth").handler("headless", ctx);
+        await commands.get("mcp:auth")?.handler("headless", ctx);
 
         // Assert
         assert.ok(
@@ -1401,22 +1410,22 @@ describe("OAuth Security Fixes", () => {
         failRefresh: true,
       });
 
-      const tools = new Map<string, any>();
-      const commands = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       const notifications: Array<{ message: string; type?: string }> = [];
       const selectPrompts: string[] = [];
       const statuses: Array<{ key: string; value: string | undefined }> = [];
 
       const pi = {
-        registerTool: (tool: any) => tools.set(tool.name, tool),
-        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-        on: (name: string, handler: any) => events.set(name, handler),
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => commands.set(name, cmd),
+        on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
         getActiveTools: () => [],
         setActiveTools: () => {},
       };
 
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -1431,7 +1440,7 @@ describe("OAuth Security Fixes", () => {
             statuses.push({ key, value });
           },
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -1450,7 +1459,7 @@ describe("OAuth Security Fixes", () => {
           }),
         );
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
@@ -1458,14 +1467,14 @@ describe("OAuth Security Fixes", () => {
         });
 
         // Act (Part 1: No stored client info — silent startup must hit N1 guard before DCR)
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // Assert (Part 1)
         assert.strictEqual(fakeServer.dcrCount, 0, "Silent startup must never trigger Dynamic Client Registration");
         assert.strictEqual(fakeServer.browserOpenCount, 0, "Silent startup must not open a browser when Not now is chosen");
         assert.deepStrictEqual(selectPrompts, ["eager-oauth needs authorization"]);
         assert.deepStrictEqual(statuses.at(-1), { key: "pi-mcp", value: "run /mcp:auth eager-oauth" });
-        await commands.get("mcp").handler("eager-oauth", ctx);
+        await commands.get("mcp")?.handler("eager-oauth", ctx);
         const detailAfterNoClient = notifications.at(-1)?.message ?? "";
         assert.match(detailAfterNoClient, /State:\s+stopped/);
         assert.match(detailAfterNoClient, /Retries:\s+0/);
@@ -1478,7 +1487,7 @@ describe("OAuth Security Fixes", () => {
           refresh_token: "expired-refresh-token",
           token_type: "Bearer",
         });
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // Assert (Part 2: Declined server is not prompted again during the same session)
         assert.strictEqual(selectPrompts.length, 1, "Declined server must not re-prompt on subsequent session_start with unchanged config");
@@ -1489,7 +1498,7 @@ describe("OAuth Security Fixes", () => {
 
         // Act (Part 3: Headless session_start notifies cleanly without duplicate AuthRequiredError: prefix)
         notifications.length = 0;
-        await events.get("session_start")({}, { ...ctx, hasUI: false });
+        await events.get("session_start")?.({}, { ...ctx, hasUI: false });
 
         // Assert (Part 3)
         const errorNotification = notifications.find((n) => n.type === "error");
@@ -1514,23 +1523,23 @@ describe("OAuth Security Fixes", () => {
         toolName: "oauth_echo",
       });
 
-      const tools = new Map<string, any>();
-      const commands = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       let activeTools: string[] = [];
       const selectPrompts: string[] = [];
 
       const pi = {
-        registerTool: (tool: any) => tools.set(tool.name, tool),
-        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-        on: (name: string, handler: any) => events.set(name, handler),
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => commands.set(name, cmd),
+        on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => {
           activeTools = names;
         },
       };
 
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -1546,7 +1555,7 @@ describe("OAuth Security Fixes", () => {
           },
           setStatus: () => {},
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -1565,7 +1574,7 @@ describe("OAuth Security Fixes", () => {
           }),
         );
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
@@ -1573,7 +1582,7 @@ describe("OAuth Security Fixes", () => {
         });
 
         // Act
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
         for (let i = 0; i < 200 && !activeTools.some((name) => name.includes("oauth_echo")); i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
@@ -1588,8 +1597,10 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(authStatus?.hasClientInfo, true);
         assert.strictEqual(authStatus?.hasTokens, true);
 
-        const statusResult = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
-        const statusRows = JSON.parse(statusResult.content[0].text);
+        const statusTool = tools.get("mcp_status");
+        assert.ok(statusTool);
+        const statusResult = await statusTool.execute("", {}, undefined, undefined, ctx);
+        const statusRows = JSON.parse(getText(statusResult.content[0]) || "[]");
         assert.strictEqual(statusRows[0].state, "ready");
         assert.deepStrictEqual(statusRows[0].tools, { discovered: 1, active: 1 });
         assert.ok(activeTools.some((name) => name.includes("oauth_echo")));
@@ -1614,8 +1625,8 @@ describe("OAuth Security Fixes", () => {
         toolName: "beta_echo",
       });
 
-      const tools = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       let activeTools: string[] = [];
       const timeline: string[] = [];
 
@@ -1643,9 +1654,9 @@ describe("OAuth Security Fixes", () => {
       });
 
       const pi = {
-        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
         registerCommand: () => {},
-        on: (name: string, handler: any) => events.set(name, handler),
+        on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => {
           activeTools = names;
@@ -1655,7 +1666,7 @@ describe("OAuth Security Fixes", () => {
         },
       };
 
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -1677,7 +1688,7 @@ describe("OAuth Security Fixes", () => {
           },
           setStatus: () => {},
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -1702,7 +1713,7 @@ describe("OAuth Security Fixes", () => {
           }),
         );
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
@@ -1713,7 +1724,7 @@ describe("OAuth Security Fixes", () => {
         });
 
         // Act
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
         await firstPromptVisible;
 
         // Assert that beta has NOT prompted while alpha's prompt is still waiting
@@ -1749,22 +1760,22 @@ describe("OAuth Security Fixes", () => {
         toolName: "oauth_echo",
       });
 
-      const tools = new Map<string, any>();
-      const commands = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       let activeTools: string[] = [];
 
       const pi = {
-        registerTool: (tool: any) => tools.set(tool.name, tool),
-        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-        on: (name: string, handler: any) => events.set(name, handler),
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => commands.set(name, cmd),
+        on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => {
           activeTools = names;
         },
       };
 
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -1775,7 +1786,7 @@ describe("OAuth Security Fixes", () => {
             }),
           setStatus: () => {},
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -1794,16 +1805,16 @@ describe("OAuth Security Fixes", () => {
           }),
         );
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
           browserOpen: fakeServer.browserOpen,
         });
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // Act (Step 1: Interactive /mcp:auth)
-        await commands.get("mcp:auth").handler("rotatable", ctx);
+        await commands.get("mcp:auth")?.handler("rotatable", ctx);
 
         // Assert (Step 1)
         assert.strictEqual(fakeServer.dcrCount, 1);
@@ -1817,9 +1828,9 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(initialTokens?.refresh_token, "refresh-token-1");
 
         // Act (Step 2: Stop server, expire access token on fake OAuth server, and reconnect silently via /mcp:start)
-        await commands.get("mcp:stop").handler("rotatable", ctx);
+        await commands.get("mcp:stop")?.handler("rotatable", ctx);
         fakeServer.expireAccessTokens();
-        await commands.get("mcp:start").handler("rotatable", ctx);
+        await commands.get("mcp:start")?.handler("rotatable", ctx);
 
         // Assert (Step 2: Silent refresh succeeded and rotated tokens on disk without opening browser or calling DCR)
         assert.strictEqual(fakeServer.dcrCount, 1, "Reconnect must reuse stored client_id and not call DCR again");
@@ -1840,7 +1851,7 @@ describe("OAuth Security Fixes", () => {
 
   describe("Origin-Bound OAuth State, DCR Persistence, and Re-Auth Edge Cases (Issues #22, #23)", () => {
     it("should canonicalize server URLs and isolate stored OAuth state across different server origins and paths (Issue 22.1)", async () => {
-      const oauthMod = (await import("../src/oauth-provider.js")) as any;
+      const oauthMod = await import("../src/oauth-provider.js");
       assert.strictEqual(typeof oauthMod.canonicalServerUrl, "function");
       assert.strictEqual(typeof oauthMod.urlsMatch, "function");
       assert.strictEqual(oauthMod.canonicalServerUrl("https://example.com/mcp///"), "https://example.com/mcp");
@@ -1975,7 +1986,9 @@ describe("OAuth Security Fixes", () => {
           redirect_uris: ["http://127.0.0.1:19876/callback"],
         });
 
-        const loaded = (await p1.clientInformation()) as any;
+        const loaded = (await p1.clientInformation()) as
+          | (Record<string, unknown> & { token_endpoint_auth_method?: string; redirect_uris?: string[] })
+          | undefined;
         assert.strictEqual(loaded?.client_id, "dcr-1");
         assert.strictEqual(loaded?.client_secret, "secret-1");
         assert.strictEqual(loaded?.client_id_issued_at, 1700000000);
@@ -2056,15 +2069,15 @@ describe("OAuth Security Fixes", () => {
       assert.strictEqual(isOAuthUnauthorizedError(new Error("Request 401 timed out after 30000ms")), false);
 
       // Cyclic cause chain must terminate and return false
-      const cycA: any = new Error("outer");
-      const cycB: any = new Error("inner");
+      const cycA = new Error("outer") as Error & { cause?: unknown };
+      const cycB = new Error("inner") as Error & { cause?: unknown };
       cycA.cause = cycB;
       cycB.cause = cycA;
       assert.strictEqual(isOAuthUnauthorizedError(cycA), false);
     });
 
     it("should fall back to POST on 405 in discoverManualAuthChallenge and forward custom headers via createHeadersFetch (Issue 23.5)", async () => {
-      const challengeMod = (await import("../src/auth-challenge.js")) as any;
+      const challengeMod = await import("../src/auth-challenge.js");
       assert.strictEqual(typeof challengeMod.createHeadersFetch, "function");
 
       const seenMethods: string[] = [];
@@ -2100,7 +2113,7 @@ describe("OAuth Security Fixes", () => {
       let capturedMerged: Headers | undefined;
       const wrappedFetch = challengeMod.createHeadersFetch(
         { "X-Base": "1", "X-Override": "base" },
-        async (_input: any, init?: RequestInit) => {
+        async (_input: unknown, init?: RequestInit) => {
           capturedMerged = new Headers(init?.headers);
           return new Response("ok", { status: 200 });
         },
@@ -2242,19 +2255,19 @@ describe("OAuth Security Fixes", () => {
       assert.ok(address && typeof address === "object");
       base = `http://127.0.0.1:${address.port}`;
 
-      const tools = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       let activeTools: string[] = [];
       let browserOpenCalls = 0;
 
       const pi = {
-        registerTool: (tool: any) => tools.set(tool.name, tool),
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
         registerCommand: () => {},
-        on: (name: string, handler: any) => events.set(name, handler),
+        on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => { activeTools = names; },
       };
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -2264,7 +2277,7 @@ describe("OAuth Security Fixes", () => {
               opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
             }),
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -2300,7 +2313,7 @@ describe("OAuth Security Fixes", () => {
           token_type: "Bearer",
         });
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
@@ -2312,10 +2325,12 @@ describe("OAuth Security Fixes", () => {
             void fetch(`${redirectUri}?code=browser-code-${browserOpenCalls}&state=${encodeURIComponent(state)}`);
           },
         });
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // Act (Part 1 — Issue 23.1: mcp_connect must invalidate rejected tokens after silent refresh 401 and open the browser)
-        await tools.get("mcp_connect").execute("", { name: "reauth" }, undefined, undefined, ctx);
+        const connectTool = tools.get("mcp_connect");
+        assert.ok(connectTool);
+        await connectTool.execute("", { name: "reauth" }, undefined, undefined, ctx);
 
         // Assert (Part 1)
         assert.strictEqual(browserOpenCalls, 1, "authorize() must open browser instead of silently refreshing again");
@@ -2323,14 +2338,18 @@ describe("OAuth Security Fixes", () => {
 
         // Act (Part 2 — Issue 23.2: Mid-session 401 during tool call transitions server to stopped + AuthRequiredError and deactivates tools)
         expireInteractiveTokenMidSession = true;
+        const protectedTool = tools.get("mcp_reauth_protected_action");
+        assert.ok(protectedTool);
         await assert.rejects(() =>
-          tools.get("mcp_reauth_protected_action").execute("", {}, undefined, undefined, ctx),
+          protectedTool.execute("", {}, undefined, undefined, ctx),
         );
 
         // Assert (Part 2: tools deactivated and mcp_status reports Authorization required)
         assert.strictEqual(activeTools.includes("mcp_reauth_protected_action"), false);
-        const statusRes = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
-        const statusRows = JSON.parse(statusRes.content[0].text);
+        const statusTool = tools.get("mcp_status");
+        assert.ok(statusTool);
+        const statusRes = await statusTool.execute("", {}, undefined, undefined, ctx);
+        const statusRows = JSON.parse(getText(statusRes.content[0]) || "[]");
         assert.strictEqual(statusRows[0].state, "stopped");
         assert.strictEqual(statusRows[0].auth, "authorization may be required");
         assert.match(statusRows[0].error, /Authorization required/);
@@ -2350,9 +2369,9 @@ describe("OAuth Security Fixes", () => {
       const fakeBeta = await startFakeOAuthServer({ serverName: "beta", toolName: "beta_echo" });
       const fakeGamma = await startFakeOAuthServer({ serverName: "gamma", toolName: "gamma_echo" });
 
-      const tools = new Map<string, any>();
-      const commands = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const commands = new Map<string, MockCommand>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       let activeTools: string[] = [];
       const timeline: string[] = [];
       const statuses: Array<string | undefined> = [];
@@ -2368,9 +2387,9 @@ describe("OAuth Security Fixes", () => {
       let resolveGammaPrompt!: (choice: string) => void;
 
       const pi = {
-        registerTool: (tool: any) => tools.set(tool.name, tool),
-        registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
-        on: (name: string, handler: any) => events.set(name, handler),
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+        registerCommand: (name: string, cmd: unknown) => commands.set(name, cmd as MockCommand),
+        on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => events.set(name, handler),
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => {
           activeTools = names;
@@ -2380,7 +2399,7 @@ describe("OAuth Security Fixes", () => {
         },
       };
 
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
@@ -2413,7 +2432,7 @@ describe("OAuth Security Fixes", () => {
             });
           },
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"));
@@ -2444,7 +2463,7 @@ describe("OAuth Security Fixes", () => {
           }),
         );
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
@@ -2460,20 +2479,20 @@ describe("OAuth Security Fixes", () => {
           },
         });
 
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
         await alphaPromptOpen;
 
         // 1. Trigger a duplicate session_start while alpha's prompt is open and beta/gamma are queued:
         // must NOT enqueue duplicate startup prompts for alpha, beta, or gamma.
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         // 2. Cancel beta's queued startup prompt via `/mcp:stop beta` while alpha's prompt is still open
-        await commands.get("mcp:stop").handler("beta", ctx);
+        await commands.get("mcp:stop")?.handler("beta", ctx);
 
         // 3. Run `/mcp:auth alpha` while alpha's startup prompt is open:
         // alpha's interactive OAuth must execute IMMEDIATELY inside alpha's current authQueue turn
         // BEFORE gamma's startup prompt opens!
-        const authAlphaPromise = commands.get("mcp:auth").handler("alpha", ctx);
+        const authAlphaPromise = commands.get("mcp:auth")?.handler("alpha", ctx);
         await gammaPromptOpen;
         await authAlphaPromise;
 
@@ -2491,14 +2510,14 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(statuses.at(-1), "run /mcp:auth gamma");
 
         // Now trigger session_start again so stopped beta fails silent auth and prompts -> decline beta too
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
         for (let i = 0; i < 50 && statuses.at(-1) !== "run /mcp:auth beta"; i++) {
           await new Promise((r) => setTimeout(r, 10));
         }
         assert.strictEqual(statuses.at(-1), "run /mcp:auth beta");
 
         // Connect beta via /mcp:auth beta -> status bar must update from beta back to remaining declined server gamma!
-        await commands.get("mcp:auth").handler("beta", ctx);
+        await commands.get("mcp:auth")?.handler("beta", ctx);
         assert.strictEqual(
           statuses.at(-1),
           "run /mcp:auth gamma",
@@ -2506,7 +2525,7 @@ describe("OAuth Security Fixes", () => {
         );
 
         // Connect gamma via /mcp:auth gamma -> status bar must clear to undefined!
-        await commands.get("mcp:auth").handler("gamma", ctx);
+        await commands.get("mcp:auth")?.handler("gamma", ctx);
         assert.strictEqual(statuses.at(-1), undefined);
       } finally {
         await events.get("session_shutdown")?.({}, ctx);
@@ -2562,23 +2581,23 @@ describe("OAuth Security Fixes", () => {
       const addr = listener.address();
       assert.ok(addr && typeof addr === "object");
 
-      const tools = new Map<string, any>();
-      const events = new Map<string, any>();
+      const tools = new Map<string, ToolDefinition>();
+      const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
       const pi = {
-        registerTool: (t: any) => tools.set(t.name, t),
+        registerTool: (t: ToolDefinition) => tools.set(t.name, t),
         registerCommand: () => {},
-        on: (n: string, h: any) => events.set(n, h),
+        on: (n: string, h: (event: unknown, ctx: unknown) => unknown) => events.set(n, h),
         getActiveTools: () => [],
         setActiveTools: () => {},
       };
-      const ctx: any = {
+      const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
           notify: () => {},
           select: async () => authCancelOption,
         },
-      };
+      });
 
       try {
         await mkdir(join(dir, ".pi"), { recursive: true });
@@ -2597,7 +2616,7 @@ describe("OAuth Security Fixes", () => {
           }),
         );
 
-        await extension(pi as any, {
+        await extension(pi as unknown as ExtensionAPI, {
           bootstrapCwd: dir,
           globalConfigPath: join(dir, "no-global.json"),
           authStorageDir: authDir,
@@ -2605,12 +2624,12 @@ describe("OAuth Security Fixes", () => {
             browserOpenCount++;
           },
         });
-        await events.get("session_start")({}, ctx);
+        await events.get("session_start")?.({}, ctx);
 
         const controller = new AbortController();
-        const connectPromise = tools
-          .get("mcp_connect")
-          .execute("", { name: "challengeSrv" }, controller.signal, undefined, ctx);
+        const connectTool = tools.get("mcp_connect");
+        assert.ok(connectTool);
+        const connectPromise = connectTool.execute("", { name: "challengeSrv" }, controller.signal, undefined, ctx);
 
         await challengeEntered;
         controller.abort();

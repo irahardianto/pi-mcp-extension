@@ -57,13 +57,13 @@ export default tseslint.config(
       "@typescript-eslint/no-unnecessary-type-assertion": "error",
       "no-empty": ["error", { allowEmptyCatch: false }],
       "@typescript-eslint/no-empty-function": "error",
+      "@typescript-eslint/no-explicit-any": "error",
     },
   },
   {
     files: ["src/**/*.ts"],
     rules: {
       "no-console": ["error", { allow: ["error"] }],
-      "@typescript-eslint/no-explicit-any": "error",
     },
   },
   {
@@ -71,8 +71,6 @@ export default tseslint.config(
     rules: {
       "no-console": "off",
       "@typescript-eslint/no-empty-function": "off",
-      // WHY: temporarily `warn` in tests only (319 pre-existing findings); tracked by #73, which flips it to `error`.
-      "@typescript-eslint/no-explicit-any": "warn",
     },
   },
 );

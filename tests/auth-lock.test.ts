@@ -16,6 +16,7 @@ import {
   type AuthLockClock,
   type AuthLockDeps,
   type AuthLockFs,
+  type AuthLockTimer,
   type LockRecord,
 } from "../src/auth-lock.js";
 import { getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
@@ -34,18 +35,22 @@ function createFakeClock(initialNow = 1_000_000) {
   let nextId = 1;
   const intervals = new Map<number, { cb: () => unknown; ms: number }>();
 
+  interface FakeTimer extends AuthLockTimer {
+    id: number;
+  }
+
   const clock: AuthLockClock = {
     now: () => currentNow,
-    setInterval: (cb, ms) => {
+    setInterval: (cb, ms): FakeTimer => {
       const id = nextId++;
       intervals.set(id, { cb, ms });
       return {
         id,
         unref() {},
-      } as any;
+      };
     },
-    clearInterval: (timer: any) => {
-      const id = typeof timer === "object" && timer !== null ? timer.id : timer;
+    clearInterval: (timer: ReturnType<typeof setInterval> | AuthLockTimer) => {
+      const id = typeof timer === "object" && timer !== null && "id" in timer && typeof timer.id === "number" ? timer.id : Number(timer);
       intervals.delete(id);
     },
   };

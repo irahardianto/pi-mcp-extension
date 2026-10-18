@@ -90,14 +90,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   switch (name) {
-    case "echo":
+    case "echo": {
+      const message = typeof args?.["message"] === "string" ? args["message"] : String(args?.["message"] ?? "");
       return {
-        content: [{ type: "text", text: `Echo: ${(args as any).message}` }],
+        content: [{ type: "text", text: `Echo: ${message}` }],
         isError: false,
       };
+    }
 
     case "add": {
-      const result = (args as any).a + (args as any).b;
+      const a = Number(args?.["a"] ?? 0);
+      const b = Number(args?.["b"] ?? 0);
+      const result = a + b;
       return {
         content: [{ type: "text", text: String(result) }],
         isError: false,
@@ -105,7 +109,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "get_status": {
-      const format = (args as any).format ?? "text";
+      const format = args?.["format"] ?? "text";
       const status = { server: "pi-mcp-test", uptime: process.uptime() };
       return {
         content: [
