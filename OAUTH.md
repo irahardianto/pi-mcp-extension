@@ -102,7 +102,7 @@ Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json` (or `<agent d
 
 ### Reset Authentication
 
-To discard stored tokens and client registration, run `/mcp:auth deepsource --reset` in an interactive Pi session. The old `/mcp:auth deepsource` reset behavior has changed: like `mcp_connect` and `/mcp:start`, it now reuses stored credentials and requests browser authorization only if needed.
+To discard stored tokens and client registration, run `/mcp:auth deepsource --reset` in an interactive Pi session. The old `/mcp:auth deepsource` reset behavior has changed: like `mcp_connect` and `/mcp:start`, `/mcp:auth <name>` now reuses stored credentials and the cached Dynamic Client Registration (`clientInfo.client_id`), requesting browser authorization only if needed. Use `--reset` whenever you need to discard the cached `client_id` and re-run Dynamic Client Registration (for example, if a provider expires or revokes a previously registered client).
 
 Interactive flows for different servers run one at a time in each Pi process, and a per-server lock (`~/.pi/agent/mcp-auth/<hash>.json.lock`, or `<agent dir>/mcp-auth/<hash>.json.lock` when `$PI_CODING_AGENT_DIR` is set) prevents simultaneous interactive flows in different Pi processes. Each lock records the holder's PID, hostname, and a unique nonce, and refreshes its file `mtime` every 30 seconds while authorization is pending. Stale locks from a crashed or `SIGKILL`ed Pi process on the same host are reclaimed automatically as soon as the dead PID is detected, and locks whose heartbeat is older than 90 seconds are reclaimed automatically across hosts (covering PID reuse and shared filesystems). Note that if a machine sleeps or is suspended for more than 90 seconds while browser authorization is waiting, another Pi process may treat the lock as stale and reclaim it; the original flow verifies its lock nonce before writing credentials and aborts with a retry error if the lock was lost. Independent processes can still attempt silent token refresh at the same time (persisting rotated tokens even while an interactive lock is held, with an in-memory fallback if disk writes fail), and PKCE verifiers remain in memory per flow.
 
@@ -175,6 +175,12 @@ When `redirectUrl` is omitted, the callback server scans forward from port `1987
 ### Token refresh failed
 
 Tokens are automatically refreshed by the MCP SDK. If refresh fails, use `mcp_connect` or `/mcp:auth <name>` in an interactive Pi session. Use `--reset` only if stored credentials must be discarded.
+
+### `"Unrecognized client_id"` or `"invalid_client"` in the browser
+
+`/mcp:auth <name>` reuses the Dynamic Client Registration (`clientInfo.client_id`) cached in `<agent dir>/mcp-auth/<hash>.json`. Some OAuth providers (such as Supabase) periodically expire or purge dynamically registered clients and render errors like `{"message":"Unrecognized client_id"}` directly in the browser tab without redirecting back to the local callback server.
+
+Run `/mcp:auth <name> --reset` (e.g. `/mcp:auth supabase --reset`) to delete the cached state file, register a new `client_id` via Dynamic Client Registration, and open a fresh authorization URL.
 
 ## Architecture
 

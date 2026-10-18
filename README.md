@@ -183,8 +183,8 @@ Server-name arguments provide autocomplete suggestions from the configured MCP s
 | `/mcp <name>` | Show detailed status and stderr log for a specific server |
 | `/mcp:start <name>` | Connect a server and wait for tool discovery |
 | `/mcp:stop <name>` | Cancel a pending connection, startup prompt, or authorization, or stop a running server and deactivate its tools |
-| `/mcp:auth <name>` | Connect with stored OAuth credentials; request browser authorization only if needed |
-| `/mcp:auth <name> --reset` | Discard stored OAuth credentials and request fresh authorization |
+| `/mcp:auth <name>` | Connect with stored OAuth credentials and client registration; request browser authorization only if needed |
+| `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization |
 
 Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, discovered and active tool counts, credential presence, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text.
 
@@ -194,6 +194,7 @@ Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and
 - **Startup prompt for eager OAuth servers**: Silent startup and background reconnects never open a browser unprompted or trigger Dynamic Client Registration when no client credentials are stored. When an `eager` OAuth server needs interactive authorization at startup in an interactive Pi session, Pi presents a sequential `<name> needs authorization` prompt (`Authorize now` / `Not now`). Choosing `Authorize now` runs the interactive OAuth flow; choosing `Not now` leaves the server stopped, shows a `run /mcp:auth <name>` footer hint, and remembers the decline for the rest of the session.
 - **Headless and SSH support**: While authorization is pending, Pi displays the authorization URL and offers `Retry: open browser again`, `Paste redirect URL`, and `Cancel authentication`. On remote/SSH or headless machines, open the URL locally and either forward the callback port (`ssh -L <port>:127.0.0.1:<port>`) or paste the browser's final `http://127.0.0.1:<port>/callback?code=...&state=...` redirect URL into `Paste redirect URL`. Only `https:` (or loopback `http:`) authorization URLs are passed to the system browser opener.
 - **Coordinated connects and cross-process locks**: Concurrent connect requests join an in-flight attempt, while `--reset` supersedes a normal connect and shares one pending reset. Cross-process interactive flows are serialized per server via `<agent dir>/mcp-auth/<hash>.json.lock` with a 30s heartbeat and automatic reclamation of locks from dead local PIDs or stale heartbeats (>90s), while allowing silent token refreshes to persist rotated tokens.
+- **Resetting stale client registrations (`--reset`)**: `/mcp:auth <name>` reuses the cached Dynamic Client Registration (`clientInfo.client_id`) stored in `<agent dir>/mcp-auth/<hash>.json`. If an OAuth provider expires or purges a previously registered client—for example, when the browser displays `{"message":"Unrecognized client_id"}` or `invalid_client` on the authorization page without redirecting back to the local callback—run `/mcp:auth <name> --reset` to discard the cached `client_id`, register a new client via Dynamic Client Registration, and start a fresh authorization flow.
 
 ### Connection readiness and active tools
 
