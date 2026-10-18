@@ -47,7 +47,7 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
     assert.equal(opens, expected);
   };
   const assertStopped = async () => {
-    await commands.get("mcp")?.handler("team server", ctx);
+    await commands.get("mcp").handler("team server", ctx);
     assert.match(messages.at(-1)!, /State:  stopped/);
   };
   try {
@@ -59,8 +59,8 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
       },
     }));
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "missing.json"), authStorageDir: join(dir, "auth"), browserOpen: () => { opens++; } });
-    await events.get("session_start")?.({}, ctx);
-    await commands.get("mcp:auth")?.handler("  team server  ", ctx);
+    await events.get("session_start")({}, ctx);
+    await commands.get("mcp:auth").handler("  team server  ", ctx);
     assert.equal(opens, 2, "One initial browser launch and one explicit Retry");
     assert.equal(choices, 2);
     assert.ok(messages.some((message) => /Authentication cancelled for team server/.test(message)));
@@ -69,20 +69,20 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
     const provider = new McpOAuthProvider("team server", { clientId: "test-client" }, undefined, join(dir, "auth"));
     await provider.saveTokens({ access_token: "test-token", token_type: "Bearer" });
     ctx.ui.select = () => new Promise(() => {});
-    const firstReset = commands.get("mcp:auth")?.handler("team server --reset", ctx);
+    const firstReset = commands.get("mcp:auth").handler("team server --reset", ctx);
     await waitForOpen(3);
-    const repeatedReset = commands.get("mcp:auth")?.handler("team server --reset", ctx);
-    const joinedStart = commands.get("mcp:start")?.handler("team server", ctx);
-    await commands.get("mcp:stop")?.handler("team server", ctx);
+    const repeatedReset = commands.get("mcp:auth").handler("team server --reset", ctx);
+    const joinedStart = commands.get("mcp:start").handler("team server", ctx);
+    await commands.get("mcp:stop").handler("team server", ctx);
     await Promise.all([firstReset, repeatedReset, joinedStart]);
     assert.equal(opens, 3, "Repeated reset must not open a second authorization");
     assert.equal((await getAuthStatus("team server", join(dir, "auth")))?.hasTokens, false);
     await assertStopped();
 
-    const shutdownReset = commands.get("mcp:auth")?.handler("team server --reset", ctx);
+    const shutdownReset = commands.get("mcp:auth").handler("team server --reset", ctx);
     await waitForOpen(4);
-    const shutdownStart = commands.get("mcp:start")?.handler("team server", ctx);
-    await events.get("session_shutdown")?.({}, ctx);
+    const shutdownStart = commands.get("mcp:start").handler("team server", ctx);
+    await events.get("session_shutdown")({}, ctx);
     await Promise.all([shutdownReset, shutdownStart]);
     assert.equal(opens, 4);
     await assertStopped();
@@ -140,20 +140,21 @@ it("stops a ready server on /mcp:auth and re-authenticates interactively instead
         browserOpen: fakeServer.browserOpen,
       },
     );
-    await events.get("session_start")?.({}, ctx);
+    await events.get("session_start")({}, ctx);
 
     // Step 1: Initial /mcp:auth connects and reaches ready state
-    await commands.get("mcp:auth")?.handler("ready-oauth", ctx);
+    await commands.get("mcp:auth").handler("ready-oauth", ctx);
     assert.equal(fakeServer.browserOpenCount, 1);
 
     // Step 2: While server is still in "ready" state, expire tokens and fail refresh on the server, then run /mcp:auth again
     fakeServer.expireAccessTokens();
     fakeServer.failRefresh = true;
-    await commands.get("mcp:auth")?.handler("ready-oauth", ctx);
+    await commands.get("mcp:auth").handler("ready-oauth", ctx);
+    const activeTools = mockExt.activeTools;
 
     // Assert: /mcp:auth stopped the ready server, detected the 401/failed refresh, and opened the browser a second time
     assert.equal(fakeServer.browserOpenCount, 2);
-    assert.ok(mockExt.activeTools.some((name) => name.includes("ready_echo")));
+    assert.ok(activeTools.some((name) => name.includes("ready_echo")));
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await fakeServer.close();
@@ -240,11 +241,11 @@ it("should report usage on bare /mcp:auth --reset, support leading /mcp:auth --r
         browserOpen: fakeServer.browserOpen,
       },
     );
-    await events.get("session_start")?.({}, ctx);
+    await events.get("session_start")({}, ctx);
 
     // 1. Bare `/mcp:auth --reset` must notify Usage error, NOT "No OAuth server named --reset"
     notifications.length = 0;
-    await commands.get("mcp:auth")?.handler("--reset", ctx);
+    await commands.get("mcp:auth").handler("--reset", ctx);
     assert.deepEqual(notifications, [{ msg: "Usage: /mcp:auth <name> [--reset]", level: "error" }]);
 
     // 2. Leading `/mcp:auth --reset oauth-srv` must reset stored tokens and run interactive OAuth
@@ -259,14 +260,14 @@ it("should report usage on bare /mcp:auth --reset, support leading /mcp:auth --r
       fakeServer.mcpUrl,
     );
     await provider.saveTokens({ access_token: "stale-valid-token", token_type: "Bearer" });
-    await commands.get("mcp:auth")?.handler("--reset oauth-srv", ctx);
+    await commands.get("mcp:auth").handler("--reset oauth-srv", ctx);
     assert.equal(fakeServer.browserOpenCount, 1, "Leading --reset must discard stored tokens and open browser");
 
     // 3. Cancelling `/mcp:start slow-plain` via `/mcp:stop slow-plain` must NOT emit a false error notification
     notifications.length = 0;
-    const startPromise = commands.get("mcp:start")?.handler("slow-plain", ctx);
+    const startPromise = commands.get("mcp:start").handler("slow-plain", ctx);
     await httpReached;
-    await commands.get("mcp:stop")?.handler("slow-plain", ctx);
+    await commands.get("mcp:stop").handler("slow-plain", ctx);
     releaseHttpConnect();
     await startPromise;
 

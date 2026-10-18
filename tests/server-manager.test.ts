@@ -41,7 +41,10 @@ function makeMockConfig(overrides?: Partial<McpConfig>): McpConfig {
 }
 
 interface MockToolResult {
-  content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+  content: [
+    { type: string; text: string; [key: string]: unknown },
+    ...Array<{ type: string; text: string; [key: string]: unknown }>,
+  ];
   isError?: boolean;
   [key: string]: unknown;
 }
@@ -163,7 +166,7 @@ describe("ServerManager integration (stdio)", () => {
     );
     assert.ok(Array.isArray(result.content));
     assert.equal(result.content[0]?.type, "text");
-    assert.ok(result.content[0]?.text?.includes("hello from pi-mcp!"));
+    assert.ok(result.content[0]?.text.includes("hello from pi-mcp!"));
   });
 
   it("executes add tool with numbers", async () => {
@@ -189,7 +192,7 @@ describe("ServerManager integration (stdio)", () => {
       () => {},
       {},
     );
-    assert.ok(result.content[0]?.text?.includes("uptime"));
+    assert.ok(result.content[0]?.text.includes("uptime"));
   });
 
   it("propagates isError: true as McpError", async () => {
@@ -461,7 +464,7 @@ await server.connect(new StdioServerTransport());
       const inspectTool = mockPi.tools.find((t) => t.name.includes("inspect_env"));
       assert.ok(inspectTool);
       const res = await inspectTool.execute("c1", {}, undefined, () => {}, {});
-      const data = JSON.parse(res.content[0]?.text ?? "{}");
+      const data = JSON.parse(res.content[0].text);
       assert.equal(data.cwd, specialCwd);
       assert.deepEqual(data.roots, [
         {
@@ -677,24 +680,24 @@ await server.connect(new StdioServerTransport());
     try {
       await extension(mockExt.api, { bootstrapCwd: cwd1, globalConfigPath });
       const ctx1 = makeCtx(cwd1);
-      await events.get("session_start")?.({}, ctx1);
+      await events.get("session_start")({}, ctx1);
 
       // Connect lazy server in cwd1
-      await tools.get("mcp_connect")?.execute("", { name: "rootsSrv" }, undefined, undefined, ctx1);
+      await tools.get("mcp_connect").execute("", { name: "rootsSrv" }, undefined, undefined, ctx1);
       const getRootsTool = tools.get("mcp_rootsSrv_get_roots");
       assert.ok(getRootsTool);
 
-      const res1 = JSON.parse((await getRootsTool.execute("1", {}, undefined, () => {}, ctx1)).content[0]?.text ?? "{}");
+      const res1 = JSON.parse((await getRootsTool.execute("1", {}, undefined, () => {}, ctx1)).content[0].text);
       assert.deepEqual(res1.roots, [{ uri: pathToFileURL(cwd1).href, name: "workspace-alpha" }]);
       assert.equal(res1.notifications, 0);
 
       // Switch session to cwd2 (identical global McpConfig, server already ready!)
       const ctx2 = makeCtx(cwd2);
-      await events.get("session_start")?.({}, ctx2);
+      await events.get("session_start")({}, ctx2);
       // Allow notification frame to be processed by child server
       await new Promise((r) => setTimeout(r, 25));
 
-      const res2 = JSON.parse((await getRootsTool.execute("2", {}, undefined, () => {}, ctx2)).content[0]?.text ?? "{}");
+      const res2 = JSON.parse((await getRootsTool.execute("2", {}, undefined, () => {}, ctx2)).content[0].text);
       assert.deepEqual(res2.roots, [{ uri: pathToFileURL(cwd2).href, name: "workspace-beta" }]);
       assert.equal(res2.notifications, 1, "Expected 1 notifications/roots/list_changed when session_start switches to cwd2");
 
@@ -720,9 +723,8 @@ await server.connect(new StdioServerTransport());
         await manager.startServer("directProbe", cwd1);
         await manager.startServer("directProbe", cwd3);
         await new Promise((r) => setTimeout(r, 25));
-        const directTool = mockPi.tools.find((t) => t.name.includes("get_roots"));
-        assert.ok(directTool);
-        const res3 = JSON.parse((await directTool.execute("3", {}, undefined, () => {}, {})).content[0]?.text ?? "{}");
+        const directTool = mockPi.tools.find((t) => t.name.includes("get_roots"))!;
+        const res3 = JSON.parse((await directTool.execute("3", {}, undefined, () => {}, {})).content[0].text);
         assert.deepEqual(res3.roots, [{ uri: pathToFileURL(cwd3).href, name: "workspace-gamma" }]);
         assert.equal(res3.notifications, 1);
       } finally {

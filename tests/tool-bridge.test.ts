@@ -6,18 +6,53 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
 import {
   convertJsonSchemaToTypebox,
   buildToolName,
   convertMcpContent,
   ToolBridge,
   listAllTools,
-  type PiExtensionAPI,
 } from "../src/tool-bridge.js";
 
-interface SchemaJson {
-  type?: string | string[];
+type SchemaTuple = [SchemaJson, SchemaJson, SchemaJson, SchemaJson, ...SchemaJson[]];
+type SchemaProps = Record<
+  | "name"
+  | "age"
+  | "address"
+  | "city"
+  | "zip"
+  | "str"
+  | "num"
+  | "int"
+  | "bool"
+  | "anyOfStr"
+  | "oneOfInt"
+  | "filter"
+  | "mode"
+  | "id"
+  | "email"
+  | "actor"
+  | "host"
+  | "next"
+  | "value"
+  | "start"
+  | "b"
+  | "count"
+  | "self"
+  | "left"
+  | "right"
+  | "mirrorId"
+  | "containerChild"
+  | "escapedRef"
+  | "protoRef",
+  SchemaJson
+> &
+  Record<string, SchemaJson>;
+
+interface SchemaJson extends TSchema {
+  type?: string;
   description?: string;
   title?: string;
   default?: unknown;
@@ -35,25 +70,33 @@ interface SchemaJson {
   uniqueItems?: boolean;
   minProperties?: number;
   maxProperties?: number;
-  properties?: Record<string, SchemaJson>;
-  patternProperties?: Record<string, SchemaJson>;
-  additionalProperties?: boolean | SchemaJson;
-  required?: string[];
-  anyOf?: SchemaJson[];
-  oneOf?: SchemaJson[];
-  allOf?: SchemaJson[];
-  items?: SchemaJson | SchemaJson[];
-  prefixItems?: SchemaJson[];
   const?: unknown;
-  enum?: unknown[];
-  [key: string]: unknown;
+  required?: string[];
+  properties: SchemaProps;
+  patternProperties?: Record<string, SchemaJson>;
+  additionalProperties: SchemaJson;
+  items: SchemaJson & SchemaTuple;
+  anyOf: SchemaTuple;
+  oneOf: SchemaTuple;
+  allOf: SchemaTuple;
 }
+
+type TestToolDefinition = Omit<ToolDefinition, "description" | "execute"> & {
+  description: string;
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+    ctx?: unknown,
+  ) => ReturnType<ToolDefinition["execute"]>;
+};
 
 // ── Schema Conversion ─────────────────────────────────────────────────────────
 
 describe("convertJsonSchemaToTypebox", () => {
   it("converts string type", () => {
-    const schema = convertJsonSchemaToTypebox({ type: "string" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ type: "string" }) as SchemaJson;
     assert.equal(schema.type, "string");
   });
 
@@ -61,7 +104,7 @@ describe("convertJsonSchemaToTypebox", () => {
     const schema = convertJsonSchemaToTypebox({
       type: "string",
       description: "A name",
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(schema.description, "A name");
   });
 
@@ -69,26 +112,26 @@ describe("convertJsonSchemaToTypebox", () => {
     const schema = convertJsonSchemaToTypebox({
       type: "string",
       enum: ["json", "text", "yaml"],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(schema.anyOf, "Should be a Union (anyOf)");
     assert.equal(schema.anyOf.length, 3);
-    assert.equal(schema.anyOf[0]?.const, "json");
-    assert.equal(schema.anyOf[1]?.const, "text");
-    assert.equal(schema.anyOf[2]?.const, "yaml");
+    assert.equal(schema.anyOf[0].const, "json");
+    assert.equal(schema.anyOf[1].const, "text");
+    assert.equal(schema.anyOf[2].const, "yaml");
   });
 
   it("converts number type", () => {
-    const schema = convertJsonSchemaToTypebox({ type: "number" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ type: "number" }) as SchemaJson;
     assert.equal(schema.type, "number");
   });
 
   it("converts integer as Integer", () => {
-    const schema = convertJsonSchemaToTypebox({ type: "integer" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ type: "integer" }) as SchemaJson;
     assert.equal(schema.type, "integer");
   });
 
   it("converts boolean type", () => {
-    const schema = convertJsonSchemaToTypebox({ type: "boolean" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ type: "boolean" }) as SchemaJson;
     assert.equal(schema.type, "boolean");
   });
 
@@ -96,7 +139,7 @@ describe("convertJsonSchemaToTypebox", () => {
     const schema = convertJsonSchemaToTypebox({
       type: "array",
       items: { type: "string" },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(schema.type, "array");
   });
 
@@ -108,7 +151,7 @@ describe("convertJsonSchemaToTypebox", () => {
         age: { type: "number" },
       },
       required: ["name"],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(schema.properties, "Should have properties");
     // TypeBox (Pi's version) expresses optionality via the `required` array,
     // not via Symbol modifiers. 'name' is required, 'age' is optional.
@@ -127,14 +170,14 @@ describe("convertJsonSchemaToTypebox", () => {
         },
       },
       required: ["address"],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(schema.properties, "Should have properties");
     const inner = schema.properties.address;
-    assert.ok(inner?.properties, "Nested object should have properties");
+    assert.ok(inner.properties, "Nested object should have properties");
   });
 
   it("falls back to Any for unknown type", () => {
-    const schema = convertJsonSchemaToTypebox({ type: "unknown-type" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ type: "unknown-type" }) as SchemaJson;
     // Any schema has no specific type field — check it doesn't throw and returns object
     assert.ok(typeof schema === "object");
   });
@@ -142,21 +185,21 @@ describe("convertJsonSchemaToTypebox", () => {
   it("converts oneOf to Union", () => {
     const schema = convertJsonSchemaToTypebox({
       oneOf: [{ type: "string" }, { type: "number" }],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(schema.anyOf, "oneOf should produce a Union (anyOf)");
     assert.equal(schema.anyOf.length, 2);
-    assert.equal(schema.anyOf[0]?.type, "string");
-    assert.equal(schema.anyOf[1]?.type, "number");
+    assert.equal(schema.anyOf[0].type, "string");
+    assert.equal(schema.anyOf[1].type, "number");
   });
 
   it("converts anyOf to Union with Null ordered first", () => {
     const schema = convertJsonSchemaToTypebox({
       anyOf: [{ type: "boolean" }, { type: "null" }],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(schema.anyOf, "anyOf should produce a Union");
     assert.equal(schema.anyOf.length, 2);
-    assert.equal(schema.anyOf[0]?.type, "null");
-    assert.equal(schema.anyOf[1]?.type, "boolean");
+    assert.equal(schema.anyOf[0].type, "null");
+    assert.equal(schema.anyOf[1].type, "boolean");
   });
 
   it("converts allOf to Intersect", () => {
@@ -165,7 +208,7 @@ describe("convertJsonSchemaToTypebox", () => {
         { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
         { type: "object", properties: { age: { type: "number" } }, required: ["age"] },
       ],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(schema.allOf, "allOf should produce an Intersect (allOf)");
     assert.equal(schema.allOf.length, 2);
   });
@@ -174,7 +217,7 @@ describe("convertJsonSchemaToTypebox", () => {
     const schema = convertJsonSchemaToTypebox({
       $ref: "#/$defs/MyString",
       $defs: { MyString: { type: "string" } },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(schema.type, "string", "$ref should resolve to the referenced type");
   });
 
@@ -182,7 +225,7 @@ describe("convertJsonSchemaToTypebox", () => {
     const schema = convertJsonSchemaToTypebox({
       $ref: "#/definitions/Foo",
       definitions: { Foo: { type: "boolean" } },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(schema.type, "boolean");
   });
 
@@ -191,24 +234,24 @@ describe("convertJsonSchemaToTypebox", () => {
       $ref: "#/$defs/Inner",
       description: "A description from the ref",
       $defs: { Inner: { type: "string" } },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(schema.type, "string");
     assert.equal(schema.description, "A description from the ref");
   });
 
   it("falls back to Any for unresolvable $ref", () => {
-    const schema = convertJsonSchemaToTypebox({ $ref: "#/definitions/NonExistent" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ $ref: "#/definitions/NonExistent" }) as SchemaJson;
     assert.ok(typeof schema === "object");
   });
 
   it("falls back to Any for external $ref", () => {
-    const schema = convertJsonSchemaToTypebox({ $ref: "external-schema.json#/Foo" }) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox({ $ref: "external-schema.json#/Foo" }) as SchemaJson;
     assert.ok(typeof schema === "object");
   });
 
   it("handles nullable types: {type: ['string', 'null']} with Null first to prevent Value.Convert coercion", async () => {
     const { Value } = await import("typebox/value");
-    const rawSchema = convertJsonSchemaToTypebox({
+    const schema = convertJsonSchemaToTypebox({
       type: "object",
       properties: {
         str: { type: ["string", "null"] },
@@ -227,23 +270,22 @@ describe("convertJsonSchemaToTypebox", () => {
           properties: { tag: { type: "string" } },
         },
       },
-    });
-    const schema = rawSchema as unknown as SchemaJson;
+    }) as SchemaJson;
 
-    assert.equal(schema.properties?.str?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.str?.anyOf?.[1]?.type, "string");
-    assert.equal(schema.properties?.num?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.num?.anyOf?.[1]?.type, "number");
-    assert.equal(schema.properties?.int?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.int?.anyOf?.[1]?.type, "integer");
-    assert.equal(schema.properties?.bool?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.bool?.anyOf?.[1]?.type, "boolean");
-    assert.equal(schema.properties?.anyOfStr?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.oneOfInt?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.filter?.anyOf?.[0]?.type, "null");
-    assert.equal(schema.properties?.mode?.anyOf?.[0]?.type, "null");
+    assert.equal(schema.properties.str.anyOf[0].type, "null");
+    assert.equal(schema.properties.str.anyOf[1].type, "string");
+    assert.equal(schema.properties.num.anyOf[0].type, "null");
+    assert.equal(schema.properties.num.anyOf[1].type, "number");
+    assert.equal(schema.properties.int.anyOf[0].type, "null");
+    assert.equal(schema.properties.int.anyOf[1].type, "integer");
+    assert.equal(schema.properties.bool.anyOf[0].type, "null");
+    assert.equal(schema.properties.bool.anyOf[1].type, "boolean");
+    assert.equal(schema.properties.anyOfStr.anyOf[0].type, "null");
+    assert.equal(schema.properties.oneOfInt.anyOf[0].type, "null");
+    assert.equal(schema.properties.filter.anyOf[0].type, "null");
+    assert.equal(schema.properties.mode.anyOf[0].type, "null");
 
-    const convertedNulls = Value.Convert(rawSchema, {
+    const convertedNulls = Value.Convert(schema, {
       str: null,
       num: null,
       int: null,
@@ -269,36 +311,36 @@ describe("convertJsonSchemaToTypebox", () => {
     const twoTypes = convertJsonSchemaToTypebox({
       type: ["string", "number"],
       description: "String or number ID",
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.ok(Array.isArray(twoTypes.anyOf));
-    assert.equal(twoTypes.anyOf?.length, 2);
-    assert.equal(twoTypes.anyOf?.[0]?.type, "string");
-    assert.equal(twoTypes.anyOf?.[1]?.type, "number");
+    assert.equal(twoTypes.anyOf.length, 2);
+    assert.equal(twoTypes.anyOf[0].type, "string");
+    assert.equal(twoTypes.anyOf[1].type, "number");
     assert.equal(twoTypes.description, "String or number ID");
 
     const withNull = convertJsonSchemaToTypebox({
       type: ["string", "number", "null"],
-    }) as unknown as SchemaJson;
-    assert.equal(withNull.anyOf?.length, 3);
-    assert.equal(withNull.anyOf?.[0]?.type, "null");
-    assert.equal(withNull.anyOf?.[1]?.type, "string");
-    assert.equal(withNull.anyOf?.[2]?.type, "number");
+    }) as SchemaJson;
+    assert.equal(withNull.anyOf.length, 3);
+    assert.equal(withNull.anyOf[0].type, "null");
+    assert.equal(withNull.anyOf[1].type, "string");
+    assert.equal(withNull.anyOf[2].type, "number");
 
     const onlyNull = convertJsonSchemaToTypebox({
       type: ["null"],
       description: "Null only",
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(onlyNull.type, "null");
     assert.equal(onlyNull.description, "Null only");
   });
 
   it("handles null input gracefully", () => {
-    const schema = convertJsonSchemaToTypebox(null as unknown as Record<string, unknown>) as unknown as SchemaJson;
+    const schema = convertJsonSchemaToTypebox(null as unknown as Record<string, unknown>) as SchemaJson;
     assert.ok(typeof schema === "object");
   });
 
   it("handles empty object schema (no properties)", () => {
-    const result = convertJsonSchemaToTypebox({ type: "object" }) as unknown as SchemaJson;
+    const result = convertJsonSchemaToTypebox({ type: "object" }) as SchemaJson;
     assert.equal(result.type, "object");
     assert.deepEqual(result.properties, {});
     assert.equal(result.patternProperties, undefined);
@@ -312,13 +354,13 @@ describe("convertJsonSchemaToTypebox", () => {
         email: { type: "string" },
       },
       anyOf: [{ required: ["id"] }, { required: ["email"] }],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(objWithAnyOf.type, "object");
-    assert.equal(objWithAnyOf.properties?.id?.type, "string");
-    assert.equal(objWithAnyOf.properties?.email?.type, "string");
+    assert.equal(objWithAnyOf.properties.id.type, "string");
+    assert.equal(objWithAnyOf.properties.email.type, "string");
     assert.ok(Array.isArray(objWithAnyOf.anyOf));
-    assert.deepEqual(objWithAnyOf.anyOf?.[0]?.required, ["id"]);
-    assert.deepEqual(objWithAnyOf.anyOf?.[1]?.required, ["email"]);
+    assert.deepEqual(objWithAnyOf.anyOf[0].required, ["id"]);
+    assert.deepEqual(objWithAnyOf.anyOf[1].required, ["email"]);
 
     const objWithOneOf = convertJsonSchemaToTypebox({
       type: "object",
@@ -327,10 +369,10 @@ describe("convertJsonSchemaToTypebox", () => {
         email: { type: "string" },
       },
       oneOf: [{ required: ["id"] }, { required: ["email"] }],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(objWithOneOf.type, "object");
-    assert.equal(objWithOneOf.properties?.id?.type, "string");
-    assert.equal(objWithOneOf.properties?.email?.type, "string");
+    assert.equal(objWithOneOf.properties.id.type, "string");
+    assert.equal(objWithOneOf.properties.email.type, "string");
     assert.ok(Array.isArray(objWithOneOf.oneOf));
 
     const objWithAllOf = convertJsonSchemaToTypebox({
@@ -353,11 +395,11 @@ describe("convertJsonSchemaToTypebox", () => {
           required: ["actor"],
         },
       },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(objWithAllOf.type, "object");
-    assert.equal(objWithAllOf.properties?.id?.type, "string");
-    assert.equal(objWithAllOf.properties?.email?.type, "string");
-    assert.equal(objWithAllOf.properties?.actor?.type, "string");
+    assert.equal(objWithAllOf.properties.id.type, "string");
+    assert.equal(objWithAllOf.properties.email.type, "string");
+    assert.equal(objWithAllOf.properties.actor.type, "string");
     assert.deepEqual(objWithAllOf.required, ["id", "email", "actor"]);
     assert.ok(Array.isArray(objWithAllOf.allOf));
 
@@ -367,19 +409,19 @@ describe("convertJsonSchemaToTypebox", () => {
       additionalProperties: { type: "integer" },
       minProperties: 1,
       maxProperties: 5,
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(implicitObj.type, "object");
-    assert.equal(implicitObj.properties?.host?.type, "string");
+    assert.equal(implicitObj.properties.host.type, "string");
     assert.deepEqual(implicitObj.required, ["host"]);
-    assert.equal((implicitObj.additionalProperties as SchemaJson)?.type, "integer");
+    assert.equal(implicitObj.additionalProperties.type, "integer");
     assert.equal(implicitObj.minProperties, 1);
     assert.equal(implicitObj.maxProperties, 5);
 
     const implicitArray = convertJsonSchemaToTypebox({
       items: { type: "boolean" },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(implicitArray.type, "array");
-    assert.equal((implicitArray.items as SchemaJson)?.type, "boolean");
+    assert.equal(implicitArray.items.type, "boolean");
   });
 
   it("prevents infinite recursion on deeply nested schemas and cyclic $ref while resolving shared DAG $refs and RFC 6901 pointers", () => {
@@ -405,10 +447,10 @@ describe("convertJsonSchemaToTypebox", () => {
           },
         },
       },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(cyclic.type, "object");
-    assert.equal(cyclic.properties?.next?.type, "object");
-    assert.equal(cyclic.properties?.next?.properties?.value?.type, "string");
+    assert.equal(cyclic.properties.next.type, "object");
+    assert.equal(cyclic.properties.next.properties.value.type, "string");
 
     // Mutually recursive $ref cycle (A -> B -> A)
     const mutualCyclic = convertJsonSchemaToTypebox({
@@ -432,10 +474,10 @@ describe("convertJsonSchemaToTypebox", () => {
           },
         },
       },
-    }) as unknown as SchemaJson;
-    assert.equal(mutualCyclic.properties?.start?.type, "object");
-    assert.equal(mutualCyclic.properties?.start?.properties?.b?.type, "object");
-    assert.equal(mutualCyclic.properties?.start?.properties?.b?.properties?.count?.type, "integer");
+    }) as SchemaJson;
+    assert.equal(mutualCyclic.properties.start.type, "object");
+    assert.equal(mutualCyclic.properties.start.properties.b.type, "object");
+    assert.equal(mutualCyclic.properties.start.properties.b.properties.count.type, "integer");
 
     // Root "#" reference cycle
     const rootCyclic = convertJsonSchemaToTypebox({
@@ -443,9 +485,9 @@ describe("convertJsonSchemaToTypebox", () => {
       properties: {
         self: { $ref: "#" },
       },
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(rootCyclic.type, "object");
-    assert.equal(rootCyclic.properties?.self?.type, "object");
+    assert.equal(rootCyclic.properties.self.type, "object");
 
     // Shared non-cyclic DAG $ref (must resolve both branches, not treat second as cycle)
     const dag = convertJsonSchemaToTypebox({
@@ -457,9 +499,9 @@ describe("convertJsonSchemaToTypebox", () => {
       $defs: {
         Leaf: { type: "integer" },
       },
-    }) as unknown as SchemaJson;
-    assert.equal(dag.properties?.left?.type, "integer");
-    assert.equal(dag.properties?.right?.type, "integer");
+    }) as SchemaJson;
+    assert.equal(dag.properties.left.type, "integer");
+    assert.equal(dag.properties.right.type, "integer");
 
     // Multi-segment JSON Pointer (#/$defs/Container/properties/child), array index, & RFC 6901 ~0 / ~1 unescaping
     const multiSegment = convertJsonSchemaToTypebox({
@@ -485,49 +527,49 @@ describe("convertJsonSchemaToTypebox", () => {
         },
         "a/b~c": { type: "boolean" },
       },
-    }) as unknown as SchemaJson;
-    assert.equal(multiSegment.properties?.mirrorId?.type, "integer");
-    assert.equal(multiSegment.properties?.containerChild?.type, "string");
-    assert.equal(multiSegment.properties?.escapedRef?.type, "boolean");
-    assert.equal(multiSegment.properties?.protoRef?.type, undefined);
+    }) as SchemaJson;
+    assert.equal(multiSegment.properties.mirrorId.type, "integer");
+    assert.equal(multiSegment.properties.containerChild.type, "string");
+    assert.equal(multiSegment.properties.escapedRef.type, "boolean");
+    assert.equal(multiSegment.properties.protoRef.type, undefined);
   });
 
   it("supports const, untyped/numeric/nullable enum, tuple items/prefixItems, and validation constraints", () => {
-    const constStr = convertJsonSchemaToTypebox({ const: "fixed", description: "Fixed literal" }) as unknown as SchemaJson;
+    const constStr = convertJsonSchemaToTypebox({ const: "fixed", description: "Fixed literal" }) as SchemaJson;
     assert.equal(constStr.const, "fixed");
     assert.equal(constStr.description, "Fixed literal");
 
-    const constNull = convertJsonSchemaToTypebox({ const: null }) as unknown as SchemaJson;
+    const constNull = convertJsonSchemaToTypebox({ const: null }) as SchemaJson;
     assert.equal(constNull.type, "null");
 
     const untypedEnum = convertJsonSchemaToTypebox({
       enum: ["alpha", 2, true, null],
       description: "Mixed nullable enum",
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(untypedEnum.description, "Mixed nullable enum");
-    assert.equal(untypedEnum.anyOf?.length, 4);
-    assert.equal(untypedEnum.anyOf?.[0]?.type, "null");
-    assert.equal(untypedEnum.anyOf?.[1]?.const, "alpha");
-    assert.equal(untypedEnum.anyOf?.[2]?.const, 2);
-    assert.equal(untypedEnum.anyOf?.[3]?.const, true);
+    assert.equal(untypedEnum.anyOf.length, 4);
+    assert.equal(untypedEnum.anyOf[0].type, "null");
+    assert.equal(untypedEnum.anyOf[1].const, "alpha");
+    assert.equal(untypedEnum.anyOf[2].const, 2);
+    assert.equal(untypedEnum.anyOf[3].const, true);
 
     const tuplePrefix = convertJsonSchemaToTypebox({
       type: "array",
       prefixItems: [{ type: "string" }, { type: "integer" }],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(tuplePrefix.type, "array");
     assert.equal(Array.isArray(tuplePrefix.items), true);
-    assert.equal((tuplePrefix.items as SchemaJson[])[0]?.type, "string");
-    assert.equal((tuplePrefix.items as SchemaJson[])[1]?.type, "integer");
+    assert.equal(tuplePrefix.items[0].type, "string");
+    assert.equal(tuplePrefix.items[1].type, "integer");
 
     const tupleItems = convertJsonSchemaToTypebox({
       type: "array",
       items: [{ type: "boolean" }, { type: "number" }],
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(tupleItems.type, "array");
     assert.equal(Array.isArray(tupleItems.items), true);
-    assert.equal((tupleItems.items as SchemaJson[])[0]?.type, "boolean");
-    assert.equal((tupleItems.items as SchemaJson[])[1]?.type, "number");
+    assert.equal(tupleItems.items[0].type, "boolean");
+    assert.equal(tupleItems.items[1].type, "number");
 
     const constrainedString = convertJsonSchemaToTypebox({
       type: "string",
@@ -537,7 +579,7 @@ describe("convertJsonSchemaToTypebox", () => {
       pattern: "^[a-z]+$",
       minLength: 2,
       maxLength: 16,
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(constrainedString.title, "Username");
     assert.equal(constrainedString.default, "anon");
     assert.equal(constrainedString.format, "slug");
@@ -552,7 +594,7 @@ describe("convertJsonSchemaToTypebox", () => {
       exclusiveMinimum: 0,
       exclusiveMaximum: 101,
       multipleOf: 5,
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(constrainedNum.minimum, 1);
     assert.equal(constrainedNum.maximum, 100);
     assert.equal(constrainedNum.exclusiveMinimum, 0);
@@ -565,7 +607,7 @@ describe("convertJsonSchemaToTypebox", () => {
       minItems: 1,
       maxItems: 10,
       uniqueItems: true,
-    }) as unknown as SchemaJson;
+    }) as SchemaJson;
     assert.equal(constrainedArr.minItems, 1);
     assert.equal(constrainedArr.maxItems, 10);
     assert.equal(constrainedArr.uniqueItems, true);
@@ -617,32 +659,17 @@ describe("buildToolName", () => {
 
 // ── Tool Bridge ───────────────────────────────────────────────────────────────
 
-function makeBridgeApi(
-  onRegister: (t: ToolDefinition) => void,
-  getActive: () => string[],
-  setActive: (names: string[]) => void,
-): PiExtensionAPI {
-  return {
-    registerTool: (t) => {
-      onRegister(t as ToolDefinition);
-    },
-    getActiveTools: getActive,
-    setActiveTools: setActive,
-  };
-}
-
-const dummyCtx = {} as ExtensionToolContext;
-
 describe("ToolBridge", () => {
   it("registers tools and activates them", async () => {
-    const registeredTools: ToolDefinition[] = [];
+    const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = [];
 
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.push(t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getAllTools: () => registeredTools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, sourceInfo: { path: "test", line: 0 } })),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
 
     const mockClient = {
       request: async () => ({
@@ -694,14 +721,15 @@ describe("ToolBridge", () => {
   });
 
   it("deactivates server tools on disconnect", async () => {
-    const registeredTools: ToolDefinition[] = [];
+    const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = ["mcp_myserver_echo", "mcp_myserver_count", "other_tool"];
 
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.push(t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getAllTools: () => registeredTools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, sourceInfo: { path: "test", line: 0 } })),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
 
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     const bridge = new ToolBridge(settings, mockPi);
@@ -720,14 +748,15 @@ describe("ToolBridge", () => {
   });
 
   it("re-registers tools on repeated refresh to capture new client", async () => {
-    const registeredTools: ToolDefinition[] = [];
+    const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = [];
 
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.push(t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getAllTools: () => registeredTools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, sourceInfo: { path: "test", line: 0 } })),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
 
     const mockClient = {
       request: async () => ({
@@ -755,13 +784,14 @@ describe("ToolBridge", () => {
   });
 
   it("includes annotation hints in tool description", async () => {
-    const registeredTools: ToolDefinition[] = [];
+    const registeredTools: TestToolDefinition[] = [];
     let annotationActiveTools: string[] = [];
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.push(t),
-      () => annotationActiveTools,
-      (names) => { annotationActiveTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getAllTools: () => registeredTools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, sourceInfo: { path: "test", line: 0 } })),
+      getActiveTools: () => annotationActiveTools,
+      setActiveTools: (names: string[]) => { annotationActiveTools = names; },
+    };
     const mockClient = {
       request: async () => ({
         tools: [{
@@ -778,23 +808,23 @@ describe("ToolBridge", () => {
     await bridge.refreshTools("myserver", mockClient);
 
     const tool = registeredTools[0]!;
-    assert.ok(tool.description?.includes("⚠️ destructive"));
+    assert.ok(tool.description.includes("⚠️ destructive"));
   });
 
   it("passes through MCP image content and filters non-text blocks on isError", async () => {
-    const registeredTools: ToolDefinition[] = [];
+    const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = [];
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.push(t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
 
-    let callResponse = {
+    let callResponse: Record<string, unknown> = {
       content: [
         { type: "text", text: "Screenshot captured" },
         { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
-      ] as Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+      ],
       isError: false,
     };
 
@@ -818,7 +848,7 @@ describe("ToolBridge", () => {
     await bridge.refreshTools("myserver", mockClient);
 
     const tool = registeredTools[0]!;
-    const okResult = await tool.execute("call-1", {}, undefined, undefined, dummyCtx);
+    const okResult = await tool.execute("call-1", {}, undefined, undefined, undefined);
     assert.deepEqual(okResult.content, [
       { type: "text", text: "Screenshot captured" },
       { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
@@ -833,11 +863,10 @@ describe("ToolBridge", () => {
       isError: true,
     };
     await assert.rejects(
-      () => tool.execute("call-2", {}, undefined, undefined, dummyCtx),
-      (err: unknown) => {
-        const e = err as Error & { code?: string };
-        assert.equal(e.message, "Render failed");
-        assert.equal(e.code, "tool");
+      () => tool.execute("call-2", {}, undefined, undefined, undefined),
+      (err: { message?: string; code?: string }) => {
+        assert.equal(err.message, "Render failed");
+        assert.equal(err.code, "tool");
         return true;
       },
     );
@@ -850,11 +879,10 @@ describe("ToolBridge", () => {
       isError: true,
     };
     await assert.rejects(
-      () => tool.execute("call-3", {}, undefined, undefined, dummyCtx),
-      (err: unknown) => {
-        const e = err as Error & { code?: string };
-        assert.equal(e.message, "Tool reported an error");
-        assert.equal(e.code, "tool");
+      () => tool.execute("call-3", {}, undefined, undefined, undefined),
+      (err: { message?: string; code?: string }) => {
+        assert.equal(err.message, "Tool reported an error");
+        assert.equal(err.code, "tool");
         return true;
       },
     );
@@ -863,11 +891,11 @@ describe("ToolBridge", () => {
   it("disambiguates intra-server and cross-server tool name collisions and isolates server deactivation", async () => {
     const registeredTools = new Map<string, ToolDefinition>();
     let activeTools: string[] = [];
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.set(t.name, t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.set((t as ToolDefinition).name, t as ToolDefinition),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     const bridge = new ToolBridge(settings, mockPi);
 
@@ -919,11 +947,11 @@ describe("ToolBridge", () => {
   it("discards stale out-of-order refreshTools responses via monotonic generation guard", async () => {
     const registeredTools = new Map<string, ToolDefinition>();
     let activeTools: string[] = [];
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.set(t.name, t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.set((t as ToolDefinition).name, t as ToolDefinition),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     const bridge = new ToolBridge(settings, mockPi);
 
@@ -974,13 +1002,13 @@ describe("ToolBridge", () => {
   });
 
   it("throws McpError on pre-aborted signal and falls back to structuredContent when content is empty", async () => {
-    const registeredTools: ToolDefinition[] = [];
+    const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = [];
-    const mockPi = makeBridgeApi(
-      (t) => registeredTools.push(t),
-      () => activeTools,
-      (names) => { activeTools = names; },
-    );
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
 
     let callCount = 0;
     const mockClient = {
@@ -1007,18 +1035,17 @@ describe("ToolBridge", () => {
     abortController.abort();
 
     await assert.rejects(
-      () => tool.execute("call-aborted", {}, abortController.signal, undefined, dummyCtx),
-      (err: unknown) => {
-        const e = err as Error & { code?: string };
-        assert.equal(e.name, "McpError");
-        assert.equal(e.message, "Tool execution cancelled");
-        assert.equal(e.code, "protocol");
+      () => tool.execute("call-aborted", {}, abortController.signal, undefined, undefined),
+      (err: { name?: string; message?: string; code?: string }) => {
+        assert.equal(err.name, "McpError");
+        assert.equal(err.message, "Tool execution cancelled");
+        assert.equal(err.code, "protocol");
         return true;
       },
     );
     assert.equal(callCount, 0, "Must not call client.request when signal is already aborted");
 
-    const structuredRes = await tool.execute("call-ok", {}, undefined, undefined, dummyCtx);
+    const structuredRes = await tool.execute("call-ok", {}, undefined, undefined, undefined);
     assert.equal(callCount, 1);
     assert.deepEqual(structuredRes.content, [
       { type: "text", text: JSON.stringify({ ok: true, count: 42 }, null, 2) },

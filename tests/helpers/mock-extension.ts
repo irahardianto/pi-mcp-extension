@@ -10,10 +10,33 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
+export interface StrictMap<K, V> extends Map<K, V> {
+  get(key: K): V;
+}
+
+export function createStrictMap<K, V>(): StrictMap<K, V> {
+  return new Map<K, V>() as StrictMap<K, V>;
+}
+
+export interface MockContentBlock {
+  type: string;
+  text: string;
+  data?: string;
+  mimeType?: string;
+  [key: string]: unknown;
+}
+
+export interface MockToolResult {
+  content: [MockContentBlock, ...MockContentBlock[]];
+  details?: unknown;
+  isError?: boolean;
+  [key: string]: unknown;
+}
+
 export interface MockTool {
   name: string;
   label?: string;
-  description?: string;
+  description: string;
   promptSnippet?: string;
   promptGuidelines?: string[];
   parameters?: unknown;
@@ -22,13 +45,8 @@ export interface MockTool {
     params: Record<string, unknown>,
     signal?: AbortSignal,
     update?: unknown,
-    ctx?: ExtensionToolContext,
-  ) => Promise<{
-    content: Array<{ type: string; text?: string; [key: string]: unknown }>;
-    details?: unknown;
-    isError?: boolean;
-    [key: string]: unknown;
-  }>;
+    ctx?: unknown,
+  ) => Promise<MockToolResult>;
   [key: string]: unknown;
 }
 
@@ -39,100 +57,72 @@ export interface MockCommand {
   [key: string]: unknown;
 }
 
-export type MockEventHandler = (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown;
+export type MockEventHandler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
 export interface MockExtension {
   api: ExtensionAPI;
-  tools: Map<string, MockTool>;
-  commands: Map<string, MockCommand>;
-  events: Map<string, MockEventHandler>;
+  tools: StrictMap<string, MockTool>;
+  commands: StrictMap<string, MockCommand>;
+  events: StrictMap<string, MockEventHandler>;
   activeTools: string[];
   mcpServers: RegisteredMcpServer[];
+}
+
+export interface PartialMockApi {
+  registerTool?: (tool: MockTool) => unknown;
+  registerCommand?: (name: string, cmd: MockCommand) => unknown;
+  on?: (event: string, handler: MockEventHandler) => unknown;
+  getActiveTools?: () => string[];
+  setActiveTools?: (names: string[]) => void;
+  getMcpServers?: () => Array<{ name: string; config: Record<string, unknown>; extensionPath: string }>;
+}
+
+export function asExtensionAPI(partial: PartialMockApi): ExtensionAPI {
+  return {
+    registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = unknown>(
+      tool: ToolDefinition<TParams, TDetails, TState>,
+    ): void {
+      partial.registerTool?.(tool as unknown as MockTool);
+    },
+    registerCommand(name: string, cmd: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
+      partial.registerCommand?.(name, cmd);
+    },
+    on(event: string, handler: unknown): () => void {
+      partial.on?.(event, handler as MockEventHandler);
+      return () => {};
+    },
+    getActiveTools(): string[] {
+      return partial.getActiveTools ? partial.getActiveTools() : [];
+    },
+    setActiveTools(names: string[]): void {
+      partial.setActiveTools?.(names);
+    },
+    getMcpServers(): RegisteredMcpServer[] {
+      return (partial.getMcpServers ? partial.getMcpServers() : []) as unknown as RegisteredMcpServer[];
+    },
+  } as unknown as ExtensionAPI;
 }
 
 export function createMockExtension(options?: {
   mcpServers?: RegisteredMcpServer[];
   activeTools?: string[];
 }): MockExtension {
-  const tools = new Map<string, MockTool>();
-  const commands = new Map<string, MockCommand>();
-  const events = new Map<string, MockEventHandler>();
+  const tools = createStrictMap<string, MockTool>();
+  const commands = createStrictMap<string, MockCommand>();
+  const events = createStrictMap<string, MockEventHandler>();
   let active = options?.activeTools ?? [];
   const mcpServers = options?.mcpServers ?? [];
 
-  const api = {
-    registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = unknown>(
-      tool: ToolDefinition<TParams, TDetails, TState>,
-    ): void {
-      tools.set(tool.name, tool as unknown as MockTool);
-    },
-    registerCommand(name: string, cmd: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
-      commands.set(name, cmd);
-    },
-    on(event: string, handler: unknown): () => void {
-      events.set(event, handler as MockEventHandler);
-      return () => {
-        events.delete(event);
-      };
-    },
-    getActiveTools(): string[] {
-      return active;
-    },
-    setActiveTools(names: string[]): void {
+  const api = asExtensionAPI({
+    registerTool: (tool) => tools.set(tool.name, tool),
+    registerCommand: (name, cmd) => commands.set(name, cmd),
+    on: (event, handler) => events.set(event, handler),
+    getActiveTools: () => active,
+    setActiveTools: (names) => {
       active = names;
     },
-    registerShortcut(): void {},
-    registerFlag(): void {},
-    getFlag(): undefined {
-      return undefined;
-    },
-    registerMessageRenderer(): void {},
-    registerMarkdownTransformer(): void {},
-    registerEntryRenderer(): void {},
-    registerToolRenderer(): void {},
-    sendMessage(): void {},
-    sendUserMessage(): void {},
-    appendEntry(): void {},
-    setSessionName(): void {},
-    getSessionName(): undefined {
-      return undefined;
-    },
-    setLabel(): void {},
-    async exec(): Promise<{ stdout: string; stderr: string; code: number; killed: boolean }> {
-      return { stdout: "", stderr: "", code: 0, killed: false };
-    },
-    getAllTools(): [] {
-      return [];
-    },
-    getSettings(): {
-      defaultTools: [];
-      toolRestrictions: [];
-      autoCompact: false;
-      maxCompactTokens: 0;
-    } {
-      return {
-        defaultTools: [],
-        toolRestrictions: [],
-        autoCompact: false,
-        maxCompactTokens: 0,
-      };
-    },
-    getCommands(): [] {
-      return [];
-    },
-    async setModel(): Promise<boolean> {
-      return true;
-    },
-    getThinkingLevel(): "off" {
-      return "off";
-    },
-    setThinkingLevel(): void {},
-    registerProvider(): void {},
-    unregisterProvider(): void {},
-    registerMcpServer(): void {},
-    unregisterMcpServer(): void {},
-    getMcpServers: () => mcpServers,
-  } as unknown as ExtensionAPI;
+    getMcpServers: () => mcpServers as unknown as Array<{ name: string; config: Record<string, unknown>; extensionPath: string }>,
+  });
 
   return {
     api,

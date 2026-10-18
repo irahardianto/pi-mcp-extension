@@ -73,7 +73,7 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
         "Bootstrap must not read or execute <cwd>/.pi/mcp.json",
       );
 
-      await events.get("session_start")?.({}, ctx);
+      await events.get("session_start")({}, ctx);
       assert.equal(
         await fileExists(markerFile),
         false,
@@ -81,14 +81,15 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
       );
 
       const status = JSON.parse(
-        (await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!,
+        (await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
       );
       assert.deepEqual(
         status.map((row: { name: string; state?: string }) => [row.name, row.state]),
         [["trusted_global", "ready"]],
       );
-      assert.ok(mockExt.activeTools.some((name) => name.startsWith("global_mcp_trusted_global_")));
-      assert.ok(!mockExt.activeTools.some((name) => name.startsWith("pwn_prefix_")));
+      const active = mockExt.activeTools;
+      assert.ok(active.some((name) => name.startsWith("global_mcp_trusted_global_")));
+      assert.ok(!active.some((name) => name.startsWith("pwn_prefix_")));
     } finally {
       await events.get("session_shutdown")?.({}, ctx);
       await rm(dir, { recursive: true, force: true });
@@ -131,18 +132,19 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
       assert.ok(events.has("session_start"), "Must register session_start even when global config is empty");
       assert.ok(events.has("mcp_servers_change"), "Must register mcp_servers_change handler");
 
-      await events.get("session_start")?.({}, ctx);
+      await events.get("session_start")({}, ctx);
 
       const status = JSON.parse(
-        (await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!,
+        (await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
       );
       assert.deepEqual(
         status.map((row: { name: string; state?: string }) => [row.name, row.state]),
         [["local_srv", "ready"]],
       );
+      const active = mockExt.activeTools;
       assert.ok(
-        mockExt.activeTools.some((name) => name === "proj_mcp_local_srv_echo"),
-        `Expected tool with project toolPrefix proj_mcp, got: ${mockExt.activeTools.join(", ")}`,
+        active.some((name) => name === "proj_mcp_local_srv_echo"),
+        `Expected tool with project toolPrefix proj_mcp, got: ${active.join(", ")}`,
       );
     } finally {
       await events.get("session_shutdown")?.({}, ctx);
@@ -204,10 +206,10 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
         bootstrapCwd: dir,
         globalConfigPath: join(dir, "absent-global.json"),
       });
-      await events.get("session_start")?.({}, ctx);
+      await events.get("session_start")({}, ctx);
 
       const initialStatus = JSON.parse(
-        (await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!,
+        (await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
       );
       const byName = new Map<string, { state?: string; lifecycle?: string }>(
         initialStatus.map((r: { name: string; state?: string; lifecycle?: string }) => [r.name, r]),
@@ -219,8 +221,9 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
       // mcp.json's lazy config takes precedence over extension's eager config
       assert.equal(byName.get("collision")?.state, "stopped");
       assert.equal(byName.get("collision")?.lifecycle, "lazy");
-      assert.ok(mockExt.activeTools.includes("mcp_ext_eager_echo"));
-      assert.ok(!mockExt.activeTools.includes("mcp_collision_echo"));
+      let active = mockExt.activeTools;
+      assert.ok(active.includes("mcp_ext_eager_echo"));
+      assert.ok(!active.includes("mcp_collision_echo"));
 
       // Dynamically unregister ext_eager and register ext_dynamic via mcp_servers_change
       registeredServers = [
@@ -230,13 +233,13 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
           extensionPath: "/ext/b.ts",
         },
       ];
-      await events.get("mcp_servers_change")?.(
+      await events.get("mcp_servers_change")(
         { type: "mcp_servers_change", servers: registeredServers },
         ctx,
       );
 
       const updatedStatus = JSON.parse(
-        (await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!,
+        (await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
       );
       const updatedByName = new Map<string, { state?: string; lifecycle?: string }>(
         updatedStatus.map((r: { name: string; state?: string; lifecycle?: string }) => [r.name, r]),
@@ -245,8 +248,9 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
       assert.equal(updatedByName.has("ext_disabled"), false, "Unregistered disabled server should be removed");
       assert.equal(updatedByName.get("ext_dynamic")?.state, "ready", "Newly registered server should be started");
       assert.equal(updatedByName.get("collision")?.state, "stopped", "mcp.json server should remain intact");
-      assert.ok(!mockExt.activeTools.includes("mcp_ext_eager_echo"));
-      assert.ok(mockExt.activeTools.includes("mcp_ext_dynamic_echo"));
+      active = mockExt.activeTools;
+      assert.ok(!active.includes("mcp_ext_eager_echo"));
+      assert.ok(active.includes("mcp_ext_dynamic_echo"));
     } finally {
       await events.get("session_shutdown")?.({}, ctx);
       await rm(dir, { recursive: true, force: true });

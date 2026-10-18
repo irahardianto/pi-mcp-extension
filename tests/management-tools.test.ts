@@ -34,16 +34,17 @@ it("registers agent-visible status and connect tools without eagerly starting a 
       tools.get("mcp_connect")?.promptSnippet,
       "Connect or reconnect to a configured MCP server by name and register its tools.",
     );
-    await events.get("session_start")?.({}, ctx);
-    assert.equal(mockExt.activeTools.length, 0);
-    const status = await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx);
-    assert.deepEqual(JSON.parse(status.content[0]!.text!).map((row: { name: string; lifecycle: string; state: string }) => [row.name, row.lifecycle, row.state]), [["lazy", "lazy", "stopped"]]);
-    await assert.rejects(tools.get("mcp_connect")!.execute("", { name: "unknown" }, undefined, undefined, ctx), /Unknown MCP server name/);
+    await events.get("session_start")({}, ctx);
+    let active = mockExt.activeTools;
+    assert.equal(active.length, 0);
+    const status = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+    assert.deepEqual(JSON.parse(status.content[0].text).map((row: { name: string; lifecycle: string; state: string }) => [row.name, row.lifecycle, row.state]), [["lazy", "lazy", "stopped"]]);
+    await assert.rejects(tools.get("mcp_connect").execute("", { name: "unknown" }, undefined, undefined, ctx), /Unknown MCP server name/);
     const abortedStarter = new AbortController();
     const abortedJoiner = new AbortController();
-    const first = tools.get("mcp_connect")!.execute("", { name: "lazy" }, abortedStarter.signal, undefined, ctx);
-    const second = tools.get("mcp_connect")!.execute("", { name: "lazy" }, abortedJoiner.signal, undefined, ctx);
-    const third = tools.get("mcp_connect")!.execute("", { name: "lazy" }, undefined, undefined, ctx);
+    const first = tools.get("mcp_connect").execute("", { name: "lazy" }, abortedStarter.signal, undefined, ctx);
+    const second = tools.get("mcp_connect").execute("", { name: "lazy" }, abortedJoiner.signal, undefined, ctx);
+    const third = tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx);
     abortedStarter.abort();
     abortedJoiner.abort();
     const [, , result] = await Promise.all([
@@ -51,30 +52,34 @@ it("registers agent-visible status and connect tools without eagerly starting a 
       assert.rejects(second, /cancelled/),
       third,
     ]);
-    assert.match(result.content[0]!.text!, /ready/);
-    assert.ok(mockExt.activeTools.some((name) => name.includes("echo")));
+    active = mockExt.activeTools;
+    assert.match(result.content[0].text, /ready/);
+    assert.ok(active.some((name) => name.includes("echo")));
     assert.ok(commands.has("mcp:start") && commands.has("mcp:stop") && commands.has("mcp:auth"));
-    const discovered = mockExt.activeTools.length;
-    const connectedStatus = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+    const discovered = active.length;
+    const connectedStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.deepEqual(connectedStatus[0].tools, { discovered, active: discovered });
     // Another extension may apply an intentional tool restriction after discovery.
     mockExt.activeTools = mockExt.activeTools.slice(1);
     await assert.rejects(
-      tools.get("mcp_connect")!.execute("", { name: "lazy" }, undefined, undefined, ctx),
+      tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
       /connected, but some discovered tools are inactive/,
     );
-    assert.equal(mockExt.activeTools.length, discovered - 1, "Connect must not override another extension's restriction");
+    active = mockExt.activeTools;
+    assert.equal(active.length, discovered - 1, "Connect must not override another extension's restriction");
     mockExt.activeTools = [];
     await assert.rejects(
-      tools.get("mcp_connect")!.execute("", { name: "lazy" }, undefined, undefined, ctx),
+      tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
       /connected, but some discovered tools are inactive/,
     );
-    assert.deepEqual(mockExt.activeTools, []);
-    const inactiveStatus = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+    active = mockExt.activeTools;
+    assert.deepEqual(active, []);
+    const inactiveStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(inactiveStatus[0].state, "ready", "Transport readiness and tool activation are separate states");
     assert.deepEqual(inactiveStatus[0].tools, { discovered, active: 0 });
-    await events.get("session_shutdown")?.({}, ctx);
-    assert.equal(mockExt.activeTools.length, 0);
+    await events.get("session_shutdown")({}, ctx);
+    active = mockExt.activeTools;
+    assert.equal(active.length, 0);
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });
@@ -117,12 +122,12 @@ it("reports headless OAuth as an actionable failure without opening a browser or
       mcpServers: { private: { transport: "streamable-http", url: `${base}/mcp`, auth: { type: "oauth", clientId: "local" }, headers: { Authorization: "Bearer secret-never-report" }, lifecycle: "lazy" } },
     }));
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "no-global.json"), authStorageDir: join(dir, "auth") });
-    await events.get("session_start")?.({}, ctx);
-    await assert.rejects(tools.get("mcp_connect")!.execute("", { name: "private" }, undefined, undefined, ctx), /requires an interactive Pi session/);
+    await events.get("session_start")({}, ctx);
+    await assert.rejects(tools.get("mcp_connect").execute("", { name: "private" }, undefined, undefined, ctx), /requires an interactive Pi session/);
     assert.equal(requests, 1);
-    const status = await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx);
-    assert.match(status.content[0]!.text!, /Authorization required/);
-    assert.doesNotMatch(status.content[0]!.text!, /secret-never-report|authorize\?|access_token/);
+    const status = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+    assert.match(status.content[0].text, /Authorization required/);
+    assert.doesNotMatch(status.content[0].text, /secret-never-report|authorize\?|access_token/);
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await new Promise<void>((resolve) => listener.close(() => resolve()));
@@ -140,18 +145,18 @@ it("cancels a management connect during retry delay", async () => {
     await mkdir(join(dir, ".pi"));
     await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({ settings: { maxRetries: 1 }, mcpServers: { broken: { command: "missing-pi-mcp-executable" } } }));
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "no-global.json") });
-    await events.get("session_start")?.({}, ctx);
+    await events.get("session_start")({}, ctx);
     const controller = new AbortController();
-    const attempt = tools.get("mcp_connect")!.execute("", { name: "broken" }, controller.signal, undefined, ctx);
+    const attempt = tools.get("mcp_connect").execute("", { name: "broken" }, controller.signal, undefined, ctx);
     const failure = assert.rejects(attempt, /cancelled/);
     for (let i = 0; i < 100; i++) {
-      const status = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+      const status = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
       if (status[0].state === "starting") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     controller.abort();
     await failure;
-    const status = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+    const status = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(status[0].state, "stopped");
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
@@ -203,19 +208,19 @@ it("opens an interactive browser only once, reopens on Retry, and cancels withou
       bootstrapCwd: dir, globalConfigPath: join(dir, "no-global.json"), authStorageDir: join(dir, "auth"),
       browserOpen: () => { opens++; },
     });
-    await events.get("session_start")?.({}, ctx);
-    const first = tools.get("mcp_connect")!.execute("", { name: "local team" }, undefined, undefined, ctx);
-    const second = tools.get("mcp_connect")!.execute("", { name: "local team" }, undefined, undefined, ctx);
+    await events.get("session_start")({}, ctx);
+    const first = tools.get("mcp_connect").execute("", { name: "local team" }, undefined, undefined, ctx);
+    const second = tools.get("mcp_connect").execute("", { name: "local team" }, undefined, undefined, ctx);
     await Promise.all([assert.rejects(first, /MCP connection cancelled/), assert.rejects(second, /MCP connection cancelled/)]);
     assert.equal(opens, 2);
     assert.equal(choices, 2);
-    const status = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+    const status = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(status[0].state, "stopped");
     const storage = join(dir, "auth");
     const unlock = await acquireAuthLock("local team", storage);
     try {
       await assert.rejects(
-        tools.get("mcp_connect")!.execute("", { name: "local team" }, undefined, undefined, ctx),
+        tools.get("mcp_connect").execute("", { name: "local team" }, undefined, undefined, ctx),
         /Another Pi process is authorizing this server/,
       );
       assert.equal(opens, 2);
@@ -224,27 +229,27 @@ it("opens an interactive browser only once, reopens on Retry, and cancels withou
     await provider.saveTokens({ access_token: "saved-token", token_type: "Bearer" });
     assert.equal((await getAuthStatus("local team", storage))?.hasTokens, true);
     ctx.ui.select = () => new Promise(() => {});
-    const firstReset = commands.get("mcp:auth")?.handler("local team --reset", ctx);
+    const firstReset = commands.get("mcp:auth").handler("local team --reset", ctx);
     for (let i = 0; i < 100 && opens < 3; i++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(opens, 3);
-    const repeatedReset = commands.get("mcp:auth")?.handler("local team --reset", ctx);
-    const joinedConnect = tools.get("mcp_connect")!.execute("", { name: "local team" }, undefined, undefined, ctx);
+    const repeatedReset = commands.get("mcp:auth").handler("local team --reset", ctx);
+    const joinedConnect = tools.get("mcp_connect").execute("", { name: "local team" }, undefined, undefined, ctx);
     const stoppedConnect = assert.rejects(joinedConnect, /MCP connection cancelled/);
-    await commands.get("mcp:stop")?.handler("local team", ctx);
+    await commands.get("mcp:stop").handler("local team", ctx);
     await Promise.all([firstReset, repeatedReset, stoppedConnect]);
     assert.equal(opens, 3, "A repeated reset must join the first browser flow");
     assert.equal((await getAuthStatus("local team", storage))?.hasTokens, false);
-    const afterStop = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+    const afterStop = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(afterStop[0].state, "stopped");
 
-    const shutdownReset = commands.get("mcp:auth")?.handler("local team --reset", ctx);
+    const shutdownReset = commands.get("mcp:auth").handler("local team --reset", ctx);
     for (let i = 0; i < 100 && opens < 4; i++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(opens, 4);
-    const shutdownConnect = tools.get("mcp_connect")!.execute("", { name: "local team" }, undefined, undefined, ctx);
+    const shutdownConnect = tools.get("mcp_connect").execute("", { name: "local team" }, undefined, undefined, ctx);
     const cancelledConnect = assert.rejects(shutdownConnect, /MCP connection cancelled/);
-    await events.get("session_shutdown")?.({}, ctx);
+    await events.get("session_shutdown")({}, ctx);
     await Promise.all([shutdownReset, cancelledConnect]);
-    const afterShutdown = JSON.parse((await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx)).content[0]!.text!);
+    const afterShutdown = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(afterShutdown[0].state, "stopped");
     assert.equal(opens, 4);
   } finally {
@@ -279,9 +284,9 @@ it("does not expose an echoed Authorization header through connect errors or sta
       mcpServers: { local: { transport: "streamable-http", url: `http://127.0.0.1:${address.port}/mcp`, headers: { Authorization: credential }, lifecycle: "lazy" } },
     }));
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "no-global.json") });
-    await events.get("session_start")?.({}, ctx);
+    await events.get("session_start")({}, ctx);
     await assert.rejects(
-      tools.get("mcp_connect")!.execute("", { name: "local" }, undefined, undefined, ctx),
+      tools.get("mcp_connect").execute("", { name: "local" }, undefined, undefined, ctx),
       (err: unknown) => {
         assert.ok(err instanceof Error);
         assert.match(err.message, /MCP connection failed/);
@@ -290,8 +295,8 @@ it("does not expose an echoed Authorization header through connect errors or sta
       },
     );
     assert.equal(echoed, 1);
-    const status = await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx);
-    assert.doesNotMatch(status.content[0]!.text!, /mock-secret-never-disclose|authorize\?token=|Authorization:/);
+    const status = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+    assert.doesNotMatch(status.content[0].text, /mock-secret-never-disclose|authorize\?token=|Authorization:/);
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await new Promise<void>((resolve) => listener.close(() => resolve()));
@@ -355,15 +360,15 @@ it("isolates a corrupt OAuth state file in mcp_status and recovers on first conn
       authStorageDir: authDir,
       browserOpen: fakeServer.browserOpen,
     });
-    await events.get("session_start")?.({}, ctx);
+    await events.get("session_start")({}, ctx);
 
     // Part 1: mcp_status isolates the corrupt file for corrupt-oauth without failing for healthy-oauth
     const origErr = console.error;
     console.error = () => {};
     let statusRows: Array<{ name: string; auth?: string; [key: string]: unknown }> = [];
     try {
-      const statusRes = await tools.get("mcp_status")!.execute("", {}, undefined, undefined, ctx);
-      statusRows = JSON.parse(statusRes.content[0]!.text!);
+      const statusRes = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
+      statusRows = JSON.parse(statusRes.content[0].text);
     } finally {
       console.error = origErr;
     }
@@ -378,12 +383,13 @@ it("isolates a corrupt OAuth state file in mcp_status and recovers on first conn
     const origErr2 = console.error;
     console.error = () => {};
     try {
-      const connectRes = await tools.get("mcp_connect")!.execute("", { name: "corrupt-oauth" }, undefined, undefined, ctx);
-      assert.match(connectRes.content[0]!.text!, /ready/);
+      const connectRes = await tools.get("mcp_connect").execute("", { name: "corrupt-oauth" }, undefined, undefined, ctx);
+      assert.match(connectRes.content[0].text, /ready/);
     } finally {
       console.error = origErr2;
     }
-    assert.ok(mockExt.activeTools.some((t) => t.includes("recovered_tool")));
+    const active = mockExt.activeTools;
+    assert.ok(active.some((t) => t.includes("recovered_tool")));
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await fakeServer.close();
