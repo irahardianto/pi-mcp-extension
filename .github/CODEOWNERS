@@ -19,7 +19,8 @@
 # Configuration parsing and project trust boundary enforcement
 /src/config.ts @irahardianto
 
-# OAuth 2.1 state persistence and cross-process locks
+# OAuth 2.1 interactive flow, state persistence, and cross-process locks
+/src/authorize-flow.ts @irahardianto
 /src/oauth-provider.ts @irahardianto
 /src/oauth-state-store.ts @irahardianto
 /src/auth-lock.ts @irahardianto
