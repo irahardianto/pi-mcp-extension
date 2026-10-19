@@ -3441,6 +3441,66 @@ describe("OAuth Security Fixes", () => {
         await rm(dir, { recursive: true, force: true });
       }
     });
+
+    it("ignores stored DCR redirect_uris when serverUrl or legacy discoveryState resource does not match", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { createHash } = await import("node:crypto");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-64-origin-"));
+      try {
+        // 1. Mismatched top-level serverUrl
+        const seeder = new McpOAuthProvider({
+          serverName: "origin-srv",
+          authConfig: {},
+          storageDir: dir,
+          serverUrl: "https://global.example.com/mcp",
+        });
+        await seeder.saveClientInformation({
+          client_id: "global-client",
+          redirect_uris: ["http://127.0.0.1:30001/callback"],
+          issuer: "https://auth.example.com",
+        });
+
+        const mismatchedSilent = new McpOAuthProvider({
+          serverName: "origin-srv",
+          authConfig: {},
+          storageDir: dir,
+          mode: "silent",
+          serverUrl: "https://project.example.com/mcp",
+        });
+        assert.strictEqual(mismatchedSilent.redirectUrl, "http://127.0.0.1:19876/callback");
+        assert.deepStrictEqual(mismatchedSilent.clientMetadata.redirect_uris, ["http://127.0.0.1:19876/callback"]);
+
+        // 2. Legacy state file without top-level serverUrl whose discoveryState resource belongs to another origin
+        const legacyHash = createHash("sha256").update("legacy-srv").digest("hex").slice(0, 16);
+        await writeFile(
+          join(dir, `${legacyHash}.json`),
+          JSON.stringify({
+            clientInfo: {
+              client_id: "legacy-client",
+              redirect_uris: ["http://127.0.0.1:30002/callback"],
+            },
+            discoveryState: {
+              resourceMetadata: {
+                resource: "https://other.example.com/mcp",
+              },
+            },
+          }),
+          "utf8",
+        );
+
+        const legacyMismatchSilent = new McpOAuthProvider({
+          serverName: "legacy-srv",
+          authConfig: {},
+          storageDir: dir,
+          mode: "silent",
+          serverUrl: "https://expected.example.com/mcp",
+        });
+        assert.strictEqual(legacyMismatchSilent.redirectUrl, "http://127.0.0.1:19876/callback");
+        assert.deepStrictEqual(legacyMismatchSilent.clientMetadata.redirect_uris, ["http://127.0.0.1:19876/callback"]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

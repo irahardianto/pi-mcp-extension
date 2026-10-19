@@ -92,7 +92,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private _cachedTokens: StoredTokens | undefined;
   private _lastReadTokens: StoredTokens | undefined;
   private _reloadedPeerTokens = false;
-  private _storedRedirectUris: string[] | undefined;
+  private _storedRedirectUris: string[] | null | undefined;
 
   constructor(options: McpOAuthProviderOptions) {
     this.serverName = options.serverName;
@@ -112,12 +112,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   private getStoredRedirectUrisSync(): string[] | undefined {
     if (this._storedRedirectUris !== undefined) {
-      return this._storedRedirectUris;
+      return this._storedRedirectUris ?? undefined;
     }
     const stored = loadStoredRedirectUrisSync(this.serverName, this.storageDir, this.serverUrl);
-    if (stored !== undefined) {
-      this._storedRedirectUris = stored;
-    }
+    this._storedRedirectUris = stored ?? null;
     return stored;
   }
 

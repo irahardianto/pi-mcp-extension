@@ -256,11 +256,8 @@ export function loadStoredRedirectUrisSync(
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
-  } catch (err) {
+  } catch {
     // WHY: State file may not exist yet (ENOENT) or directory may be inaccessible; return undefined.
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return undefined;
-    }
     return undefined;
   }
 
@@ -268,8 +265,17 @@ export function loadStoredRedirectUrisSync(
     const json: unknown = JSON.parse(raw);
     const parsed = StoredStateSchema.safeParse(json);
     if (!parsed.success) return undefined;
-    if (serverUrl !== undefined && parsed.data.serverUrl !== undefined && !urlsMatch(parsed.data.serverUrl, serverUrl)) {
-      return undefined;
+    if (serverUrl !== undefined) {
+      if (parsed.data.serverUrl !== undefined && !urlsMatch(parsed.data.serverUrl, serverUrl)) {
+        return undefined;
+      }
+      if (parsed.data.serverUrl === undefined) {
+        const discoveryState = parsed.data.discoveryState as OAuthDiscoveryState | undefined;
+        const resource = (discoveryState?.resourceMetadata as { resource?: unknown } | undefined)?.resource;
+        if (typeof resource === "string" && !isResourceCompatibleWithServerUrl(resource, serverUrl)) {
+          return undefined;
+        }
+      }
     }
     const uris = parsed.data.clientInfo?.redirect_uris;
     if (Array.isArray(uris) && uris.length > 0) {
