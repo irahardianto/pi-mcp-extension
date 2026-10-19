@@ -21,6 +21,7 @@
 
 # OAuth 2.1 state persistence and cross-process locks
 /src/oauth-provider.ts @irahardianto
+/src/oauth-state-store.ts @irahardianto
 /src/auth-lock.ts @irahardianto
 
 # Loopback OAuth callback listener and URL validation
