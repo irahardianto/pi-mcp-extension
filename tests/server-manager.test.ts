@@ -833,6 +833,10 @@ await server.connect(new StdioServerTransport());
     }
 
     await assertionPromise;
+    const failedServer = manager.getServer("failing");
+    assert.ok(failedServer?.lastError instanceof Error);
+    assert.equal(failedServer.lastError instanceof McpError, false);
+    assert.equal(failedServer.lastError.message, "simulated transport connection failure");
     assert.ok(capturedSignal);
     assert.equal(
       EventEmitter.getEventListeners(capturedSignal, "abort").length,
@@ -1352,6 +1356,15 @@ describe("classifyConnectFailure", () => {
         assert.equal(action.delayMs, RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]);
       },
     },
+    {
+      name: "returns 'retry' with 30000ms fallback delay when retryCount is out-of-bounds negative",
+      input: { ...defaultInput, retryCount: -1, maxRetries: 3 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, 30000);
+      },
+    },
 
     // 8. Non-Error inputs
     {
@@ -1370,6 +1383,20 @@ describe("classifyConnectFailure", () => {
       assertDetails: (action) => {
         assert.equal(action.kind, "give-up");
         assert.ok(action.error.message.includes("string error message"));
+      },
+    },
+    {
+      name: "preserves structured status property on non-Error object for OAuth 401 detection",
+      input: {
+        ...defaultInput,
+        error: { status: 401, message: "Unauthorized" },
+        hasAuth: true,
+        transport: "streamable-http",
+      },
+      expectedKind: "auth-required",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "auth-required");
+        assert.equal(action.invalidateTokens, true);
       },
     },
   ];

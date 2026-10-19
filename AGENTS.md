@@ -44,7 +44,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 |---|---|
 | `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; connection coordination (`connectRequested`, `connectAttempts`, `authQueue`, startup auth prompts); interactive `authorize()`; `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`; `mcp_status` / `mcp_connect` tools |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
-| `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
+| `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), pure connect-failure classification (`classifyConnectFailure`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
 | `src/transport-factory.ts` | SDK transport construction (`stdio`, `streamable-http`, `sse`), environment resolution (`resolveEnv`), silent OAuth provider wiring, and transport-level SDK workarounds (`createTransport`) |
 | `src/stdio-process.ts` | Stdio child-process supervision (`isPidAlive`, `ensurePidTerminated`, `instrumentStdioTransport`, injectable `StdioProcessDeps`) and `StringDecoder` stderr line splitting (`createLineSplitter`) |
 | `src/tool-bridge.ts` | `tools/list` discovery, tool naming/hashing/collisions, Pi tool registration and `callTool` |

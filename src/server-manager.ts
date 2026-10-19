@@ -198,7 +198,7 @@ export function classifyConnectFailure(input: ClassifyConnectFailureInput): Conn
     return { kind: "auth-required", invalidateTokens: false };
   }
 
-  if (input.hasAuth && input.transport !== "stdio" && isOAuthUnauthorizedError(error)) {
+  if (input.hasAuth && input.transport !== "stdio" && isOAuthUnauthorizedError(input.error)) {
     // WHY: Check OAuth unauthorized errors BEFORE the generic `error.code === "protocol"`
     // fast-fail so 401/403 failures during initial tools/list (`onToolRefresh`) are
     // classified as `AuthRequiredError` rather than raw protocol failures, and stale
@@ -931,16 +931,18 @@ export class ServerManager {
         serverName: server.name,
       });
 
+      const error = err instanceof Error ? err : new Error(String(err));
+
       switch (action.kind) {
         case "cancelled":
           throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
         case "retry-corrupt-state": {
-          const error = err instanceof Error ? err : new Error(String(err));
           console.error(`[pi-mcp] ${sanitizeTerminalText(error.message)}`);
           if (signal.aborted) throw new AuthCancelledError(server.name);
           return this._connect(server, server.cwd ?? cwd, signal, true);
         }
         case "auth-required": {
+          server.lastError = error;
           if (action.invalidateTokens) {
             await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
           }
@@ -954,11 +956,11 @@ export class ServerManager {
           server.state = "stopped";
           throw action.error;
         case "give-up":
-          server.lastError = action.error;
+          server.lastError = error;
           server.state = "stopped";
           throw action.error;
         case "retry": {
-          server.lastError = err instanceof Error ? err : new Error(String(err));
+          server.lastError = error;
           server.retryCount++;
           await this._waitRetry(server, signal, action.delayMs);
           if (signal.aborted) throw new AuthCancelledError(server.name);
