@@ -143,14 +143,18 @@ Workflows live in `.github/workflows/`. The checks below run on every PR, whatev
 | `Code-Review` | Accepted risk: a solo maintainer can't get approvals, since Scorecard needs a reviewer or merger other than the author. Dismiss as "won't fix" | Revisit when a second maintainer joins |
 | `CII-Best-Practices` | Maintainer action: register and self-certify at [bestpractices.dev](https://www.bestpractices.dev) | n/a |
 
-**Branch ruleset as code.** `.github/rulesets/default-branch.json` is the source of truth for protecting `main`: it blocks deletion and force pushes, with no bypass actors (Scorecard tier 1). It deliberately does **not** require PRs, reviews, or status checks:
-- A solo maintainer can't approve their own PRs.
-- The release job pushes `chore: release vX.Y.Z` straight to `main` with `GITHUB_TOKEN`. On a user-owned repo the GitHub Actions app can't be a ruleset bypass actor (the API returns 422), so such rules would break publishing. Branch rulesets don't apply to tags.
+**Repository rulesets as code.** `.github/rulesets/` contains the declarative sources of truth for branch and tag protections:
+- `.github/rulesets/default-branch.json` protects `main`: it blocks deletion, blocks force pushes, and requires linear history, with no bypass actors (Scorecard tier 1). It deliberately does **not** require PRs, reviews, or status checks:
+  - A solo maintainer can't approve their own PRs.
+  - The release job pushes `chore: release vX.Y.Z` straight to `main` with `GITHUB_TOKEN`. On a user-owned repo the GitHub Actions app can't be a ruleset bypass actor (the API returns 422), so such rules would break publishing.
+- `.github/rulesets/release-tags.json` protects release tags (`refs/tags/v*`): it blocks deletion, blocks force pushes, and blocks tag mutations, while allowing the maintainer (repository admin) to bypass and allowing `publish.yml` to create new release tags.
 
 ```bash
-gh api repos/irahardianto/pi-mcp-extension/rulesets                                                                  # list live rulesets (check for drift)
-gh api --method POST repos/irahardianto/pi-mcp-extension/rulesets --input .github/rulesets/default-branch.json       # create
-gh api --method PUT repos/irahardianto/pi-mcp-extension/rulesets/<id> --input .github/rulesets/default-branch.json  # update
+gh api repos/irahardianto/pi-mcp-extension/rulesets                                                                   # list live rulesets (check for drift)
+gh api --method POST repos/irahardianto/pi-mcp-extension/rulesets --input .github/rulesets/default-branch.json        # create branch ruleset
+gh api --method PUT repos/irahardianto/pi-mcp-extension/rulesets/<id> --input .github/rulesets/default-branch.json   # update branch ruleset
+gh api --method POST repos/irahardianto/pi-mcp-extension/rulesets --input .github/rulesets/release-tags.json         # create tag ruleset
+gh api --method PUT repos/irahardianto/pi-mcp-extension/rulesets/<id> --input .github/rulesets/release-tags.json    # update tag ruleset
 ```
 
 When you edit a workflow:
