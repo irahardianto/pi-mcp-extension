@@ -147,7 +147,86 @@ export function sanitizeStderrLine(line: string): string {
 export type ServerState = "stopped" | "starting" | "ready";
 
 /** Fixed retry delay schedule — predictable, no jitter math needed. */
-const RETRY_DELAYS_MS = [1000, 3000, 5000, 10000, 30000] as const;
+export const RETRY_DELAYS_MS = [1000, 3000, 5000, 10000, 30000] as const;
+
+export type TransportType = ServerConfig["transport"];
+
+export type ConnectFailureAction =
+  | { kind: "cancelled" }
+  | { kind: "retry-corrupt-state" }
+  | { kind: "auth-required"; invalidateTokens: boolean }
+  | { kind: "fail"; error: Error }
+  | { kind: "give-up"; error: McpError }
+  | { kind: "retry"; delayMs: number };
+
+export interface ClassifyConnectFailureInput {
+  error: unknown;
+  aborted: boolean;
+  corruptStateRecovered: boolean;
+  hasAuth: boolean;
+  transport: TransportType;
+  retryCount: number;
+  maxRetries: number;
+  serverName?: string;
+}
+
+/**
+ * Pure failure classifier for connection attempts.
+ * Classifies failure into cancelled, retry-corrupt-state, auth-required, fail (fast-fail),
+ * give-up (retries exhausted), or retry with a specific delay.
+ */
+export function classifyConnectFailure(input: ClassifyConnectFailureInput): ConnectFailureAction {
+  if (input.aborted || input.error instanceof AuthCancelledError) {
+    return { kind: "cancelled" };
+  }
+
+  const error = input.error instanceof Error ? input.error : new Error(String(input.error));
+
+  if (
+    !input.corruptStateRecovered &&
+    error instanceof McpError &&
+    error.code === "config" &&
+    /Corrupt OAuth state file/i.test(error.message)
+  ) {
+    // WHY: McpOAuthProvider._loadState() already backed up and removed the corrupt
+    // state file before throwing this error. Log the warning and retry once immediately
+    // without consuming retryCount so OAuth can proceed cleanly into AuthRequiredError.
+    return { kind: "retry-corrupt-state" };
+  }
+
+  if (error instanceof AuthRequiredError) {
+    return { kind: "auth-required", invalidateTokens: false };
+  }
+
+  if (input.hasAuth && input.transport !== "stdio" && isOAuthUnauthorizedError(error)) {
+    // WHY: Check OAuth unauthorized errors BEFORE the generic `error.code === "protocol"`
+    // fast-fail so 401/403 failures during initial tools/list (`onToolRefresh`) are
+    // classified as `AuthRequiredError` rather than raw protocol failures, and stale
+    // tokens on disk are invalidated before interactive re-authorization runs.
+    return { kind: "auth-required", invalidateTokens: true };
+  }
+
+  if (error instanceof McpError && (error.code === "protocol" || error.code === "config")) {
+    return { kind: "fail", error };
+  }
+
+  if (input.retryCount >= input.maxRetries) {
+    const serverName = input.serverName ?? (error instanceof McpError ? error.server : "");
+    const code = error instanceof McpError && error.code === "timeout" ? "timeout" : "connection";
+    return {
+      kind: "give-up",
+      error: new McpError(
+        `Connection failed after ${input.retryCount} retries: ${error.message}`,
+        serverName,
+        code,
+        input.error,
+      ),
+    };
+  }
+
+  const delayMs = RETRY_DELAYS_MS[Math.min(input.retryCount, RETRY_DELAYS_MS.length - 1)] ?? 30000;
+  return { kind: "retry", delayMs };
+}
 
 /** Maximum stderr lines stored per server (circular). */
 const STDERR_BUFFER_SIZE = 100;
@@ -480,31 +559,17 @@ export class ServerManager {
     }
   }
 
-  private async _connect(
-    server: ManagedServer,
-    cwd: string,
-    signal: AbortSignal,
-    corruptStateRecovered = false,
-  ): Promise<void> {
-    server.lastError = null;
-    const currentCwd = server.cwd ?? cwd;
-    server.cwd = currentCwd;
-    const timeoutMs = this._resolveTimeoutMs(server);
-    // Note: retryCount is NOT reset here — it's only reset after successful connect.
-    // This ensures the retry limit is respected across reconnection attempts.
-    // It IS reset when startServer() is called explicitly (e.g. /mcp:start)
-    // via the caller having already set retryCount = 0 before calling _connect.
+  private _appendStderr(server: ManagedServer, line: string): void {
+    server.stderrLog.push(line);
+    if (server.stderrLog.length > STDERR_BUFFER_SIZE) {
+      server.stderrLog.shift();
+    }
+  }
 
-    const appendStderr = (line: string): void => {
-      server.stderrLog.push(line);
-      if (server.stderrLog.length > STDERR_BUFFER_SIZE) {
-        server.stderrLog.shift();
-      }
-    };
-
+  private _createAndInstrumentTransport(server: ManagedServer, cwd: string): Transport {
     let transport: Transport;
     try {
-      transport = this.createTransport(server.name, server.config, currentCwd);
+      transport = this.createTransport(server.name, server.config, cwd);
     } catch (err) {
       server.state = "stopped";
       server.lastError = err instanceof Error ? err : new Error(String(err));
@@ -516,8 +581,6 @@ export class ServerManager {
       );
     }
 
-    server.transport = transport;
-
     if (transport instanceof StdioClientTransport) {
       instrumentStdioTransport(transport, {
         onPid: (pid) => {
@@ -526,12 +589,20 @@ export class ServerManager {
         onStderrLine: (rawLine) => {
           const clean = sanitizeStderrLine(rawLine);
           if (!clean) return;
-          appendStderr(clean);
+          this._appendStderr(server, clean);
           console.error(`[pi-mcp] [${server.name}] ${clean}`);
         },
       });
     }
 
+    return transport;
+  }
+
+  private _createClient(
+    server: ManagedServer,
+    cwd: string,
+    signal: AbortSignal,
+  ): Client {
     const client = new Client(
       { name: "pi-mcp", version: "1.0.0" },
       {
@@ -590,246 +661,313 @@ export class ServerManager {
         const safeLogger = sanitizeTerminalText(String(logger), { maxLength: 100 });
         const safeMsg = sanitizeTerminalText(rawMsg ?? "");
         console.error(`[pi-mcp:${server.name}] [${safeLevel}] ${safeLogger}: ${safeMsg}`);
-        appendStderr(`[${safeLevel}] ${safeLogger}: ${safeMsg}`);
+        this._appendStderr(server, `[${safeLevel}] ${safeLogger}: ${safeMsg}`);
       },
     );
 
-    server.client = client;
-    try {
-      await this._connectWithTimeoutAndSignal(client, transport, timeoutMs, signal, server.name);
-      if (signal.aborted) throw new AuthCancelledError(server.name);
-      if (transport instanceof StdioClientTransport && !server.childPid) {
-        server.childPid = transport.pid;
+    return client;
+  }
+
+  private async _handshakeAndDiscover(
+    server: ManagedServer,
+    client: Client,
+    transport: Transport,
+    timeoutMs: number,
+    signal: AbortSignal,
+    currentCwd: string,
+  ): Promise<void> {
+    await this._connectWithTimeoutAndSignal(client, transport, timeoutMs, signal, server.name);
+    if (signal.aborted) throw new AuthCancelledError(server.name);
+    if (transport instanceof StdioClientTransport && !server.childPid) {
+      server.childPid = transport.pid;
+    }
+    // Readiness includes tool discovery, not just the MCP handshake.
+    if (this.onToolRefresh) {
+      await this.onToolRefresh(server.name, client, {
+        requestTimeoutMs: timeoutMs,
+        signal,
+      });
+    }
+    if (signal.aborted) throw new AuthCancelledError(server.name);
+    server.state = "ready";
+    server.retryCount = 0;
+    server.lastError = null;
+    if (server.cwd && server.cwd !== currentCwd) {
+      void client.sendRootsListChanged().catch(() => {
+        // WHY: Best-effort notification if cwd was updated while handshake was in flight.
+      });
+    }
+  }
+
+  private _startHealthCheck(
+    server: ManagedServer,
+    timeoutMs: number,
+    signal: AbortSignal,
+    cwd: string,
+  ): void {
+    if (!server.config.healthCheckIntervalMs) {
+      return;
+    }
+    let pingInFlight = false;
+    const runHealthCheck = async (): Promise<void> => {
+      if (pingInFlight || server.state !== "ready" || !server.client || signal.aborted) {
+        return;
       }
-      // Readiness includes tool discovery, not just the MCP handshake.
-      if (this.onToolRefresh) {
-        await this.onToolRefresh(server.name, client, {
-          requestTimeoutMs: timeoutMs,
+      pingInFlight = true;
+      let pingTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const pingOptions = {
+          timeout: timeoutMs,
           signal,
-        });
-      }
-      if (signal.aborted) throw new AuthCancelledError(server.name);
-      server.state = "ready";
-      server.retryCount = 0;
-      server.lastError = null;
-      if (server.cwd && server.cwd !== currentCwd) {
-        void client.sendRootsListChanged().catch(() => {
-          // WHY: Best-effort notification if cwd was updated while handshake was in flight.
-        });
-      }
-      if (server.config.healthCheckIntervalMs) {
-        let pingInFlight = false;
-        const runHealthCheck = async (): Promise<void> => {
-          if (pingInFlight || server.state !== "ready" || !server.client || signal.aborted) {
-            return;
-          }
-          pingInFlight = true;
-          let pingTimer: ReturnType<typeof setTimeout> | undefined;
-          try {
-            const pingOptions = {
-              timeout: timeoutMs,
-              signal,
-            };
-            const pingCall = (
-              server.client.ping as (
-                opts?: { timeout?: number; signal?: AbortSignal },
-                extraOpts?: { timeout?: number; signal?: AbortSignal },
-              ) => Promise<unknown>
-            )(pingOptions, pingOptions);
-            pingCall.catch(() => {
-              // WHY: Handled via Promise.race below.
-            });
-            await Promise.race([
-              pingCall,
-              new Promise<never>((_resolve, reject) => {
-                pingTimer = setTimeout(
-                  () =>
-                    reject(
-                      new McpError(
-                        `Health check ping timed out after ${timeoutMs}ms`,
-                        server.name,
-                        "timeout",
-                      ),
-                    ),
-                  timeoutMs,
-                );
-              }),
-            ]);
-          } catch {
-            // WHY: Ping failure triggers background recovery if the server is still ready.
-            // The ping error is intentionally not kept on lastError because _recover() →
-            // _shutdown() synchronously resets lastError during teardown before any reader
-            // observes it; if reconnection fails, _recover() records the failure on lastError.
-            if (server.state === "ready" && !signal.aborted) {
-              void this._recover(server, server.cwd ?? cwd);
-            }
-          } finally {
-            if (pingTimer !== undefined) {
-              clearTimeout(pingTimer);
-            }
-            pingInFlight = false;
-          }
         };
-        server.healthCheckTimer = setInterval(() => {
-          void runHealthCheck();
-        }, server.config.healthCheckIntervalMs);
-      }
-      // Unexpected transport close (e.g. the server subprocess crashes
-      // mid-session). Without this the state would stay "ready" and tools
-      // would remain active against a dead server. Deliberate closes abort
-      // the signal first, so they are ignored here.
-      client.onclose = () => {
-        if (signal.aborted || server.client !== client) return;
-        console.error(`[pi-mcp] Server ${server.name} closed unexpectedly, reconnecting`);
-        void this._recover(server, server.cwd ?? cwd);
-      };
-      // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
-      // stream drops via transport.onerror (forwarded to client.onerror) rather than
-      // transport.onclose. Crucially, StreamableHTTPClientTransport.send() invokes
-      // this.onerror(error) synchronously BEFORE `throw error` rejects the send()
-      // promise; deferring _recover() via setImmediate lets Protocol.request() and
-      // ToolBridge.execute() observe the original transport/401 error (and run
-      // handleUnauthorizedServerError if applicable) before client.close() rejects
-      // pending requests with "Connection closed".
-      const scheduleErrorRecovery = () => {
-        const errorGeneration = server.generation ?? 0;
-        setImmediate(() => {
-          if (
-            (server.generation ?? 0) !== errorGeneration ||
-            server.state !== "ready" ||
-            signal.aborted ||
-            server.client !== client
-          ) {
-            return;
-          }
-          void this._recover(server, server.cwd ?? cwd);
+        const pingCall = (
+          server.client.ping as (
+            opts?: { timeout?: number; signal?: AbortSignal },
+            extraOpts?: { timeout?: number; signal?: AbortSignal },
+          ) => Promise<unknown>
+        )(pingOptions, pingOptions);
+        pingCall.catch(() => {
+          // WHY: Handled via Promise.race below.
         });
-      };
-      client.onerror = (err) => {
-        if (server.state !== "ready" || signal.aborted || server.client !== client) {
-          return;
+        await Promise.race([
+          pingCall,
+          new Promise<never>((_resolve, reject) => {
+            pingTimer = setTimeout(
+              () =>
+                reject(
+                  new McpError(
+                    `Health check ping timed out after ${timeoutMs}ms`,
+                    server.name,
+                    "timeout",
+                  ),
+                ),
+              timeoutMs,
+            );
+          }),
+        ]);
+      } catch {
+        // WHY: Ping failure triggers background recovery if the server is still ready.
+        // The ping error is intentionally not kept on lastError because _recover() →
+        // _shutdown() synchronously resets lastError during teardown before any reader
+        // observes it; if reconnection fails, _recover() records the failure on lastError.
+        if (server.state === "ready" && !signal.aborted) {
+          void this._recover(server, server.cwd ?? cwd);
         }
-        const rawMsg = err instanceof Error ? err.message : String(err);
+      } finally {
+        if (pingTimer !== undefined) {
+          clearTimeout(pingTimer);
+        }
+        pingInFlight = false;
+      }
+    };
+    server.healthCheckTimer = setInterval(() => {
+      void runHealthCheck();
+    }, server.config.healthCheckIntervalMs);
+  }
+
+  private _wireDisconnectRecovery(
+    server: ManagedServer,
+    client: Client,
+    signal: AbortSignal,
+    cwd: string,
+  ): void {
+    // Unexpected transport close (e.g. the server subprocess crashes
+    // mid-session). Without this the state would stay "ready" and tools
+    // would remain active against a dead server. Deliberate closes abort
+    // the signal first, so they are ignored here.
+    client.onclose = () => {
+      if (signal.aborted || server.client !== client) return;
+      console.error(`[pi-mcp] Server ${server.name} closed unexpectedly, reconnecting`);
+      void this._recover(server, server.cwd ?? cwd);
+    };
+    // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
+    // stream drops via transport.onerror (forwarded to client.onerror) rather than
+    // transport.onclose. Crucially, StreamableHTTPClientTransport.send() invokes
+    // this.onerror(error) synchronously BEFORE `throw error` rejects the send()
+    // promise; deferring _recover() via setImmediate lets Protocol.request() and
+    // ToolBridge.execute() observe the original transport/401 error (and run
+    // handleUnauthorizedServerError if applicable) before client.close() rejects
+    // pending requests with "Connection closed".
+    const scheduleErrorRecovery = () => {
+      const errorGeneration = server.generation ?? 0;
+      setImmediate(() => {
         if (
-          /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
-            rawMsg,
-          )
+          (server.generation ?? 0) !== errorGeneration ||
+          server.state !== "ready" ||
+          signal.aborted ||
+          server.client !== client
         ) {
           return;
         }
-        const msg = sanitizeTerminalText(rawMsg);
-        if (server.config.transport === "sse") {
-          console.error(`[pi-mcp] Server ${server.name} SSE stream error, reconnecting: ${msg}`);
-          scheduleErrorRecovery();
-          return;
-        }
-        if (server.config.transport === "streamable-http") {
-          if (isOAuthUnauthorizedError(err)) {
-            console.error(`[pi-mcp] Server ${server.name} HTTP auth error, recovering: ${msg}`);
-            scheduleErrorRecovery();
-            return;
-          }
-          // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
-          // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
-          // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
-          // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
-          // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
-          // stream drops on established streams report "SSE stream disconnected" or
-          // "Maximum reconnection attempts (0) exceeded." instead.
-          if (/Failed to open SSE stream:/i.test(rawMsg)) {
-            return;
-          }
-          console.error(`[pi-mcp] Server ${server.name} HTTP stream error, reconnecting: ${msg}`);
-          scheduleErrorRecovery();
-        }
-      };
-    } catch (err) {
-      const pid =
-        server.childPid ??
-        (transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
-        (transport instanceof StdioClientTransport ? transport.pid : null);
-      server.childPid = null;
-      await Promise.allSettled([
-        client.close(),
-        ensurePidTerminated(pid),
-      ]);
-      await ensurePidTerminated(pid);
-      if (server.client === client) {
-        server.client = null;
-        server.transport = undefined;
-      }
-      if (signal.aborted || err instanceof AuthCancelledError) {
-        throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
-      }
-      const error = err instanceof Error ? err : new Error(String(err));
-      if (
-        !corruptStateRecovered &&
-        error instanceof McpError &&
-        error.code === "config" &&
-        /Corrupt OAuth state file/i.test(error.message)
-      ) {
-        // WHY: McpOAuthProvider._loadState() already backed up and removed the corrupt
-        // state file before throwing this error. Log the warning and retry once immediately
-        // without consuming retryCount so OAuth can proceed cleanly into AuthRequiredError.
-        console.error(`[pi-mcp] ${sanitizeTerminalText(error.message)}`);
-        if (signal.aborted) throw new AuthCancelledError(server.name);
-        return this._connect(server, server.cwd ?? cwd, signal, true);
-      }
-      server.lastError = error;
-      if (error instanceof AuthRequiredError) {
-        server.state = "stopped";
-        throw error;
-      }
-      if (Boolean(server.config.auth) && server.config.transport !== "stdio" && isOAuthUnauthorizedError(error)) {
-        // WHY: Check OAuth unauthorized errors BEFORE the generic `error.code === "protocol"`
-        // fast-fail so 401/403 failures during initial tools/list (`onToolRefresh`) are
-        // classified as `AuthRequiredError` rather than raw protocol failures, and stale
-        // tokens on disk are invalidated before interactive re-authorization runs.
-        await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
-        const authError = new AuthRequiredError(server.name);
-        server.lastError = authError;
-        server.state = "stopped";
-        throw authError;
-      }
-      if (error instanceof McpError && error.code === "protocol") {
-        server.state = "stopped";
-        throw error;
-      }
-      if (server.retryCount >= this.settings.maxRetries) {
-        server.state = "stopped";
-        const code = error instanceof McpError && error.code === "timeout" ? "timeout" : "connection";
-        throw new McpError(
-          `Connection failed after ${server.retryCount} retries: ${error.message}`,
-          server.name,
-          code,
-          err,
-        );
-      }
-      const delayMs = RETRY_DELAYS_MS[Math.min(server.retryCount++, RETRY_DELAYS_MS.length - 1)] ?? 30000;
-      await new Promise<void>((resolve) => {
-        if (signal.aborted) {
-          resolve();
-          return;
-        }
-        const onAbort = () => {
-          if (server.retryTimer) {
-            clearTimeout(server.retryTimer);
-            server.retryTimer = null;
-          }
-          resolve();
-        };
-        const timer = setTimeout(() => {
-          signal.removeEventListener("abort", onAbort);
-          server.retryTimer = null;
-          resolve();
-        }, delayMs);
-        server.retryTimer = timer;
-        signal.addEventListener("abort", onAbort, { once: true });
+        void this._recover(server, server.cwd ?? cwd);
       });
-      if (signal.aborted) throw new AuthCancelledError(server.name);
-      return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
+    };
+    client.onerror = (err) => {
+      if (server.state !== "ready" || signal.aborted || server.client !== client) {
+        return;
+      }
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      if (
+        /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
+          rawMsg,
+        )
+      ) {
+        return;
+      }
+      const msg = sanitizeTerminalText(rawMsg);
+      if (server.config.transport === "sse") {
+        console.error(`[pi-mcp] Server ${server.name} SSE stream error, reconnecting: ${msg}`);
+        scheduleErrorRecovery();
+        return;
+      }
+      if (server.config.transport === "streamable-http") {
+        if (isOAuthUnauthorizedError(err)) {
+          console.error(`[pi-mcp] Server ${server.name} HTTP auth error, recovering: ${msg}`);
+          scheduleErrorRecovery();
+          return;
+        }
+        // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
+        // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
+        // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
+        // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
+        // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
+        // stream drops on established streams report "SSE stream disconnected" or
+        // "Maximum reconnection attempts (0) exceeded." instead.
+        if (/Failed to open SSE stream:/i.test(rawMsg)) {
+          return;
+        }
+        console.error(`[pi-mcp] Server ${server.name} HTTP stream error, reconnecting: ${msg}`);
+        scheduleErrorRecovery();
+      }
+    };
+  }
+
+  private async _cleanupFailedConnect(
+    server: ManagedServer,
+    client: Client,
+    transport: Transport,
+  ): Promise<void> {
+    const pid =
+      server.childPid ??
+      (transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
+      (transport instanceof StdioClientTransport ? transport.pid : null);
+    server.childPid = null;
+    await Promise.allSettled([
+      client.close(),
+      ensurePidTerminated(pid),
+    ]);
+    // WHY: Secondary safety check to guarantee PID termination even if transport.close()
+    // or child process exit raced during the initial Promise.allSettled.
+    await ensurePidTerminated(pid);
+    if (server.client === client) {
+      server.client = null;
+      server.transport = undefined;
     }
   }
+
+  private async _waitRetry(
+    server: ManagedServer,
+    signal: AbortSignal,
+    delayMs: number,
+  ): Promise<void> {
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const onAbort = () => {
+        if (server.retryTimer) {
+          clearTimeout(server.retryTimer);
+          server.retryTimer = null;
+        }
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        server.retryTimer = null;
+        resolve();
+      }, delayMs);
+      server.retryTimer = timer;
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async _connect(
+    server: ManagedServer,
+    cwd: string,
+    signal: AbortSignal,
+    corruptStateRecovered = false,
+  ): Promise<void> {
+    server.lastError = null;
+    const currentCwd = server.cwd ?? cwd;
+    server.cwd = currentCwd;
+    const timeoutMs = this._resolveTimeoutMs(server);
+    // Note: retryCount is NOT reset here — it's only reset after successful connect.
+    // This ensures the retry limit is respected across reconnection attempts.
+    // It IS reset when startServer() is called explicitly (e.g. /mcp:start)
+    // via the caller having already set retryCount = 0 before calling _connect.
+
+    const transport = this._createAndInstrumentTransport(server, currentCwd);
+    server.transport = transport;
+
+    const client = this._createClient(server, cwd, signal);
+    server.client = client;
+
+    try {
+      await this._handshakeAndDiscover(server, client, transport, timeoutMs, signal, currentCwd);
+      this._startHealthCheck(server, timeoutMs, signal, cwd);
+      this._wireDisconnectRecovery(server, client, signal, cwd);
+    } catch (err) {
+      await this._cleanupFailedConnect(server, client, transport);
+
+      const action = classifyConnectFailure({
+        error: err,
+        aborted: signal.aborted,
+        corruptStateRecovered,
+        hasAuth: Boolean(server.config.auth),
+        transport: server.config.transport,
+        retryCount: server.retryCount,
+        maxRetries: this.settings.maxRetries,
+        serverName: server.name,
+      });
+
+      switch (action.kind) {
+        case "cancelled":
+          throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
+        case "retry-corrupt-state": {
+          const error = err instanceof Error ? err : new Error(String(err));
+          console.error(`[pi-mcp] ${sanitizeTerminalText(error.message)}`);
+          if (signal.aborted) throw new AuthCancelledError(server.name);
+          return this._connect(server, server.cwd ?? cwd, signal, true);
+        }
+        case "auth-required": {
+          if (action.invalidateTokens) {
+            await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
+          }
+          const authError = err instanceof AuthRequiredError ? err : new AuthRequiredError(server.name);
+          server.lastError = authError;
+          server.state = "stopped";
+          throw authError;
+        }
+        case "fail":
+          server.lastError = action.error;
+          server.state = "stopped";
+          throw action.error;
+        case "give-up":
+          server.lastError = action.error;
+          server.state = "stopped";
+          throw action.error;
+        case "retry": {
+          server.lastError = err instanceof Error ? err : new Error(String(err));
+          server.retryCount++;
+          await this._waitRetry(server, signal, action.delayMs);
+          if (signal.aborted) throw new AuthCancelledError(server.name);
+          return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
+        }
+      }
+    }
+  }
+
 
   /** Tear down a server that died or stopped responding, then reconnect. */
   private async _recover(server: ManagedServer, cwd: string): Promise<void> {

@@ -5,10 +5,17 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { ServerManager } from "../src/server-manager.js";
+import {
+  ServerManager,
+  classifyConnectFailure,
+  RETRY_DELAYS_MS,
+  type ConnectFailureAction,
+} from "../src/server-manager.js";
 import { ToolBridge, type PiExtensionAPI } from "../src/tool-bridge.js";
 import type { McpConfig } from "../src/config.js";
-import { McpError } from "../src/errors.js";
+import { McpError, AuthCancelledError } from "../src/errors.js";
+import { AuthRequiredError } from "../src/oauth-provider.js";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { Socket } from "node:net";
@@ -1031,6 +1038,349 @@ await server.connect(new StdioServerTransport());
       await rm(dir, { recursive: true, force: true });
     }
   });
+});
+
+describe("classifyConnectFailure", () => {
+  interface TestCase {
+    name: string;
+    input: Parameters<typeof classifyConnectFailure>[0];
+    expectedKind: ConnectFailureAction["kind"];
+    assertDetails?: (action: ConnectFailureAction) => void;
+  }
+
+  const defaultInput = {
+    error: new Error("connection reset"),
+    aborted: false,
+    corruptStateRecovered: false,
+    hasAuth: false,
+    transport: "streamable-http" as const,
+    retryCount: 0,
+    maxRetries: 3,
+    serverName: "test-srv",
+  };
+
+  const testCases: TestCase[] = [
+    // 1. Cancellation
+    {
+      name: "returns 'cancelled' when aborted is true",
+      input: { ...defaultInput, aborted: true },
+      expectedKind: "cancelled",
+    },
+    {
+      name: "returns 'cancelled' when error is AuthCancelledError (even if aborted is false)",
+      input: { ...defaultInput, aborted: false, error: new AuthCancelledError("test-srv") },
+      expectedKind: "cancelled",
+    },
+    {
+      name: "returns 'cancelled' when both aborted is true and error is AuthCancelledError",
+      input: { ...defaultInput, aborted: true, error: new AuthCancelledError("test-srv") },
+      expectedKind: "cancelled",
+    },
+
+    // 2. Corrupt OAuth state
+    {
+      name: "returns 'retry-corrupt-state' on corrupt state McpError when corruptStateRecovered is false",
+      input: {
+        ...defaultInput,
+        error: new McpError("Corrupt OAuth state file /path/to/tokens.json: SyntaxError", "test-srv", "config"),
+        corruptStateRecovered: false,
+      },
+      expectedKind: "retry-corrupt-state",
+    },
+    {
+      name: "fast-fails as 'fail' on corrupt state McpError when corruptStateRecovered is true",
+      input: {
+        ...defaultInput,
+        error: new McpError("Corrupt OAuth state file /path/to/tokens.json: SyntaxError", "test-srv", "config"),
+        corruptStateRecovered: true,
+      },
+      expectedKind: "fail",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "fail");
+        assert.ok(action.error instanceof McpError);
+        assert.equal(action.error.code, "config");
+      },
+    },
+
+    // 3. AuthRequiredError (already thrown by OAuthProvider)
+    {
+      name: "returns 'auth-required' with invalidateTokens=false on direct AuthRequiredError",
+      input: {
+        ...defaultInput,
+        error: new AuthRequiredError("test-srv"),
+        hasAuth: true,
+      },
+      expectedKind: "auth-required",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "auth-required");
+        assert.equal(action.invalidateTokens, false);
+      },
+    },
+    {
+      name: "returns 'auth-required' with invalidateTokens=false on direct AuthRequiredError even if hasAuth is false",
+      input: {
+        ...defaultInput,
+        error: new AuthRequiredError("test-srv"),
+        hasAuth: false,
+      },
+      expectedKind: "auth-required",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "auth-required");
+        assert.equal(action.invalidateTokens, false);
+      },
+    },
+
+    // 4. OAuth unauthorized errors (isOAuthUnauthorizedError)
+    {
+      name: "returns 'auth-required' with invalidateTokens=true for streamable-http with auth on 401",
+      input: {
+        ...defaultInput,
+        error: new UnauthorizedError("401 Unauthorized"),
+        hasAuth: true,
+        transport: "streamable-http",
+      },
+      expectedKind: "auth-required",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "auth-required");
+        assert.equal(action.invalidateTokens, true);
+      },
+    },
+    {
+      name: "returns 'auth-required' with invalidateTokens=true for sse with auth on 401",
+      input: {
+        ...defaultInput,
+        error: new UnauthorizedError("401 Unauthorized"),
+        hasAuth: true,
+        transport: "sse",
+      },
+      expectedKind: "auth-required",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "auth-required");
+        assert.equal(action.invalidateTokens, true);
+      },
+    },
+    {
+      name: "WHY: prioritizes OAuth-401 over protocol fast-fail when protocol McpError contains 401 and hasAuth=true",
+      input: {
+        ...defaultInput,
+        error: new McpError("POSTing to https://example.com/mcp: 401 Unauthorized", "test-srv", "protocol"),
+        hasAuth: true,
+        transport: "streamable-http",
+      },
+      expectedKind: "auth-required",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "auth-required");
+        assert.equal(action.invalidateTokens, true);
+      },
+    },
+    {
+      name: "does not return 'auth-required' on 401 when hasAuth is false (fails or retries)",
+      input: {
+        ...defaultInput,
+        error: new McpError("POSTing to https://example.com/mcp: 401 Unauthorized", "test-srv", "protocol"),
+        hasAuth: false,
+        transport: "streamable-http",
+      },
+      expectedKind: "fail", // Protocol McpError fast-fails when not handled as auth
+    },
+    {
+      name: "does not return 'auth-required' on 401 when transport is stdio",
+      input: {
+        ...defaultInput,
+        error: new UnauthorizedError("401 Unauthorized"),
+        hasAuth: true,
+        transport: "stdio",
+      },
+      expectedKind: "retry", // UnauthorizedError is not an McpError, so stdio retries
+    },
+
+    // 5. Fast-fail (protocol or config error)
+    {
+      name: "fast-fails as 'fail' on protocol McpError (non-401)",
+      input: {
+        ...defaultInput,
+        error: new McpError("JSON-RPC parse error", "test-srv", "protocol"),
+      },
+      expectedKind: "fail",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "fail");
+        assert.ok(action.error instanceof McpError);
+        assert.equal(action.error.code, "protocol");
+      },
+    },
+    {
+      name: "fast-fails as 'fail' on config McpError (non-corrupt-state)",
+      input: {
+        ...defaultInput,
+        error: new McpError("Invalid server configuration", "test-srv", "config"),
+      },
+      expectedKind: "fail",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "fail");
+        assert.ok(action.error instanceof McpError);
+        assert.equal(action.error.code, "config");
+      },
+    },
+
+    // 6. Retries exhausted (give-up)
+    {
+      name: "returns 'give-up' when retryCount equals maxRetries",
+      input: {
+        ...defaultInput,
+        retryCount: 3,
+        maxRetries: 3,
+        error: new Error("ECONNREFUSED"),
+      },
+      expectedKind: "give-up",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "give-up");
+        assert.ok(action.error instanceof McpError);
+        assert.equal(action.error.code, "connection");
+        assert.equal(action.error.server, "test-srv");
+        assert.ok(action.error.message.includes("Connection failed after 3 retries: ECONNREFUSED"));
+      },
+    },
+    {
+      name: "returns 'give-up' when retryCount exceeds maxRetries",
+      input: {
+        ...defaultInput,
+        retryCount: 5,
+        maxRetries: 3,
+        error: new Error("ECONNREFUSED"),
+      },
+      expectedKind: "give-up",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "give-up");
+        assert.ok(action.error instanceof McpError);
+        assert.equal(action.error.code, "connection");
+      },
+    },
+    {
+      name: "returns 'give-up' with code 'timeout' when exhausted error is a timeout McpError",
+      input: {
+        ...defaultInput,
+        retryCount: 2,
+        maxRetries: 2,
+        error: new McpError("Connection timed out after 5000ms", "test-srv", "timeout"),
+      },
+      expectedKind: "give-up",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "give-up");
+        assert.ok(action.error instanceof McpError);
+        assert.equal(action.error.code, "timeout");
+        assert.equal(action.error.server, "test-srv");
+      },
+    },
+    {
+      name: "falls back to error.server on give-up when input.serverName is omitted",
+      input: {
+        error: new McpError("Server down", "inferred-srv", "connection"),
+        aborted: false,
+        corruptStateRecovered: false,
+        hasAuth: false,
+        transport: "streamable-http",
+        retryCount: 1,
+        maxRetries: 1,
+      },
+      expectedKind: "give-up",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "give-up");
+        assert.equal(action.error.server, "inferred-srv");
+      },
+    },
+    {
+      name: "falls back to empty server name on give-up when both serverName and error.server are missing",
+      input: {
+        error: new Error("Bare failure"),
+        aborted: false,
+        corruptStateRecovered: false,
+        hasAuth: false,
+        transport: "streamable-http",
+        retryCount: 1,
+        maxRetries: 1,
+      },
+      expectedKind: "give-up",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "give-up");
+        assert.equal(action.error.server, "");
+      },
+    },
+
+    // 7. Retries scheduled with delays
+    {
+      name: "returns 'retry' with delay schedule for retryCount 0",
+      input: { ...defaultInput, retryCount: 0, maxRetries: 5 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, RETRY_DELAYS_MS[0]);
+      },
+    },
+    {
+      name: "returns 'retry' with delay schedule for retryCount 1",
+      input: { ...defaultInput, retryCount: 1, maxRetries: 5 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, RETRY_DELAYS_MS[1]);
+      },
+    },
+    {
+      name: "returns 'retry' with delay schedule for retryCount 2",
+      input: { ...defaultInput, retryCount: 2, maxRetries: 5 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, RETRY_DELAYS_MS[2]);
+      },
+    },
+    {
+      name: "returns 'retry' with delay schedule for retryCount 3",
+      input: { ...defaultInput, retryCount: 3, maxRetries: 5 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, RETRY_DELAYS_MS[3]);
+      },
+    },
+    {
+      name: "returns 'retry' with capped delay schedule for high retryCount",
+      input: { ...defaultInput, retryCount: 10, maxRetries: 20 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]);
+      },
+    },
+
+    // 8. Non-Error inputs
+    {
+      name: "handles non-Error thrown string values cleanly",
+      input: { ...defaultInput, error: "string error message", retryCount: 0, maxRetries: 2 },
+      expectedKind: "retry",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "retry");
+        assert.equal(action.delayMs, 1000);
+      },
+    },
+    {
+      name: "handles non-Error thrown string values on retries exhausted",
+      input: { ...defaultInput, error: "string error message", retryCount: 2, maxRetries: 2 },
+      expectedKind: "give-up",
+      assertDetails: (action) => {
+        assert.equal(action.kind, "give-up");
+        assert.ok(action.error.message.includes("string error message"));
+      },
+    },
+  ];
+
+  for (const tc of testCases) {
+    it(tc.name, () => {
+      const result = classifyConnectFailure(tc.input);
+      assert.equal(result.kind, tc.expectedKind);
+      tc.assertDetails?.(result);
+    });
+  }
 });
 
 
