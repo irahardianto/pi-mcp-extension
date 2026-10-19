@@ -624,7 +624,7 @@ it("should clear server.attempt and server.controller on stopServer and unblock 
 });
 
 it("should cancel listAllTools and refreshTools with AuthCancelledError instead of wrapping in McpError('protocol') (Issue 19.2)", async () => {
-  const { AuthCancelledError } = await import("../src/index.js");
+  const { AuthCancelledError } = await import("../src/authorize-flow.js");
   const mockPi = {
     registerTool: () => {},
     getActiveTools: () => [],

@@ -26,15 +26,17 @@ import {
 import { discoverManualAuthChallenge } from "../src/auth-challenge.js";
 import { CallbackUrlValidationError, isSafeAuthorizationUrl, parseCallbackUrl } from "../src/callback-url.js";
 import extension, {
+  startupAuthLaterOption,
+  startupAuthNowOption,
+} from "../src/index.js";
+import {
   AuthCancelledError,
   authCancelOption,
   authPasteOption,
   authRetryOption,
   browserOpenCommand,
-  startupAuthLaterOption,
-  startupAuthNowOption,
   waitForOAuthCallback,
-} from "../src/index.js";
+} from "../src/authorize-flow.js";
 import {
   asExtensionAPI,
   createMockContext,
