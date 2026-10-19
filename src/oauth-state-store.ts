@@ -4,6 +4,7 @@
 
 import type { OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import { readFile, writeFile, mkdir, unlink, chmod, rename } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { McpError } from "./errors.js";
@@ -241,3 +242,43 @@ export async function saveState(
     throw err;
   }
 }
+
+/**
+ * Synchronously load stored DCR redirect URIs from disk if valid and origin-compatible.
+ * Used by silent McpOAuthProvider to report registered redirect_uris synchronously.
+ */
+export function loadStoredRedirectUrisSync(
+  serverName: string,
+  storageDir?: string,
+  serverUrl?: string,
+): string[] | undefined {
+  const path = statePath(serverName, storageDir);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (err) {
+    // WHY: State file may not exist yet (ENOENT) or directory may be inaccessible; return undefined.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    return undefined;
+  }
+
+  try {
+    const json: unknown = JSON.parse(raw);
+    const parsed = StoredStateSchema.safeParse(json);
+    if (!parsed.success) return undefined;
+    if (serverUrl !== undefined && parsed.data.serverUrl !== undefined && !urlsMatch(parsed.data.serverUrl, serverUrl)) {
+      return undefined;
+    }
+    const uris = parsed.data.clientInfo?.redirect_uris;
+    if (Array.isArray(uris) && uris.length > 0) {
+      return uris.map(String);
+    }
+  } catch {
+    // WHY: Malformed JSON or parse failure; async loadState handles backup/reporting.
+    return undefined;
+  }
+  return undefined;
+}
+

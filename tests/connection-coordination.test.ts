@@ -123,8 +123,8 @@ describe("isolated OAuth storage", () => {
   it("silent attempts never replace PKCE and stored tokens survive until explicit reset", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-auth-lock-"));
     try {
-      const interactive = new McpOAuthProvider("test", { clientId: "local" }, undefined, dir);
-      const silent = new McpOAuthProvider("test", { clientId: "local" }, undefined, dir, true);
+      const interactive = new McpOAuthProvider({ serverName: "test", authConfig: { clientId: "local" }, storageDir: dir, mode: "interactive" });
+      const silent = new McpOAuthProvider({ serverName: "test", authConfig: { clientId: "local" }, storageDir: dir, mode: "silent" });
       await interactive.saveCodeVerifier("original");
       await interactive.saveTokens({ access_token: "stored", token_type: "Bearer" });
       await assert.rejects(silent.saveCodeVerifier("other"), AuthRequiredError);
@@ -169,7 +169,7 @@ it("does not retry an OAuth browser challenge or alter stored PKCE during a sile
     settings: { toolPrefix: "mcp", requestTimeoutMs: 2000, maxRetries: 2 },
     mcpServers: { local: { lifecycle: "lazy", transport: "streamable-http", url: `${base}/mcp`, args: [], auth: { type: "oauth", clientId: "local-client" } } },
   }, dir);
-  const provider = new McpOAuthProvider("local", { clientId: "local-client" }, undefined, dir);
+  const provider = new McpOAuthProvider({ serverName: "local", authConfig: { clientId: "local-client" }, storageDir: dir });
   try {
     await provider.saveCodeVerifier("existing-flow");
     await assert.rejects(manager.startServer("local", process.cwd()), AuthRequiredError);
@@ -322,7 +322,7 @@ it("should fail immediately with AuthRequiredError and transition connectRequest
     },
     authDir,
   );
-  const provider = new McpOAuthProvider("local", { clientId: "local-client", redirectUrl }, undefined, authDir);
+  const provider = new McpOAuthProvider({ serverName: "local", authConfig: { clientId: "local-client", redirectUrl }, storageDir: authDir });
   const events = createStrictMap<string, MockEventHandler>();
 
   try {

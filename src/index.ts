@@ -35,7 +35,7 @@ import {
   callbackServerConfigFromRedirectUrl,
 } from "./callback-server.js";
 import { CallbackUrlValidationError, isSafeAuthorizationUrl, parseCallbackUrl } from "./callback-url.js";
-import { setCallbackPort, McpOAuthProvider, acquireAuthLock, type AuthLockHandle } from "./oauth-provider.js";
+import { McpOAuthProvider, acquireAuthLock, type AuthLockHandle } from "./oauth-provider.js";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { discoverManualAuthChallenge, createHeadersFetch } from "./auth-challenge.js";
 import type { ManualAuthChallenge } from "./auth-challenge.js";
@@ -847,7 +847,9 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         });
         if (signal.aborted) throw new AuthCancelledError(serverName);
         if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
-        setCallbackPort(port);
+        // WHY: In interactive mode, redirectUrl must match the port that the callback server
+        // actually bound (which may differ from preferredPort if port fallback was used).
+        const boundRedirectUrl = config.auth?.redirectUrl ?? `http://127.0.0.1:${port}/callback`;
 
         // 2. Generate a cryptographically secure state parameter for CSRF protection
         oauthState = Array.from(crypto.getRandomValues(new Uint8Array(32)))
@@ -879,16 +881,17 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           }
         };
 
-        const authProvider = new McpOAuthProvider(
+        const authProvider = new McpOAuthProvider({
           serverName,
-          config.auth || { type: "oauth" },
-          launchAuthorizationBrowser,
-          paths.authStorageDir,
-          false,
-          () => signal.aborted,
-          () => unlock!.assertHeld(),
-          config.url,
-        );
+          authConfig: config.auth || { type: "oauth" },
+          onAuthRequired: launchAuthorizationBrowser,
+          storageDir: paths.authStorageDir,
+          mode: "interactive",
+          isCancelled: () => signal.aborted,
+          assertLockHeld: () => unlock!.assertHeld(),
+          serverUrl: config.url,
+          redirectUrl: boundRedirectUrl,
+        });
 
         if (!reset) {
           // WHY: authorize() is only entered after silent connect failed with AuthRequiredError.

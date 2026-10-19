@@ -225,7 +225,7 @@ it("opens an interactive browser only once, reopens on Retry, and cancels withou
       );
       assert.equal(opens, 2);
     } finally { await unlock(); }
-    const provider = new McpOAuthProvider("local team", { clientId: "local-client" }, undefined, storage);
+    const provider = new McpOAuthProvider({ serverName: "local team", authConfig: { clientId: "local-client" }, storageDir: storage });
     await provider.saveTokens({ access_token: "saved-token", token_type: "Bearer" });
     assert.equal((await getAuthStatus("local team", storage))?.hasTokens, true);
     ctx.ui.select = () => new Promise(() => {});
@@ -350,7 +350,7 @@ it("isolates a corrupt OAuth state file in mcp_status and recovers on first conn
     );
 
     // Seed valid state for healthy-oauth and corrupt JSON for corrupt-oauth
-    const healthyProvider = new McpOAuthProvider("healthy-oauth", { type: "oauth" }, undefined, authDir);
+    const healthyProvider = new McpOAuthProvider({ serverName: "healthy-oauth", authConfig: { type: "oauth" }, storageDir: authDir });
     await healthyProvider.saveTokens({ access_token: "healthy-token", token_type: "Bearer" });
     await writeFile(statePath("corrupt-oauth", authDir), "{corrupt-json-state", "utf8");
 

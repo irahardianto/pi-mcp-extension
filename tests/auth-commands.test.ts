@@ -66,7 +66,11 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
     assert.ok(messages.some((message) => /Authentication cancelled for team server/.test(message)));
     await assertStopped();
 
-    const provider = new McpOAuthProvider("team server", { clientId: "test-client" }, undefined, join(dir, "auth"));
+    const provider = new McpOAuthProvider({
+      serverName: "team server",
+      authConfig: { clientId: "test-client" },
+      storageDir: join(dir, "auth"),
+    });
     await provider.saveTokens({ access_token: "test-token", token_type: "Bearer" });
     ctx.ui.select = () => new Promise(() => {});
     const firstReset = commands.get("mcp:auth").handler("team server --reset", ctx);
@@ -249,16 +253,13 @@ it("should report usage on bare /mcp:auth --reset, support leading /mcp:auth --r
     assert.deepEqual(notifications, [{ msg: "Usage: /mcp:auth <name> [--reset]", level: "error" }]);
 
     // 2. Leading `/mcp:auth --reset oauth-srv` must reset stored tokens and run interactive OAuth
-    const provider = new McpOAuthProvider(
-      "oauth-srv",
-      { type: "oauth" },
-      undefined,
-      authDir,
-      false,
-      () => false,
-      undefined,
-      fakeServer.mcpUrl,
-    );
+    const provider = new McpOAuthProvider({
+      serverName: "oauth-srv",
+      authConfig: { type: "oauth" },
+      storageDir: authDir,
+      mode: "interactive",
+      serverUrl: fakeServer.mcpUrl,
+    });
     await provider.saveTokens({ access_token: "stale-valid-token", token_type: "Bearer" });
     await commands.get("mcp:auth").handler("--reset oauth-srv", ctx);
     assert.equal(fakeServer.browserOpenCount, 1, "Leading --reset must discard stored tokens and open browser");

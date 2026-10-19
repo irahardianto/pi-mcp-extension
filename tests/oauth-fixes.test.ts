@@ -59,7 +59,7 @@ describe("OAuth Security Fixes", () => {
 
   beforeEach(async () => {
     // Create a fresh provider for each test
-    provider = new McpOAuthProvider(testServerName, {}, undefined, testStorage);
+    provider = new McpOAuthProvider({ serverName: testServerName, authConfig: {}, storageDir: testStorage });
   });
 
   afterEach(async () => {
@@ -100,7 +100,7 @@ describe("OAuth Security Fixes", () => {
 
   describe("Token Handling", () => {
     it("should expose configured scope through client metadata", () => {
-      provider = new McpOAuthProvider(testServerName, { scope: "read write" }, undefined, testStorage);
+      provider = new McpOAuthProvider({ serverName: testServerName, authConfig: { scope: "read write" }, storageDir: testStorage });
 
       assert.strictEqual(provider.clientMetadata.scope, "read write");
     });
@@ -567,7 +567,7 @@ describe("OAuth Security Fixes", () => {
 
   describe("IPv4 Binding (Medium Fix #12)", () => {
     it("should use 127.0.0.1 in redirect URL", () => {
-      const provider = new McpOAuthProvider(testServerName, {}, undefined, testStorage);
+      const provider = new McpOAuthProvider({ serverName: testServerName, authConfig: {}, storageDir: testStorage });
       const redirectUrl = String(provider.redirectUrl);
 
       assert.match(redirectUrl, /^http:\/\/127\.0\.0\.1:\d+\/callback$/,
@@ -576,7 +576,7 @@ describe("OAuth Security Fixes", () => {
 
     it("should respect custom redirect URL if provided", () => {
       const customUrl = "https://example.com/callback";
-      const provider = new McpOAuthProvider(testServerName, { redirectUrl: customUrl }, undefined, testStorage);
+      const provider = new McpOAuthProvider({ serverName: testServerName, authConfig: { redirectUrl: customUrl }, storageDir: testStorage });
       const redirectUrl = String(provider.redirectUrl);
 
       assert.strictEqual(redirectUrl, customUrl, "Custom redirect URL should be preserved");
@@ -1417,7 +1417,7 @@ describe("OAuth Security Fixes", () => {
       const { chmod } = await import("node:fs/promises");
       const { resetAuth } = await import("../src/oauth-provider.js");
       const roStorage = await mkdtemp(join(tmpdir(), "pi-mcp-oauth-ro-"));
-      const roProvider = new McpOAuthProvider(testServerName, {}, undefined, roStorage);
+      const roProvider = new McpOAuthProvider({ serverName: testServerName, authConfig: {}, storageDir: roStorage });
       await roProvider.saveTokens({
         access_token: "test-token",
         token_type: "Bearer",
@@ -1440,7 +1440,7 @@ describe("OAuth Security Fixes", () => {
   describe("Startup OAuth Offer, Silent DCR Guard, and Real HTTP OAuth Fixture (Issue #7, N1, N8)", () => {
     it("should throw AuthRequiredError when clientInformation is called on a silent provider without clientId or stored clientInfo", async () => {
       // Arrange
-      const silentProvider = new McpOAuthProvider(testServerName, {}, undefined, testStorage, true);
+      const silentProvider = new McpOAuthProvider({ serverName: testServerName, authConfig: {}, storageDir: testStorage, mode: "silent" });
 
       // Act & Assert
       await assert.rejects(
@@ -1529,7 +1529,7 @@ describe("OAuth Security Fixes", () => {
         assert.match(detailAfterNoClient, /Retries:\s+0/);
 
         // Act (Part 2: Seed clientInfo + expired token with failing refresh, and verify session remembers decline without re-prompting)
-        const seededProvider = new McpOAuthProvider("eager-oauth", { type: "oauth" }, undefined, authDir);
+        const seededProvider = new McpOAuthProvider({ serverName: "eager-oauth", authConfig: { type: "oauth" }, storageDir: authDir });
         await seededProvider.saveClientInformation({ client_id: "seeded-client" });
         await seededProvider.saveTokens({
           access_token: "expired-access-token",
@@ -1869,7 +1869,7 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(fakeServer.codeExchangeCount, 1);
         assert.strictEqual(fakeServer.refreshCount, 0);
 
-        const inspectProvider = new McpOAuthProvider("rotatable", { type: "oauth" }, undefined, authDir);
+        const inspectProvider = new McpOAuthProvider({ serverName: "rotatable", authConfig: { type: "oauth" }, storageDir: authDir });
         const initialTokens = await inspectProvider.tokens();
         assert.strictEqual(initialTokens?.access_token, "access-token-1");
         assert.strictEqual(initialTokens?.refresh_token, "refresh-token-1");
@@ -1914,16 +1914,12 @@ describe("OAuth Security Fixes", () => {
         const globalUrl = "https://global.example.com/mcp/";
         const evilUrl = "https://evil.example.com/mcp";
 
-        const globalProvider = new McpOAuthProvider(
-          "shared-name",
-          { type: "oauth" },
-          undefined,
-          dir,
-          false,
-          () => false,
-          undefined,
-          globalUrl,
-        );
+        const globalProvider = new McpOAuthProvider({
+          serverName: "shared-name",
+          authConfig: { type: "oauth" },
+          storageDir: dir,
+          serverUrl: globalUrl,
+        });
         await globalProvider.saveClientInformation({ client_id: "global-client" });
         await globalProvider.saveTokens({ access_token: "global-secret-token", token_type: "Bearer" });
         await globalProvider.saveDiscoveryState({
@@ -1935,31 +1931,23 @@ describe("OAuth Security Fixes", () => {
         });
 
         // Same URL (ignoring trailing slash) sees stored state
-        const sameOriginProvider = new McpOAuthProvider(
-          "shared-name",
-          { type: "oauth" },
-          undefined,
-          dir,
-          false,
-          () => false,
-          undefined,
-          "https://global.example.com/mcp",
-        );
+        const sameOriginProvider = new McpOAuthProvider({
+          serverName: "shared-name",
+          authConfig: { type: "oauth" },
+          storageDir: dir,
+          serverUrl: "https://global.example.com/mcp",
+        });
         assert.strictEqual((await sameOriginProvider.tokens())?.access_token, "global-secret-token");
         assert.strictEqual((await sameOriginProvider.clientInformation())?.client_id, "global-client");
         assert.strictEqual((await oauthMod.getAuthStatus("shared-name", dir, "https://global.example.com/mcp"))?.hasTokens, true);
 
         // Different URL with same serverName must NOT read global tokens, clientInfo, or discoveryState
-        const evilProvider = new McpOAuthProvider(
-          "shared-name",
-          { type: "oauth" },
-          undefined,
-          dir,
-          false,
-          () => false,
-          undefined,
-          evilUrl,
-        );
+        const evilProvider = new McpOAuthProvider({
+          serverName: "shared-name",
+          authConfig: { type: "oauth" },
+          storageDir: dir,
+          serverUrl: evilUrl,
+        });
         assert.strictEqual(await evilProvider.tokens(), undefined);
         assert.strictEqual(await evilProvider.clientInformation(), undefined);
         assert.strictEqual(await evilProvider.discoveryState(), undefined);
@@ -1999,16 +1987,12 @@ describe("OAuth Security Fixes", () => {
           "utf8",
         );
 
-        const newUrlProvider = new McpOAuthProvider(
-          "legacy-srv",
-          { type: "oauth" },
-          undefined,
-          dir,
-          false,
-          () => false,
-          undefined,
-          "https://new-host.example.com/mcp",
-        );
+        const newUrlProvider = new McpOAuthProvider({
+          serverName: "legacy-srv",
+          authConfig: { type: "oauth" },
+          storageDir: dir,
+          serverUrl: "https://new-host.example.com/mcp",
+        });
         assert.strictEqual(await newUrlProvider.tokens(), undefined);
         assert.strictEqual(await newUrlProvider.clientInformation(), undefined);
         assert.strictEqual(await newUrlProvider.discoveryState(), undefined);
@@ -2020,12 +2004,11 @@ describe("OAuth Security Fixes", () => {
     it("should preserve DCR metadata fields and invalidate expired client_secret or changed redirect_uris (Issue 22.2)", async () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-dcr-meta-"));
       try {
-        const p1 = new McpOAuthProvider(
-          "dcr-srv",
-          { type: "oauth", redirectUrl: "http://127.0.0.1:19876/callback" },
-          undefined,
-          dir,
-        );
+        const p1 = new McpOAuthProvider({
+          serverName: "dcr-srv",
+          authConfig: { type: "oauth", redirectUrl: "http://127.0.0.1:19876/callback" },
+          storageDir: dir,
+        });
         const futureExpiry = Math.floor(Date.now() / 1000) + 3600;
         await p1.saveClientInformation({
           client_id: "dcr-1",
@@ -2047,13 +2030,11 @@ describe("OAuth Security Fixes", () => {
         assert.deepStrictEqual(loaded?.redirect_uris, ["http://127.0.0.1:19876/callback"]);
 
         // Interactive provider with a different redirectUrl (e.g. fallback port) returns undefined to trigger fresh DCR
-        const pChangedRedirect = new McpOAuthProvider(
-          "dcr-srv",
-          { type: "oauth", redirectUrl: "http://127.0.0.1:19877/callback" },
-          undefined,
-          dir,
-          false,
-        );
+        const pChangedRedirect = new McpOAuthProvider({
+          serverName: "dcr-srv",
+          authConfig: { type: "oauth", redirectUrl: "http://127.0.0.1:19877/callback" },
+          storageDir: dir,
+        });
         assert.strictEqual(await pChangedRedirect.clientInformation(), undefined);
 
         // Expired client_secret: returns undefined in interactive mode, throws AuthRequiredError in silent mode
@@ -2065,7 +2046,7 @@ describe("OAuth Security Fixes", () => {
         });
         assert.strictEqual(await p1.clientInformation(), undefined);
 
-        const pSilent = new McpOAuthProvider("dcr-srv", { type: "oauth" }, undefined, dir, true);
+        const pSilent = new McpOAuthProvider({ serverName: "dcr-srv", authConfig: { type: "oauth" }, storageDir: dir, mode: "silent" });
         await assert.rejects(() => pSilent.clientInformation(), AuthRequiredError);
       } finally {
         await rm(dir, { recursive: true, force: true });
@@ -2366,16 +2347,13 @@ describe("OAuth Security Fixes", () => {
         );
 
         // Seed initial expired token + refresh token that AS accepts but RS rejects
-        const seeder = new McpOAuthProvider(
-          "reauth",
-          { type: "oauth", clientId: "reauth-client" },
-          undefined,
-          authDir,
-          false,
-          () => false,
-          undefined,
-          `${base}/mcp`,
-        );
+        const seeder = new McpOAuthProvider({
+          serverName: "reauth",
+          authConfig: { type: "oauth", clientId: "reauth-client" },
+          storageDir: authDir,
+          isCancelled: () => false,
+          serverUrl: `${base}/mcp`,
+        });
         await seeder.saveTokens({
           access_token: "initial-expired",
           refresh_token: "refresh-still-valid-at-as",
@@ -2718,7 +2696,7 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issuer-tokens-"));
       const authDir = dir;
       try {
-        const p1 = new McpOAuthProvider("srv-tokens", {}, undefined, authDir);
+        const p1 = new McpOAuthProvider({ serverName: "srv-tokens", authConfig: {}, storageDir: authDir });
         await p1.saveTokens({
           access_token: "at-123",
           token_type: "Bearer",
@@ -2735,7 +2713,7 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(parsed.tokens?.issuer, "https://auth.example.com");
 
         // 2. Fresh provider instance loading from disk returns issuer
-        const p2 = new McpOAuthProvider("srv-tokens", {}, undefined, authDir);
+        const p2 = new McpOAuthProvider({ serverName: "srv-tokens", authConfig: {}, storageDir: authDir });
         const loadedTokens = await p2.tokens();
         assert.ok(loadedTokens);
         assert.strictEqual(loadedTokens?.access_token, "at-123");
@@ -2751,7 +2729,7 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issuer-client-"));
       const authDir = dir;
       try {
-        const p1 = new McpOAuthProvider("srv-client", {}, undefined, authDir);
+        const p1 = new McpOAuthProvider({ serverName: "srv-client", authConfig: {}, storageDir: authDir });
         await p1.saveClientInformation({
           client_id: "cid-456",
           client_secret: "sec-456",
@@ -2771,7 +2749,7 @@ describe("OAuth Security Fixes", () => {
         assert.deepStrictEqual(parsed.clientInfo?.redirect_uris, ["http://127.0.0.1:19876/callback"]);
 
         // 2. Fresh provider instance loading from disk returns issuer and DCR metadata
-        const p2 = new McpOAuthProvider("srv-client", {}, undefined, authDir);
+        const p2 = new McpOAuthProvider({ serverName: "srv-client", authConfig: {}, storageDir: authDir });
         const loadedClient = await p2.clientInformation();
         assert.ok(loadedClient);
         assert.strictEqual(loadedClient?.client_id, "cid-456");
@@ -2815,7 +2793,7 @@ describe("OAuth Security Fixes", () => {
           "utf8",
         );
 
-        const provider = new McpOAuthProvider("legacy-srv", {}, undefined, authDir);
+        const provider = new McpOAuthProvider({ serverName: "legacy-srv", authConfig: {}, storageDir: authDir });
         const tokens = await provider.tokens();
         assert.ok(tokens);
         assert.strictEqual(tokens?.access_token, "legacy-at");
@@ -2834,7 +2812,7 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issuer-mismatch-"));
       const authDir = dir;
       try {
-        const provider = new McpOAuthProvider("mismatch-srv", {}, undefined, authDir);
+        const provider = new McpOAuthProvider({ serverName: "mismatch-srv", authConfig: {}, storageDir: authDir });
         // Stored tokens were issued by auth-one
         await provider.saveTokens({
           access_token: "compromised-at",
@@ -2884,12 +2862,12 @@ describe("OAuth Security Fixes", () => {
         // When auth() runs, because the stored token has issuer auth-one, it MUST NOT
         // post the refresh token to auth-two's token endpoint.
         let redirectedUrl: URL | undefined;
-        const redirectProvider = new McpOAuthProvider(
-          "mismatch-srv",
-          {},
-          (url) => { redirectedUrl = url; },
-          authDir,
-        );
+        const redirectProvider = new McpOAuthProvider({
+          serverName: "mismatch-srv",
+          authConfig: {},
+          onAuthRequired: (url) => { redirectedUrl = url; },
+          storageDir: authDir,
+        });
 
         const result = await auth(redirectProvider, {
           serverUrl: "https://mcp.example.com/srv",
@@ -2909,7 +2887,7 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issuer-peer-"));
       const authDir = dir;
       try {
-        const seeder = new McpOAuthProvider("peer-srv", {}, undefined, authDir);
+        const seeder = new McpOAuthProvider({ serverName: "peer-srv", authConfig: {}, storageDir: authDir });
         await seeder.saveTokens({
           access_token: "initial-at",
           refresh_token: "initial-rt",
@@ -2918,13 +2896,13 @@ describe("OAuth Security Fixes", () => {
         });
 
         // Process B in silent mode reads initial tokens
-        const processB = new McpOAuthProvider("peer-srv", {}, undefined, authDir, true);
+        const processB = new McpOAuthProvider({ serverName: "peer-srv", authConfig: {}, storageDir: authDir, mode: "silent" });
         const tokensB1 = await processB.tokens();
         assert.strictEqual(tokensB1?.access_token, "initial-at");
         assert.strictEqual(tokensB1?.issuer, "https://auth.example.com");
 
         // Process A rotates tokens on disk
-        const processA = new McpOAuthProvider("peer-srv", {}, undefined, authDir, true);
+        const processA = new McpOAuthProvider({ serverName: "peer-srv", authConfig: {}, storageDir: authDir, mode: "silent" });
         await processA.saveTokens({
           access_token: "rotated-at",
           refresh_token: "rotated-rt",
@@ -2950,7 +2928,7 @@ describe("OAuth Security Fixes", () => {
       const authDir = dir;
       try {
         const { invalidateStoredTokens } = await import("../src/oauth-provider.js");
-        const p = new McpOAuthProvider("inval-srv", {}, undefined, authDir);
+        const p = new McpOAuthProvider({ serverName: "inval-srv", authConfig: {}, storageDir: authDir });
         await p.saveClientInformation({
           client_id: "cid-1",
           issuer: "https://auth.example.com",
@@ -2964,7 +2942,7 @@ describe("OAuth Security Fixes", () => {
         // Invalidate tokens only via invalidateStoredTokens
         await invalidateStoredTokens("inval-srv", authDir);
 
-        const p2 = new McpOAuthProvider("inval-srv", {}, undefined, authDir);
+        const p2 = new McpOAuthProvider({ serverName: "inval-srv", authConfig: {}, storageDir: authDir });
         assert.strictEqual(await p2.tokens(), undefined);
         const clientAfterTokensInval = await p2.clientInformation();
         assert.strictEqual(clientAfterTokensInval?.client_id, "cid-1");
@@ -2985,7 +2963,13 @@ describe("OAuth Security Fixes", () => {
       try {
         const serverUrl = "https://mcp.example.com/team-a";
         const evilUrl = "https://mcp.example.com/team-b";
-        const p = new McpOAuthProvider("origin-srv", {}, undefined, authDir, false, () => false, undefined, serverUrl);
+        const p = new McpOAuthProvider({
+          serverName: "origin-srv",
+          authConfig: {},
+          storageDir: authDir,
+          isCancelled: () => false,
+          serverUrl,
+        });
         await p.saveClientInformation({
           client_id: "cid-orig",
           issuer: "https://auth.example.com",
@@ -2997,7 +2981,13 @@ describe("OAuth Security Fixes", () => {
         });
 
         // When loaded with matching serverUrl: returns credentials with issuer
-        const matchProvider = new McpOAuthProvider("origin-srv", {}, undefined, authDir, false, () => false, undefined, serverUrl);
+        const matchProvider = new McpOAuthProvider({
+          serverName: "origin-srv",
+          authConfig: {},
+          storageDir: authDir,
+          isCancelled: () => false,
+          serverUrl,
+        });
         const matchTokens = await matchProvider.tokens();
         const matchClient = await matchProvider.clientInformation();
         assert.strictEqual(matchTokens?.access_token, "at-orig");
@@ -3005,7 +2995,13 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(matchClient?.issuer, "https://auth.example.com");
 
         // When loaded with mismatched serverUrl: returns undefined (origin binding)
-        const evilProvider = new McpOAuthProvider("origin-srv", {}, undefined, authDir, false, () => false, undefined, evilUrl);
+        const evilProvider = new McpOAuthProvider({
+          serverName: "origin-srv",
+          authConfig: {},
+          storageDir: authDir,
+          isCancelled: () => false,
+          serverUrl: evilUrl,
+        });
         assert.strictEqual(await evilProvider.tokens(), undefined);
         assert.strictEqual(await evilProvider.clientInformation(), undefined);
       } finally {
@@ -3068,13 +3064,12 @@ describe("OAuth Security Fixes", () => {
           return new Response("Not found", { status: 404 });
         };
 
-        const silentProvider = new McpOAuthProvider(
-          "legacy-refresh-srv",
-          {},
-          undefined,
-          authDir,
-          true,
-        );
+        const silentProvider = new McpOAuthProvider({
+          serverName: "legacy-refresh-srv",
+          authConfig: {},
+          storageDir: authDir,
+          mode: "silent",
+        });
 
         const result = await auth(silentProvider, {
           serverUrl: "https://mcp.example.com/srv",
@@ -3098,7 +3093,12 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-silent-new-dcr-"));
       const authDir = dir;
       try {
-        const silentProvider = new McpOAuthProvider("new-dcr-srv", {}, undefined, authDir, true);
+        const silentProvider = new McpOAuthProvider({
+          serverName: "new-dcr-srv",
+          authConfig: {},
+          storageDir: authDir,
+          mode: "silent",
+        });
         await assert.rejects(
           () => silentProvider.saveClientInformation({
             client_id: "new-unregistered-cid",
@@ -3122,12 +3122,11 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-static-bind-"));
       const authDir = dir;
       try {
-        const p1 = new McpOAuthProvider(
-          "static-srv",
-          { clientId: "cfg-client-id", clientSecret: "cfg-secret" },
-          undefined,
-          authDir,
-        );
+        const p1 = new McpOAuthProvider({
+          serverName: "static-srv",
+          authConfig: { clientId: "cfg-client-id", clientSecret: "cfg-secret" },
+          storageDir: authDir,
+        });
 
         // Before first save, clientInformation returns static config without issuer
         const initialClient = await p1.clientInformation();
@@ -3151,13 +3150,12 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual("client_secret" in (parsedState.clientInfo ?? {}), false);
 
         // Silent path with static clientId must also never persist client_secret to disk
-        const silentStatic = new McpOAuthProvider(
-          "static-silent-srv",
-          { clientId: "cfg-silent-id", clientSecret: "cfg-silent-sec" },
-          undefined,
-          authDir,
-          true,
-        );
+        const silentStatic = new McpOAuthProvider({
+          serverName: "static-silent-srv",
+          authConfig: { clientId: "cfg-silent-id", clientSecret: "cfg-silent-sec" },
+          storageDir: authDir,
+          mode: "silent",
+        });
         await silentStatic.saveClientInformation({
           client_id: "cfg-silent-id",
           client_secret: "cfg-silent-sec",
@@ -3172,12 +3170,11 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual("client_secret" in (parsedSilentState.clientInfo ?? {}), false);
 
         // Fresh provider returns bound issuer
-        const p2 = new McpOAuthProvider(
-          "static-srv",
-          { clientId: "cfg-client-id", clientSecret: "cfg-secret" },
-          undefined,
-          authDir,
-        );
+        const p2 = new McpOAuthProvider({
+          serverName: "static-srv",
+          authConfig: { clientId: "cfg-client-id", clientSecret: "cfg-secret" },
+          storageDir: authDir,
+        });
         const boundClient = await p2.clientInformation();
         assert.strictEqual(boundClient?.client_id, "cfg-client-id");
         assert.strictEqual(boundClient?.issuer, "https://auth-one.example.com");
@@ -3185,12 +3182,11 @@ describe("OAuth Security Fixes", () => {
         // After /mcp:auth <server> --reset equivalent (resetAuth)
         await resetAuth("static-srv", authDir);
 
-        const p3 = new McpOAuthProvider(
-          "static-srv",
-          { clientId: "cfg-client-id", clientSecret: "cfg-secret" },
-          undefined,
-          authDir,
-        );
+        const p3 = new McpOAuthProvider({
+          serverName: "static-srv",
+          authConfig: { clientId: "cfg-client-id", clientSecret: "cfg-secret" },
+          storageDir: authDir,
+        });
         const resetClient = await p3.clientInformation();
         assert.strictEqual(resetClient?.client_id, "cfg-client-id");
         assert.strictEqual(resetClient?.issuer, undefined);
@@ -3215,7 +3211,11 @@ describe("OAuth Security Fixes", () => {
       const dir = await mkdtemp(join(tmpdir(), "pi-mcp-no-restamp-"));
       const authDir = dir;
       try {
-        const p = new McpOAuthProvider("stamped-srv", {}, undefined, authDir);
+        const p = new McpOAuthProvider({
+          serverName: "stamped-srv",
+          authConfig: {},
+          storageDir: authDir,
+        });
         await p.saveClientInformation({
           client_id: "cid-fixed",
           issuer: "https://auth-one.example.com",
@@ -3240,7 +3240,12 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(client1?.issuer, "https://auth-one.example.com");
 
         // Same invariant in silent mode: must reject with McpError and not re-stamp with different issuer
-        const silentP = new McpOAuthProvider("stamped-srv", {}, undefined, authDir, true);
+        const silentP = new McpOAuthProvider({
+          serverName: "stamped-srv",
+          authConfig: {},
+          storageDir: authDir,
+          mode: "silent",
+        });
         await assert.rejects(
           () =>
             silentP.saveClientInformation({
@@ -3263,6 +3268,175 @@ describe("OAuth Security Fixes", () => {
         const raw = await readFile(join(authDir, `${hash}.json`), "utf8");
         const parsed = JSON.parse(raw);
         assert.strictEqual(parsed.clientInfo?.issuer, "https://auth-one.example.com");
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("Issue #64: remove global callback port and use options object for McpOAuthProvider", () => {
+    it("two providers for different servers in one process do not affect each other's redirectUrl", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-64-isolation-"));
+      try {
+        const providerA = new McpOAuthProvider({
+          serverName: "server-a",
+          authConfig: {},
+          storageDir: dir,
+          redirectUrl: "http://127.0.0.1:20001/callback",
+        });
+        const providerB = new McpOAuthProvider({
+          serverName: "server-b",
+          authConfig: {},
+          storageDir: dir,
+          redirectUrl: "http://127.0.0.1:20002/callback",
+        });
+        const providerSilent = new McpOAuthProvider({
+          serverName: "server-c",
+          authConfig: {},
+          storageDir: dir,
+          mode: "silent",
+        });
+
+        // Ensure that providerA, providerB, and providerSilent all have independent redirect URLs
+        assert.strictEqual(providerA.redirectUrl, "http://127.0.0.1:20001/callback");
+        assert.strictEqual(providerB.redirectUrl, "http://127.0.0.1:20002/callback");
+        assert.strictEqual(providerSilent.redirectUrl, "http://127.0.0.1:19876/callback");
+
+        assert.deepStrictEqual(providerA.clientMetadata.redirect_uris, ["http://127.0.0.1:20001/callback"]);
+        assert.deepStrictEqual(providerB.clientMetadata.redirect_uris, ["http://127.0.0.1:20002/callback"]);
+        assert.deepStrictEqual(providerSilent.clientMetadata.redirect_uris, ["http://127.0.0.1:19876/callback"]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("silent provider reports registered redirect_uris in clientMetadata and redirectUrl", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-64-silent-dcr-"));
+      try {
+        const seeder = new McpOAuthProvider({
+          serverName: "dcr-server",
+          authConfig: {},
+          storageDir: dir,
+        });
+        await seeder.saveClientInformation({
+          client_id: "registered-client-id",
+          redirect_uris: ["http://127.0.0.1:31415/callback", "http://localhost:31415/callback"],
+          issuer: "https://auth.example.com",
+        });
+
+        const silent = new McpOAuthProvider({
+          serverName: "dcr-server",
+          authConfig: {},
+          storageDir: dir,
+          mode: "silent",
+        });
+
+        assert.strictEqual(silent.redirectUrl, "http://127.0.0.1:31415/callback");
+        assert.deepStrictEqual(silent.clientMetadata.redirect_uris, [
+          "http://127.0.0.1:31415/callback",
+          "http://localhost:31415/callback",
+        ]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("silent provider fallback priority: stored DCR -> configured auth.redirectUrl -> default 127.0.0.1:19876", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-64-fallback-"));
+      try {
+        // 1. Default fallback: no state, no configured redirectUrl
+        const pDefault = new McpOAuthProvider({
+          serverName: "default-srv",
+          authConfig: {},
+          storageDir: dir,
+          mode: "silent",
+        });
+        assert.strictEqual(pDefault.redirectUrl, "http://127.0.0.1:19876/callback");
+        assert.deepStrictEqual(pDefault.clientMetadata.redirect_uris, ["http://127.0.0.1:19876/callback"]);
+
+        // 2. Configured fallback: no state, configured auth.redirectUrl
+        const pConfigured = new McpOAuthProvider({
+          serverName: "configured-srv",
+          authConfig: { redirectUrl: "http://127.0.0.1:24000/callback" },
+          storageDir: dir,
+          mode: "silent",
+        });
+        assert.strictEqual(pConfigured.redirectUrl, "http://127.0.0.1:24000/callback");
+        assert.deepStrictEqual(pConfigured.clientMetadata.redirect_uris, ["http://127.0.0.1:24000/callback"]);
+
+        // 3. Stored DCR priority: stored state has redirect_uris, overrides configured auth.redirectUrl
+        const seeder = new McpOAuthProvider({
+          serverName: "priority-srv",
+          authConfig: { redirectUrl: "http://127.0.0.1:24000/callback" },
+          storageDir: dir,
+        });
+        await seeder.saveClientInformation({
+          client_id: "priority-client",
+          redirect_uris: ["http://127.0.0.1:25000/dcr-callback"],
+          issuer: "https://auth.example.com",
+        });
+
+        const pDcr = new McpOAuthProvider({
+          serverName: "priority-srv",
+          authConfig: { redirectUrl: "http://127.0.0.1:24000/callback" },
+          storageDir: dir,
+          mode: "silent",
+        });
+        assert.strictEqual(pDcr.redirectUrl, "http://127.0.0.1:25000/dcr-callback");
+        assert.deepStrictEqual(pDcr.clientMetadata.redirect_uris, ["http://127.0.0.1:25000/dcr-callback"]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("interactive provider uses explicit redirectUrl option when provided, and falls back to configured or default", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-64-interactive-"));
+      try {
+        const pExplicit = new McpOAuthProvider({
+          serverName: "interactive-srv",
+          authConfig: { redirectUrl: "http://127.0.0.1:18000/callback" },
+          storageDir: dir,
+          redirectUrl: "http://127.0.0.1:19999/callback",
+        });
+        assert.strictEqual(pExplicit.redirectUrl, "http://127.0.0.1:19999/callback");
+        assert.deepStrictEqual(pExplicit.clientMetadata.redirect_uris, ["http://127.0.0.1:19999/callback"]);
+
+        const pConfig = new McpOAuthProvider({
+          serverName: "interactive-srv",
+          authConfig: { redirectUrl: "http://127.0.0.1:18000/callback" },
+          storageDir: dir,
+        });
+        assert.strictEqual(pConfig.redirectUrl, "http://127.0.0.1:18000/callback");
+        assert.deepStrictEqual(pConfig.clientMetadata.redirect_uris, ["http://127.0.0.1:18000/callback"]);
+
+        const pDef = new McpOAuthProvider({
+          serverName: "interactive-srv",
+          authConfig: {},
+          storageDir: dir,
+        });
+        assert.strictEqual(pDef.redirectUrl, "http://127.0.0.1:19876/callback");
+        assert.deepStrictEqual(pDef.clientMetadata.redirect_uris, ["http://127.0.0.1:19876/callback"]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("gracefully falls back when stored state on disk is corrupt or invalid JSON", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { createHash } = await import("node:crypto");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-64-corrupt-"));
+      try {
+        const hash = createHash("sha256").update("corrupt-srv").digest("hex").slice(0, 16);
+        await writeFile(join(dir, `${hash}.json`), "{ broken json ...", "utf8");
+
+        const silent = new McpOAuthProvider({
+          serverName: "corrupt-srv",
+          authConfig: {},
+          storageDir: dir,
+          mode: "silent",
+        });
+        assert.strictEqual(silent.redirectUrl, "http://127.0.0.1:19876/callback");
+        assert.deepStrictEqual(silent.clientMetadata.redirect_uris, ["http://127.0.0.1:19876/callback"]);
       } finally {
         await rm(dir, { recursive: true, force: true });
       }

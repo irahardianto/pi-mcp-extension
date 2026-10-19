@@ -49,16 +49,13 @@ export function createTransport(
   let authProvider: OAuthClientProvider | undefined;
   if (config.auth && config.transport !== "stdio") {
     // Silent transport attempts must not write PKCE or launch a browser.
-    authProvider = new McpOAuthProvider(
+    authProvider = new McpOAuthProvider({
       serverName,
-      config.auth,
-      undefined,
+      authConfig: config.auth,
       storageDir,
-      true,
-      undefined,
-      undefined,
-      config.url,
-    );
+      mode: "silent",
+      serverUrl: config.url,
+    });
   }
 
   switch (config.transport) {

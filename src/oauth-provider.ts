@@ -26,6 +26,7 @@ import {
 import {
   canonicalServerUrl,
   loadState,
+  loadStoredRedirectUrisSync,
   saveState,
   type StoredState,
   type StoredTokens,
@@ -58,64 +59,110 @@ export interface AuthConfig {
   clientSecret?: string | undefined;
 }
 
-// ─── Callback Server Port ───────────────────────────────────────────────────────
+const DEFAULT_CALLBACK_PORT = 19876;
+const DEFAULT_REDIRECT_URL = `http://127.0.0.1:${DEFAULT_CALLBACK_PORT}/callback`;
 
-let callbackPort = 19876;
-
-/** Set the callback server port. Called by the auth flow when the server starts. */
-export function setCallbackPort(port: number): void {
-  callbackPort = port;
-}
-
-/** Get the current callback server port. */
-export function getCallbackPort(): number {
-  return callbackPort;
+export interface McpOAuthProviderOptions {
+  serverName: string;
+  authConfig: AuthConfig;
+  serverUrl?: string | undefined;
+  storageDir?: string | undefined;
+  mode?: "silent" | "interactive" | undefined;
+  redirectUrl?: string | URL | undefined;
+  onAuthRequired?: ((url: URL) => void | Promise<void>) | undefined;
+  isCancelled?: (() => boolean) | undefined;
+  assertLockHeld?: (() => Promise<void>) | undefined;
 }
 
 // ─── OAuthClientProvider Implementation ────────────────────────────────────────
 
 export class McpOAuthProvider implements OAuthClientProvider {
-  private serverName: string;
-  private authConfig: AuthConfig;
-  private _redirectUrl: string | undefined;
-  private _onAuthRequired: ((url: URL) => void | Promise<void>) | undefined;
+  private readonly serverName: string;
+  private readonly authConfig: AuthConfig;
+  private readonly serverUrl: string | undefined;
+  private readonly storageDir: string | undefined;
+  private readonly mode: "silent" | "interactive";
+  private readonly explicitRedirectUrl: string | URL | undefined;
+  private readonly _onAuthRequired: ((url: URL) => void | Promise<void>) | undefined;
+  private readonly isCancelled: () => boolean;
+  private readonly assertLockHeld: (() => Promise<void>) | undefined;
+
   private _oauthState: string | undefined;
   private _codeVerifier: string | undefined;
   private _cachedTokens: StoredTokens | undefined;
   private _lastReadTokens: StoredTokens | undefined;
   private _reloadedPeerTokens = false;
+  private _storedRedirectUris: string[] | undefined;
 
-  constructor(
-    serverName: string,
-    authConfig: AuthConfig,
-    onAuthRequired?: (url: URL) => void | Promise<void>,
-    private readonly storageDir?: string,
-    private readonly silent = false,
-    private readonly isCancelled: () => boolean = () => false,
-    private readonly assertLockHeld?: (() => Promise<void>) | undefined,
-    private readonly serverUrl?: string | undefined,
-  ) {
-    this.serverName = serverName;
-    this.authConfig = authConfig;
-    this._redirectUrl = authConfig.redirectUrl;
-    this._onAuthRequired = onAuthRequired;
+  constructor(options: McpOAuthProviderOptions) {
+    this.serverName = options.serverName;
+    this.authConfig = options.authConfig;
+    this.serverUrl = options.serverUrl;
+    this.storageDir = options.storageDir;
+    this.mode = options.mode ?? "interactive";
+    this.explicitRedirectUrl = options.redirectUrl;
+    this._onAuthRequired = options.onAuthRequired;
+    this.isCancelled = options.isCancelled ?? (() => false);
+    this.assertLockHeld = options.assertLockHeld;
+  }
+
+  private get silent(): boolean {
+    return this.mode === "silent";
+  }
+
+  private getStoredRedirectUrisSync(): string[] | undefined {
+    if (this._storedRedirectUris !== undefined) {
+      return this._storedRedirectUris;
+    }
+    const stored = loadStoredRedirectUrisSync(this.serverName, this.storageDir, this.serverUrl);
+    if (stored !== undefined) {
+      this._storedRedirectUris = stored;
+    }
+    return stored;
   }
 
   // --- redirectUrl ---
 
   get redirectUrl(): string | URL {
-    // Use configured redirect URL if provided, otherwise use the callback server
-    // Use 127.0.0.1 explicitly (IPv4) to match the callback server binding
-    return this._redirectUrl || `http://127.0.0.1:${callbackPort}/callback`;
+    if (this.mode === "silent") {
+      // WHY: A silent provider never starts an authorization flow, but clientMetadata.redirect_uris
+      // must still match what the client was registered with. Prefer the stored DCR redirect_uris
+      // (preserved per AGENTS.md), then the configured auth.redirectUrl, then the default 127.0.0.1:19876 callback.
+      const stored = this.getStoredRedirectUrisSync();
+      if (stored && stored.length > 0 && stored[0] !== undefined) {
+        return stored[0];
+      }
+    }
+    // WHY: In interactive mode, redirectUrl is the URL the callback server actually bound
+    // (passed in by authorize()), falling back to configured auth.redirectUrl, then the default
+    // 127.0.0.1:19876 callback URL.
+    return (
+      this.explicitRedirectUrl ??
+      this.authConfig.redirectUrl ??
+      DEFAULT_REDIRECT_URL
+    );
   }
 
   // --- clientMetadata ---
 
   get clientMetadata(): OAuthClientMetadata {
-    const redirectUrl = String(this.redirectUrl);
+    // WHY: A silent provider never starts an authorization flow, but clientMetadata.redirect_uris
+    // must still match what the client was registered with. Prefer the stored DCR redirect_uris
+    // (preserved per AGENTS.md), then the configured auth.redirectUrl, then the default 127.0.0.1:19876 callback.
+    let redirectUris: string[];
+    if (this.mode === "silent") {
+      const stored = this.getStoredRedirectUrisSync();
+      if (stored && stored.length > 0) {
+        redirectUris = stored;
+      } else {
+        redirectUris = [String(this.explicitRedirectUrl ?? this.authConfig.redirectUrl ?? DEFAULT_REDIRECT_URL)];
+      }
+    } else {
+      redirectUris = [String(this.redirectUrl)];
+    }
     return {
       client_name: `pi-mcp/${this.serverName}`,
-      redirect_uris: [redirectUrl],
+      redirect_uris: redirectUris,
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: this.authConfig.clientSecret ? "client_secret_basic" : "none",
@@ -141,6 +188,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
     const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
     const info = state.clientInfo;
     if (info) {
+      if (Array.isArray(info.redirect_uris) && info.redirect_uris.length > 0) {
+        this._storedRedirectUris = info.redirect_uris;
+      }
       if (
         info.client_secret !== undefined &&
         typeof info.client_secret_expires_at === "number" &&
@@ -302,6 +352,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
           : undefined,
       issuer: issuerToBind,
     };
+    if (Array.isArray(state.clientInfo?.redirect_uris) && state.clientInfo.redirect_uris.length > 0) {
+      this._storedRedirectUris = state.clientInfo.redirect_uris;
+    }
     await this.assertLockHeld?.();
     await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
@@ -482,10 +535,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
         state.discoveryState = undefined;
         this._codeVerifier = undefined;
         this._cachedTokens = undefined;
+        this._storedRedirectUris = undefined;
         break;
       case "client":
         changedDisk = state.clientInfo !== undefined;
         state.clientInfo = undefined;
+        this._storedRedirectUris = undefined;
         break;
       case "tokens":
         changedDisk = state.tokens !== undefined;

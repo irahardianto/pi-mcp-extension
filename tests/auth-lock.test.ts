@@ -467,15 +467,13 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
         },
       });
 
-      const provider = new McpOAuthProvider(
+      const provider = new McpOAuthProvider({
         serverName,
-        {},
-        undefined,
-        dir,
-        false,
-        () => false,
-        () => unlock.assertHeld(),
-      );
+        authConfig: {},
+        storageDir: dir,
+        mode: "interactive",
+        assertLockHeld: () => unlock.assertHeld(),
+      });
 
       // Remove lock from fake fs to simulate lock loss
       files.delete(targetLockPath);
@@ -574,8 +572,18 @@ describe("OAuth lock and state integration (real filesystem)", () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-silent-refresh-"));
     const serverName = "refresh-server";
     try {
-      const silent = new McpOAuthProvider(serverName, { clientId: "client-1" }, undefined, dir, true);
-      const reader = new McpOAuthProvider(serverName, { clientId: "client-1" }, undefined, dir, true);
+      const silent = new McpOAuthProvider({
+        serverName,
+        authConfig: { clientId: "client-1" },
+        storageDir: dir,
+        mode: "silent",
+      });
+      const reader = new McpOAuthProvider({
+        serverName,
+        authConfig: { clientId: "client-1" },
+        storageDir: dir,
+        mode: "silent",
+      });
 
       // Act (Part 1: silent saveTokens when unlocked persists to disk and preserves expires_in + scope)
       await silent.saveTokens({
@@ -619,13 +627,12 @@ describe("OAuth lock and state integration (real filesystem)", () => {
       // Arrange (Part 3: force disk write failure in silent.saveTokens)
       const blockedStorageDir = join(dir, "blocked-file-as-dir");
       await writeFile(blockedStorageDir, "not-a-directory", "utf8");
-      const fallbackSilent = new McpOAuthProvider(
+      const fallbackSilent = new McpOAuthProvider({
         serverName,
-        { clientId: "client-1" },
-        undefined,
-        blockedStorageDir,
-        true,
-      );
+        authConfig: { clientId: "client-1" },
+        storageDir: blockedStorageDir,
+        mode: "silent",
+      });
 
       const errors: unknown[][] = [];
       const origConsoleError = console.error;
@@ -658,7 +665,12 @@ describe("OAuth lock and state integration (real filesystem)", () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-peer-refresh-"));
     const serverName = "peer-server";
     try {
-      const seeder = new McpOAuthProvider(serverName, { clientId: "c1" }, undefined, dir, false);
+      const seeder = new McpOAuthProvider({
+        serverName,
+        authConfig: { clientId: "c1" },
+        storageDir: dir,
+        mode: "interactive",
+      });
       await seeder.saveClientInformation({ client_id: "c1" });
       await seeder.saveTokens({
         access_token: "access-1",
@@ -666,8 +678,18 @@ describe("OAuth lock and state integration (real filesystem)", () => {
         token_type: "Bearer",
       });
 
-      const processA = new McpOAuthProvider(serverName, { clientId: "c1" }, undefined, dir, true);
-      const processB = new McpOAuthProvider(serverName, { clientId: "c1" }, undefined, dir, true);
+      const processA = new McpOAuthProvider({
+        serverName,
+        authConfig: { clientId: "c1" },
+        storageDir: dir,
+        mode: "silent",
+      });
+      const processB = new McpOAuthProvider({
+        serverName,
+        authConfig: { clientId: "c1" },
+        storageDir: dir,
+        mode: "silent",
+      });
 
       // Both processes read initial tokens
       assert.equal((await processA.tokens())?.refresh_token, "refresh-1");
@@ -766,7 +788,7 @@ describe("OAuth lock and state integration (real filesystem)", () => {
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
       await writeFile(filePath, corruptContent, { encoding: "utf8", mode: 0o600 });
-      const provider = new McpOAuthProvider(serverName, {}, undefined, dir);
+      const provider = new McpOAuthProvider({ serverName, authConfig: {}, storageDir: dir });
 
       // Act & Assert (First read backs up the corrupt file and throws McpError(code="config"))
       let backupFilePath = "";
@@ -813,7 +835,7 @@ describe("OAuth lock and state integration (real filesystem)", () => {
         "utf8",
       );
 
-      const provider = new McpOAuthProvider(serverName, {}, undefined, dir);
+      const provider = new McpOAuthProvider({ serverName, authConfig: {}, storageDir: dir });
 
       // Act
       await assert.rejects(() => provider.codeVerifier(), /No PKCE code verifier/);
