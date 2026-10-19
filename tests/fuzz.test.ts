@@ -858,20 +858,28 @@ describe("fuzz: createHeadersFetch & discoverManualAuthChallenge", () => {
           }
 
           assert.ok(receivedHeaders instanceof Headers);
+          const headers = receivedHeaders;
+          const expectedReq = new Headers(req);
+          const expectedBase = new Headers(base);
           // Request headers override collisions
-          for (const [k, v] of Object.entries(req)) {
-            assert.equal(receivedHeaders.get(k), v);
-          }
+          expectedReq.forEach((v, k) => {
+            assert.equal(headers.get(k), v);
+          });
           // Non-colliding base headers are preserved
-          const reqLowerKeys = new Set(Object.keys(req).map((k) => k.toLowerCase()));
-          for (const [k, v] of Object.entries(base)) {
-            if (!reqLowerKeys.has(k.toLowerCase())) {
-              assert.equal(receivedHeaders.get(k), v);
+          expectedBase.forEach((v, k) => {
+            if (!expectedReq.has(k)) {
+              assert.equal(headers.get(k), v);
             }
-          }
+          });
         },
       ),
-      testOptions(),
+      {
+        ...testOptions(),
+        examples: [
+          [{}, { k: "", K: "" }],
+          [{ a: "1", A: "2" }, { b: "3", B: "4" }],
+        ],
+      },
     );
   });
 
