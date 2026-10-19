@@ -42,7 +42,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 
 | File | Owns |
 |---|---|
-| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; connection coordination (`connectRequested`, `connectAttempts`, `authQueue`, startup auth prompts); interactive `authorize()`; `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`; `mcp_status` / `mcp_connect` tools |
+| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; interactive `authorize()`; `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`; `mcp_status` / `mcp_connect` tools |
+| `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, startup auth prompts, eager server starts, session teardown) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), pure connect-failure classification (`classifyConnectFailure`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
 | `src/transport-factory.ts` | SDK transport construction (`stdio`, `streamable-http`, `sse`), environment resolution (`resolveEnv`), silent OAuth provider wiring, and transport-level SDK workarounds (`createTransport`) |
@@ -77,7 +78,7 @@ User-facing docs and repository policies to keep in sync with behavior changes: 
 
 Each of these was a real bug, and the listed suites guard it. If you touch the area, run those suites first.
 
-**Lifecycle & processes** (`server-manager.test.ts`, `stdio-process.test.ts`, `connection-coordination.test.ts`, `management-tools.test.ts`)
+**Lifecycle & processes** (`server-manager.test.ts`, `stdio-process.test.ts`, `connection-coordinator.test.ts`, `connection-coordination.test.ts`, `management-tools.test.ts`)
 - `server.attempt` and `connectAttempts` entries are cleared in `finally` / `_shutdown()` on every path: success, failure, abort, reload.
 - stdio: pass the session `cwd` to `StdioClientTransport`, track the child PID as soon as it spawns (`instrumentStdioTransport`), and have `_shutdown()` do SIGTERM → bounded wait → SIGKILL (`ensurePidTerminated`), including before retrying a failed handshake.
 - Health checks never overlap, each ping is time-bounded, and transport `onclose` triggers recovery for all three transports.

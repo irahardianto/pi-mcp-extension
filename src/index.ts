@@ -27,6 +27,10 @@ import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
 import { McpError, AuthCancelledError } from "./errors.js";
+import {
+  ConnectionCoordinator,
+  formatErrorMessage,
+} from "./connection-coordinator.js";
 import { spawn } from "node:child_process";
 
 // OAuth imports
@@ -85,13 +89,10 @@ export { AuthCancelledError } from "./errors.js";
 export const authRetryOption = "Retry: open browser again";
 export const authPasteOption = "Paste redirect URL";
 export const authCancelOption = "Cancel authentication";
-export const startupAuthNowOption = "Authorize now";
-export const startupAuthLaterOption = "Not now";
-
-function formatErrorMessage(err: unknown): string {
-  const msg = err instanceof McpError ? err.userMessage : err instanceof Error ? err.message : String(err);
-  return sanitizeTerminalText(msg.replace(/^AuthRequiredError:\s*/, ""));
-}
+export {
+  startupAuthNowOption,
+  startupAuthLaterOption,
+} from "./connection-coordinator.js";
 
 interface OAuthCallbackResult {
   type: "callback";
@@ -279,253 +280,13 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   const manager = new ServerManager(config, paths.authStorageDir);
   const bridge = new ToolBridge(config.settings, pi);
   const callbackServer = paths.callbackServer ?? new CallbackServer();
-  const connectAttempts = new Map<string, { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }>();
-  const declinedStartupAuth = new Set<string>();
-  const startupPromptControllers = new Map<string, AbortController>();
-  let authQueue: Promise<void> = Promise.resolve();
-  let activeStartupTurn: { serverName: string; handoffPromise?: Promise<void> } | null = null;
-  let activeCtx: ExtensionContext | undefined;
-
-  // WHY: Allow an aborted waiter on authQueue to wake up and reject immediately without breaking
-  // the sequential promise chain for subsequent non-aborted waiters.
-  function waitForQueueTurn(previous: Promise<void>, signal: AbortSignal, serverName: string): Promise<void> {
-    if (signal.aborted) {
-      return Promise.reject(new AuthCancelledError(serverName));
-    }
-    return new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        reject(new AuthCancelledError(serverName));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      previous.then(
-        () => {
-          signal.removeEventListener("abort", onAbort);
-          if (signal.aborted) {
-            reject(new AuthCancelledError(serverName));
-          } else {
-            resolve();
-          }
-        },
-        (err: unknown) => {
-          signal.removeEventListener("abort", onAbort);
-          reject(err);
-        },
-      );
-    });
-  }
-
-  async function runSerializedAuth(
-    serverName: string,
-    signal: AbortSignal,
-    fn: () => Promise<void>,
-  ): Promise<void> {
-    const previous = authQueue;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    authQueue = previous.then(() => gate);
-    try {
-      await waitForQueueTurn(previous, signal, serverName);
-      await fn();
-    } finally {
-      release();
-    }
-  }
-
-  function syncDeclinedAuthStatus(ctx: ExtensionContext | undefined = activeCtx): void {
-    for (const declinedName of Array.from(declinedStartupAuth)) {
-      const server = manager.getServer(declinedName);
-      if (!server || server.state === "ready") {
-        declinedStartupAuth.delete(declinedName);
-      }
-    }
-    if (!ctx) return;
-    if (declinedStartupAuth.size === 0) {
-      ctx.ui.setStatus?.("pi-mcp", undefined);
-      return;
-    }
-    // WHY: Display the most recent remaining server that still needs authorization so resolving
-    // one server does not clear the footer hint while other declined servers are still pending.
-    const remaining = Array.from(declinedStartupAuth);
-    const displayServer = remaining[remaining.length - 1]!;
-    ctx.ui.setStatus?.("pi-mcp", `run /mcp:auth ${displayServer}`);
-  }
-
-  async function teardownSessionState(ctx?: ExtensionContext): Promise<void> {
-    declinedStartupAuth.clear();
-    ctx?.ui.setStatus?.("pi-mcp", undefined);
-    for (const controller of startupPromptControllers.values()) {
-      controller.abort();
-    }
-    startupPromptControllers.clear();
-    const inFlightPromises = Array.from(connectAttempts.values(), (attempt) => attempt.promise);
-    for (const attempt of connectAttempts.values()) {
-      attempt.controller.abort();
-    }
-    connectAttempts.clear();
-    if (inFlightPromises.length > 0) {
-      await Promise.allSettled(inFlightPromises);
-    }
-    await callbackServer.stop().catch(() => {
-      // WHY: Ignore callback server shutdown errors during session teardown.
-    });
-    for (const server of manager.getAllServers()) {
-      bridge.removeServer(server.name);
-    }
-    await manager.shutdownAll();
-  }
-
-  function enqueueStartupAuthPrompt(name: string, ctx: ExtensionContext): void {
-    // WHY: Deduplicate startup prompts when session_start fires multiple times or while a prompt
-    // for the same server is already queued or active.
-    if (startupPromptControllers.has(name)) {
-      return;
-    }
-    const promptController = new AbortController();
-    // WHY: Register the AbortController immediately when queued (before awaiting authQueue) so
-    // /mcp:stop, /mcp:auth, or session teardown can cancel prompts that are still waiting in line.
-    startupPromptControllers.set(name, promptController);
-
-    const previous = authQueue;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    authQueue = previous.then(() => gate);
-
-    void (async () => {
-      let currentTurn: { serverName: string; handoffPromise?: Promise<void> } | null = null;
-      try {
-        await waitForQueueTurn(previous, promptController.signal, name);
-        if (
-          promptController.signal.aborted ||
-          declinedStartupAuth.has(name) ||
-          manager.getServer(name)?.state === "ready" ||
-          connectAttempts.has(name)
-        ) {
-          return;
-        }
-        currentTurn = { serverName: name };
-        activeStartupTurn = currentTurn;
-        let choice: string | undefined;
-        try {
-          choice = await new Promise<string | undefined>((resolve, reject) => {
-            if (promptController.signal.aborted) {
-              resolve(undefined);
-              return;
-            }
-            const onAbort = () => resolve(undefined);
-            promptController.signal.addEventListener("abort", onAbort, { once: true });
-            ctx.ui
-              .select(
-                `${name} needs authorization`,
-                [startupAuthNowOption, startupAuthLaterOption],
-                { signal: promptController.signal },
-              )
-              .then(
-                (value) => {
-                  promptController.signal.removeEventListener("abort", onAbort);
-                  resolve(value);
-                },
-                (err: unknown) => {
-                  promptController.signal.removeEventListener("abort", onAbort);
-                  if (promptController.signal.aborted) resolve(undefined);
-                  else reject(err);
-                },
-              );
-          });
-        } finally {
-          if (startupPromptControllers.get(name) === promptController) {
-            startupPromptControllers.delete(name);
-          }
-        }
-        if (currentTurn.handoffPromise) {
-          // WHY: An explicit connectRequested (/mcp:auth, /mcp:start, or mcp_connect) superseded
-          // this server's startup prompt while it held the active queue turn. Hold the queue slot
-          // until that connection/auth finishes before letting the next server's prompt appear.
-          await currentTurn.handoffPromise.catch(() => {
-            // WHY: Errors from an explicit connectRequested handoff are surfaced to its own caller.
-          });
-          return;
-        }
-        if (
-          promptController.signal.aborted ||
-          manager.getServer(name)?.state === "ready" ||
-          connectAttempts.has(name)
-        ) {
-          return;
-        }
-        if (choice === startupAuthNowOption) {
-          try {
-            await connectRequested(name, ctx, undefined, false, true);
-          } catch (err) {
-            if (!(err instanceof AuthCancelledError)) {
-              const msg = formatErrorMessage(err);
-              ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
-            }
-          }
-        } else {
-          declinedStartupAuth.add(name);
-          syncDeclinedAuthStatus(ctx);
-        }
-      } catch (err) {
-        if (!(err instanceof AuthCancelledError)) {
-          const msg = formatErrorMessage(err);
-          ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
-        }
-      } finally {
-        if (startupPromptControllers.get(name) === promptController) {
-          startupPromptControllers.delete(name);
-        }
-        if (currentTurn && activeStartupTurn === currentTurn) {
-          if (currentTurn.handoffPromise) {
-            await currentTurn.handoffPromise.catch(() => {
-              // WHY: Suppress rejection here because connectRequested caller handles it.
-            });
-          }
-          activeStartupTurn = null;
-        }
-        release();
-      }
-    })();
-  }
-
-  async function startEagerServers(
-    serversToStart: Array<[string, ServerConfig]>,
-    ctx: ExtensionContext,
-  ): Promise<void> {
-    const authRequiredServers = new Set<string>();
-
-    // Start all eager servers concurrently
-    await Promise.allSettled(
-      serversToStart.map(async ([name, cfg]) => {
-        try {
-          await manager.startServer(name, ctx.cwd);
-        } catch (err) {
-          if (err instanceof AuthRequiredError && cfg.auth && ctx.hasUI) {
-            authRequiredServers.add(name);
-            return;
-          }
-          const msg = formatErrorMessage(err);
-          ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
-        }
-      }),
-    );
-
-    for (const [name] of serversToStart) {
-      if (!authRequiredServers.has(name)) continue;
-      if (declinedStartupAuth.has(name)) {
-        syncDeclinedAuthStatus(ctx);
-        continue;
-      }
-      enqueueStartupAuthPrompt(name, ctx);
-    }
-
-    for (let i = 0; i < 4 * authRequiredServers.size; i++) {
-      await Promise.resolve();
-    }
-  }
+  const coordinator = new ConnectionCoordinator({
+    manager,
+    bridge,
+    getConfig: () => config,
+    authorize: (name, ctx, signal, reset) => authorize(name, ctx, signal, reset),
+    stopCallbackServer: () => callbackServer.stop(),
+  });
 
   manager.setToolRefreshCallback(async (serverName, client, options) => {
     const server = manager.getServer(serverName);
@@ -548,19 +309,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   });
   manager.setServerStoppedCallback((name) => bridge.deactivateServer(name));
   manager.setRecoveryFailedCallback((serverName, error) => {
-    if (error instanceof AuthRequiredError) {
-      declinedStartupAuth.add(serverName);
-      activeCtx?.ui.notify(
-        `pi-mcp: ${serverName} requires re-authorization — run /mcp:auth ${serverName}`,
-        "warning",
-      );
-      syncDeclinedAuthStatus(activeCtx);
-    } else {
-      activeCtx?.ui.notify(
-        `pi-mcp: Lost connection to ${serverName} — ${formatErrorMessage(error)}`,
-        "error",
-      );
-    }
+    coordinator.handleRecoveryFailed(serverName, error);
   });
   bridge.setAuthErrorCallback(async (serverName) => {
     await manager.handleUnauthorizedServerError(serverName);
@@ -568,7 +317,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
-    activeCtx = ctx;
+    coordinator.setActiveContext(ctx);
     // Only load project-level <cwd>/.pi/mcp.json when the project is trusted.
     const includeProjectConfig =
       typeof (ctx as { isProjectTrusted?: () => boolean }).isProjectTrusted === "function"
@@ -583,7 +332,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       ctx.ui.notify(`pi-mcp: Config error — ${msg}`, "error");
       // WHY: Switching sessions into a directory with an invalid config must tear down stale
       // servers, tools, prompts, and status from the previous session rather than leaving them active.
-      await teardownSessionState(ctx);
+      await coordinator.teardown(ctx);
       fileConfig = {
         settings: { ...DEFAULT_SETTINGS },
         mcpServers: {},
@@ -603,7 +352,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         const eagerServers = Object.entries(config.mcpServers).filter(
           ([, cfg]) => cfg.lifecycle === "eager",
         );
-        await startEagerServers(eagerServers, ctx);
+        await coordinator.startEagerServers(eagerServers, ctx);
       }
       return;
     }
@@ -622,7 +371,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     // If config changed (different cwd with project-level overrides or registered servers),
     // shut down old servers and rebuild the manager's server list
     if (JSON.stringify(sessionConfig) !== JSON.stringify(config)) {
-      await teardownSessionState(ctx);
+      await coordinator.teardown(ctx);
       // Rebuild server entries from new config
       bridge.updateSettings(sessionConfig.settings);
       manager.rebuildServers(sessionConfig);
@@ -631,19 +380,19 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       // WHY: Even when config is identical across session switches, update running servers'
       // cwd and emit notifications/roots/list_changed if the workspace directory changed.
       manager.updateCwd(ctx.cwd);
-      syncDeclinedAuthStatus(ctx);
+      coordinator.syncStatus(ctx);
     }
 
     const eagerServers = Object.entries(sessionConfig.mcpServers).filter(
       ([, cfg]) => cfg.lifecycle === "eager",
     );
 
-    await startEagerServers(eagerServers, ctx);
+    await coordinator.startEagerServers(eagerServers, ctx);
   });
 
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
   pi.on("mcp_servers_change", async (event, ctx: ExtensionContext) => {
-    activeCtx = ctx;
+    coordinator.setActiveContext(ctx);
     const entries = Array.isArray((event as { servers?: unknown })?.servers)
       ? ((event as { servers: RegisteredMcpServer[] }).servers)
       : getRegisteredEntries();
@@ -666,15 +415,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
 
     for (const name of removedOrChanged) {
-      declinedStartupAuth.delete(name);
-      startupPromptControllers.get(name)?.abort();
-      startupPromptControllers.delete(name);
-      connectAttempts.get(name)?.controller.abort();
+      coordinator.cancelServer(name);
       bridge.removeServer(name);
       await manager.removeServer(name);
     }
     if (removedOrChanged.length > 0) {
-      syncDeclinedAuthStatus(ctx);
+      coordinator.syncStatus(ctx);
     }
 
     const addedEager: Array<[string, ServerConfig]> = [];
@@ -691,26 +437,13 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     config = mergeWithRegisteredServers(fileConfig, extensionServers);
 
     if (addedEager.length > 0) {
-      await startEagerServers(addedEager, ctx);
+      await coordinator.startEagerServers(addedEager, ctx);
     }
   });
 
-  pi.on("session_shutdown", async (_event, _ctx: ExtensionContext) => {
-    activeCtx = undefined;
-    declinedStartupAuth.clear();
-    for (const controller of startupPromptControllers.values()) controller.abort();
-    startupPromptControllers.clear();
-    for (const attempt of connectAttempts.values()) attempt.controller.abort();
-    connectAttempts.clear();
-    await callbackServer.stop().catch(() => {
-      // WHY: Ignore callback server shutdown errors during session_shutdown.
-    });
-
-    // Deactivate all tools before shutting down servers
-    for (const server of manager.getAllServers()) {
-      bridge.deactivateServer(server.name);
-    }
-    await manager.shutdownAll();
+  pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
+    await coordinator.teardown(ctx, { removeServers: false });
+    coordinator.setActiveContext(undefined);
   });
 
   // ── 4. /mcp — show server status ─────────────────────────────────────────
@@ -760,11 +493,8 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
         return;
       }
-      declinedStartupAuth.delete(serverName);
-      syncDeclinedAuthStatus(ctx);
-      startupPromptControllers.get(serverName)?.abort();
-      startupPromptControllers.delete(serverName);
-      connectAttempts.get(serverName)?.controller.abort();
+      coordinator.cancelServer(serverName);
+      coordinator.syncStatus(ctx);
       bridge.deactivateServer(serverName);
       await manager.stopServer(serverName);
       ctx.ui.notify(`pi-mcp: Stopped ${serverName}`, "info");
@@ -786,7 +516,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         return;
       }
       try {
-        await connectRequested(serverName, ctx);
+        await coordinator.connect(serverName, ctx);
         ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
       } catch (err) {
         if (err instanceof AuthCancelledError) {
@@ -1066,139 +796,6 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
   }
 
-  async function connectRequested(
-    serverName: string,
-    ctx: ExtensionContext,
-    signal?: AbortSignal,
-    reset = false,
-    alreadyQueued = false,
-  ): Promise<void> {
-    activeCtx = ctx;
-    const server = manager.getServer(serverName);
-    if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
-    if (signal?.aborted) throw new AuthCancelledError(serverName);
-    if (reset && !server.config.auth) throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
-    if (reset && !ctx.hasUI) throw new AuthRequiredError(serverName);
-
-    const inheritedStartupTurn =
-      !alreadyQueued && activeStartupTurn?.serverName === serverName ? activeStartupTurn : null;
-
-    const waitForAttempt = async (entry: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }): Promise<void> => {
-      entry.waiters++;
-      let released = false;
-      const releaseWaiter = () => {
-        if (!released) {
-          released = true;
-          entry.waiters--;
-        }
-      };
-      if (!signal) {
-        try {
-          return await entry.promise;
-        } finally {
-          releaseWaiter();
-        }
-      }
-      let stopPromise: Promise<unknown> | undefined;
-      let onAbort!: () => void;
-      const aborted = new Promise<never>((_resolve, reject) => {
-        onAbort = () => {
-          releaseWaiter();
-          if (entry.waiters === 0) {
-            if (connectAttempts.get(serverName) === entry) {
-              connectAttempts.delete(serverName);
-            }
-            entry.controller.abort();
-            stopPromise = manager.stopServer(serverName);
-            void stopPromise.finally(() => reject(new AuthCancelledError(serverName)));
-          } else {
-            reject(new AuthCancelledError(serverName));
-          }
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-      try {
-        return await Promise.race([entry.promise, aborted]);
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-        releaseWaiter();
-        await stopPromise;
-      }
-    };
-
-    const existing = connectAttempts.get(serverName);
-    // All requests join an in-flight reset. A reset supersedes a normal connect.
-    if (existing && !existing.controller.signal.aborted && (!reset || existing.reset)) {
-      return await waitForAttempt(existing);
-    }
-
-    const controller = new AbortController();
-    if (existing) {
-      existing.controller.abort();
-      void manager.stopServer(serverName);
-    }
-    let entry!: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number };
-    const task = (async () => {
-      // Wait for a superseded connect to release its callback listener and auth lock.
-      if (existing) {
-        await existing.promise.catch(() => {
-          // WHY: Ignore errors from the superseded connect attempt while waiting for cleanup.
-        });
-      }
-      if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-      if (reset) {
-        bridge.deactivateServer(serverName);
-        await manager.stopServer(serverName);
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-      }
-      try {
-        if (!reset) await manager.startServer(serverName, ctx.cwd);
-        else throw new AuthRequiredError(serverName);
-        if (controller.signal.aborted) { await manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
-        declinedStartupAuth.delete(serverName);
-        syncDeclinedAuthStatus(ctx);
-        return;
-      } catch (err) {
-        if (!(err instanceof AuthRequiredError) || !server.config.auth) throw err;
-      }
-      if (!ctx.hasUI) throw new AuthRequiredError(serverName);
-      const runInteractiveAuth = async (): Promise<void> => {
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-        await authorize(serverName, ctx, controller.signal, reset);
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-        await manager.startServer(serverName, ctx.cwd);
-        if (controller.signal.aborted) { await manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
-      };
-      if (alreadyQueued || inheritedStartupTurn) {
-        await runInteractiveAuth();
-      } else {
-        await runSerializedAuth(serverName, controller.signal, runInteractiveAuth);
-      }
-      declinedStartupAuth.delete(serverName);
-      syncDeclinedAuthStatus(ctx);
-    })().catch((err: unknown) => {
-      if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-      throw err;
-    }).finally(() => {
-      if (connectAttempts.get(serverName) === entry) connectAttempts.delete(serverName);
-    });
-    void task.catch(() => {
-      // WHY: Prevent unhandled rejection when task settles after an aborted waiter detaches.
-    });
-    if (inheritedStartupTurn) {
-      // WHY: Attach handoffPromise before aborting the active startup prompt so the prompt turn
-      // stays held for this server's interactive auth instead of advancing authQueue to the next server.
-      inheritedStartupTurn.handoffPromise = task;
-    }
-    if (!alreadyQueued) {
-      startupPromptControllers.get(serverName)?.abort();
-      startupPromptControllers.delete(serverName);
-    }
-    entry = { promise: task, controller, reset, waiters: 0 };
-    connectAttempts.set(serverName, entry);
-    return await waitForAttempt(entry);
-  }
-
   pi.registerTool({
     name: "mcp_status",
     label: "MCP status",
@@ -1248,7 +845,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     parameters: Type.Object({ name: Type.String({ description: "Exact configured MCP server name" }) }),
     async execute(_id, { name }, signal, _update, ctx) {
       try {
-        await connectRequested(name, ctx, signal);
+        await coordinator.connect(name, ctx, { signal });
       } catch (err) {
         const message = signal?.aborted || err instanceof AuthCancelledError
           ? "MCP connection cancelled. Retry when ready."
@@ -1285,7 +882,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         bridge.deactivateServer(name);
         await manager.stopServer(name);
       }
-      try { await connectRequested(name, ctx, undefined, reset); ctx.ui.notify(`pi-mcp: ${name} ready`, "info"); }
+      try { await coordinator.connect(name, ctx, { reset }); ctx.ui.notify(`pi-mcp: ${name} ready`, "info"); }
       catch (err) {
         ctx.ui.notify(`pi-mcp: ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`, err instanceof AuthCancelledError ? "info" : "error");
       }
