@@ -223,6 +223,7 @@ describe("ConnectionCoordinator direct unit tests", () => {
   });
 
   it("serializes interactive auth on authQueue and wakes up aborted waiter immediately", async () => {
+    const auth1Entered = gate();
     const auth1Gate = gate();
     const authOrder: string[] = [];
 
@@ -232,8 +233,10 @@ describe("ConnectionCoordinator direct unit tests", () => {
         oauth2: { config: { transport: "sse", url: "https://2.example.com", auth: { type: "oauth", clientId: "c2" } }, state: "stopped" },
         oauth3: { config: { transport: "sse", url: "https://3.example.com", auth: { type: "oauth", clientId: "c3" } }, state: "stopped" },
       },
-      onStartServer: async () => {
-        throw new AuthRequiredError("oauth");
+      onStartServer: async (name) => {
+        if (!authOrder.includes(name)) {
+          throw new AuthRequiredError(name);
+        }
       },
     });
     const fakeBridge = makeFakeBridge();
@@ -245,6 +248,7 @@ describe("ConnectionCoordinator direct unit tests", () => {
       authorize: async (name) => {
         authOrder.push(name);
         if (name === "oauth1") {
+          auth1Entered.resolve();
           await auth1Gate.promise;
         }
       },
@@ -255,7 +259,7 @@ describe("ConnectionCoordinator direct unit tests", () => {
 
     // oauth1 enters authorize and holds authQueue
     const conn1 = coordinator.connect("oauth1", ctx);
-    await new Promise((r) => setTimeout(r, 20));
+    await auth1Entered.promise;
     assert.deepEqual(authOrder, ["oauth1"]);
 
     // oauth2 waits in line on authQueue
@@ -266,21 +270,20 @@ describe("ConnectionCoordinator direct unit tests", () => {
     let conn3Done = false;
     const conn3 = coordinator.connect("oauth3", ctx).then(() => {
       conn3Done = true;
-    }).catch(() => {
-      // expected if startServer rejects with AuthRequiredError after auth
     });
 
     // Aborting oauth2 must immediately reject conn2 with AuthCancelledError without waiting for oauth1
     abort2.abort();
     await assert.rejects(conn2, AuthCancelledError);
     assert.equal(conn3Done, false, "oauth3 should not have run while oauth1 is still holding the queue");
+    assert.deepEqual(authOrder, ["oauth1"]);
 
     // Release oauth1
     auth1Gate.resolve();
-    await assert.rejects(conn1, AuthRequiredError);
-    await conn3;
+    await Promise.all([conn1, conn3]);
 
-    assert.ok(authOrder.includes("oauth3"), "oauth3 must execute after oauth1 released the queue");
+    assert.equal(conn3Done, true);
+    assert.deepEqual(authOrder, ["oauth1", "oauth3"], "oauth3 must execute after oauth1 released the queue while aborted oauth2 is skipped");
   });
 
   it("teardown aborts in-flight attempts, clears declined status, stops callback server, and shuts down servers", async () => {

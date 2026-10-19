@@ -52,10 +52,6 @@ export class ConnectionCoordinator {
     this.deps = deps;
   }
 
-  getActiveContext(): ExtensionContext | undefined {
-    return this.activeCtx;
-  }
-
   setActiveContext(ctx: ExtensionContext | undefined): void {
     this.activeCtx = ctx;
   }
@@ -66,10 +62,6 @@ export class ConnectionCoordinator {
 
   isStartupAuthDeclined(serverName: string): boolean {
     return this.declinedStartupAuth.has(serverName);
-  }
-
-  hasStartupPrompt(serverName: string): boolean {
-    return this.startupPromptControllers.has(serverName);
   }
 
   get inFlightAttemptCount(): number {
@@ -140,10 +132,6 @@ export class ConnectionCoordinator {
     const remaining = Array.from(this.declinedStartupAuth);
     const displayServer = remaining[remaining.length - 1]!;
     ctx.ui.setStatus?.("pi-mcp", `run /mcp:auth ${displayServer}`);
-  }
-
-  syncDeclinedAuthStatus(ctx: ExtensionContext | undefined = this.activeCtx): void {
-    this.syncStatus(ctx);
   }
 
   markAuthRequired(serverName: string, ctx: ExtensionContext | undefined = this.activeCtx): void {
@@ -359,19 +347,11 @@ export class ConnectionCoordinator {
   async connect(
     serverName: string,
     ctx: ExtensionContext,
-    optionsOrSignal?: ConnectOptions | AbortSignal,
-    resetArg = false,
-    alreadyQueuedArg = false,
+    options?: ConnectOptions,
   ): Promise<void> {
-    const opts: ConnectOptions =
-      optionsOrSignal instanceof AbortSignal ||
-      (typeof optionsOrSignal === "object" && optionsOrSignal !== null && "aborted" in optionsOrSignal)
-        ? { signal: optionsOrSignal as AbortSignal, reset: resetArg, alreadyQueued: alreadyQueuedArg }
-        : (optionsOrSignal ?? { reset: resetArg, alreadyQueued: alreadyQueuedArg });
-
-    const signal = opts.signal;
-    const reset = opts.reset ?? false;
-    const alreadyQueued = opts.alreadyQueued ?? false;
+    const signal = options?.signal;
+    const reset = options?.reset ?? false;
+    const alreadyQueued = options?.alreadyQueued ?? false;
 
     this.activeCtx = ctx;
     const server = this.deps.manager.getServer(serverName);
@@ -497,15 +477,5 @@ export class ConnectionCoordinator {
     entry = { promise: task, controller, reset, waiters: 0 };
     this.connectAttempts.set(serverName, entry);
     return await waitForAttempt(entry);
-  }
-
-  connectRequested(
-    serverName: string,
-    ctx: ExtensionContext,
-    signal?: AbortSignal,
-    reset = false,
-    alreadyQueued = false,
-  ): Promise<void> {
-    return this.connect(serverName, ctx, { signal, reset, alreadyQueued });
   }
 }
