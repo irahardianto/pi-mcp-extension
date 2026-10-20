@@ -1,0 +1,96 @@
+name: Bug report
+description: Report a bug in pi-mcp-extension
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in as much detail as you can. **Remove all tokens, headers, secrets, and credentials from any config you paste.**
+  - type: input
+    id: pi-mcp-version
+    attributes:
+      label: pi-mcp-extension version
+      description: From `npm ls pi-mcp-extension` or the installed package version.
+      placeholder: "1.9.11"
+    validations:
+      required: true
+  - type: input
+    id: pi-version
+    attributes:
+      label: Pi version
+      placeholder: "x.y.z"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      placeholder: "22.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - stdio
+        - sse
+        - streamable-http
+    validations:
+      required: true
+  - type: dropdown
+    id: oauth
+    attributes:
+      label: Uses OAuth?
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Redacted mcp.json snippet
+      description: |
+        Paste the relevant server config. **WARNING: remove all tokens, headers, secrets, client secrets, and credentials before posting.**
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: mcp-status
+    attributes:
+      label: "`/mcp` and `/mcp <name>` output"
+      description: Output of `/mcp` and `/mcp <name>` in Pi.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
