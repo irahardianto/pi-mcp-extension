@@ -29,7 +29,7 @@ Tests must pass on macOS and Windows too. Skip a test only when the behavior is 
 
 ## Hard rules
 
-1. **Never write to `stdout`** (`console.log`, `process.stdout`). It belongs to Pi's TUI/RPC stream. User-facing output goes through `ctx.ui.notify(...)` / `ctx.ui.setStatus("pi-mcp", ...)`; use `console.error("[pi-mcp] ...")` only when no UI context exists.
+1. **Never write to `stdout`** (`console.log`, `process.stdout`). It belongs to Pi's TUI/RPC stream. User-facing output goes through `ctx.ui.notify(...)` / `ctx.ui.setStatus("pi-mcp", ...)`; use `console.error("[pi-mcp] ...")` only when no UI context exists. Never write diagnostics to `stderr` while a UI is active either — report them through `reportDiagnostic(...)` in `src/debug-log.ts` (log file, or a Pi notification for user-actionable events), which falls back to `console.error` only when no UI context exists.
 2. **Pushing to `main` is a manual override only.** Always work on a branch and open a PR. Never push to `main`, publish, or tag unless the user explicitly instructs it for that change; every push to `main` can publish to npm (see [Commits & release](#commits--release)). Never run `npm publish` / `npm version`, edit `version` in `package.json`, or hand-write a versioned `CHANGELOG.md` heading.
 3. **No silent error swallowing.** No empty `catch {}` or `.catch(() => {})`. Handle expected codes (`ENOENT`, `ESRCH`, `EEXIST`) explicitly; an intentional best-effort teardown ignore needs a `// WHY:` comment.
 4. **Never log or surface secrets**: access/refresh tokens, `client_secret`, authorization codes, PKCE verifiers, `Authorization` headers. Never commit real credentials, even in fixtures. If `gitleaks` flags a real secret, revoke and rotate it first, then report it privately as described in [`SECURITY.md`](SECURITY.md), never in a public issue or PR.
@@ -60,6 +60,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/callback-server.ts`, `src/callback-url.ts` | Instance-scoped `CallbackServer` loopback OAuth callback listener; pure redirect/callback URL validation (`callbackServerConfigFromRedirectUrl`) and headless paste-back parsing |
 | `src/auth-challenge.ts` | `WWW-Authenticate` discovery (RFC 9728 `resource_metadata`, `scope`) |
 | `src/terminal-text.ts` | Pure terminal/notification text sanitization (`sanitizeTerminalText`): strips ANSI/OSC/DCS/C1 escape sequences and C0/C1 control characters, collapses line breaks, and bounds string length on code-point boundaries |
+| `src/debug-log.ts` | Opt-in redacting debug log (`PI_MCP_DEBUG=1` → `<agentDir>/logs/pi-mcp.log`, JSON Lines, `0o600`, ~2 MB rotation) plus the process-wide diagnostic sink (`reportDiagnostic`): allow-listed fields, secret masking, injectable `DebugLogDeps` |
 | `src/errors.ts` | `McpError` kinds `config \| connection \| auth \| timeout \| protocol`; `AuthRequiredError`, `AuthLockError`, `AuthCancelledError` |
 
 Tests live in `tests/*.test.ts` (`node:test` + `node:assert/strict`, run through `tsx`). Fixtures: `tests/mock-server.ts`, `tests/helpers/`. Property-based fuzz tests live in `tests/fuzz.test.ts` (using `fast-check`, detected by OpenSSF Scorecard). Keep tests out of `src/`.
@@ -105,6 +106,11 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 **Config validation** (`config.test.ts`): reject bad config at load time, not at connect time.
 - `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`.
 - `auth` is rejected on `stdio` servers, and `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated when the config loads.
+
+**Diagnostics** (`debug-log.test.ts`, `server-manager.test.ts`)
+- The extension writes to `stderr` only when no UI context exists, and only `warn`/`error` events (plus `info` events explicitly flagged `stderr: true`, e.g. child-server output and the headless OAuth URL fallback); other `info` telemetry is log-file only, so headless stderr output is unchanged from before the sink. While a UI is active, every diagnostic goes through `reportDiagnostic(...)` in `src/debug-log.ts`: the log file when `PI_MCP_DEBUG=1`, a `ctx.ui.notify(...)` for user-actionable events, and nothing otherwise. Semgrep `pi-mcp.no-stderr` keeps direct `console.error` / `process.stderr.write` calls out of every module except `src/debug-log.ts`.
+- The log file lives in `<agentDir>/logs/pi-mcp.log` (`0o600` in a `0o700` directory), is rotated to `pi-mcp.log.1` at ~2 MB, and is only created when `PI_MCP_DEBUG=1` is set. File-mode assertions are POSIX-only: skip them on Windows (`fs.stat` there reports `0o666`).
+- The logger API takes allow-listed field names only (`SAFE_FIELD_NAMES`); unknown names are dropped, and a final pass masks token-like substrings. Never pass a raw error object, an HTTP body, or a token to it.
 
 ## Bug-fix workflow
 

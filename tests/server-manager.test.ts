@@ -896,10 +896,11 @@ await server.connect(new StdioServerTransport());
     );
   });
 
-  it("sanitizes notifications/message fields and server error messages across stderrLog, console.error, /mcp, and ctx.ui.notify (#66)", async (t) => {
-    const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  it("sanitizes notifications/message fields and server error messages across stderrLog, the debug log, /mcp, and ctx.ui.notify (#66)", async (t) => {
+    const { mkdtemp, rm, writeFile, readFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { default: extension } = await import("../src/index.js");
+    const { DebugLog, setDebugLog } = await import("../src/debug-log.js");
 
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-sanitize-66-"));
     const scriptPath = join(dir, "malicious-server.mjs");
@@ -988,6 +989,12 @@ await server.connect(new StdioServerTransport());
       assert.ok(!pattern.test(text), `Must not contain control characters: ${JSON.stringify(text)}`);
     };
 
+    // The debug log is enabled so the sanitized server output can be inspected
+    // where it now goes: the log file instead of Pi's stderr.
+    const logDir = join(dir, "logs");
+    const debugLog = new DebugLog(logDir);
+    setDebugLog(debugLog);
+
     try {
       await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath });
       await mockExt.events.get("session_start")({}, ctx);
@@ -996,11 +1003,25 @@ await server.connect(new StdioServerTransport());
       await mockExt.commands.get("mcp:start").handler("logSrv", ctx);
       await new Promise((r) => setTimeout(r, 30));
 
-      const logStderr = stderrCalls.find((line) => line.startsWith("[pi-mcp:logSrv]"));
-      assert.ok(logStderr, `Expected [pi-mcp:logSrv] console.error call, got: ${JSON.stringify(stderrCalls)}`);
-      assertNoEscapeOrControl(logStderr, false);
-      assert.ok(logStderr.includes("[warning] db [pi-mcp] spoofed:"));
-      assert.ok(logStderr.endsWith("…"), "Expected oversized notifications/message data to be truncated");
+      // While a UI is active the extension must not write to Pi's stderr (#71).
+      assert.deepEqual(
+        stderrCalls,
+        [],
+        `Expected no stderr output while a UI is active, got: ${JSON.stringify(stderrCalls)}`,
+      );
+
+      await debugLog.flush();
+      const logText = await readFile(join(logDir, "pi-mcp.log"), "utf-8");
+      assertNoEscapeOrControl(logText, true);
+      const logLine = logText
+        .split("\n")
+        .find((line) => line.includes('"event":"server.log"'));
+      assert.ok(logLine, `Expected a server.log entry in the debug log, got: ${JSON.stringify(logText)}`);
+      assert.ok(logLine.includes("[warning] db [pi-mcp] spoofed:"));
+      assert.ok(logLine.includes("…"), "Expected oversized notifications/message data to be truncated");
+      const logEntry = JSON.parse(logLine) as { message: string; server: string };
+      assert.equal(logEntry.server, "logSrv");
+      assert.ok(logEntry.message.endsWith("…"));
 
       // Inspect /mcp logSrv detail output
       notifications.length = 0;
@@ -1038,6 +1059,7 @@ await server.connect(new StdioServerTransport());
       assertNoEscapeOrControl(lastErrorLine, false);
       assert.ok(lastErrorLine.endsWith("…"));
     } finally {
+      setDebugLog(null);
       await mockExt.events.get("session_shutdown")?.({}, ctx);
       await rm(dir, { recursive: true, force: true });
     }

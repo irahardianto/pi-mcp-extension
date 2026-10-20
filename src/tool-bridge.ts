@@ -20,6 +20,7 @@ import { McpError, AuthCancelledError } from "./errors.js";
 import type { Settings } from "./config.js";
 import { isOAuthUnauthorizedError } from "./server-manager.js";
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
+import { reportDiagnostic } from "./debug-log.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -138,9 +139,13 @@ export async function listAllTools(
       throw new AuthCancelledError(serverName);
     }
     if (pageCount >= MAX_PAGES) {
-      console.error(
-        `[pi-mcp] tools/list pagination exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
-      );
+      reportDiagnostic({
+        level: "warn",
+        event: "tools.pagination_limit",
+        server: serverName,
+        message: `tools/list pagination exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
+        fields: { pages: pageCount },
+      });
       break;
     }
     const requestOptions = {

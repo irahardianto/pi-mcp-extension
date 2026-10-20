@@ -77,6 +77,18 @@ body:
     validations:
       required: true
   - type: textarea
+    id: debug-log
+    attributes:
+      label: Debug log
+      description: |
+        If you can reproduce the problem, run `PI_MCP_DEBUG=1 pi` and attach
+        `<agent dir>/logs/pi-mcp.log` (JSON Lines). It records the extension's own
+        decisions — server state transitions, retries, OAuth refresh — and contains
+        no credentials: tokens and secrets are masked automatically.
+      render: text
+    validations:
+      required: false
+  - type: textarea
     id: reproduce
     attributes:
       label: Steps to reproduce

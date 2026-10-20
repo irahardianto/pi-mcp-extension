@@ -13,7 +13,8 @@ import type {
   ExtensionCommandContext,
   RegisteredMcpServer,
 } from "@earendil-works/pi-coding-agent";
-import { loadConfig, type McpConfig, type ServerConfig } from "./config.js";
+import { join } from "node:path";
+import { loadConfig, type McpConfig, type ServerConfig, agentDir } from "./config.js";
 import {
   collectRegisteredServers,
   mergeWithRegisteredServers,
@@ -32,6 +33,15 @@ import {
 } from "./connection-coordinator.js";
 import { CallbackServer } from "./callback-server.js";
 import { authorize as runAuthorize } from "./authorize-flow.js";
+import {
+  DebugLog,
+  describeError,
+  getDebugLog,
+  isDebugLogEnabled,
+  reportDiagnostic,
+  setDebugLog,
+  setDiagnosticUi,
+} from "./debug-log.js";
 
 export {
   startupAuthNowOption,
@@ -41,6 +51,13 @@ export {
 const DEFAULT_SETTINGS = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 } as const;
 
 export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string; globalConfigPath?: string; authStorageDir?: string; browserOpen?: (url: string) => void | Promise<void>; callbackServer?: CallbackServer } = {}): Promise<void> {
+  // ── 0. Opt-in diagnostic log ───────────────────────────────────────────────
+  // WHY: The debug log is created before anything else so bootstrap failures
+  // are captured too. The file is only touched when the first event is written.
+  if (isDebugLogEnabled()) {
+    setDebugLog(new DebugLog(join(agentDir(), "logs")));
+  }
+
   // ── 1. Load and validate config ──────────────────────────────────────────
   // cwd and project trust are available on the ExtensionContext passed to event handlers.
   // At bootstrap (before session_start) we load ONLY the global config so untrusted
@@ -54,9 +71,16 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       includeProjectConfig: false,
     });
   } catch (err) {
-    // Can't notify yet (no ctx), so log to stderr. The session_start handler
-    // will re-try with the real cwd and surface errors properly.
-    console.error(`[pi-mcp] Config error: ${sanitizeTerminalText(err instanceof McpError ? err.message : String(err))}`);
+    // Can't notify yet (no ctx), so the diagnostic goes to stderr (and to the
+    // debug log when it is enabled). The session_start handler will re-try with
+    // the real cwd and surface errors properly.
+    const { kind, message } = describeError(err);
+    reportDiagnostic({
+      level: "error",
+      event: "config.error",
+      message: `Config error: ${message}`,
+      fields: { kind },
+    });
   }
 
   const getRegisteredEntries = (): RegisteredMcpServer[] =>
@@ -67,7 +91,15 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   let extensionServers = collectRegisteredServers(
     getRegisteredEntries(),
     fileConfig.mcpServers,
-    (err) => console.error(`[pi-mcp] Config error: ${sanitizeTerminalText(err instanceof McpError ? err.message : String(err))}`),
+    (err) => {
+      const { kind, message } = describeError(err);
+      reportDiagnostic({
+        level: "error",
+        event: "config.error",
+        message: `Config error: ${message}`,
+        fields: { kind },
+      });
+    },
   );
   let config: McpConfig = mergeWithRegisteredServers(fileConfig, extensionServers);
 
@@ -113,6 +145,16 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
     coordinator.setActiveContext(ctx);
+    // WHY: While a UI is active, the extension never writes to Pi's stderr —
+    // the TUI owns that stream. Diagnostics go to the debug log instead, and
+    // user-actionable ones are surfaced through ctx.ui.notify(...).
+    setDiagnosticUi(ctx.ui, ctx.hasUI);
+    reportDiagnostic({
+      level: "info",
+      event: "session.started",
+      message: `pi-mcp session started in ${ctx.cwd}`,
+      fields: { outcome: "started" },
+    });
     // Only load project-level <cwd>/.pi/mcp.json when the project is trusted.
     const includeProjectConfig =
       typeof (ctx as { isProjectTrusted?: () => boolean }).isProjectTrusted === "function"
@@ -166,6 +208,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     // If config changed (different cwd with project-level overrides or registered servers),
     // shut down old servers and rebuild the manager's server list
     if (JSON.stringify(sessionConfig) !== JSON.stringify(config)) {
+      reportDiagnostic({
+        level: "info",
+        event: "session.reload",
+        message: "MCP configuration changed; reloading servers and tools",
+        fields: { outcome: "config_changed" },
+      });
       await coordinator.teardown(ctx);
       // Rebuild server entries from new config
       bridge.updateSettings(sessionConfig.settings);
@@ -188,6 +236,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
   pi.on("mcp_servers_change", async (event, ctx: ExtensionContext) => {
     coordinator.setActiveContext(ctx);
+    setDiagnosticUi(ctx.ui, ctx.hasUI);
     const entries = Array.isArray((event as { servers?: unknown })?.servers)
       ? ((event as { servers: RegisteredMcpServer[] }).servers)
       : getRegisteredEntries();
@@ -237,8 +286,18 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   });
 
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
+    reportDiagnostic({
+      level: "info",
+      event: "session.teardown",
+      message: "pi-mcp session shutting down",
+      fields: { outcome: "shutdown" },
+    });
     await coordinator.teardown(ctx, { removeServers: false });
     coordinator.setActiveContext(undefined);
+    setDiagnosticUi(null, false);
+    // WHY: Flush the queued debug-log writes before the process may exit, so a
+    // bug report attached right after the session ends is not missing events.
+    await getDebugLog()?.flush();
   });
 
   // ── 4. /mcp — show server status ─────────────────────────────────────────
@@ -356,7 +415,14 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
           } catch (err) {
             // WHY: Never let a single server's corrupt state file abort mcp_status for all servers.
             // getAuthStatus() already backed up and deleted the corrupt file before throwing.
-            console.error(`[pi-mcp] ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`);
+            const { kind, message } = describeError(err);
+            reportDiagnostic({
+              level: "error",
+              event: "oauth.state_corrupt",
+              server: server.name,
+              message,
+              fields: { kind },
+            });
             authCorrupt = true;
           }
         }

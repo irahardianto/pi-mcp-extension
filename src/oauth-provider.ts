@@ -31,6 +31,7 @@ import {
   type StoredState,
   type StoredTokens,
 } from "./oauth-state-store.js";
+import { describeError, reportDiagnostic } from "./debug-log.js";
 
 export { acquireAuthLock, AuthLockError, AuthRequiredError, type AcquireAuthLockOptions, type AuthLockHandle };
 
@@ -283,6 +284,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
           };
         }
         await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+        reportDiagnostic({
+          level: "info",
+          event: "oauth.client_info_saved",
+          server: this.serverName,
+          message: `Stored OAuth client information for "${this.serverName}"`,
+          fields: { outcome: "saved" },
+        });
       } catch (err) {
         if (err instanceof AuthRequiredError || err instanceof McpError) {
           throw err;
@@ -291,7 +299,14 @@ export class McpOAuthProvider implements OAuthClientProvider {
         // /mcp:auth or --reset), acquireAuthLock fails fast. We skip this background binding
         // without failing the refresh — the SDK will bind client information again on the next refresh.
         if (!(err instanceof AuthLockError)) {
-          console.error(`[pi-mcp] Failed to persist OAuth client info for "${this.serverName}":`, err);
+          const { kind, message } = describeError(err);
+          reportDiagnostic({
+            level: "error",
+            event: "oauth.client_info_persist_failed",
+            server: this.serverName,
+            message: `Failed to persist OAuth client info for "${this.serverName}": ${message}`,
+            fields: { kind },
+          });
         }
       } finally {
         await handle?.();
@@ -417,6 +432,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this._cachedTokens = undefined;
         this._lastReadTokens = storedTokens;
         this._reloadedPeerTokens = false;
+        reportDiagnostic({
+          level: "info",
+          event: "oauth.refresh",
+          server: this.serverName,
+          message: `Refreshed OAuth tokens for "${this.serverName}"`,
+          fields: { outcome: "rotated", peerReloaded: false },
+        });
       } catch (err) {
         // WHY: When another process holds the interactive auth lock (e.g. during --reset),
         // keep the refreshed tokens in memory for this session without clobbering disk state.
@@ -424,7 +446,14 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this._lastReadTokens = storedTokens;
         this._reloadedPeerTokens = false;
         if (!(err instanceof AuthLockError)) {
-          console.error(`[pi-mcp] Failed to persist refreshed OAuth tokens for "${this.serverName}":`, err);
+          const { kind, message } = describeError(err);
+          reportDiagnostic({
+            level: "error",
+            event: "oauth.tokens_persist_failed",
+            server: this.serverName,
+            message: `Failed to persist refreshed OAuth tokens for "${this.serverName}": ${message}`,
+            fields: { kind },
+          });
         }
       } finally {
         await handle?.();
@@ -445,6 +474,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this._cachedTokens = undefined;
     this._lastReadTokens = storedTokens;
     this._reloadedPeerTokens = false;
+    reportDiagnostic({
+      level: "info",
+      event: "oauth.tokens_saved",
+      server: this.serverName,
+      message: `Stored OAuth tokens for "${this.serverName}"`,
+      fields: { outcome: "authorized", peerReloaded: false },
+    });
   }
 
   // --- redirectToAuthorization ---
@@ -453,11 +489,21 @@ export class McpOAuthProvider implements OAuthClientProvider {
     if (this._onAuthRequired) {
       await this._onAuthRequired(authorizationUrl);
     } else {
-      // Fallback: just log it
-      console.error(
-        `[pi-mcp] OAuth authorization required for "${this.serverName}".`,
-        `\n  Open this URL in your browser: ${authorizationUrl.toString()}`,
-      );
+      // Fallback: no interactive handler is wired, so the authorization URL is
+      // surfaced through the diagnostic sink. The URL carries no credential
+      // (no authorization code, no PKCE verifier) and is redacted like any
+      // other message before it is written to the log file.
+      reportDiagnostic({
+        level: "info",
+        event: "oauth.authorization_required",
+        server: this.serverName,
+        message: `OAuth authorization required for "${this.serverName}". Open this URL in your browser: ${authorizationUrl.toString()}`,
+        fields: { outcome: "redirect" },
+        notify: true,
+        // WHY: this fallback fires only headless (no interactive handler is
+        // wired); the URL is the only way to proceed, so it must reach stderr.
+        stderr: true,
+      });
     }
   }
 
@@ -577,6 +623,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
           this._cachedTokens = diskState.tokens;
           this._lastReadTokens = diskState.tokens;
           this._reloadedPeerTokens = true;
+          reportDiagnostic({
+            level: "info",
+            event: "oauth.refresh",
+            server: this.serverName,
+            message: `Reloaded OAuth tokens rotated by another Pi process for "${this.serverName}"`,
+            fields: { outcome: "peer_reloaded", peerReloaded: true },
+          });
           return;
         }
       }

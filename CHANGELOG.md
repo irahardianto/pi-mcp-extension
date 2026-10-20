@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Opt-in debug log: set `PI_MCP_DEBUG=1` to record the extension's own decisions (server state transitions, retries and backoff, OAuth token refresh, cross-process auth-lock contention, 401/403 classification, session reloads) as JSON Lines in `<agent dir>/logs/pi-mcp.log`. The directory is `0o700` and the file is `0o600`, the log is rotated to `pi-mcp.log.1` at ~2 MB, and only allow-listed field names are recorded — a final pass masks anything token-like (`access_token`, `refresh_token`, `client_secret`, `code=`, `code_verifier`, `Authorization:` / `Bearer …`). Without the environment variable no log file is created (#71).
+
+### Changed
+- The extension no longer writes diagnostics to Pi's stderr while a UI is active — that stream belongs to the TUI. Server output, reconnection notices, and OAuth events now go to the debug log (when enabled) or are dropped, and user-actionable events are surfaced as Pi notifications. Headless runs without a UI keep the stderr output they have always had — warnings, errors, and child-server output; new informational events (state transitions, token refresh, session lifecycle) are recorded only in the debug log (#71).
+
 ## [1.9.11] - 2026-10-19
 
 ### Changed

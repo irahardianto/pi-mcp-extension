@@ -23,6 +23,7 @@ import {
 } from "./oauth-provider.js";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
+import { describeError, reportDiagnostic } from "./debug-log.js";
 import type { ServerConfig } from "./config.js";
 import type { ServerManager } from "./server-manager.js";
 
@@ -57,7 +58,11 @@ export function openBrowser(url: string): Promise<void> {
     });
 
     child.once("error", (err) => {
-      console.error(`[pi-mcp] Failed to open browser: ${sanitizeTerminalText(err.message)}`);
+      reportDiagnostic({
+        level: "error",
+        event: "auth.browser_open_failed",
+        message: `Failed to open browser: ${sanitizeTerminalText(err.message)}`,
+      });
       reject(err);
     });
 
@@ -250,11 +255,25 @@ export async function authorize(
   const cancel = () => { if (oauthState) callbackServer.cancel(oauthState); };
   signal.addEventListener("abort", cancel, { once: true });
   let unlock: AuthLockHandle | undefined;
+  reportDiagnostic({
+    level: "info",
+    event: "auth.started",
+    server: serverName,
+    message: `Starting OAuth authorization for "${serverName}"`,
+    fields: { outcome: reset ? "reset" : "authorize" },
+  });
   try {
     if (signal.aborted) throw new AuthCancelledError(serverName);
     unlock = await acquireAuthLock(serverName, deps.authStorageDir, {
       onLost: () => {
         lockLost = true;
+        reportDiagnostic({
+          level: "warn",
+          event: "auth.lock_lost",
+          server: serverName,
+          message: `Authorization lock lost for "${serverName}"`,
+          fields: { outcome: "contended" },
+        });
         cancel();
       },
     });
@@ -344,7 +363,14 @@ export async function authorize(
         await authProvider.invalidateCredentials("tokens");
       } catch (err) {
         if (err instanceof McpError && err.code === "config" && /Corrupt OAuth state file/i.test(err.message)) {
-          console.error(`[pi-mcp] ${sanitizeTerminalText(err.message)}`);
+          const { kind, message } = describeError(err);
+          reportDiagnostic({
+            level: "warn",
+            event: "oauth.state_corrupt",
+            server: serverName,
+            message,
+            fields: { kind },
+          });
         } else {
           throw err;
         }
@@ -366,9 +392,12 @@ export async function authorize(
       if (signal.aborted) {
         throw new AuthCancelledError(serverName);
       }
-      console.error(
-        `[pi-mcp] Failed to discover OAuth challenge for "${serverName}"; falling back to standard discovery`,
-      );
+      reportDiagnostic({
+        level: "warn",
+        event: "auth.challenge_discovery_failed",
+        server: serverName,
+        message: `Failed to discover OAuth challenge for "${serverName}"; falling back to standard discovery`,
+      });
       return {};
     });
     if (signal.aborted) throw new AuthCancelledError(serverName);
@@ -411,7 +440,14 @@ export async function authorize(
       if (err instanceof McpError && err.code === "config" && /Corrupt OAuth state file/i.test(err.message)) {
         // WHY: McpOAuthProvider._loadState() backed up and removed the corrupt state file.
         // Retry auth() once so interactive authorization proceeds cleanly.
-        console.error(`[pi-mcp] ${sanitizeTerminalText(err.message)}`);
+        const { kind, message } = describeError(err);
+        reportDiagnostic({
+          level: "warn",
+          event: "oauth.state_corrupt",
+          server: serverName,
+          message,
+          fields: { kind },
+        });
         authResult = await auth(authProvider, authOptions);
       } else {
         throw err;
@@ -495,7 +531,22 @@ export async function authorize(
 
     if (signal.aborted) throw new AuthCancelledError(serverName);
     if (lockLost) throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+    reportDiagnostic({
+      level: "info",
+      event: "auth.completed",
+      server: serverName,
+      message: `OAuth authorization completed for "${serverName}"`,
+      fields: { outcome: "authorized" },
+    });
   } catch (err) {
+    const { kind, message } = describeError(err);
+    reportDiagnostic({
+      level: err instanceof AuthCancelledError ? "info" : "error",
+      event: "auth.failed",
+      server: serverName,
+      message: `OAuth authorization failed for "${serverName}": ${message}`,
+      fields: { kind },
+    });
     if (lockLost && !signal.aborted) {
       throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
     }

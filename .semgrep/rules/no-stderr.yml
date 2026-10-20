@@ -1,0 +1,18 @@
+rules:
+  # AGENTS.md hard rule 1 (stderr half): no diagnostics on Pi's stderr while a
+  # UI is active. The only sanctioned console.error calls are the headless
+  # fallbacks inside src/debug-log.ts; everything else goes through
+  # reportDiagnostic(...).
+  - id: pi-mcp.no-stderr
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      stderr belongs to Pi's TUI while a UI is active (AGENTS.md hard rule 1). Report
+      diagnostics through reportDiagnostic(...) in src/debug-log.ts; direct console.error /
+      process.stderr.write calls are only allowed inside src/debug-log.ts itself.
+    paths:
+      include: ["/src/**"]
+      exclude: ["/src/debug-log.ts"]
+    pattern-either:
+      - pattern: console.error(...)
+      - pattern: process.stderr.write(...)

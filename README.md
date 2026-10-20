@@ -203,6 +203,30 @@ Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and
 
 `mcp_connect` checks current tool activation before reporting success, including when the server is already connected. If discovered tools are inactive, it reports that condition instead of overriding another extension's tool restrictions. Check the active tool policy or conflicting extension. A reconnect is not a substitute for fixing an extension that removes tools at each user turn.
 
+## Debug log
+
+Set `PI_MCP_DEBUG=1` before starting Pi to record what the extension itself is doing — server state transitions, retries and backoff, OAuth refresh and cross-process lock contention, 401/403 classification, and session reloads:
+
+```bash
+PI_MCP_DEBUG=1 pi
+```
+
+The log is written to `<agent dir>/logs/pi-mcp.log` (JSON Lines, one event per line):
+
+```json
+{"ts":"2026-01-01T00:00:00.000Z","level":"info","event":"server.state","server":"github","message":"Server github state starting -> ready","from":"starting","to":"ready","ms":412}
+```
+
+- **Off by default.** Without `PI_MCP_DEBUG=1` no log file is created.
+- **Private.** The directory is `0o700` and the file is `0o600`, like the OAuth credential files.
+- **Bounded.** The file is rotated to `pi-mcp.log.1` at ~2 MB; a single backup is kept.
+- **Redacted.** Only allow-listed field names are recorded, and a final pass masks anything that looks like a token (`access_token`, `refresh_token`, `client_secret`, `code=`, `code_verifier`, `Authorization:` / `Bearer …`).
+- **Best-effort.** A failed log write never breaks a connection or a tool call.
+
+Attach the file to a bug report. It contains no credentials.
+
+While a Pi UI is active, the extension never writes diagnostics to Pi's stderr (that stream belongs to the TUI): events go to the log file instead, and user-actionable ones are surfaced as Pi notifications. Headless runs without a UI keep the stderr output they have always had — warnings, errors, and child-server output; informational events such as state transitions are recorded only in the debug log.
+
 ## How It Works
 
 ```

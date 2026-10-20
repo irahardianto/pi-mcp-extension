@@ -28,6 +28,7 @@ import { AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } f
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { ToolRefreshOptions } from "./tool-bridge.js";
 import { sanitizeTerminalText, type SanitizeTerminalTextOptions } from "./terminal-text.js";
+import { describeError, reportDiagnostic } from "./debug-log.js";
 import {
   ensurePidTerminated,
   instrumentStdioTransport,
@@ -250,6 +251,8 @@ export interface ManagedServer {
   attempt?: Promise<void> | undefined;
   controller?: AbortController | undefined;
   generation?: number;
+  /** Timestamp of the last state transition — used for the debug log's `ms` field. */
+  stateSince?: number | undefined;
 }
 
 /** Called after tool list is refreshed for a server (e.g. on list_changed notification). */
@@ -285,6 +288,7 @@ export class ServerManager {
         stderrLog: [],
         healthCheckTimer: null,
         retryTimer: null,
+        stateSince: Date.now(),
       });
     }
   }
@@ -304,6 +308,29 @@ export class ServerManager {
 
   private _resolveTimeoutMs(server: ManagedServer): number {
     return server.config.requestTimeoutMs ?? this.settings.requestTimeoutMs;
+  }
+
+  /**
+   * Move a server to a new lifecycle state and record the transition.
+   *
+   * The transition is reported to the debug log (never to stderr while a UI is
+   * active) so maintainers can see when a server started, became ready, or
+   * was torn down.
+   */
+  private _setState(server: ManagedServer, next: ServerState, reason?: string): void {
+    const from = server.state;
+    if (from === next) return;
+    const now = Date.now();
+    const ms = server.stateSince !== undefined ? now - server.stateSince : undefined;
+    server.state = next;
+    server.stateSince = now;
+    reportDiagnostic({
+      level: "info",
+      event: "server.state",
+      server: server.name,
+      message: `Server ${server.name} state ${from} -> ${next}`,
+      fields: { from, to: next, ms, reason },
+    });
   }
 
   createTransport(name: string, config: ServerConfig, cwd?: string): Transport {
@@ -415,7 +442,7 @@ export class ServerManager {
     server.retryCount = 0;
     const controller = new AbortController();
     server.controller = controller;
-    server.state = "starting";
+    this._setState(server, "starting");
     const attempt = this._connect(server, cwd, controller.signal);
     server.attempt = attempt;
     try {
@@ -455,6 +482,7 @@ export class ServerManager {
       stderrLog: [],
       healthCheckTimer: null,
       retryTimer: null,
+      stateSince: Date.now(),
     });
   }
 
@@ -571,7 +599,7 @@ export class ServerManager {
     try {
       transport = this.createTransport(server.name, server.config, cwd);
     } catch (err) {
-      server.state = "stopped";
+      this._setState(server, "stopped", "transport");
       server.lastError = err instanceof Error ? err : new Error(String(err));
       throw new McpError(
         `Failed to create transport: ${server.lastError.message}`,
@@ -590,7 +618,15 @@ export class ServerManager {
           const clean = sanitizeStderrLine(rawLine);
           if (!clean) return;
           this._appendStderr(server, clean);
-          console.error(`[pi-mcp] [${server.name}] ${clean}`);
+          reportDiagnostic({
+            level: "info",
+            event: "server.stderr",
+            server: server.name,
+            message: clean,
+            // WHY: child-server stderr historically went to stderr; keep it
+            // visible in headless runs, where there is no /mcp ring buffer UI.
+            stderr: true,
+          });
         },
       });
     }
@@ -642,10 +678,15 @@ export class ServerManager {
               signal,
             });
           } catch (err) {
-            const msg = sanitizeTerminalText(err instanceof Error ? err.message : String(err));
-            console.error(
-              `[pi-mcp] Failed to refresh tools for ${server.name}: ${msg}`,
-            );
+            const { kind, message } = describeError(err);
+            reportDiagnostic({
+              level: "error",
+              event: "server.tools_refresh_failed",
+              server: server.name,
+              message: `Failed to refresh tools for ${server.name}: ${message}`,
+              fields: { kind },
+              notify: true,
+            });
           }
         }
       },
@@ -660,7 +701,16 @@ export class ServerManager {
         const safeLevel = sanitizeTerminalText(String(level), { maxLength: 32 });
         const safeLogger = sanitizeTerminalText(String(logger), { maxLength: 100 });
         const safeMsg = sanitizeTerminalText(rawMsg ?? "");
-        console.error(`[pi-mcp:${server.name}] [${safeLevel}] ${safeLogger}: ${safeMsg}`);
+        reportDiagnostic({
+          level: "info",
+          event: "server.log",
+          server: server.name,
+          message: `[${safeLevel}] ${safeLogger}: ${safeMsg}`,
+          fields: { logLevel: safeLevel, logger: safeLogger },
+          // WHY: server log messages historically went to stderr; keep them
+          // visible in headless runs, where there is no /mcp ring buffer UI.
+          stderr: true,
+        });
         this._appendStderr(server, `[${safeLevel}] ${safeLogger}: ${safeMsg}`);
       },
     );
@@ -689,7 +739,7 @@ export class ServerManager {
       });
     }
     if (signal.aborted) throw new AuthCancelledError(server.name);
-    server.state = "ready";
+    this._setState(server, "ready");
     server.retryCount = 0;
     server.lastError = null;
     if (server.cwd && server.cwd !== currentCwd) {
@@ -777,7 +827,13 @@ export class ServerManager {
     // the signal first, so they are ignored here.
     client.onclose = () => {
       if (signal.aborted || server.client !== client) return;
-      console.error(`[pi-mcp] Server ${server.name} closed unexpectedly, reconnecting`);
+      reportDiagnostic({
+        level: "warn",
+        event: "server.disconnected",
+        server: server.name,
+        message: `Server ${server.name} closed unexpectedly, reconnecting`,
+        fields: { transport: server.config.transport },
+      });
       void this._recover(server, server.cwd ?? cwd);
     };
     // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
@@ -816,13 +872,25 @@ export class ServerManager {
       }
       const msg = sanitizeTerminalText(rawMsg);
       if (server.config.transport === "sse") {
-        console.error(`[pi-mcp] Server ${server.name} SSE stream error, reconnecting: ${msg}`);
+        reportDiagnostic({
+          level: "warn",
+          event: "server.stream_error",
+          server: server.name,
+          message: `Server ${server.name} SSE stream error, reconnecting: ${msg}`,
+          fields: { transport: "sse" },
+        });
         scheduleErrorRecovery();
         return;
       }
       if (server.config.transport === "streamable-http") {
         if (isOAuthUnauthorizedError(err)) {
-          console.error(`[pi-mcp] Server ${server.name} HTTP auth error, recovering: ${msg}`);
+          reportDiagnostic({
+            level: "warn",
+            event: "server.auth_error",
+            server: server.name,
+            message: `Server ${server.name} HTTP auth error, recovering: ${msg}`,
+            fields: { transport: "streamable-http" },
+          });
           scheduleErrorRecovery();
           return;
         }
@@ -836,7 +904,13 @@ export class ServerManager {
         if (/Failed to open SSE stream:/i.test(rawMsg)) {
           return;
         }
-        console.error(`[pi-mcp] Server ${server.name} HTTP stream error, reconnecting: ${msg}`);
+        reportDiagnostic({
+          level: "warn",
+          event: "server.stream_error",
+          server: server.name,
+          message: `Server ${server.name} HTTP stream error, reconnecting: ${msg}`,
+          fields: { transport: "streamable-http" },
+        });
         scheduleErrorRecovery();
       }
     };
@@ -932,12 +1006,27 @@ export class ServerManager {
       });
 
       const error = err instanceof Error ? err : new Error(String(err));
+      const { kind: errorKind, message: errorMessage } = describeError(err);
+
+      reportDiagnostic({
+        level: action.kind === "cancelled" ? "info" : "warn",
+        event: "server.connect_failure",
+        server: server.name,
+        message: `Connection attempt for ${server.name} failed: ${errorMessage}`,
+        fields: { outcome: action.kind, kind: errorKind, attempt: server.retryCount },
+      });
 
       switch (action.kind) {
         case "cancelled":
           throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
         case "retry-corrupt-state": {
-          console.error(`[pi-mcp] ${sanitizeTerminalText(error.message)}`);
+          reportDiagnostic({
+            level: "warn",
+            event: "oauth.state_corrupt",
+            server: server.name,
+            message: errorMessage,
+            fields: { kind: errorKind },
+          });
           if (signal.aborted) throw new AuthCancelledError(server.name);
           return this._connect(server, server.cwd ?? cwd, signal, true);
         }
@@ -948,20 +1037,27 @@ export class ServerManager {
           }
           const authError = err instanceof AuthRequiredError ? err : new AuthRequiredError(server.name);
           server.lastError = authError;
-          server.state = "stopped";
+          this._setState(server, "stopped", "auth-required");
           throw authError;
         }
         case "fail":
           server.lastError = action.error;
-          server.state = "stopped";
+          this._setState(server, "stopped", "failed");
           throw action.error;
         case "give-up":
           server.lastError = error;
-          server.state = "stopped";
+          this._setState(server, "stopped", "give-up");
           throw action.error;
         case "retry": {
           server.lastError = error;
           server.retryCount++;
+          reportDiagnostic({
+            level: "warn",
+            event: "server.retry",
+            server: server.name,
+            message: `Retrying ${server.name} in ${action.delayMs}ms (attempt ${server.retryCount})`,
+            fields: { attempt: server.retryCount, delayMs: action.delayMs },
+          });
           await this._waitRetry(server, signal, action.delayMs);
           if (signal.aborted) throw new AuthCancelledError(server.name);
           return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
@@ -983,7 +1079,14 @@ export class ServerManager {
           if (err instanceof AuthCancelledError) return;
           const error = err instanceof Error ? err : new Error(String(err));
           server.lastError = error;
-          console.error(`[pi-mcp] [${server.name}] Background recovery failed: ${sanitizeTerminalText(error.message)}`);
+          const { kind, message } = describeError(err);
+          reportDiagnostic({
+            level: "error",
+            event: "server.recovery_failed",
+            server: server.name,
+            message: `Background recovery failed for ${server.name}: ${message}`,
+            fields: { kind },
+          });
           this.onRecoveryFailed?.(server.name, error);
         });
       });
@@ -1008,7 +1111,7 @@ export class ServerManager {
       server.healthCheckTimer = null;
     }
 
-    server.state = "stopped";
+    this._setState(server, "stopped", "shutdown");
     server.lastError = null;
     this.onServerStopped?.(server.name);
     const client = server.client;
