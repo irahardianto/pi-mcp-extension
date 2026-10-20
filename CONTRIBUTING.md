@@ -8,6 +8,9 @@ authoritative rules, commands, invariants, and release process live in
 
 - [`AGENTS.md`](./AGENTS.md) — hard rules, verification commands, architecture,
   invariants, CI, and commits/release.
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — behavioral overview of how
+  the runtime fits together (lifecycle, coordination, config trust, and
+  credential storage).
 - [`README.md`](./README.md) — install, configuration, commands, and tools.
 - [`OAUTH.md`](./OAUTH.md) — OAuth 2.1 flows, headless paste-back, and token storage.
 - [`SECURITY.md`](./SECURITY.md) — security scope and private reporting.
@@ -56,11 +59,12 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
 ship with the next patch or feature release. A lifecycle regression can
 therefore reach users bundled with an unrelated fix.
 
-Run this checklist for PRs that touch `src/server-manager.ts`,
-`src/index.ts`, OAuth/callback/lock modules (`oauth-provider.ts`,
-`authorize-flow.ts`, `oauth-state-store.ts`, `auth-lock.ts`,
-`callback-*.ts`), or any refactor that moves lifecycle code. Paste the
-checklist with results into the PR description.
+Run this checklist for PRs that touch `src/index.ts`,
+`src/connection-coordinator.ts`, `src/server-manager.ts`,
+`src/transport-factory.ts`, `src/stdio-process.ts`, OAuth/callback/lock modules
+(`oauth-provider.ts`, `authorize-flow.ts`, `oauth-state-store.ts`,
+`auth-lock.ts`, `callback-*.ts`), or any refactor that moves lifecycle code.
+Paste the checklist with results into the PR description.
 
 ### Load the built package
 
