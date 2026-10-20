@@ -20,7 +20,7 @@ The PR title is a Conventional Commit and decides the release:
 - [ ] `npm run lint`
 - [ ] `npm test`
 - [ ] `npm pack --dry-run`
-- [ ] Smoke test (see [CONTRIBUTING.md](CONTRIBUTING.md) if present)
+- [ ] Smoke test (see [CONTRIBUTING.md](CONTRIBUTING.md#pre-merge-smoke-test))
 
 ## Self-review
 
