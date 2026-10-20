@@ -107,8 +107,9 @@ config: `export PI_CODING_AGENT_DIR=/tmp/pi-mcp-smoke/agent`.
 - [ ] **Project config trust**: an untrusted project's `.pi/mcp.json` is
       ignored; the same file is applied after trusting the project
       (`pi --approve`).
-- [ ] **Session reload**: switching directories restarts servers and leaves no
-      orphan child processes (`pgrep -af <server command>` after Pi exits).
+- [ ] **Session reload**: starting a new session (`/new`) or relaunching Pi in
+      another directory restarts servers and leaves no orphan child processes
+      (`pgrep -af <server command>` after Pi exits).
 
 ## Reporting security issues
 
