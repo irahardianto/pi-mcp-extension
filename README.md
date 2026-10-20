@@ -264,7 +264,7 @@ Implements the **MCP 2025-03-26** specification for tool clients:
 
 ## Contributing / Architecture
 
-For a behavioral overview of how the runtime fits together — lifecycle, coordination, config trust, and credential storage — see [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, workflow, and the pre-merge smoke-test checklist, and [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a behavioral overview of how the runtime fits together (lifecycle, coordination, config trust, and credential storage).
 
 ## Development
 

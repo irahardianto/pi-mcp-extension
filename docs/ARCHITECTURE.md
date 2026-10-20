@@ -146,6 +146,7 @@ sequenceDiagram
     Cfg-->>Entry: merged McpConfig or McpError
     alt config invalid
         Entry->>Coord: teardown(ctx)
+        Entry->>Bridge: updateSettings(default settings)
         Entry->>Mgr: rebuildServers(empty defaults)
         Entry->>Coord: startEagerServers(eager, ctx)
     else config changed
@@ -217,6 +218,7 @@ sequenceDiagram
     participant Coord as Coordinator
     participant Queue as authQueue
     participant Mgr as ServerManager
+    participant Bridge as ToolBridge
     participant Authz as authorize()
     participant CB as CallbackServer
     participant Ui as Pi UI
@@ -283,13 +285,12 @@ Details:
 flowchart TD
     Start["loadConfig(cwd, globalPath, includeProjectConfig)"]
     Trust{"includeProjectConfig?"}
-    Global["Read hashless global mcp.json as JSONC<br/>(agentDir: PI_CODING_AGENT_DIR or ~/.pi/agent)"]
+    Global["Read global agentDir/mcp.json as JSONC<br/>(PI_CODING_AGENT_DIR or ~/.pi/agent)"]
     Project["Read cwd/.pi/mcp.json as JSONC"]
     Skip["Project config skipped<br/>(bootstrap or untrusted project)"]
-    GParse{"Global validates?"}
-    PParse{"Project validates?"}
+    GParse{"Global validates?<br/>(missing → empty defaults)"}
+    PParse{"Project validates?<br/>(missing → skipped)"}
     Merge["Merge: project settings override only stated keys;<br/>a project server entry replaces the global one by name"]
-    Empty["Empty valid config (no files present)"]
     Config["Validated McpConfig"]
     Err["McpError config with file path"]
 
@@ -312,12 +313,13 @@ Behavior:
 - **Bootstrap** calls `loadConfig()` with `includeProjectConfig: false`, so the global
   file is read but a project file never is, before trust is resolved.
 - **`session_start`** sets `includeProjectConfig` from `ctx.isProjectTrusted()`.
-- **JSONC.** `//` and `/* ... *` comments are stripped in a single pass that preserves
+- **JSONC.** `//` and `/* ... */` comments are stripped in a single pass that preserves
   newlines, so `JSON.parse` error messages keep accurate line numbers.
 - **Merge.** Project `settings` override only the keys they state (project settings
   carry no defaults), and a project server entry replaces the global entry with the same
-  name entirely. There is no deep merge and **no `${VAR}` interpolation** — config is
-  WYSIWYG.
+  name entirely. If neither file exists, `loadConfig()` returns an empty valid config
+  with default settings. There is no deep merge and **no `${VAR}` interpolation** —
+  config is WYSIWYG.
 - **Pi 1.x aliases** are normalized before validation: `type` → `transport`, `"http"` →
   `"streamable-http"`, `oauth` → `auth`, and `timeout` (seconds) → `requestTimeoutMs`.
   Defaults: `transport` is `stdio` (or `streamable-http` when `url` is set), `lifecycle`
@@ -342,36 +344,44 @@ is `<hash>.json`; the interactive lock is `<hash>.json.lock`.
 
 ```mermaid
 flowchart TD
-    subgraph WritePath["Write path — saveState and acquireAuthLock"]
-        W1["loadState: validate schema, compare stored serverUrl to expected"]
-        W2{"Another process holds<br/>hash.json.lock?"}
-        W3["acquireAuthLock: create 0600 with pid, hostname, nonce, createdAt"]
-        W4["30s heartbeat touches mtime; stale if mtime over 90s or same-host PID is dead"]
-        W5["write temp file 0600 then rename; chmod dir 0700 and file 0600"]
-        W6["AuthLockError, caller retries later"]
-        W1 --> W2
-        W2 -->|yes| W4
-        W2 -->|no| W3
-        W4 -->|stale| W3
-        W4 -->|not stale| W6
-        W3 --> W5
+    subgraph WritePath["Write path — acquireAuthLock and saveState"]
+        W1{"Another process holds<br/>hash.json.lock?"}
+        W2["acquireAuthLock: create 0600 with<br/>pid, hostname, nonce, createdAt"]
+        W3{"30s heartbeat stale (>90s)<br/>or same-host PID dead?"}
+        W4["AuthLockError, caller retries later"]
+        W5["loadState + update state:<br/>verify serverUrl and issuer binding"]
+        W6["saveState: write temp file 0600 then rename;<br/>chmod dir 0700 and file 0600"]
+        W1 -->|no| W2
+        W1 -->|yes| W3
+        W3 -->|stale: nonce-verified reclaim| W2
+        W3 -->|not stale| W4
+        W2 --> W5
+        W5 --> W6
     end
 
     subgraph ReadPath["Read path — loadState"]
         R1["read hash.json"]
-        R2{"stored serverUrl matches expected?"}
-        R3["return state: clientInfo, tokens, discoveryState"]
-        R4["return empty state; another origin is never reused"]
-        R5{"parse or validate fails?"}
-        R6["rename to hash.json.corrupt-timestamp and raise McpError config"]
+        R2{"parse or schema<br/>validate fails?"}
+        R3["rename to hash.json.corrupt-timestamp<br/>and raise McpError config"]
+        R4{"stored serverUrl<br/>matches expected?"}
+        R5["return empty state;<br/>another origin is never reused"]
+        R6["return state:<br/>clientInfo, tokens, discoveryState"]
         R1 --> R2
-        R2 -->|yes| R5
+        R2 -->|yes| R3
         R2 -->|no| R4
-        R5 -->|yes| R6
-        R5 -->|no| R3
+        R4 -->|no| R5
+        R4 -->|yes| R6
     end
 
-    Tokens["Single-use refresh: reload from disk before invalidating; if a peer already rotated tokens, adopt them instead of deleting"]
+    subgraph RefreshPath["Single-use refresh — invalidateCredentials(tokens)"]
+        T1["Refresh rejected → reload hash.json once"]
+        T2{"Peer process already<br/>rotated tokens on disk?"}
+        T3["Adopt peer tokens in memory<br/>instead of deleting"]
+        T4["Clear stored tokens under lock<br/>and raise AuthRequiredError"]
+        T1 --> T2
+        T2 -->|yes| T3
+        T2 -->|no| T4
+    end
 ```
 
 Behavior:
@@ -405,5 +415,6 @@ Behavior:
 ## See also
 
 - [AGENTS.md Repository map](../AGENTS.md#repository-map) — which module owns what.
+- [CONTRIBUTING.md](../CONTRIBUTING.md) — setup, workflow, and the pre-merge smoke-test checklist.
 - [OAUTH.md](../OAUTH.md) — the user-facing OAuth flow and troubleshooting.
 - [README.md](../README.md) — configuration, commands, and MCP spec compliance.
