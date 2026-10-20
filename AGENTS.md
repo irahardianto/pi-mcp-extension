@@ -4,6 +4,8 @@ Instructions for AI coding agents (Pi, Claude Code, OpenCode, Codex, Cursor, Ant
 
 **What this is:** a TypeScript extension for the Pi coding agent that bridges MCP servers (`stdio`, `sse`, `streamable-http`) into Pi tools and `/mcp*` commands, with OAuth 2.1 (PKCE + DCR) for remote servers. Pi loads `src/index.ts` directly as TypeScript. There is no build step, and the npm tarball ships `src/` as-is (relative imports use `.js` specifiers per `Node16` resolution).
 
+For a behavioral overview of how the runtime fits together (lifecycle, coordination, config trust, and credential storage), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The *Repository map* below names every module.
+
 ## Commands
 
 ```bash

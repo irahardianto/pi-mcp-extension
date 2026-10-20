@@ -262,6 +262,10 @@ Implements the **MCP 2025-03-26** specification for tool clients:
 | Prompts bridge | ⏳ v2 |
 | Sampling | ⏳ v2 |
 
+## Contributing / Architecture
+
+For a behavioral overview of how the runtime fits together — lifecycle, coordination, config trust, and credential storage — see [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
+
 ## Development
 
 ```bash
