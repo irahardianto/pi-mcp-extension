@@ -132,95 +132,13 @@ jobs:
           fi
           echo "Verified npm version: ${ACTUAL_NPM_VERSION} (meets minimum ${MIN_NPM_VERSION} for OIDC Trusted Publishing)"
 
-      - name: Determine version bump
-        id: bump
-        run: |
-          # Get the latest commit message(s) since last published version
-          # Check if there's a previous commit to compare against
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-
-          if [ -n "$PREV_TAG" ]; then
-            LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%s")
-            BODIES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%B")
-          else
-            LOG=$(git log -1 --pretty=format:"%s")
-            BODIES=$(git log -1 --pretty=format:"%B")
-          fi
-
-          # Default to none
-          BUMP="none"
-
-          # Check for breaking change indicator in subject or commit body
-          if echo "$LOG" | grep -qE "^[a-z]+(\(.+\))?!:" || echo "$BODIES" | grep -qE "^BREAKING[ -]CHANGE:"; then
-            BUMP="major"
-          # Check for feature commits
-          elif echo "$LOG" | grep -qE "^feat(\(.+\))?:"; then
-            BUMP="minor"
-          # Check for fix or perf commits
-          elif echo "$LOG" | grep -qE "^(fix|perf)(\(.+\))?:"; then
-            BUMP="patch"
-          fi
-
-          # Dry-run rehearsal: if bump is none and DRY_RUN is true, simulate a patch bump so the
-          # dry-run workflow exercises version stamping, package inspection, and dry-run publishing.
-          if [ "$BUMP" = "none" ] && [ "$DRY_RUN" = "true" ]; then
-            echo "::notice::Dry run rehearsal: detected bump is 'none', using 'patch' for rehearsal"
-            BUMP="patch"
-          fi
-
-          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
-          echo "Detected bump level: ${BUMP}"
-
-      - name: Bump version
-        if: steps.bump.outputs.bump != 'none'
-        id: version
+      - name: Release
+        # WHY: the release commit and its tag are pushed to main *before* the package is
+        # published, so a concurrent merge into main can never leave npm holding a version
+        # that main does not know about (issue #82). The script retries a rejected push on
+        # the latest main and repairs an npm/git divergence left by an earlier run.
+        # WHY: the script runs on Node's built-in type stripping, so the release job never
+        # installs dependencies (no `npm ci` with a write token).
         env:
-          BUMP_LEVEL: ${{ steps.bump.outputs.bump }}
-        run: |
-          # Bump the version in package.json (no commit, no tag yet)
-          OLD_VERSION=$(node -p "require('./package.json').version")
-          npm version "$BUMP_LEVEL" --no-git-tag-version --allow-same-version
-          NEW_VERSION=$(node -p "require('./package.json').version")
-          if [ -f CHANGELOG.md ]; then
-            sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [${NEW_VERSION}] - $(date -u +%Y-%m-%d)/" CHANGELOG.md
-          fi
-          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Bumped ${OLD_VERSION} → ${NEW_VERSION}"
-
-      - name: Publish to npm
-        if: steps.bump.outputs.bump != 'none'
-        run: |
-          PACKAGE=$(node -p "require('./package.json').name")
-          VERSION=$(node -p "require('./package.json').version")
-          if npm view "${PACKAGE}@${VERSION}" version &>/dev/null; then
-            echo "Version ${VERSION} already published — skipping."
-            echo "publish=false" >> "$GITHUB_ENV"
-          else
-            if [ "$DRY_RUN" = "true" ]; then
-              npm publish --access public --provenance --dry-run
-              echo "Published (dry run) ${PACKAGE}@${VERSION}"
-              echo "publish=false" >> "$GITHUB_ENV"
-            else
-              npm publish --access public --provenance
-              echo "Published ${PACKAGE}@${VERSION}"
-              echo "publish=true" >> "$GITHUB_ENV"
-            fi
-          fi
-
-      - name: Commit version bump and tag
-        if: steps.bump.outputs.bump != 'none' && env.publish == 'true' && env.DRY_RUN != 'true'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          VERSION=$(node -p "require('./package.json').version")
-          if [ -f CHANGELOG.md ]; then
-            git add CHANGELOG.md
-          fi
-          git add package.json package-lock.json
-          git commit -m "chore: release v${VERSION}"
-          git tag "v${VERSION}"
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
-          git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" push origin HEAD:main
-          git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" push origin "v${VERSION}"
+          RELEASE_TOKEN: ${{ github.token }}
+        run: node scripts/release.ts

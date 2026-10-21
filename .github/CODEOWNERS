@@ -16,6 +16,9 @@
 /package.json @irahardianto
 /package-lock.json @irahardianto
 
+# Release tooling (pushes to main and publishes to npm)
+/scripts/ @irahardianto
+
 # Configuration parsing and project trust boundary enforcement
 /src/config.ts @irahardianto
 

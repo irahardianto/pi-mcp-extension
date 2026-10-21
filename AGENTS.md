@@ -14,6 +14,7 @@ npm run typecheck                                    # tsc --noEmit (strict, exa
 npm test                                             # all suites: node --import tsx/esm --test ./tests/*.test.ts
 npm run test:coverage                                # all suites with coverage floor (95% lines / 85% branches / 83% functions)
 node --import tsx/esm --test tests/config.test.ts    # one suite
+node --import tsx/esm --test tests/release.test.ts  # release-flow harness (scripts/release.ts)
 node --import tsx/esm --test tests/fuzz.test.ts      # property-based fuzz tests (fast-check)
 FAST_CHECK_SEED=123456789 node --import tsx/esm --test tests/fuzz.test.ts # replay exact fuzz seed
 node --import tsx/esm --test --test-name-pattern="collision" tests/tool-bridge.test.ts   # matching tests
@@ -64,6 +65,12 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/errors.ts` | `McpError` kinds `config \| connection \| auth \| timeout \| protocol`; `AuthRequiredError`, `AuthLockError`, `AuthCancelledError` |
 
 Tests live in `tests/*.test.ts` (`node:test` + `node:assert/strict`, run through `tsx`). Fixtures: `tests/mock-server.ts`, `tests/helpers/`. Property-based fuzz tests live in `tests/fuzz.test.ts` (using `fast-check`, detected by OpenSSF Scorecard). Keep tests out of `src/`.
+
+Release tooling lives outside `src/` (it is not shipped to npm and must not depend on the extension's runtime):
+
+| File | Owns |
+|---|---|
+| `scripts/release.ts` | Release orchestration for `.github/workflows/publish.yml`: bump detection, release commit + tag creation, push ordering and retry, npm/git divergence repair, `GitPort` / `NpmPort` adapters |
 
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/default-branch.json` (branch protection ruleset). `.github/CODEOWNERS` lists the security-sensitive paths.
 
@@ -197,3 +204,15 @@ Work on a branch and open a PR. Use Conventional Commits; scopes are fine (e.g. 
 - Dependabot PRs are titled `chore(deps): ...`, `chore(deps-dev): ...`, or `ci(deps): ...`, so they don't release. When a runtime bump must raise the minimum version for users (e.g. a security floor), retitle it `fix(deps): ...` and add a `CHANGELOG.md` entry.
 - Releases never overlap (`concurrency: publish`) and are never cancelled mid-flight. The release job runs on Node 24 and uses its bundled npm (>= 11.5.1, verified fail-closed without downloads) for OIDC Trusted Publishing; it never runs `npm ci` or `npm install`, so no install script runs with the write token.
 - Maintainers can rehearse a release with `gh workflow run publish.yml -f dry_run=true`: it runs `npm publish --dry-run` and never commits, tags, or pushes (with no release-worthy commits it rehearses a patch). A real manual release (`dry_run=false`) is only allowed from `main`.
+
+### Release ordering (npm ↔ git)
+
+The release flow lives in `scripts/release.ts` and runs on Node's built-in type stripping (`node scripts/release.ts`), so the release job never installs dependencies. Its order is the point of #82:
+
+1. **Push first.** The `chore: release vX.Y.Z` commit is pushed to `main` and the `vX.Y.Z` tag is pushed, and only then is the package published to npm. If `main` moves while the release runs, the push is rejected — and because nothing was published yet, the release is retried on the new `main` tip (the bump is recomputed there) instead of leaving npm and git out of sync. The published tarball is always exactly the tree that was pushed, so the release always ships the current `main`, whose commits each passed the `pull_request` CI of their own PR.
+2. **Never publish without a tag.** A version reaches npm only after its commit *and* its tag are on `main`. A rejected push therefore leaves npm untouched; the next run repairs the state.
+3. **Self-healing.** Each run first reconciles npm and git: a version npm holds without a git tag gets its release commit and tag recreated, and a tagged version npm never received gets published. A failed publish or a failed tag push is therefore repaired by the next run instead of stalling the release forever.
+4. **Bump rules are unchanged** (see the table above).
+
+`tests/release.test.ts` is the harness for this: it drives the real git adapter against a throwaway repository with a fake registry, and covers the race (`main` moving mid-release), the "push rejected" case (nothing is published), the two repair cases, and the dry-run rehearsal.
+

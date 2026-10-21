@@ -14,7 +14,7 @@ export default tseslint.config(
     ...tseslint.configs.disableTypeChecked,
   },
   {
-    files: ["src/**/*.ts", "tests/**/*.ts"],
+    files: ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
     extends: [tseslint.configs.base],
     languageOptions: {
       parserOptions: {
