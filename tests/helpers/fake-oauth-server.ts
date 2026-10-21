@@ -47,6 +47,12 @@ export interface FakeOAuthServer {
   addValidRefreshToken: (refreshToken: string) => void;
   /** Headless browser opener that follows the /authorize 302 redirect to the local callback server over real HTTP. */
   browserOpen: (url: string) => Promise<void>;
+  /**
+   * Last error thrown while handling a request. Kept server-side only: the HTTP
+   * response never carries exception text, so tests assert on the detail here
+   * instead of on a response body.
+   */
+  readonly lastError: Error | null;
   close: () => Promise<void>;
 }
 
@@ -85,6 +91,7 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
   let unauthorizedMcpCount = 0;
   let browserOpenCount = 0;
   let failRefresh = options.failRefresh ?? false;
+  let lastError: Error | null = null;
 
   let authCodeCounter = 0;
   let accessTokenCounter = 0;
@@ -98,6 +105,23 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
 
   const wwwAuthenticateHeader = () =>
     `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp" scope="mcp:tools"`;
+
+  /**
+   * Record a failed request server-side and answer with a generic error.
+   *
+   * The exception text (and its stack) is never reflected back to the client:
+   * it can contain untrusted input, so echoing it would leak internals and let
+   * a crafted payload be interpreted as markup. Tests assert on `lastError`
+   * instead of on the response body.
+   */
+  const failRequest = (res: ServerResponse, err: unknown): void => {
+    lastError = err instanceof Error ? err : new Error(String(err));
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    sendJson(res, 500, { error: "internal_server_error" });
+  };
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     try {
@@ -377,15 +401,16 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
         }
       }
 
-      res.writeHead(404);
+      res.writeHead(404, { "content-type": "text/plain" });
       res.end("Not Found");
     } catch (err) {
-      res.writeHead(500);
-      res.end(err instanceof Error ? err.message : String(err));
+      failRequest(res, err);
     }
   };
   const listener = createServer((req, res) => {
-    void handleRequest(req, res);
+    void handleRequest(req, res).catch((err: unknown) => {
+      failRequest(res, err);
+    });
   });
 
   await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
@@ -428,6 +453,9 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
     },
     get browserOpenCount() {
       return browserOpenCount;
+    },
+    get lastError() {
+      return lastError;
     },
     get failRefresh() {
       return failRefresh;
