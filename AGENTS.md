@@ -75,7 +75,7 @@ Release tooling lives outside `src/` (it is not shipped to npm and must not depe
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/default-branch.json` (branch protection ruleset). `.github/CODEOWNERS` lists the security-sensitive paths.
 
 > [!NOTE]
-> `index.ts`, `server-manager.ts`, `tool-bridge.ts`, and `oauth-provider.ts` exceed the ~400-line target. Do **not** split them opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change. Put substantial new pure logic in a focused module instead of growing these files.
+> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~1100 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
 
 ## Architecture
 
@@ -153,7 +153,7 @@ Workflows live in `.github/workflows/`. The checks below run on every PR, whatev
 | Check | How this repo satisfies it | Don't regress |
 |---|---|---|
 | `Pinned-Dependencies` | Actions are pinned by commit SHA, installs use `npm ci`, downloaded binaries are checksum-verified, and the release job uses Node 24's bundled npm | No `npm install -g`, `npx <pkg>@<ver>`, `pip install`, or `curl \| sh` in workflows |
-| `SAST` | Semgrep and zizmor upload SARIF on every PR. Scorecard counts the last 30 PR-merged commits (direct release-bot pushes are excluded), so older pre-Semgrep commits age out | Never skip the SARIF uploads on same-repo PRs |
+| `SAST` | Semgrep and zizmor upload SARIF on every PR. Scorecard counts the last 30 PR-merged commits (direct release-bot pushes are excluded) | Never skip the SARIF uploads on same-repo PRs |
 | `Fuzzing` | `tests/fuzz.test.ts` imports `fast-check` (Scorecard detects that import) and runs under `npm test` | Keep that import form and the file in `tests/` |
 | `Token-Permissions`, `Dangerous-Workflow` | `permissions: {}` / `contents: read` at workflow level, untrusted input only through `env:` | Enforced by zizmor and actionlint |
 | `Branch-Protection` | Repository ruleset from `.github/rulesets/default-branch.json` (see below) | Keep the live ruleset identical to the file |
