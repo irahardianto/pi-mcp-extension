@@ -3,7 +3,8 @@
  *
  * The tests drive the real git adapter against a real (local) repository so the
  * race that issue #82 describes — `main` moving while a release runs — is exercised
- * for real, and pair it with a fake npm registry so the npm side is deterministic.
+ * for real, and pair it with a fake pull-request port and a fake npm registry so the
+ * GitHub and npm sides are deterministic.
  */
 
 import { describe, it } from "node:test";
@@ -18,9 +19,11 @@ import {
   createGit,
   detectBump,
   runRelease,
+  REQUIRED_WORKFLOWS,
   type CommitInfo,
   type GitPort,
   type NpmPort,
+  type PullRequestPort,
 } from "../scripts/release.js";
 
 function git(cwd: string, args: string[]): string {
@@ -137,39 +140,94 @@ class FakeNpm implements NpmPort {
   }
 }
 
-/** Push a concurrent commit to `main` right before the first push of the release. */
-function raceOnPush(gitPort: GitPort, other: string): GitPort {
-  let raced = false;
-  return new Proxy(gitPort, {
-    get(target, property, receiver) {
-      if (property === "pushBranch") {
-        return (sha: string): void => {
-          if (!raced) {
-            raced = true;
-            git(other, ["push", "origin", "main"]);
-          }
-          target.pushBranch(sha);
-        };
-      }
-      const value = Reflect.get(target, property, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+/** A git command that is allowed to fail; the status and stderr are returned. */
+function gitAllowFailure(cwd: string, args: string[]): { status: number; stderr: string } {
+  try {
+    git(cwd, args);
+    return { status: 0, stderr: "" };
+  } catch (error) {
+    const failure = error as { status?: number; stderr?: string };
+    return {
+      status: typeof failure.status === "number" ? failure.status : 1,
+      stderr: failure.stderr ?? "",
+    };
+  }
 }
 
-/** Reject every push, as a protected branch would. */
-function rejectPushes(gitPort: GitPort): GitPort {
-  return new Proxy(gitPort, {
-    get(target, property, receiver) {
-      if (property === "pushBranch") {
-        return (): void => {
-          throw new Error("rejected (non-fast-forward)");
-        };
-      }
-      const value = Reflect.get(target, property, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+/**
+ * A `PullRequestPort` that simulates GitHub against the local bare remote.
+ *
+ * The simulated squash merge is a fast-forward push of the release commit to `main`
+ * (followed by a branch deletion, like `--delete-branch`). That push fails exactly
+ * like a real merge would when `main` moved under the release commit, which is how
+ * the tests exercise the mid-release race.
+ */
+class FakePullRequests implements PullRequestPort {
+  readonly pushedBranches: string[] = [];
+  readonly openedTitles: string[] = [];
+  readonly dispatched: string[] = [];
+  readonly waited: string[] = [];
+  readonly merges: string[] = [];
+  mergeAttempts = 0;
+  /** Reject every simulated merge, as a branch required-checks rule would. */
+  rejectMerges = false;
+  /** Reject every simulated check wait, as a failing required check would. */
+  rejectChecks = false;
+  /** Runs once right before the first simulated merge (the race hook). */
+  beforeFirstMerge: (() => void) | undefined;
+
+  private readonly cwd: string;
+  private nextNumber = 1;
+  private readonly branchHeads = new Map<string, string>();
+
+  constructor(cwd: string) {
+    this.cwd = cwd;
+  }
+
+  pushReleaseBranch(version: string, sha: string): void {
+    this.pushedBranches.push(`release/v${version}`);
+    this.branchHeads.set(version, sha);
+    git(this.cwd, ["push", "--force", "origin", `${sha}:refs/heads/release/v${version}`]);
+  }
+
+  openReleasePullRequest(version: string): number {
+    this.openedTitles.push(`chore: release v${version}`);
+    return this.nextNumber++;
+  }
+
+  dispatchRequiredWorkflows(branch: string): void {
+    for (const workflow of REQUIRED_WORKFLOWS) {
+      this.dispatched.push(`${workflow}@${branch}`);
+    }
+  }
+
+  waitForRequiredChecks(branch: string): void {
+    this.waited.push(branch);
+    if (this.rejectChecks) {
+      throw new Error(`required checks failed on ${branch}`);
+    }
+  }
+
+  mergeReleasePullRequest(prNumber: number, version: string): string {
+    this.mergeAttempts += 1;
+    if (this.beforeFirstMerge !== undefined) {
+      const hook = this.beforeFirstMerge;
+      this.beforeFirstMerge = undefined;
+      hook();
+    }
+    if (this.rejectMerges) {
+      throw new Error(`merge of PR #${prNumber} was rejected`);
+    }
+    const sha = this.branchHeads.get(version);
+    assert.ok(sha !== undefined, "the release branch was pushed before merging");
+    const result = gitAllowFailure(this.cwd, ["push", "origin", `${sha}:main`]);
+    if (result.status !== 0) {
+      throw new Error(`merge of PR #${prNumber} was rejected: ${result.stderr.trim()}`);
+    }
+    this.merges.push(`#${prNumber} v${version}`);
+    git(this.cwd, ["push", "origin", "--delete", `release/v${version}`]);
+    return sha;
+  }
 }
 
 /** Reject every tag push, as a broken tag refspec would. */
@@ -201,6 +259,13 @@ function remoteTags(remote: string): string[] {
     .split("\n")
     .map((tag) => tag.trim())
     .filter((tag) => tag !== "");
+}
+
+function remoteBranches(remote: string): string[] {
+  return git(remote, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+    .split("\n")
+    .map((branch) => branch.trim())
+    .filter((branch) => branch !== "");
 }
 
 describe("detectBump", () => {
@@ -245,12 +310,14 @@ describe("compareVersions", () => {
 });
 
 describe("runRelease", () => {
-  it("pushes the release commit and its tag before publishing", () => {
+  it("lands the release commit and its tag through a pull request before publishing", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
+        pullRequests,
         npm,
         now: () => new Date("2026-10-21T00:00:00Z"),
       });
@@ -260,6 +327,18 @@ describe("runRelease", () => {
       assert.equal(outcome.version, "1.1.0");
       assert.equal(npm.publishCount, 1);
       assert.deepEqual([...npm.published], ["1.1.0"]);
+
+      // The release landed through a PR: pushed branch, dispatched checks, one merge.
+      assert.deepEqual(pullRequests.pushedBranches, ["release/v1.1.0"]);
+      assert.deepEqual(pullRequests.openedTitles, ["chore: release v1.1.0"]);
+      assert.deepEqual(
+        pullRequests.dispatched,
+        REQUIRED_WORKFLOWS.map((workflow) => `${workflow}@release/v1.1.0`),
+      );
+      assert.deepEqual(pullRequests.waited, ["release/v1.1.0"]);
+      assert.deepEqual(pullRequests.merges, ["#1 v1.1.0"]);
+      // The merged release branch is deleted, like --delete-branch.
+      assert.deepEqual(remoteBranches(fixture.remote), ["main"]);
 
       assert.equal(remoteVersion(fixture.remote), "1.1.0");
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0", "v1.1.0"]);
@@ -279,8 +358,15 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
+      // Push the concurrent commit right before the first simulated merge, so the
+      // merge is rejected as non-fast-forward and the release must be retried.
+      pullRequests.beforeFirstMerge = (): void => {
+        git(fixture.other, ["push", "origin", "main"]);
+      };
       const outcome = runRelease({
-        git: raceOnPush(createGit(fixture.workspace), fixture.other),
+        git: createGit(fixture.workspace),
+        pullRequests,
         npm,
         now: () => new Date("2026-10-21T00:00:00Z"),
       });
@@ -301,30 +387,67 @@ describe("runRelease", () => {
         git(fixture.remote, ["rev-parse", "main"]).trim(),
       );
       assert.deepEqual([...npm.published], ["1.1.0"]);
+      // The retry recreated the release commit on the new tip and re-ran the checks.
+      assert.deepEqual(pullRequests.pushedBranches, ["release/v1.1.0", "release/v1.1.0"]);
+      assert.equal(pullRequests.mergeAttempts, 2);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   });
 
-  it("publishes nothing when the release commit cannot be pushed", () => {
+  it("publishes nothing when the release PR cannot be merged", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
+      pullRequests.rejectMerges = true;
       assert.throws(
         () =>
           runRelease({
-            git: rejectPushes(createGit(fixture.workspace)),
+            git: createGit(fixture.workspace),
+            pullRequests,
             npm,
             maxPushAttempts: 2,
           }),
-        /rejected/,
+        /merge of PR #[0-9]+ was rejected/,
       );
 
-      // Nothing reached npm: the version only exists once the tag is on main.
+      // Nothing reached npm: the version only exists once the PR is merged and tagged.
       assert.equal(npm.publishCount, 0);
       assert.equal(npm.published.size, 0);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
       assert.equal(remoteVersion(fixture.remote), "1.0.0");
+      // The failed attempts left the release branch behind for the next run to reuse.
+      assert.equal(pullRequests.mergeAttempts, 2);
+      assert.deepEqual(remoteBranches(fixture.remote).sort(), ["main", "release/v1.1.0"]);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+
+  it("publishes nothing when the required checks on the release PR fail", () => {
+    const fixture = createFixture();
+    try {
+      const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
+      pullRequests.rejectChecks = true;
+      assert.throws(
+        () =>
+          runRelease({
+            git: createGit(fixture.workspace),
+            pullRequests,
+            npm,
+          }),
+        /required checks failed/,
+      );
+
+      // Nothing reached npm and nothing landed on main; the release branch stays
+      // behind and the next run retries on a fresh release commit.
+      assert.equal(npm.publishCount, 0);
+      assert.equal(remoteVersion(fixture.remote), "1.0.0");
+      assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
+      assert.deepEqual(remoteBranches(fixture.remote).sort(), ["main", "release/v1.1.0"]);
+      assert.equal(pullRequests.mergeAttempts, 0);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
@@ -334,10 +457,12 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
       assert.throws(
         () =>
           runRelease({
             git: rejectTagPushes(createGit(fixture.workspace)),
+            pullRequests,
             npm,
             maxPushAttempts: 2,
           }),
@@ -348,7 +473,8 @@ describe("runRelease", () => {
       assert.equal(npm.publishCount, 0);
       assert.equal(npm.published.size, 0);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
-      // The release commit is on main, so the next run can repair the missing tag.
+      // The release commit is on main (through the PR), so the next run can repair
+      // the missing tag.
       assert.equal(remoteVersion(fixture.remote), "1.1.0");
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -361,8 +487,10 @@ describe("runRelease", () => {
       const npm = new FakeNpm(fixture.workspace);
       npm.published.add("1.1.0");
 
+      const pullRequests = new FakePullRequests(fixture.workspace);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
+        pullRequests,
         npm,
         now: () => new Date("2026-10-21T00:00:00Z"),
       });
@@ -375,6 +503,8 @@ describe("runRelease", () => {
         git(fixture.remote, ["rev-parse", "v1.1.0"]).trim(),
         git(fixture.remote, ["rev-parse", "main"]).trim(),
       );
+      // The repair commit landed through a PR as well.
+      assert.deepEqual(pullRequests.merges, ["#1 v1.1.0"]);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
@@ -383,7 +513,7 @@ describe("runRelease", () => {
   it("publishes a tagged version that never reached npm", () => {
     const fixture = createFixture();
     try {
-      // Simulate a release that pushed the commit and the tag but never published.
+      // Simulate a release that landed the commit and the tag but never published.
       writePackageFiles(fixture.workspace, "1.1.0");
       git(fixture.workspace, ["add", "-A"]);
       git(fixture.workspace, ["commit", "-m", "chore: release v1.1.0"]);
@@ -392,8 +522,10 @@ describe("runRelease", () => {
       git(fixture.workspace, ["push", "origin", "v1.1.0"]);
 
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
+        pullRequests,
         npm,
         now: () => new Date("2026-10-21T00:00:00Z"),
       });
@@ -401,7 +533,10 @@ describe("runRelease", () => {
       assert.equal(outcome.published, true);
       assert.equal(npm.publishCount, 1);
       assert.deepEqual([...npm.published], ["1.1.0"]);
-      // No second release was created for the same commits.
+      // No second release was created for the same commits, and no PR was needed:
+      // the release commit is already on main.
+      assert.deepEqual(pullRequests.merges, []);
+      assert.deepEqual(pullRequests.dispatched, []);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0", "v1.1.0"]);
       assert.equal(
         git(fixture.remote, ["rev-list", "--count", "main"]).trim(),
@@ -421,14 +556,19 @@ describe("runRelease", () => {
       git(fixture.workspace, ["push", "origin", "main"]);
 
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
+        pullRequests,
         npm,
       });
 
       assert.equal(outcome.released, false);
       assert.equal(npm.publishCount, 0);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
+      // No release PR was opened for a non-release.
+      assert.deepEqual(pullRequests.dispatched, []);
+      assert.deepEqual(pullRequests.merges, []);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
@@ -438,8 +578,10 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
+        pullRequests,
         npm,
         dryRun: true,
         now: () => new Date("2026-10-21T00:00:00Z"),
@@ -451,6 +593,9 @@ describe("runRelease", () => {
       assert.equal(npm.publishCount, 0);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
       assert.equal(remoteVersion(fixture.remote), "1.0.0");
+      // The rehearsal opens no pull request.
+      assert.deepEqual(pullRequests.dispatched, []);
+      assert.deepEqual(pullRequests.merges, []);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }

@@ -19,6 +19,20 @@
     },
     {
       "type": "required_linear_history"
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "required_status_checks": [
+          { "context": "check (22)" },
+          { "context": "check (24)" },
+          { "context": "pr-title" },
+          { "context": "gitleaks" },
+          { "context": "semgrep" },
+          { "context": "dependency-review" }
+        ],
+        "strict_required_status_checks_policy": false
+      }
     }
   ],
   "bypass_actors": []

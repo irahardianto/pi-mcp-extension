@@ -3,6 +3,10 @@ name: pr-title
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # WHY: publish.yml dispatches this workflow onto the release branch: a PR created
+  # with GITHUB_TOKEN triggers no pull_request workflows, so the release PR gets its
+  # `pr-title` check run this way instead.
+  workflow_dispatch:
 
 permissions:
   contents: read # WHY: default workflow-level read access
@@ -18,15 +22,42 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read # WHY: read repo metadata
-      pull-requests: read # WHY: gh api inspects changed files to verify CHANGELOG.md
+      pull-requests: read # WHY: gh api inspects changed files to verify CHANGELOG.md, and resolves the PR when dispatched
     steps:
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # WHY: dispatched runs carry no pull_request payload; resolve the open PR
+            # for the branch instead.
+            PR_NUMBER_EVENT="$(gh pr list --head "$HEAD_REF" --state open --json number --jq '.[0].number // empty')"
+            if [ -z "$PR_NUMBER_EVENT" ]; then
+              printf '::error::No open pull request for branch %s to validate.\n' "$HEAD_REF"
+              exit 1
+            fi
+          fi
+          TITLE="$(gh pr view "$PR_NUMBER_EVENT" --json title --jq .title)"
+          BODY="$(gh pr view "$PR_NUMBER_EVENT" --json body --jq '.body // ""')"
+          {
+            printf 'number=%s\n' "$PR_NUMBER_EVENT"
+            printf 'title=%s\n' "$TITLE"
+            printf 'body<<PR_BODY_EOF\n%s\nPR_BODY_EOF\n' "$BODY"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Validate PR title and changelog entry
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          TITLE: ${{ github.event.pull_request.title }}
-          BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          TITLE: ${{ steps.pr.outputs.title }}
+          BODY: ${{ steps.pr.outputs.body }}
         run: |
           set -euo pipefail
 

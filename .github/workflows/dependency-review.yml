@@ -4,6 +4,10 @@ on:
   # WHY: no `branches:` filter. Stacked PRs target another PR's branch,
   # not `main`, and must be checked before merging into their base.
   pull_request:
+  # WHY: publish.yml dispatches this workflow onto the release branch: a PR created
+  # with GITHUB_TOKEN triggers no pull_request workflows, so the release PR gets its
+  # `dependency-review` check run this way instead.
+  workflow_dispatch:
 
 # Least privilege: dependency review API comparison requires only repository read permissions.
 # WHY: Avoid comment-summary-in-pr which requires pull-requests: write; the action automatically
@@ -20,13 +24,45 @@ jobs:
     name: dependency-review
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read # WHY: resolve the release PR's base/head SHAs when dispatched by publish.yml
     steps:
+      - name: Resolve comparison refs
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # WHY: dispatched runs carry no pull_request payload; resolve the open PR
+            # for the branch and use its base/head SHAs.
+            BASE_REF="$(gh pr list --head "$HEAD_REF" --state open --json baseRefOid --jq '.[0].baseRefOid // empty')"
+            HEAD_REF_SHA="$(gh pr list --head "$HEAD_REF" --state open --json headRefOid --jq '.[0].headRefOid // empty')"
+            if [ -z "$BASE_REF" ] || [ -z "$HEAD_REF_SHA" ]; then
+              printf '::error::No open pull request for branch %s to review dependencies for.\n' "$HEAD_REF"
+              exit 1
+            fi
+          else
+            BASE_REF="$PR_BASE"
+            HEAD_REF_SHA="$PR_HEAD"
+          fi
+          printf 'base=%s\nhead=%s\n' "$BASE_REF" "$HEAD_REF_SHA" >> "$GITHUB_OUTPUT"
+
       # WHY: actions/checkout is intentionally omitted. actions/dependency-review-action v5.0.0
-      # compares dependency manifests using GitHub's Dependency Review API and bases/heads from
-      # the PR event payload. Local workspace files are not read when configuration is inline.
+      # compares dependency manifests using GitHub's Dependency Review API. Local workspace
+      # files are not read when configuration is inline; the comparison refs come from the
+      # resolve step (the PR event payload on pull_request, the release PR on dispatch).
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
+          base-ref: ${{ steps.refs.outputs.base }}
+          head-ref: ${{ steps.refs.outputs.head }}
           fail-on-severity: high
           # WHY: fail-on-scopes filters both vulnerability and license checks to runtime dependencies.
           # Dev dependencies are vetted through Dependabot alerts and CI checks without blocking PRs.

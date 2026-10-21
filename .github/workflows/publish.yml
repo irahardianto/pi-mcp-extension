@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Run npm publish --dry-run (rehearsal only; no commit, tag, or push)"
+        description: "Run npm publish --dry-run (rehearsal only; no commit, tag, push, or pull request)"
         type: boolean
         default: true
 
@@ -75,9 +75,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
-      contents: write # WHY: commit the version bump and push git tags / release commits back to main
+      contents: write # WHY: push the release branch and tag, and merge the release PR
       id-token: write # WHY: mint Sigstore provenance attestations for npm OIDC Trusted Publishing
-    timeout-minutes: 15
+      pull-requests: write # WHY: open, retitle and squash-merge the release PR (required status checks on main block direct pushes)
+      actions: write # WHY: dispatch the required workflows onto the release branch (a GITHUB_TOKEN PR triggers no pull_request workflows)
+    # WHY: the release PR waits for the dispatched required workflows (CI matrix plus
+    # OS tests), which take longer than the checks the job runs itself.
+    timeout-minutes: 30
     env:
       # DRY_RUN is true only when manually dispatched with dry_run=true.
       # Push events or dispatch with dry_run=false evaluate to false.
@@ -133,10 +137,12 @@ jobs:
           echo "Verified npm version: ${ACTUAL_NPM_VERSION} (meets minimum ${MIN_NPM_VERSION} for OIDC Trusted Publishing)"
 
       - name: Release
-        # WHY: the release commit and its tag are pushed to main *before* the package is
-        # published, so a concurrent merge into main can never leave npm holding a version
-        # that main does not know about (issue #82). The script retries a rejected push on
-        # the latest main and repairs an npm/git divergence left by an earlier run.
+        # WHY: the release commit and its tag land on main *before* the package is
+        # published — through a pull request, because the required status checks on
+        # main block direct pushes for everyone — so a concurrent merge into main can
+        # never leave npm holding a version that main does not know about (issue #82).
+        # The script retries a rejected merge on the latest main and repairs an
+        # npm/git divergence left by an earlier run.
         # WHY: the script runs on Node's built-in type stripping, so the release job never
         # installs dependencies (no `npm ci` with a write token).
         env:

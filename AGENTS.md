@@ -70,7 +70,7 @@ Release tooling lives outside `src/` (it is not shipped to npm and must not depe
 
 | File | Owns |
 |---|---|
-| `scripts/release.ts` | Release orchestration for `.github/workflows/publish.yml`: bump detection, release commit + tag creation, push ordering and retry, npm/git divergence repair, `GitPort` / `NpmPort` adapters |
+| `scripts/release.ts` | Release orchestration for `.github/workflows/publish.yml`: bump detection, release commit + tag creation, release-PR orchestration (branch push, PR open/retitle, dispatched required checks, squash merge, rejected-merge retry), npm/git divergence repair, `GitPort` / `PullRequestPort` / `NpmPort` adapters |
 
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/default-branch.json` (branch protection ruleset). `.github/CODEOWNERS` lists the security-sensitive paths.
 
@@ -134,7 +134,7 @@ Self-review before finishing:
 
 ## CI
 
-Workflows live in `.github/workflows/`. The checks below run on every PR, whatever its base branch (so each PR in a stack is checked too), and on every push to `main`.
+Workflows live in `.github/workflows/`. The checks below run on every PR, whatever its base branch (so each PR in a stack is checked too), and on every push to `main`. `publish.yml` also dispatches `ci.yml`, `pr-title.yml`, `secret-scan.yml`, `semgrep.yml`, and `dependency-review.yml` onto the `release/vX.Y.Z` branch (`workflow_dispatch`) before merging a release PR: a PR created with `GITHUB_TOKEN` triggers no `pull_request` workflows, and the dispatched runs land on the PR head SHA, where they satisfy the ruleset's required status checks.
 
 | Workflow | Job | What it enforces |
 |---|---|---|
@@ -143,8 +143,8 @@ Workflows live in `.github/workflows/`. The checks below run on every PR, whatev
 | `workflow-lint.yml` | `workflow-lint` | `actionlint` (syntax, expressions, shellcheck of `run:` scripts) and `zizmor` (Actions security: injection, pinning, permissions, credentials), failing on any finding of low severity or above |
 | `secret-scan.yml` | `gitleaks` | No secrets in the PR's commits (pushes to `main`: the pushed range; weekly and on dispatch: full history). Output is redacted |
 | `semgrep.yml` | `semgrep` | Semgrep registry packs (`p/typescript`, `p/javascript`, `p/github-actions`) plus the custom rules in `.semgrep/rules/` that encode hard rules 1, 4, 5 and the security invariants above; drops in-source-suppressed findings before SARIF upload |
-| `dependency-review.yml` | `dependency-review` | Dependencies added or changed by the PR: no high/critical advisories and no copyleft licenses in runtime scope |
-| `pr-title.yml` | `pr-title` | PR title is a Conventional Commit; `feat` / `fix` / `perf` / `!` titles must change `CHANGELOG.md`; a PR-description line starting with `BREAKING CHANGE:` requires `!` in the title |
+| `dependency-review.yml` | `dependency-review` | Dependencies added or changed by the PR: no high/critical advisories and no copyleft licenses in runtime scope. Also runs on `workflow_dispatch` (dispatched by `publish.yml` onto the release branch, where it resolves the PR's base/head) |
+| `pr-title.yml` | `pr-title` | PR title is a Conventional Commit; `feat` / `fix` / `perf` / `!` titles must change `CHANGELOG.md`; a PR-description line starting with `BREAKING CHANGE:` requires `!` in the title. Also runs on `workflow_dispatch` (dispatched by `publish.yml` onto the release branch, where it resolves the PR) |
 
 ### OpenSSF Scorecard
 
@@ -161,9 +161,9 @@ Workflows live in `.github/workflows/`. The checks below run on every PR, whatev
 | `CII-Best-Practices` | Maintainer action: register and self-certify at [bestpractices.dev](https://www.bestpractices.dev) | n/a |
 
 **Repository rulesets as code.** `.github/rulesets/` contains the declarative sources of truth for branch and tag protections:
-- `.github/rulesets/default-branch.json` protects `main`: it blocks deletion, blocks force pushes, and requires linear history, with no bypass actors (Scorecard tier 1). It deliberately does **not** require PRs, reviews, or status checks:
+- `.github/rulesets/default-branch.json` protects `main`: it blocks deletion, blocks force pushes, requires linear history, and requires the status checks (`check (22)`, `check (24)`, `pr-title`, `gitleaks`, `semgrep`, `dependency-review`), with no bypass actors (Scorecard tier 1). It deliberately does **not** require PRs or reviews:
   - A solo maintainer can't approve their own PRs.
-  - The release job pushes `chore: release vX.Y.Z` straight to `main` with `GITHUB_TOKEN`. On a user-owned repo the GitHub Actions app can't be a ruleset bypass actor (the API returns 422), so such rules would break publishing.
+  - Required status checks block direct pushes to `main` for everyone — on a user-owned repo the GitHub Actions app can't be a ruleset bypass actor (the API returns 422) — so the release job lands every release through a PR instead (see [Commits & release](#commits--release)): it pushes `release/vX.Y.Z`, dispatches the required workflows onto the branch (a `GITHUB_TOKEN` PR triggers no `pull_request` workflows), waits for them, and squash-merges. A maintainer who needs an emergency direct push temporarily lifts the ruleset instead of carrying a bypass actor.
 - `.github/rulesets/release-tags.json` protects release tags (`refs/tags/v*`): it blocks deletion, blocks force pushes, and blocks tag mutations, while allowing the maintainer (repository admin) to bypass and allowing `publish.yml` to create new release tags.
 
 ```bash
@@ -189,7 +189,7 @@ Work on a branch and open a PR. Use Conventional Commits; scopes are fine (e.g. 
 - **Regular PRs are squash-merged**, so **the PR title becomes the commit that decides the release**, and the PR description becomes the commit body. The `pr-title` check enforces both (see [CI](#ci)).
 - **Stacked PRs are the exception**: their commits can land on `main` individually, so every commit subject in a stack must be a correct Conventional Commit.
 
-`.github/workflows/publish.yml` runs on every push to `main`. Its `verify` job repeats the CI checks on Node 22 and 24 with a read-only token; only then does the `release` job (the only job with `contents: write` / `id-token: write`, in the `npm-publish` environment) scan **all commit subjects since the last tag** and publish automatically:
+`.github/workflows/publish.yml` runs on every push to `main`. Its `verify` job repeats the CI checks on Node 22 and 24 with a read-only token; only then does the `release` job (the only job with elevated permissions — `contents: write`, `id-token: write`, `pull-requests: write`, `actions: write`, in the `npm-publish` environment) scan **all commit subjects since the last tag** and release automatically. Releases land on `main` through a pull request, because the ruleset's required status checks block direct pushes for everyone: the release job pushes `release/vX.Y.Z`, opens `chore: release vX.Y.Z`, dispatches the required workflows onto the branch (a `GITHUB_TOKEN` PR triggers no `pull_request` workflows), waits for them to pass, and squash-merges. The `chore: release vX.Y.Z` commit and the `vX.Y.Z` tag land on `main` **before** the package is published:
 
 | Prefix | Release |
 |---|---|
@@ -200,7 +200,7 @@ Work on a branch and open a PR. Use Conventional Commits; scopes are fine (e.g. 
 
 - For `feat` / `fix` / `perf` / breaking changes, add a user-facing entry under `## [Unreleased]` in `CHANGELOG.md`. The workflow stamps the version and date.
 - Because the scan covers everything since the last tag, a `docs:` push still publishes if unreleased `fix:` / `feat:` commits are already on `main`.
-- The bot creates the `chore: release vX.Y.Z` commit and the tag. Don't create them by hand.
+- The bot creates the `chore: release vX.Y.Z` commit and the tag (through the release PR). Don't create them by hand. A maintainer may squash-merge a stuck release PR by hand — the next run detects the landed release commit and repairs the missing tag or publish.
 - Dependabot PRs are titled `chore(deps): ...`, `chore(deps-dev): ...`, or `ci(deps): ...`, so they don't release. When a runtime bump must raise the minimum version for users (e.g. a security floor), retitle it `fix(deps): ...` and add a `CHANGELOG.md` entry.
 - Releases never overlap (`concurrency: publish`) and are never cancelled mid-flight. The release job runs on Node 24 and uses its bundled npm (>= 11.5.1, verified fail-closed without downloads) for OIDC Trusted Publishing; it never runs `npm ci` or `npm install`, so no install script runs with the write token.
 - Maintainers can rehearse a release with `gh workflow run publish.yml -f dry_run=true`: it runs `npm publish --dry-run` and never commits, tags, or pushes (with no release-worthy commits it rehearses a patch). A real manual release (`dry_run=false`) is only allowed from `main`.
@@ -209,10 +209,10 @@ Work on a branch and open a PR. Use Conventional Commits; scopes are fine (e.g. 
 
 The release flow lives in `scripts/release.ts` and runs on Node's built-in type stripping (`node scripts/release.ts`), so the release job never installs dependencies. Its order is the point of #82:
 
-1. **Push first.** The `chore: release vX.Y.Z` commit is pushed to `main` and the `vX.Y.Z` tag is pushed, and only then is the package published to npm. If `main` moves while the release runs, the push is rejected — and because nothing was published yet, the release is retried on the new `main` tip (the bump is recomputed there) instead of leaving npm and git out of sync. The published tarball is always exactly the tree that was pushed, so the release always ships the current `main`, whose commits each passed the `pull_request` CI of their own PR.
-2. **Never publish without a tag.** A version reaches npm only after its commit *and* its tag are on `main`. A rejected push therefore leaves npm untouched; the next run repairs the state.
-3. **Self-healing.** Each run first reconciles npm and git: a version npm holds without a git tag gets its release commit and tag recreated, and a tagged version npm never received gets published. A failed publish or a failed tag push is therefore repaired by the next run instead of stalling the release forever.
+1. **Land first.** The `chore: release vX.Y.Z` commit lands on `main` through the release PR (`release/vX.Y.Z` + dispatched required checks + squash merge) and the `vX.Y.Z` tag is pushed, and only then is the package published to npm. If `main` moves while the release runs, the merge is rejected — and because nothing was published yet, the release is retried on the new `main` tip (the release commit is recreated there) instead of leaving npm and git out of sync. The published tarball is always exactly the tree that landed, so the release always ships the current `main`, whose commits each passed the `pull_request` CI of their own PR.
+2. **Never publish without a tag.** A version reaches npm only after its commit *and* its tag are on `main`. A rejected merge therefore leaves npm untouched; the next run repairs the state.
+3. **Self-healing.** Each run first reconciles npm and git: a version npm holds without a git tag gets its release commit and tag recreated (through a release PR), and a tagged version npm never received gets published. A failed publish, a failed tag push, or a failed required check on the release PR is therefore repaired by the next run instead of stalling the release forever.
 4. **Bump rules are unchanged** (see the table above).
 
-`tests/release.test.ts` is the harness for this: it drives the real git adapter against a throwaway repository with a fake registry, and covers the race (`main` moving mid-release), the "push rejected" case (nothing is published), the two repair cases, and the dry-run rehearsal.
+`tests/release.test.ts` is the harness for this: it drives the real git adapter against a throwaway repository with fake pull-request and registry ports, and covers the race (`main` moving mid-release, rejected merge), the "merge rejected" and "required checks failed" cases (nothing is published), the two repair cases, and the dry-run rehearsal.
 

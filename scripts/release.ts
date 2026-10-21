@@ -1,26 +1,35 @@
 /**
  * Release orchestration for `.github/workflows/publish.yml`.
  *
- * The release job publishes the package to npm and pushes the `chore: release vX.Y.Z`
- * commit plus the `vX.Y.Z` tag back to `main`. The ordering between those two actions
- * is what keeps npm and git in sync:
+ * The release job publishes the package to npm and lands the `chore: release vX.Y.Z`
+ * commit plus the `vX.Y.Z` tag on `main` through a pull request. The ordering between
+ * those two actions is what keeps npm and git in sync:
  *
- * 1. The release commit and its tag are pushed to `main` **first**.
+ * 1. The release commit and its tag land on `main` **first**.
  * 2. Only then is the package published to npm.
  *
- * If `main` moves while the release runs, the push is rejected as non-fast-forward.
+ * WHY: the default-branch ruleset requires the status checks, and required status
+ * checks block direct pushes to `main` for everyone — on a user-owned repo the
+ * GitHub Actions app cannot be a ruleset bypass actor (the API returns 422). The
+ * release therefore pushes `release/v<version>`, opens `chore: release v<version>`,
+ * and squash-merges the PR once the required workflows passed on the branch. A PR
+ * created with `GITHUB_TOKEN` triggers no `pull_request` workflows, so the required
+ * workflows are dispatched onto the branch by `PullRequestPort.dispatchRequiredWorkflows`;
+ * their check runs land on the PR head sha and satisfy the ruleset at merge time.
+ *
+ * If `main` moves while the release runs, the merge is rejected as non-fast-forward.
  * Because nothing has been published yet, the release is simply retried on the new
- * `main` tip (the version bump is recomputed there). The published tarball is
- * therefore always exactly the tree that was pushed, and npm never holds a version
- * that `main` does not know about.
+ * `main` tip (the release commit is recreated there). The published tarball is
+ * therefore always exactly the tree that landed, and npm never holds a version that
+ * `main` does not know about.
  *
  * The job is also self-healing: if a previous run left npm and git out of sync
  * (npm has a version without a tag, or a tag exists that was never published), the
  * next run repairs the divergence instead of skipping the release forever.
  *
- * Everything is expressed against the `GitPort` / `NpmPort` interfaces so the flow can
- * be unit tested against a real git repository and a fake registry
- * (see `tests/release.test.ts`).
+ * Everything is expressed against the `GitPort` / `PullRequestPort` / `NpmPort`
+ * interfaces so the flow can be unit tested against a real git repository with fake
+ * GitHub and registry ports (see `tests/release.test.ts`).
  *
  * WHY: this module is executed by Node directly (`node scripts/release.ts`) and must
  * therefore use erasable TypeScript syntax only — Node strips the types at runtime and
@@ -67,8 +76,6 @@ export interface GitPort {
   commitRelease(version: string): string;
   /** Create (or move) the `v<version>` tag. */
   tag(version: string, sha: string): void;
-  /** Push a commit to `main`. Throws when the remote rejects the push. */
-  pushBranch(sha: string): void;
   /** Push the `v<version>` tag. Throws when the remote rejects the push. */
   pushTag(version: string): void;
 }
@@ -83,20 +90,42 @@ export interface NpmPort {
   publishDryRun(): void;
 }
 
+/**
+ * Everything the release flow needs from the GitHub pull-request machinery.
+ *
+ * The production adapter talks to `gh`; the tests simulate the merge against a real
+ * (local) git remote. A rejected merge means `main` moved while the release ran (or
+ * the PR conflicts); the flow recreates the release commit on the new tip and
+ * retries the whole branch/PR/checks/merge dance (see `landReleaseOnMain`).
+ */
+export interface PullRequestPort {
+  /** Push the release commit to `refs/heads/release/v<version>` (forced: a retried attempt reuses the branch). */
+  pushReleaseBranch(version: string, sha: string): void;
+  /** Open the `chore: release v<version>` PR, or reuse the open PR for the branch (retitled); returns its number. */
+  openReleasePullRequest(version: string): number;
+  /** Dispatch the required workflows onto the release branch. */
+  dispatchRequiredWorkflows(branch: string): void;
+  /** Wait until every dispatched workflow run finished successfully. Throws otherwise. */
+  waitForRequiredChecks(branch: string): void;
+  /** Squash-merge the release PR (deleting the branch) and return the merge commit sha on `main`. */
+  mergeReleasePullRequest(prNumber: number, version: string): string;
+}
+
 export interface ReleaseOptions {
   readonly git: GitPort;
+  readonly pullRequests: PullRequestPort;
   readonly npm: NpmPort;
   /** Rehearse only: never commit, tag, push or publish. */
   readonly dryRun?: boolean;
   /** Clock injection point (tests pin it). */
   readonly now?: () => Date;
-  /** How often a rejected push is retried on a newer `main`. */
+  /** How often a rejected release-PR merge is retried on a newer `main`. */
   readonly maxPushAttempts?: number;
   readonly log?: (message: string) => void;
 }
 
 export interface ReleaseOutcome {
-  /** A new release commit and tag were pushed to `main`. */
+  /** A new release commit and tag landed on `main` (through the release PR). */
   readonly released: boolean;
   /** The version in `main` is on npm. */
   readonly published: boolean;
@@ -108,6 +137,29 @@ export interface ReleaseOutcome {
 
 const DEFAULT_MAX_PUSH_ATTEMPTS = 3;
 const RELEASE_COMMIT_PREFIX = "chore: release v";
+/** How often the thin `gh` adapter polls for a dispatched workflow run to appear. */
+const RUN_APPEAR_ATTEMPTS = 20;
+/** Poll interval (seconds) for dispatched workflow runs. */
+const RUN_POLL_SECONDS = 15;
+
+/**
+ * The workflows dispatched onto the release branch. Together they produce exactly
+ * the check contexts required by `.github/rulesets/default-branch.json`:
+ * `check (22)` and `check (24)` (ci.yml), `pr-title`, `gitleaks` (secret-scan.yml),
+ * `semgrep`, and `dependency-review`.
+ */
+export const REQUIRED_WORKFLOWS: readonly string[] = [
+  "ci.yml",
+  "pr-title.yml",
+  "secret-scan.yml",
+  "semgrep.yml",
+  "dependency-review.yml",
+];
+
+/** The release branch name for a version. */
+export function releaseBranchName(version: string): string {
+  return `release/v${version}`;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Pure helpers                                                               */
@@ -248,6 +300,26 @@ function pushEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * WHY: the flow is synchronous and dependency-free; the thin `gh` adapter below is
+ * the only place that waits, and it does so through a child `sleep` so no timers or
+ * libraries are needed (the release job runs on ubuntu-latest).
+ */
+function sleep(seconds: number): void {
+  execFileSync("sleep", [String(seconds)], { stdio: "ignore" });
+}
+
+/** The `owner/repo` slug, derived from the `origin` remote (used for `gh api` paths). */
+function repoSlug(cwd: string): string {
+  const result = run("git", ["remote", "get-url", "origin"], { cwd, allowFailure: true });
+  const url = result.stdout.trim();
+  const match = url.match(/github\.com[/:]([^/\s]+\/[^/\s]+?)(?:\.git)?\s*$/);
+  if (result.status !== 0 || match === null || match[1] === undefined) {
+    throw new Error(`could not derive the repository slug from the origin remote (${url || "no remote"})`);
+  }
+  return match[1];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Ports                                                                       */
 /* -------------------------------------------------------------------------- */
@@ -373,11 +445,134 @@ export function createGit(cwd: string): GitPort {
     tag(version: string, sha: string): void {
       git(["tag", "-f", `v${version}`, sha]);
     },
-    pushBranch(sha: string): void {
-      git(["push", "origin", `${sha}:main`], { env: { ...process.env, ...pushEnvironment() } });
-    },
     pushTag(version: string): void {
       git(["push", "origin", `v${version}`], { env: { ...process.env, ...pushEnvironment() } });
+    },
+  };
+}
+
+/**
+ * A `PullRequestPort` backed by the `gh` CLI (available on GitHub runners).
+ *
+ * WHY: the flow itself never talks to `gh`; this adapter is the only I/O seam, so the
+ * tests drive the flow with a fake port (see tests/release.test.ts) and the adapter
+ * is exercised for real only by an actual release.
+ */
+export function createPullRequests(cwd: string): PullRequestPort {
+  // WHY: gh reads GH_TOKEN; RELEASE_TOKEN keeps the credential away from the npm CLI
+  // that runs in the same job (see pushEnvironment).
+  const token = process.env["RELEASE_TOKEN"] ?? process.env["GITHUB_TOKEN"];
+  const ghEnv = (): NodeJS.ProcessEnv => ({ ...process.env, GH_TOKEN: token ?? "" });
+  const gh = (args: readonly string[], allowFailure = false): RunResult =>
+    run("gh", [...args], { cwd, env: ghEnv(), allowFailure });
+  const ok = (args: readonly string[]): string => {
+    const result = gh(args, true);
+    if (result.status !== 0) {
+      throw new Error(`\`gh ${args.join(" ")}\` failed with exit code ${result.status}: ${result.stderr.trim()}`);
+    }
+    return result.stdout.trim();
+  };
+
+  return {
+    pushReleaseBranch(version: string, sha: string): void {
+      // WHY: --force: a previously failed attempt may have left the branch behind;
+      // release/* branches are not protected by any ruleset.
+      run("git", ["push", "--force", "origin", `${sha}:refs/heads/${releaseBranchName(version)}`], {
+        cwd,
+        env: { ...process.env, ...pushEnvironment() },
+      });
+    },
+    openReleasePullRequest(version: string): number {
+      const title = `${RELEASE_COMMIT_PREFIX}${version}`;
+      // WHY: the body is static; the release commit itself carries the version bump.
+      const body =
+        "Automated release PR. The publish workflow dispatches the required status checks onto this branch and squash-merges once they pass.";
+      const created = gh(
+        ["pr", "create", "--base", "main", "--head", releaseBranchName(version), "--title", title, "--body", body],
+        true,
+      );
+      if (created.status === 0) {
+        const url = created.stdout.trim();
+        const number = Number.parseInt(url.slice(url.lastIndexOf("/") + 1), 10);
+        if (Number.isInteger(number)) return number;
+        throw new Error(`unexpected \`gh pr create\` output: ${url}`);
+      }
+      // WHY: a retry after a rejected merge reuses the branch; retitle the open PR so
+      // the squash-merge subject always matches the released version.
+      const listed = ok([
+        "pr",
+        "list",
+        "--head",
+        releaseBranchName(version),
+        "--state",
+        "open",
+        "--json",
+        "number",
+        "--jq",
+        ".[0].number // empty",
+      ]);
+      if (listed === "") {
+        throw new Error(`could not create or find the release PR: ${created.stderr.trim()}`);
+      }
+      const prNumber = Number.parseInt(listed, 10);
+      if (!Number.isInteger(prNumber)) {
+        throw new Error(`unexpected \`gh pr list\` output: ${listed}`);
+      }
+      ok(["pr", "edit", String(prNumber), "--title", title, "--body", body]);
+      return prNumber;
+    },
+    dispatchRequiredWorkflows(branch: string): void {
+      for (const workflow of REQUIRED_WORKFLOWS) {
+        ok(["workflow", "run", workflow, "--ref", branch]);
+      }
+    },
+    waitForRequiredChecks(branch: string): void {
+      for (const workflow of REQUIRED_WORKFLOWS) {
+        // WHY: a dispatched run can take a few seconds to register; poll for it. A
+        // completed run on the branch is a leftover of a previous failed attempt, so
+        // prefer a run that has not completed yet.
+        let runId = "";
+        for (let attempt = 0; attempt < RUN_APPEAR_ATTEMPTS && runId === ""; attempt += 1) {
+          const result = gh(
+            ["run", "list", "--workflow", workflow, "--branch", branch, "--limit", "5", "--json", "databaseId,status"],
+            true,
+          );
+          if (result.status === 0) {
+            let decoded: unknown;
+            try {
+              decoded = JSON.parse(result.stdout);
+            } catch {
+              decoded = [];
+            }
+            const runs = Array.isArray(decoded) ? decoded.filter(isJsonObject) : [];
+            const chosen = runs.find((entry) => entry["status"] !== "completed") ?? runs[0];
+            const databaseId = chosen?.["databaseId"];
+            if (typeof databaseId === "number") runId = String(databaseId);
+          }
+          if (runId === "") sleep(RUN_POLL_SECONDS);
+        }
+        if (runId === "") {
+          throw new Error(`dispatched workflow ${workflow} never started on ${branch}`);
+        }
+        // WHY: --exit-status fails this step when the run fails.
+        ok(["run", "watch", runId, "--exit-status", "--interval", String(RUN_POLL_SECONDS)]);
+      }
+    },
+    mergeReleasePullRequest(prNumber: number, version: string): string {
+      ok([
+        "pr",
+        "merge",
+        String(prNumber),
+        "--squash",
+        "--delete-branch",
+        "--subject",
+        `${RELEASE_COMMIT_PREFIX}${version}`,
+      ]);
+      const mergeSha = ok(["api", `repos/${repoSlug(cwd)}/pulls/${prNumber}`, "--jq", ".merge_commit_sha // empty"]);
+      if (mergeSha === "") {
+        throw new Error(`no merge commit for PR #${prNumber}`);
+      }
+      return mergeSha;
     },
   };
 }
@@ -452,12 +647,18 @@ export function createNpm(cwd: string): NpmPort {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Create the release commit for `version` on top of the current `origin/main` and push
- * it together with its tag. A rejected push means `main` moved while the release ran:
- * the commit is recreated on the new tip and the push is retried.
+ * Land the release commit for `version` on `main` through a pull request.
+ *
+ * The release commit is created on the current `origin/main` tip, pushed to
+ * `release/v<version>`, and squash-merged once the required workflows passed on
+ * the branch. A rejected merge means `main` moved while the release ran: the
+ * release commit is recreated on the new tip (the bump is *not* recomputed; a
+ * commit that lands mid-release is picked up by the next run's scan) and the
+ * branch, PR and checks are retried.
  */
-function createAndPushRelease(
+function landReleaseOnMain(
   git: GitPort,
+  pullRequests: PullRequestPort,
   version: string,
   date: string,
   attempts: number,
@@ -469,24 +670,21 @@ function createAndPushRelease(
     git.resetHard(base);
     git.stageVersion(version, date);
     const sha = git.commitRelease(version);
+    const branch = releaseBranchName(version);
+    pullRequests.pushReleaseBranch(version, sha);
+    const prNumber = pullRequests.openReleasePullRequest(version);
+    pullRequests.dispatchRequiredWorkflows(branch);
+    pullRequests.waitForRequiredChecks(branch);
     try {
-      git.pushBranch(sha);
+      return pullRequests.mergeReleasePullRequest(prNumber, version);
     } catch (error) {
-      log(`push of the release commit was rejected (attempt ${attempt}/${attempts})`);
+      log(
+        `merge of the release PR #${prNumber} was rejected (attempt ${attempt}/${attempts}) — retrying on the latest main`,
+      );
       if (attempt === attempts) throw error;
-      continue;
     }
-    git.tag(version, sha);
-    try {
-      git.pushTag(version);
-    } catch (error) {
-      log(`push of the release tag was rejected (attempt ${attempt}/${attempts})`);
-      if (attempt === attempts) throw error;
-      continue;
-    }
-    return sha;
   }
-  throw new Error("could not push the release commit");
+  throw new Error("could not land the release on main");
 }
 
 /**
@@ -525,7 +723,8 @@ function pushTagWithRetry(
  *    version is not on npm (a release that pushed but could not publish, or a tag push
  *    that failed). The missing tag is created and the version is published.
  * 3. **Release** — the commits since the last tag decide the bump. The release commit
- *    and its tag are pushed to `main` first; only then is the package published.
+ *    and its tag land on `main` (through the release PR) first; only then is the
+ *    package published.
  */
 export function runRelease(options: ReleaseOptions): ReleaseOutcome {
   const { git, npm } = options;
@@ -568,7 +767,10 @@ export function runRelease(options: ReleaseOptions): ReleaseOutcome {
     .pop();
   if (ahead !== undefined) {
     log(`npm has ${ahead} but git has no tag for it — repairing the git history`);
-    createAndPushRelease(git, ahead, date, maxPushAttempts, log);
+    // WHY: the repair commit must also land through a PR (required status checks on
+    // `main` block direct pushes).
+    const mergeSha = landReleaseOnMain(git, options.pullRequests, ahead, date, maxPushAttempts, log);
+    pushTagWithRetry(git, ahead, mergeSha, maxPushAttempts, log);
     tags.add(`v${ahead}`);
     tipVersion = ahead;
     repaired = true;
@@ -595,57 +797,37 @@ export function runRelease(options: ReleaseOptions): ReleaseOutcome {
   }
 
   // Phase 3 — release the commits that landed since the last tag.
-  let version: string | undefined;
-  let releaseSha: string | undefined;
-  for (let attempt = 1; attempt <= maxPushAttempts; attempt += 1) {
-    git.fetch();
-    const base = git.baseSha();
-    const baseVersion = git.versionAt(base);
-    if (baseVersion === undefined) {
-      log("package.json has no version — nothing to release");
-      break;
-    }
-    const bump = detectBump(git.commitsSince(git.nearestTag(base), base));
-    if (bump === "none") {
-      log("no release-worthy commits since the last tag");
-      break;
-    }
+  git.fetch();
+  const base = git.baseSha();
+  const baseVersion = git.versionAt(base);
+  const bump =
+    baseVersion === undefined ? "none" : detectBump(git.commitsSince(git.nearestTag(base), base));
+  if (baseVersion === undefined) {
+    log("package.json has no version — nothing to release");
+  } else if (bump === "none") {
+    log("no release-worthy commits since the last tag");
+  } else {
     const target = bumpVersion(baseVersion, bump);
     if (published.has(target)) {
       log(`${target} is already published — nothing to publish`);
-      break;
+    } else {
+      // The release commit and its tag land on `main` before anything is published.
+      // WHY: the version is computed once; a commit that lands on `main` mid-release
+      // is picked up by the next run's scan instead of recomputing the bump here.
+      const mergeSha = landReleaseOnMain(git, options.pullRequests, target, date, maxPushAttempts, log);
+      pushTagWithRetry(git, target, mergeSha, maxPushAttempts, log);
+
+      // Phase 3b — the commit and its tag are on `main`; publishing now keeps npm and
+      // git in sync. A failure here is repaired by the next run (phase 2).
+      log(`publishing ${target}`);
+      npm.publish();
+      published.add(target);
+
+      return { released: true, published: true, repaired, version: target };
     }
-    git.resetHard(base);
-    git.stageVersion(target, date);
-    const sha = git.commitRelease(target);
-    try {
-      git.pushBranch(sha);
-    } catch (error) {
-      log(
-        `push of the release commit was rejected (attempt ${attempt}/${maxPushAttempts}) — retrying on the latest main`,
-      );
-      if (attempt === maxPushAttempts) throw error;
-      continue;
-    }
-    version = target;
-    releaseSha = sha;
-    break;
   }
 
-  if (releaseSha === undefined || version === undefined) {
-    return { released: false, published: published.has(tipVersion), repaired };
-  }
-
-  // The release commit is on `main`; the tag goes out before anything is published.
-  pushTagWithRetry(git, version, releaseSha, maxPushAttempts, log);
-
-  // Phase 3b — the commit and its tag are on `main`; publishing now keeps npm and git
-  // in sync. A failure here is repaired by the next run (phase 2).
-  log(`publishing ${version}`);
-  npm.publish();
-  published.add(version);
-
-  return { released: true, published: true, repaired, version };
+  return { released: false, published: published.has(tipVersion), repaired };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -658,6 +840,7 @@ function runCli(): void {
   };
   const outcome = runRelease({
     git: createGit(process.cwd()),
+    pullRequests: createPullRequests(process.cwd()),
     npm: createNpm(process.cwd()),
     dryRun: process.env["DRY_RUN"] === "true",
     log,
