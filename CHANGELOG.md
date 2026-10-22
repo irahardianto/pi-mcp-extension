@@ -41,11 +41,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.9.6] - 2026-10-17
 
+### Security
+- Validate OAuth callback state on both successful and error responses, preventing forged error callbacks from bypassing the state check.
+
+### Fixed
+- Tear down stale session state when a session reloads or config loading fails; refresh timeout settings and MCP roots when settings or the working directory change.
+- Propagate cancellation through queued authorization, and coordinate and deduplicate startup OAuth prompts with manual authorization and stop requests.
+- Accept `/mcp:auth --reset` with the flag before or after the server name, and report `/mcp:start` cancellations as informational rather than errors.
+
 ## [1.9.5] - 2026-10-17
+
+### Security
+- Sanitize stdio server output before logging or displaying it, stripping terminal control sequences and other unsafe characters.
+
+### Fixed
+- Apply effective request timeouts and cancellation signals to MCP operations, and keep health-check pings bounded and non-overlapping.
+- Recover from unexpected SSE and Streamable HTTP disconnects, unblock SSE startup when closing, and surface failed recovery to the user.
+- Use the session working directory for stdio servers and encoded MCP root URIs, and reliably terminate child processes after failed handshakes and shutdown.
 
 ## [1.9.4] - 2026-10-17
 
+### Security
+- Bind stored OAuth tokens, client information, and discovery state to the configured canonical server URL, preventing project configs that reuse a global server name at another URL from accessing or overwriting its credentials. Preserve Dynamic Client Registration authentication and redirect metadata, and validate client-secret expiry and registered redirects.
+
+### Fixed
+- Coordinate OAuth state writes and refresh-token rotation across processes; recover from stale locks and isolate corrupt per-server state.
+- Recover from rejected credentials during connection, tool listing, and tool calls, including `403 insufficient_scope`; discover auth challenges when a server rejects `GET` with `405` and pass configured headers during authorization.
+
 ## [1.9.3] - 2026-10-17
+
+### Fixed
+- Improve JSON Schema compatibility for nullable and multi-type values, composed and empty objects, recursive `$ref`s, tuples, enums, and validation constraints, including schemas expected by Gemini and OpenAI.
+- Prevent tool-name collisions within and across servers and discard stale concurrent tool refreshes; preserve structured tool results and empty resource text, reject already-aborted calls, and include prompt snippets in `mcp_status` and `mcp_connect`.
 
 ## [1.9.2] - 2026-10-17
 
