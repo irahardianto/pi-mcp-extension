@@ -8,20 +8,22 @@
  * 1. The release commit and its tag land on `main` **first**.
  * 2. Only then is the package published to npm.
  *
- * WHY: the default-branch ruleset requires the status checks, and required status
- * checks block direct pushes to `main` for everyone — on a user-owned repo the
- * GitHub Actions app cannot be a ruleset bypass actor (the API returns 422). The
- * release therefore pushes `release/v<version>`, opens `chore: release v<version>`,
- * and squash-merges the PR once the required workflows passed on the branch. A PR
- * created with `GITHUB_TOKEN` triggers no `pull_request` workflows, so the required
- * workflows are dispatched onto the branch by `PullRequestPort.dispatchRequiredWorkflows`;
- * their check runs land on the PR head sha and satisfy the ruleset at merge time.
+ * WHY: the default-branch ruleset requires a pull request with the status checks,
+ * and required status checks block direct pushes to `main` for everyone — on a
+ * user-owned repo the GitHub Actions app cannot be a ruleset bypass actor (the API
+ * returns 422). The release therefore pushes `release/v<version>`, opens
+ * `chore: release v<version>`, and squash-merges the PR once the required workflows
+ * passed on the branch. A PR created with `GITHUB_TOKEN` triggers no `pull_request`
+ * workflows, so the required workflows are dispatched onto the branch by
+ * `PullRequestPort.dispatchRequiredWorkflows`; their check runs land on the PR head
+ * sha and satisfy the ruleset at merge time.
  *
- * If `main` moves while the release runs, the merge is rejected as non-fast-forward.
- * Because nothing has been published yet, the release is simply retried on the new
- * `main` tip (the release commit is recreated there). The published tarball is
- * therefore always exactly the tree that landed, and npm never holds a version that
- * `main` does not know about.
+ * If `main` moves while the release runs, the merge is rejected — non-fast-forward,
+ * or a stale branch under the ruleset's required-up-to-date policy. Because nothing
+ * has been published yet, the release is simply retried on the new `main` tip (the
+ * release commit is recreated there). The published tarball is therefore always
+ * exactly the tree that landed, and npm never holds a version that `main` does not
+ * know about.
  *
  * The job is also self-healing: if a previous run left npm and git out of sync
  * (npm has a version without a tag, or a tag exists that was never published), the
@@ -145,11 +147,14 @@ const RUN_POLL_SECONDS = 15;
 /**
  * The workflows dispatched onto the release branch. Together they produce exactly
  * the check contexts required by `.github/rulesets/default-branch.json`:
- * `check (22)` and `check (24)` (ci.yml), `pr-title`, `gitleaks` (secret-scan.yml),
- * `semgrep`, and `dependency-review`.
+ * `check (22)`, `check (24)`, and `test (macos-latest)` (ci.yml), `workflow-lint`,
+ * `pr-title`, `gitleaks` (secret-scan.yml), `semgrep`, and `dependency-review`.
+ * Keep this list in step with the ruleset's required checks; `tests/repo-policy.test.ts`
+ * fails when a required context has no dispatched workflow.
  */
 export const REQUIRED_WORKFLOWS: readonly string[] = [
   "ci.yml",
+  "workflow-lint.yml",
   "pr-title.yml",
   "secret-scan.yml",
   "semgrep.yml",
