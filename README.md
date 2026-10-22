@@ -3,6 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
 [![license](https://img.shields.io/npm/l/pi-mcp-extension.svg)](https://github.com/irahardianto/pi-mcp-extension/blob/main/LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/irahardianto/pi-mcp-extension/badge)](https://scorecard.dev/viewer/?uri=github.com/irahardianto/pi-mcp-extension)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15659/badge)](https://www.bestpractices.dev/projects/15659)
 
 **Connect [Pi](https://pi.dev) to any MCP server.** Supabase, DeepSource, Playwright, Context7, filesystem, databases — if it speaks [MCP](https://modelcontextprotocol.io), Pi can use it.
 
