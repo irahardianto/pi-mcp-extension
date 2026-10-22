@@ -40,6 +40,13 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
 
 ## Workflow
 
+- New functionality, observable behavior changes, and bug fixes must add or
+  update deterministic automated tests in `tests/`. Test observable behavior,
+  using injected fakes instead of wall-clock sleeps. If no test is needed (for
+  example, docs-only, CI-only, or chore-only changes with no runtime impact, or
+  behavior-preserving refactoring already covered by existing tests), explain
+  why in the PR.
+  See [`AGENTS.md`](./AGENTS.md#testing--bug-fix-workflow) for the full policy.
 - Work on a branch and open a PR. Do not push to `main`; every push to `main`
   can publish to npm.
 - Use a [Conventional Commit](https://www.conventionalcommits.org/) **PR title**.

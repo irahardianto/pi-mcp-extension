@@ -21,6 +21,8 @@ The PR title is a Conventional Commit and decides the release:
 - [ ] `npm test`
 - [ ] `npm pack --dry-run`
 - [ ] Smoke test (see [CONTRIBUTING.md](CONTRIBUTING.md#pre-merge-smoke-test))
+- [ ] Automated tests in `tests/` added or updated for new functionality, behavior changes, or bug fixes; if not applicable, explain why (e.g. docs-only, CI-only,
+      chore-only with no runtime impact, or behavior-preserving refactor already covered by existing tests)
 
 ## Self-review
 

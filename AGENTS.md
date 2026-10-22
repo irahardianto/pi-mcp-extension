@@ -119,7 +119,11 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - The log file lives in `<agentDir>/logs/pi-mcp.log` (`0o600` in a `0o700` directory), is rotated to `pi-mcp.log.1` at ~2 MB, and is only created when `PI_MCP_DEBUG=1` is set. File-mode assertions are POSIX-only: skip them on Windows (`fs.stat` there reports `0o666`).
 - The logger API takes allow-listed field names only (`SAFE_FIELD_NAMES`); unknown names are dropped, and a final pass masks token-like substrings. Never pass a raw error object, an HTTP body, or a token to it.
 
-## Bug-fix workflow
+## Testing & bug-fix workflow
+
+New functionality, observable behavior changes, and bug fixes **must** add or update deterministic automated tests in `tests/`. Tests must cover observable behavior rather than mirror implementation details; use injected fakes, clocks, or transports instead of wall-clock sleeps. A change that cannot affect runtime behavior (for example, docs-only, CI-only, chore-only, or behavior-preserving refactoring already covered by existing tests) does not need a new test; state the rationale in the PR.
+
+For bug fixes, follow this deterministic regression-test workflow:
 
 1. **Reproduce:** write a deterministic failing test in `tests/` (fake clocks, transports, or deps; no wall-clock sleeps) before editing `src/`.
 2. **Trace:** follow the whole state machine, including abort, reload, and multi-process interleavings, not just the symptom.
@@ -215,4 +219,3 @@ The release flow lives in `scripts/release.ts` and runs on Node's built-in type 
 4. **Bump rules are unchanged** (see the table above).
 
 `tests/release.test.ts` is the harness for this: it drives the real git adapter against a throwaway repository with fake pull-request and registry ports, and covers the race (`main` moving mid-release, rejected merge), the "merge rejected" and "required checks failed" cases (nothing is published), the two repair cases, and the dry-run rehearsal.
-
