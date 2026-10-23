@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import {
   authorize,
   browserOpenCommand,
-  authCancelOption,
-  authPasteOption,
-  authRetryOption,
   AuthCancelledError,
   type AuthorizeDeps,
 } from "../src/authorize-flow.js";
+import {
+  authCancelOption,
+  authPasteOption,
+  authRetryOption,
+} from "../src/authorize-dialog.js";
 import { McpError } from "../src/errors.js";
 import type { ServerManager } from "../src/server-manager.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
