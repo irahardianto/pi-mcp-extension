@@ -837,6 +837,16 @@ describe("fuzz: stripJsonComments & parseRegisteredServerConfig", () => {
 
 // ─── Suite 8: createHeadersFetch & discoverManualAuthChallenge ────────────────
 
+/**
+ * Header field values ignore leading/trailing optional whitespace (RFC 9110 §5.5).
+ * `Headers` combines case-insensitive duplicate keys with ", " and trims that
+ * trailing space when the combined value is written back, so expectations must
+ * be compared after the same normalization instead of as raw strings.
+ */
+function normalizedHeaderValue(value: string | null): string | null {
+  return value === null ? null : value.trim();
+}
+
 describe("fuzz: createHeadersFetch & discoverManualAuthChallenge", () => {
   it("createHeadersFetch merges headers with per-request overrides and preserves base headers", async () => {
     await fc.assert(
@@ -863,12 +873,12 @@ describe("fuzz: createHeadersFetch & discoverManualAuthChallenge", () => {
           const expectedBase = new Headers(base);
           // Request headers override collisions
           expectedReq.forEach((v, k) => {
-            assert.equal(headers.get(k), v);
+            assert.equal(normalizedHeaderValue(headers.get(k)), normalizedHeaderValue(v));
           });
           // Non-colliding base headers are preserved
           expectedBase.forEach((v, k) => {
             if (!expectedReq.has(k)) {
-              assert.equal(headers.get(k), v);
+              assert.equal(normalizedHeaderValue(headers.get(k)), normalizedHeaderValue(v));
             }
           });
         },
@@ -878,6 +888,9 @@ describe("fuzz: createHeadersFetch & discoverManualAuthChallenge", () => {
         examples: [
           [{}, { k: "", K: "" }],
           [{ a: "1", A: "2" }, { b: "3", B: "4" }],
+          // Regression: case-colliding request keys combine to ", " and the
+          // trailing optional whitespace is trimmed when written back.
+          [{ $: "" }, { n: "", N: "" }],
         ],
       },
     );
