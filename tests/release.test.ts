@@ -20,10 +20,12 @@ import {
   detectBump,
   runRelease,
   REQUIRED_WORKFLOWS,
+  selectDispatchedRun,
   type CommitInfo,
   type GitPort,
   type NpmPort,
   type PullRequestPort,
+  type WorkflowRun,
 } from "../scripts/release.js";
 
 function git(cwd: string, args: string[]): string {
@@ -39,6 +41,7 @@ interface Fixture {
   readonly remote: string;
   readonly workspace: string;
   readonly other: string;
+  readonly server: string;
   readonly otherSha: string;
 }
 
@@ -108,7 +111,17 @@ function createFixture(options: { withFeature?: boolean } = {}): Fixture {
   git(other, ["add", "-A"]);
   git(other, ["commit", "-m", "fix: an unrelated change"]);
 
-  return { root, remote, workspace, other, otherSha: git(other, ["rev-parse", "HEAD"]).trim() };
+  // WHY: a third clone plays GitHub's server. The simulated squash merge is created
+  // there, so the release workspace has never seen the merge commit until it fetches —
+  // exactly like the runner after `gh pr merge`.
+  const server = path.join(root, "server");
+  execFileSync("git", ["clone", remote, server], { stdio: "ignore" });
+  git(server, ["config", "user.name", "GitHub"]);
+  git(server, ["config", "user.email", "github@example.com"]);
+  git(server, ["config", "commit.gpgsign", "false"]);
+  git(server, ["config", "core.autocrlf", "false"]);
+
+  return { root, remote, workspace, other, server, otherSha: git(other, ["rev-parse", "HEAD"]).trim() };
 }
 
 class FakeNpm implements NpmPort {
@@ -157,10 +170,12 @@ function gitAllowFailure(cwd: string, args: string[]): { status: number; stderr:
 /**
  * A `PullRequestPort` that simulates GitHub against the local bare remote.
  *
- * The simulated squash merge is a fast-forward push of the release commit to `main`
- * (followed by a branch deletion, like `--delete-branch`). That push fails exactly
- * like a real merge would when `main` moved under the release commit, which is how
- * the tests exercise the mid-release race.
+ * The simulated squash merge behaves like GitHub's: it creates a brand-new commit on
+ * the "server" clone whose tree is the PR head's tree and whose parent is the `main`
+ * tip the PR was opened against, then pushes it to `main`. The release workspace
+ * therefore does not have the merge commit until it fetches. A push that is no longer
+ * fast-forward is rejected exactly like a real merge under the ruleset's
+ * required-up-to-date policy, which is how the tests exercise the mid-release race.
  */
 class FakePullRequests implements PullRequestPort {
   readonly pushedBranches: string[] = [];
@@ -177,16 +192,21 @@ class FakePullRequests implements PullRequestPort {
   beforeFirstMerge: (() => void) | undefined;
 
   private readonly cwd: string;
+  private readonly server: string;
   private nextNumber = 1;
   private readonly branchHeads = new Map<string, string>();
+  private readonly branchBases = new Map<string, string>();
 
-  constructor(cwd: string) {
+  constructor(cwd: string, server: string) {
     this.cwd = cwd;
+    this.server = server;
   }
 
   pushReleaseBranch(version: string, sha: string): void {
     this.pushedBranches.push(`release/v${version}`);
     this.branchHeads.set(version, sha);
+    // The PR is opened against the `main` tip the release was based on.
+    this.branchBases.set(version, git(this.cwd, ["rev-parse", "origin/main"]).trim());
     git(this.cwd, ["push", "--force", "origin", `${sha}:refs/heads/release/v${version}`]);
   }
 
@@ -218,15 +238,27 @@ class FakePullRequests implements PullRequestPort {
     if (this.rejectMerges) {
       throw new Error(`merge of PR #${prNumber} was rejected`);
     }
-    const sha = this.branchHeads.get(version);
-    assert.ok(sha !== undefined, "the release branch was pushed before merging");
-    const result = gitAllowFailure(this.cwd, ["push", "origin", `${sha}:main`]);
+    const head = this.branchHeads.get(version);
+    const base = this.branchBases.get(version);
+    assert.ok(head !== undefined, "the release branch was pushed before merging");
+    assert.ok(base !== undefined, "the release branch recorded its base before merging");
+    git(this.server, ["fetch", "--force", "origin"]);
+    const tree = git(this.server, ["rev-parse", `${head}^{tree}`]).trim();
+    const mergeSha = git(this.server, [
+      "commit-tree",
+      tree,
+      "-p",
+      base,
+      "-m",
+      `chore: release v${version} (#${prNumber})`,
+    ]).trim();
+    const result = gitAllowFailure(this.server, ["push", "origin", `${mergeSha}:main`]);
     if (result.status !== 0) {
       throw new Error(`merge of PR #${prNumber} was rejected: ${result.stderr.trim()}`);
     }
     this.merges.push(`#${prNumber} v${version}`);
-    git(this.cwd, ["push", "origin", "--delete", `release/v${version}`]);
-    return sha;
+    git(this.server, ["push", "origin", "--delete", `release/v${version}`]);
+    return mergeSha;
   }
 }
 
@@ -309,12 +341,36 @@ describe("compareVersions", () => {
   });
 });
 
+describe("selectDispatchedRun", () => {
+  const run = (databaseId: number): WorkflowRun => ({ databaseId });
+
+  it("returns the run created by the dispatch", () => {
+    assert.deepEqual(selectDispatchedRun([run(11), run(12)], 11), run(12));
+  });
+
+  it("returns nothing until a run newer than the dispatch baseline exists", () => {
+    assert.equal(selectDispatchedRun([], 11), undefined);
+    assert.equal(selectDispatchedRun([run(10), run(11)], 11), undefined);
+  });
+
+  it("never accepts a completed run left by an earlier attempt", () => {
+    // WHY: a retried release re-dispatches on the same branch. The runs of the failed
+    // attempt are exactly the ones a retry must not mistake for its own checks.
+    const stale = [run(7), run(8), run(9)];
+    assert.equal(selectDispatchedRun(stale, 9), undefined);
+  });
+
+  it("prefers the newest run when several appeared", () => {
+    assert.deepEqual(selectDispatchedRun([run(13), run(12), run(14)], 11), run(14));
+  });
+});
+
 describe("runRelease", () => {
   it("lands the release commit and its tag through a pull request before publishing", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
         pullRequests,
@@ -346,6 +402,12 @@ describe("runRelease", () => {
         git(fixture.remote, ["rev-parse", "v1.1.0"]).trim(),
         git(fixture.remote, ["rev-parse", "main"]).trim(),
       );
+      // WHY: the squash merge created a commit the workspace had never seen; the flow
+      // must fetch it before tagging, so `origin/main` points at the tagged commit.
+      assert.equal(
+        git(fixture.workspace, ["rev-parse", "origin/main"]).trim(),
+        git(fixture.remote, ["rev-parse", "main"]).trim(),
+      );
 
       const changelog = git(fixture.remote, ["show", "main:CHANGELOG.md"]);
       assert.match(changelog, /## \[1\.1\.0\] - 2026-10-21/);
@@ -358,7 +420,7 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       // Push the concurrent commit right before the first simulated merge, so the
       // merge is rejected as non-fast-forward and the release must be retried.
       pullRequests.beforeFirstMerge = (): void => {
@@ -399,7 +461,7 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       pullRequests.rejectMerges = true;
       assert.throws(
         () =>
@@ -429,7 +491,7 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       pullRequests.rejectChecks = true;
       assert.throws(
         () =>
@@ -457,7 +519,7 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       assert.throws(
         () =>
           runRelease({
@@ -487,7 +549,7 @@ describe("runRelease", () => {
       const npm = new FakeNpm(fixture.workspace);
       npm.published.add("1.1.0");
 
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
         pullRequests,
@@ -522,7 +584,7 @@ describe("runRelease", () => {
       git(fixture.workspace, ["push", "origin", "v1.1.0"]);
 
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
         pullRequests,
@@ -556,7 +618,7 @@ describe("runRelease", () => {
       git(fixture.workspace, ["push", "origin", "main"]);
 
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
         pullRequests,
@@ -578,7 +640,7 @@ describe("runRelease", () => {
     const fixture = createFixture();
     try {
       const npm = new FakeNpm(fixture.workspace);
-      const pullRequests = new FakePullRequests(fixture.workspace);
+      const pullRequests = new FakePullRequests(fixture.workspace, fixture.server);
       const outcome = runRelease({
         git: createGit(fixture.workspace),
         pullRequests,

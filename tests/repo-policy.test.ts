@@ -154,3 +154,17 @@ describe("release workflow dispatch coverage", () => {
     }
   });
 });
+
+describe("release flow never writes main directly", () => {
+  it("has no command that pushes a commit or branch to main", () => {
+    // WHY: the ruleset requires a pull request, so the only accepted path onto `main`
+    // is the release PR merge (issue #131). A direct push would also fail at runtime.
+    const release = readRepoFile("scripts/release.ts");
+    for (const forbidden of [":main", "refs/heads/main", "origin main"]) {
+      assert.ok(
+        !release.includes(forbidden),
+        `scripts/release.ts must not push to main (found "${forbidden}"); land the release through the release PR`,
+      );
+    }
+  });
+});
