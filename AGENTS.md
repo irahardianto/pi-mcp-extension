@@ -69,7 +69,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/callback-server.ts`, `src/callback-url.ts` | Instance-scoped `CallbackServer` loopback OAuth callback listener; pure redirect/callback URL validation (`callbackServerConfigFromRedirectUrl`) and headless paste-back parsing |
 | `src/auth-challenge.ts` | `WWW-Authenticate` discovery (RFC 9728 `resource_metadata`, `scope`) |
 | `src/terminal-text.ts` | Pure terminal/notification text sanitization (`sanitizeTerminalText`): strips ANSI/OSC/DCS/C1 escape sequences and C0/C1 control characters, collapses line breaks, and bounds string length on code-point boundaries |
-| `src/debug-log.ts` | Opt-in redacting debug log (`PI_MCP_DEBUG=1` → `<agentDir>/logs/pi-mcp.log`, JSON Lines, `0o600`, ~2 MB rotation) plus the process-wide diagnostic sink (`reportDiagnostic`): allow-listed fields, secret masking, injectable `DebugLogDeps` |
+| `src/debug-log.ts` | Opt-in debug log file writer (`PI_MCP_DEBUG=1` → `<agentDir>/logs/pi-mcp.log`, `0o600`, ~2 MB rotation, `DebugLog`, injectable `DebugLogDeps`) and process-wide diagnostic sink (`reportDiagnostic`, UI routing, headless stderr fallback) |
+| `src/debug-log-format.ts` | Pure diagnostic log field allow-listing (`SAFE_FIELD_NAMES`, `sanitizeLogFields`), secret masking (`redactSecrets`, `sanitizeLogText`), error classification (`describeError`), and JSON Lines entry formatting (`buildLogEntry`, `formatLogLine`) |
 | `src/errors.ts` | `McpError` kinds `config \| connection \| auth \| timeout \| protocol`; `AuthRequiredError`, `AuthLockError`, `AuthCancelledError` |
 
 Tests live in `tests/*.test.ts` (`node:test` + `node:assert/strict`, run through `tsx`). Fixtures: `tests/mock-server.ts`, `tests/helpers/`. Property-based fuzz tests live in `tests/fuzz.test.ts` (using `fast-check`, detected by OpenSSF Scorecard). Keep tests out of `src/`.
