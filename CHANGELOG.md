@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Bump `zod` runtime dependency floor to `^4.6.7` (`GHSA-mrhx-c7xc-m3w5`) and update transitive lockfile dependencies `body-parser` to `2.4.0` (`GHSA-27r3-jxmh-p828`) and `fast-uri` to `3.1.9` (`GHSA-w74x-v6f9-j3xg`, `GHSA-xhq7-xmqj-769h`, `GHSA-wjr9-j795-jxcr`, `GHSA-333x-w4r6-6crp`).
+
 ## [1.10.1] - 2026-10-23
 
 ### Fixed
