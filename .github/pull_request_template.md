@@ -13,6 +13,7 @@ The PR title is a Conventional Commit and decides the release:
 - `type!:` or `BREAKING CHANGE:` in the body → major
 
 - [ ] `CHANGELOG.md` updated under `## [Unreleased]` (required for `feat` / `fix` / `perf` / breaking changes)
+- [ ] `SECURITY.md` Supported Versions table names the new minor line (`X.Y.x` as `:white_check_mark:`, the previous line as `:x:`) — required for `feat` (minor) and breaking (major) changes, which start a new supported line
 
 ## Verification
 

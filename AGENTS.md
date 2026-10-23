@@ -205,6 +205,7 @@ Work on a branch and open a PR. Use Conventional Commits; scopes are fine (e.g. 
 | anything else (`docs:`, `chore:`, `refactor:`, `test:`, `ci:`, …) | none |
 
 - For `feat` / `fix` / `perf` / breaking changes, add a user-facing entry under `## [Unreleased]` in `CHANGELOG.md`. The workflow stamps the version and date.
+- For `feat:` (minor) and `type!:` / `BREAKING CHANGE:` (major) changes, update the Supported Versions table in `SECURITY.md` in the same PR: the new minor line becomes `:white_check_mark:` and the line before it becomes `:x:`. The release flow bumps `package.json` and `CHANGELOG.md` on its own, but it never edits `SECURITY.md`, so a missed update leaves the security policy pointing users at an unsupported release (and at the wrong BadgeApp `vulnerability_report_process` evidence).
 - Because the scan covers everything since the last tag, a `docs:` push still publishes if unreleased `fix:` / `feat:` commits are already on `main`.
 - The bot creates the `chore: release vX.Y.Z` commit and the tag (through the release PR). Don't create them by hand. A maintainer may squash-merge a stuck release PR by hand — the next run detects the landed release commit and repairs the missing tag or publish.
 - Dependabot PRs are titled `chore(deps): ...`, `chore(deps-dev): ...`, or `ci(deps): ...`, so they don't release. When a runtime bump must raise the minimum version for users (e.g. a security floor), retitle it `fix(deps): ...` and add a `CHANGELOG.md` entry.

@@ -2,12 +2,16 @@
 
 ## Supported Versions
 
-Only the latest minor version receives bug fixes and security updates. Fixes are published to npm as patch releases.
+Only the latest minor version receives bug fixes and security updates. A new minor line (`1.11.0`) replaces the previous one as the supported line as soon as it is published; the previous line then receives no further fixes. Within the supported line, fixes ship to npm as patch releases (`1.10.0` → `1.10.1`), so staying on `latest` always keeps you supported.
+
+The table names the supported line as `major.minor.x`, so it stays accurate across patch releases:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.9.x   | :white_check_mark: |
-| < 1.9   | :x:                |
+| 1.10.x  | :white_check_mark: |
+| < 1.10  | :x:                |
+
+This table is maintained by hand: the release workflow bumps `package.json` and `CHANGELOG.md` automatically, so a `feat:` (minor) or breaking (major) change must update it in the same pull request (see [AGENTS.md](AGENTS.md#commits--release)).
 
 ## Reporting a Vulnerability
 
