@@ -4,6 +4,7 @@
 
 import * as Type from "typebox";
 import type { TSchema } from "typebox";
+import { resolveRefTarget } from "./schema-refs.js";
 
 // ─── Schema Conversion ────────────────────────────────────────────────────────
 
@@ -65,77 +66,6 @@ function withSchemaOptions(schema: TSchema, opts: Record<string, unknown>): TSch
   if (Object.keys(opts).length === 0) return schema;
   const clone = Object.defineProperties<TSchema>({}, Object.getOwnPropertyDescriptors(schema));
   return Object.assign(clone, opts);
-}
-
-function unescapeJsonPointer(segment: string): string {
-  // WHY: RFC 6901 §4 requires unescaping "~1" to "/" before "~0" to "~" so "~01" becomes "~1".
-  return segment.replace(/~1/g, "/").replace(/~0/g, "~");
-}
-
-function stepJsonPointer(curr: unknown, part: string): unknown {
-  if (!curr || typeof curr !== "object") {
-    return undefined;
-  }
-  if (Array.isArray(curr)) {
-    if (!/^(?:0|[1-9][0-9]*)$/.test(part)) {
-      return undefined;
-    }
-    const idx = Number(part);
-    return idx >= 0 && idx < curr.length ? curr[idx] : undefined;
-  }
-  if (!Object.prototype.hasOwnProperty.call(curr, part)) {
-    return undefined;
-  }
-  return (curr as Record<string, unknown>)[part];
-}
-
-export function resolveRefTarget(
-  ref: string,
-  rootDefs: Record<string, Record<string, unknown>> | undefined,
-  rootSchema: Record<string, unknown>,
-): Record<string, unknown> | undefined {
-  if (ref === "#") {
-    return rootSchema;
-  }
-  if (!ref.startsWith("#/")) {
-    return undefined;
-  }
-
-  const parts = ref.slice(2).split("/").map(unescapeJsonPointer);
-
-  if (
-    (parts[0] === "$defs" || parts[0] === "definitions") &&
-    parts.length >= 2 &&
-    rootDefs &&
-    Object.prototype.hasOwnProperty.call(rootDefs, parts[1]!)
-  ) {
-    const defEntry = rootDefs[parts[1]!];
-    if (defEntry && typeof defEntry === "object" && !Array.isArray(defEntry)) {
-      if (parts.length === 2) {
-        return defEntry;
-      }
-      let curr: unknown = defEntry;
-      for (let i = 2; i < parts.length; i++) {
-        curr = stepJsonPointer(curr, parts[i]!);
-        if (curr === undefined) break;
-      }
-      if (curr && typeof curr === "object" && !Array.isArray(curr)) {
-        return curr as Record<string, unknown>;
-      }
-    }
-  }
-
-  let curr: unknown = rootSchema;
-  for (const part of parts) {
-    curr = stepJsonPointer(curr, part);
-    if (curr === undefined) {
-      return undefined;
-    }
-  }
-  if (curr && typeof curr === "object" && !Array.isArray(curr)) {
-    return curr as Record<string, unknown>;
-  }
-  return undefined;
 }
 
 /**
