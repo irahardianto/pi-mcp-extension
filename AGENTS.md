@@ -22,6 +22,8 @@ npm pack --dry-run                                   # tarball must contain only
 semgrep --test --metrics=off .semgrep/               # custom Semgrep rules against their fixtures
 semgrep scan --metrics=off --config p/typescript --config p/javascript --config p/github-actions --config .semgrep/ --error   # the CI scan
 gitleaks git --redact -v                             # secret scan of the full git history (uses .gitleaks.toml)
+GITHUB_REPOSITORY=<owner>/<repo> GITHUB_TOKEN=$(gh auth token) RULESET_AUDIT_TOKEN=$(gh auth token) \
+  node --import tsx/esm scripts/ruleset-audit.ts      # the ruleset drift audit (.github/workflows/ruleset-audit.yml)
 ```
 
 Node 22+ (CI runs 22 and 24 on Linux, and 22 on macOS and Windows). A change is done only when lint, typecheck, test, and pack all pass.
@@ -72,6 +74,9 @@ Release tooling lives outside `src/` (it is not shipped to npm and must not depe
 | File | Owns |
 |---|---|
 | `scripts/release.ts` | Release orchestration for `.github/workflows/publish.yml`: bump detection, release commit + tag creation, release-PR orchestration (branch push, PR open/retitle, dispatched required checks, squash merge, rejected-merge retry), npm/git divergence repair, `GitPort` / `PullRequestPort` / `NpmPort` adapters |
+| `scripts/ruleset-audit.ts` | Ruleset drift audit for `.github/workflows/ruleset-audit.yml`: normalizes a file and the live ruleset to the same comparable form (`normalizeRuleset`, `diffRulesets`), verifies required check contexts against recent check runs (`requiredStatusContexts`, `checkRunNames`, `missingContexts`), and a thin `GitHubApi` fetch client |
+
+`scripts/release.ts` stays fully standalone because the release job runs it on bare Node with no dependency install. `scripts/ruleset-audit.ts` may import the two **pure** `src/` utilities it needs (`jsonc.ts` for the canonical JSONC parser, `terminal-text.ts` for sanitizing API error text) because it runs through `tsx` after `npm ci`; it must not import runtime modules that touch Pi, transports, or stored state. That keeps one JSONC parser and one sanitizer in the repository instead of a drifting copy.
 
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/default-branch.json` (branch protection ruleset). `.github/CODEOWNERS` lists the security-sensitive paths.
 
@@ -150,6 +155,7 @@ Workflows live in `.github/workflows/`. The checks below run on every PR, whatev
 | `semgrep.yml` | `semgrep` | Semgrep registry packs (`p/typescript`, `p/javascript`, `p/github-actions`) plus the custom rules in `.semgrep/rules/` that encode hard rules 1, 4, 5 and the security invariants above; drops in-source-suppressed findings before SARIF upload |
 | `dependency-review.yml` | `dependency-review` | Dependencies added or changed by the PR: no high/critical advisories and no copyleft licenses in runtime scope. Also runs on `workflow_dispatch` (dispatched by `publish.yml` onto the release branch, where it resolves the PR's base/head) |
 | `pr-title.yml` | `pr-title` | PR title is a Conventional Commit; `feat` / `fix` / `perf` / `!` titles must change `CHANGELOG.md`; a PR-description line starting with `BREAKING CHANGE:` requires `!` in the title. Also runs on `workflow_dispatch` (dispatched by `publish.yml` onto the release branch, where it resolves the PR) |
+| `ruleset-audit.yml` | `ruleset-audit` | Weekly, on `workflow_dispatch`, and on PRs touching `.github/rulesets/**`: every live ruleset must match its file field for field (`name`, `target`, `enforcement`, `conditions`, `rules` + `parameters`, `bypass_actors`), every file must have a live ruleset and vice versa, and every required check context must still be reported by a recent commit on `main` or a recent PR head. Not a required check (it is not part of the release dispatch). A PR from a fork can only verify contexts, so it posts a warning annotation saying the live comparison was skipped |
 
 ### OpenSSF Scorecard
 
@@ -172,8 +178,15 @@ Workflows live in `.github/workflows/`. The checks below run on every PR, whatev
   - Because branches must be up to date, a release merge rejected by a concurrent push to `main` is retried on the new tip; nothing is published before the merge lands ([Release ordering](#release-ordering-npm--git)).
 - `.github/rulesets/release-tags.json` protects release tags (`refs/tags/v*`): it blocks deletion, blocks force pushes, and blocks tag mutations, while allowing the maintainer (repository admin) to bypass and allowing `publish.yml` to create new release tags.
 
+`ruleset-audit.yml` (via `scripts/ruleset-audit.ts`) is what keeps the files honest: it fails when any live ruleset field drifts from the file, when a ruleset exists on only one side, or when a required check context is no longer reported by a recent commit (a renamed job would otherwise block every merge to `main`, including releases). Both sides are normalized to the same comparable form first, so whitespace, key order, array order, and API-only fields (`id`, `node_id`, timestamps, `_links`, `source`) never read as drift.
+
+The rulesets API needs repository administration read access, which the workflow `GITHUB_TOKEN` does not have. Create a fine-grained token with **Administration: read** (or a classic token with `repo`) and store it as the `RULESET_AUDIT_TOKEN` secret; the scheduled and dispatched audits fail without it. Pull requests never receive secrets from forks, so those runs skip the live comparison, still verify the check contexts, and post a warning annotation so a green check does not read as "the live rulesets were compared". The scheduled or dispatched run is the authoritative one.
+
+The files must state every parameter the API returns, including its defaults (`do_not_enforce_on_create`, `required_reviewers`, `require_extra_approval_for_unattributed_changes`, …). When the audit reports a new live-only parameter, add it to the file in the same PR that responds to the failure — never silence the audit.
+
 ```bash
-gh api repos/irahardianto/pi-mcp-extension/rulesets                                                                   # list live rulesets (check for drift)
+gh workflow run ruleset-audit.yml                                                                                     # the drift audit (weekly + on demand)
+gh api repos/irahardianto/pi-mcp-extension/rulesets                                                                   # list live rulesets (debugging drift by hand)
 gh api --method POST repos/irahardianto/pi-mcp-extension/rulesets --input .github/rulesets/default-branch.json        # create branch ruleset
 gh api --method PUT repos/irahardianto/pi-mcp-extension/rulesets/<id> --input .github/rulesets/default-branch.json   # update branch ruleset
 gh api --method POST repos/irahardianto/pi-mcp-extension/rulesets --input .github/rulesets/release-tags.json         # create tag ruleset

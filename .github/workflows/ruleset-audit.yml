@@ -1,0 +1,65 @@
+name: ruleset-audit
+
+# WHY: `.github/rulesets/*.json` is the declarative source of truth for branch and tag
+# protection, but nothing verified that the live rulesets still match those files. A
+# ruleset edited in the GitHub UI or through the API used to drift silently and weaken
+# `main`'s protection. The audit (scripts/ruleset-audit.ts, issue #135) compares every
+# field of every live ruleset with its file and checks that each required status-check
+# context is still reported by a recent commit — a renamed job would otherwise block
+# every merge to `main`, including automated releases.
+on:
+  # WHY: weekly, alongside the other scheduled audits; catches a UI/API edit that never
+  # produced a commit.
+  schedule:
+    - cron: '45 2 * * 1'
+  workflow_dispatch:
+  # WHY: no `branches:` filter (AGENTS.md -> Commits & release): a stacked PR targets
+  # another PR's branch, and a ruleset edit must be audited before it lands.
+  pull_request:
+    paths:
+      - '.github/rulesets/**'
+      - '.github/workflows/ruleset-audit.yml'
+      - 'scripts/ruleset-audit.ts'
+      - 'tests/ruleset-audit.test.ts'
+
+# Least privilege for every job: the audit only reads the repository and the GitHub API.
+permissions:
+  contents: read
+
+concurrency:
+  group: ruleset-audit-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs; never cancel a scheduled run mid-flight.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    name: ruleset-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read # Read the check-run names of recent commits
+      pull-requests: read # Read the head SHAs of recent pull requests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Audit the live rulesets
+        env:
+          # WHY: the workflow token reads commits, check runs and pull requests, but the
+          # rulesets API needs repository administration read access, which it does not
+          # have — RULESET_AUDIT_TOKEN is a fine-grained token with "Administration: read"
+          # (or a classic token with `repo`). Fork PRs never receive secrets: those runs
+          # skip the live comparison with a warning instead of failing.
+          GITHUB_TOKEN: ${{ github.token }}
+          RULESET_AUDIT_TOKEN: ${{ secrets.RULESET_AUDIT_TOKEN }}
+          RULESET_AUDIT_REQUIRE_LIVE: ${{ github.event_name != 'pull_request' && '1' || '' }}
+        run: node --import tsx/esm scripts/ruleset-audit.ts
