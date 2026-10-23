@@ -47,7 +47,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 
 | File | Owns |
 |---|---|
-| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`; `mcp_status` / `mcp_connect` tools |
+| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; `mcp_status` / `mcp_connect` tools |
+| `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash-command registration (`registerCommands`) |
 | `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, startup auth prompts, eager server starts, session teardown) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow (`authorize`), browser launcher (`openBrowser`, `browserOpenCommand`), callback waiter (`waitForOAuthCallback`), and dialog option constants |
