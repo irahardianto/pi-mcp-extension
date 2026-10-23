@@ -5,9 +5,7 @@ on:
   # not `main`, and must be checked before merging into their base.
   pull_request:
   merge_group:
-  # WHY: publish.yml dispatches this workflow onto the release branch: a PR created
-  # with GITHUB_TOKEN triggers no pull_request workflows, so the release PR gets its
-  # `dependency-review` check run this way instead.
+  # WHY: allow manual runs against an open PR branch (e.g. `gh workflow run dependency-review.yml --ref <branch>`).
   workflow_dispatch:
 
 # Least privilege: dependency review API comparison requires only repository read permissions.
@@ -27,7 +25,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: read # WHY: resolve the release PR's base/head SHAs when dispatched by publish.yml
+      pull-requests: read # WHY: resolve the open PR's base/head SHAs when manually dispatched via workflow_dispatch
     steps:
       - name: Resolve comparison refs
         id: refs
@@ -66,7 +64,7 @@ jobs:
       # compares dependency manifests using GitHub's Dependency Review API. Local workspace
       # files are not read when configuration is inline; the comparison refs come from the
       # resolve step (the PR event payload on pull_request, the merge_group payload in a
-      # merge queue, or the release PR on workflow_dispatch).
+      # merge queue, or the branch's open PR on workflow_dispatch).
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:

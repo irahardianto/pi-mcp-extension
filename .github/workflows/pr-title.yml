@@ -4,9 +4,7 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
   merge_group:
-  # WHY: publish.yml dispatches this workflow onto the release branch: a PR created
-  # with GITHUB_TOKEN triggers no pull_request workflows, so the release PR gets its
-  # `pr-title` check run this way instead.
+  # WHY: allow manual runs against an open PR branch (e.g. `gh workflow run pr-title.yml --ref <branch>`).
   workflow_dispatch:
 
 permissions:

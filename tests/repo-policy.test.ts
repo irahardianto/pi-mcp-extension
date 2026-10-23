@@ -1,12 +1,12 @@
 /**
  * Guards the repository policy in `.github/rulesets/default-branch.json` (issue #132):
  * `main` takes changes only through a pull request with the required checks, and the
- * release flow dispatches a workflow for every required check context.
+ * release flow approves the `pull_request` workflow runs for every required check context.
  *
- * The ruleset file only works while the release flow produces the contexts it
- * requires: a required check that no dispatched workflow reports would leave every
- * release PR pending forever. These assertions keep the two in step without needing
- * GitHub access.
+ * The ruleset file only works while the release flow approves the workflows that produce
+ * the contexts it requires: a required check from a workflow outside `REQUIRED_WORKFLOWS`
+ * would stay `action_required` and leave every release PR pending forever. These
+ * assertions keep the two in step without needing GitHub access.
  */
 
 import assert from "node:assert/strict";
@@ -142,10 +142,22 @@ describe("release workflow approval coverage", () => {
 
   it("approves only workflows that record pull_request runs", () => {
     // WHY: only pull_request runs attach their check runs to the release PR, so the
-    // approve step is meaningless for a workflow without a pull_request trigger.
+    // approve step is meaningless for a workflow without a pull_request trigger — and
+    // workflow_dispatch runs never satisfy required PR status checks (#150).
     for (const workflow of REQUIRED_WORKFLOWS) {
       const contents = readRepoFile(`.github/workflows/${workflow}`);
       assert.match(contents, /^ {2}pull_request:/m, `${workflow} must declare pull_request`);
+      assert.ok(
+        !contents.includes("dispatches this workflow") && !contents.includes("dispatched by publish.yml"),
+        `${workflow} must not claim publish.yml dispatches it (publish.yml approves pull_request runs instead)`,
+      );
+    }
+    const release = readRepoFile("scripts/release.ts");
+    for (const forbidden of ['"workflow", "run"', "/dispatches"]) {
+      assert.ok(
+        !release.includes(forbidden),
+        `scripts/release.ts must approve pull_request runs rather than dispatching workflows (found ${forbidden})`,
+      );
     }
   });
 
