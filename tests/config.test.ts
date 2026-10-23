@@ -13,8 +13,8 @@ import {
   agentDir,
   loadConfig as loadConfigFile,
   parseRegisteredServerConfig,
-  stripJsonComments,
 } from "../src/config.js";
+import { stripJsonComments } from "../src/jsonc.js";
 import { McpError } from "../src/errors.js";
 
 // ── Helpers ─

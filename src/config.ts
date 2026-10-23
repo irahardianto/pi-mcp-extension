@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { callbackServerConfigFromRedirectUrl } from "./callback-server.js";
 import { McpError } from "./errors.js";
+import { stripJsonComments } from "./jsonc.js";
 
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
@@ -226,80 +227,6 @@ export interface LoadConfigOptions {
 }
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
-
-/**
- * Strip `//` line comments and `/* ... *\/` block comments outside of double-quoted
- * JSON strings in a single character-by-character pass.
- *
- * Preserves `\n` and `\r` characters so line numbers in `JSON.parse` error messages
- * remain accurate. Unterminated `/*` block comments are left intact so `JSON.parse`
- * fails with a syntax error rather than silently truncating the document.
- */
-export function stripJsonComments(text: string): string {
-  let out = "";
-  let inString = false;
-  let i = 0;
-
-  while (i < text.length) {
-    const ch = text[i]!;
-
-    if (inString) {
-      if (ch === "\\") {
-        out += ch;
-        if (i + 1 < text.length) {
-          out += text[i + 1]!;
-          i += 2;
-        } else {
-          i += 1;
-        }
-        continue;
-      }
-      if (ch === '"') {
-        inString = false;
-      }
-      out += ch;
-      i += 1;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-      i += 1;
-      continue;
-    }
-
-    if (ch === "/" && text[i + 1] === "/") {
-      i += 2;
-      while (i < text.length && text[i] !== "\n") {
-        if (text[i] === "\r" && text[i + 1] === "\n") break;
-        i += 1;
-      }
-      continue;
-    }
-
-    if (ch === "/" && text[i + 1] === "*") {
-      const closeIdx = text.indexOf("*/", i + 2);
-      if (closeIdx === -1) {
-        // WHY: Leave unterminated block comments intact so JSON.parse fails with a
-        // SyntaxError rather than silently truncating the rest of the file.
-        out += text.slice(i);
-        break;
-      }
-      for (let j = i; j < closeIdx + 2; j += 1) {
-        const commentCh = text[j]!;
-        out += commentCh === "\n" || commentCh === "\r" ? commentCh : " ";
-      }
-      i = closeIdx + 2;
-      continue;
-    }
-
-    out += ch;
-    i += 1;
-  }
-
-  return out;
-}
 
 async function readJsonFile(path: string): Promise<unknown> {
   let text: string;

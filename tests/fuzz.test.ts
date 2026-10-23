@@ -36,10 +36,8 @@ import {
   convertJsonSchemaToTypebox,
 } from "../src/schema-convert.js";
 import { buildToolName } from "../src/tool-bridge.js";
-import {
-  stripJsonComments,
-  parseRegisteredServerConfig,
-} from "../src/config.js";
+import { parseRegisteredServerConfig } from "../src/config.js";
+import { stripJsonComments } from "../src/jsonc.js";
 import {
   createHeadersFetch,
   discoverManualAuthChallenge,

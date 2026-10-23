@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { stripJsonComments } from "../src/jsonc.js";
 import { REQUIRED_WORKFLOWS } from "../scripts/release.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,7 +24,12 @@ function readRepoFile(relativePath: string): string {
 }
 
 function readRuleset(): unknown {
-  const parsed: unknown = JSON.parse(readRepoFile(".github/rulesets/default-branch.json"));
+  // WHY: parse the ruleset through the same JSONC tolerator the runtime uses
+  // for `mcp.json`, so a future maintainer can add `// WHY: …` style comments to
+  // `.github/rulesets/default-branch.json` (mirroring the convention used
+  // throughout `src/`) without breaking these tests. The functions below
+  // narrow `unknown` into the rule parameters and required contexts.
+  const parsed: unknown = JSON.parse(stripJsonComments(readRepoFile(".github/rulesets/default-branch.json")));
   return parsed;
 }
 

@@ -54,7 +54,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/stdio-process.ts` | Stdio child-process supervision (`isPidAlive`, `ensurePidTerminated`, `instrumentStdioTransport`, injectable `StdioProcessDeps`) and `StringDecoder` stderr line splitting (`createLineSplitter`) |
 | `src/tool-bridge.ts` | `tools/list` discovery, tool naming/hashing/collisions, Pi tool registration and `callTool` |
 | `src/schema-convert.ts` | Pure MCP JSON Schema → TypeBox conversion (`convertJsonSchemaToTypebox`, `orderUnionMembers`, `resolveRefTarget`) |
-| `src/config.ts` | Zod schemas, JSONC parsing, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases |
+| `src/jsonc.ts` | Pure JSONC text utility (`stripJsonComments`): single-pass `//` line and `/* */` block comment removal outside of double-quoted strings, preserving `\n`/`\r` so `JSON.parse` error line numbers stay accurate. Used by `src/config.ts` (runtime `mcp.json`) and, as the single canonical import path, the test suites (`tests/config.test.ts`, `tests/fuzz.test.ts`, `tests/repo-policy.test.ts` for `.github/rulesets/default-branch.json`) |
+| `src/config.ts` | Zod schemas, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases |
 | `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, refresh rotation, credential invalidation |
 | `src/oauth-state-store.ts` | Persisted OAuth state: Zod schemas (`StoredStateSchema`), URL canonicalization and origin-binding checks (`canonicalServerUrl`, `urlsMatch`, `isResourceCompatibleWithServerUrl`), atomic `0o600` load/save (`loadState`, `saveState`, `loadStoredRedirectUrisSync`) |
 | `src/auth-lock.ts` | Cross-process `<hash>.json.lock` with heartbeat and stale-lock reclaim; injectable `AuthLockDeps` |
