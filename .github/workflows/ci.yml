@@ -73,9 +73,6 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    # WHY: Issue #54: Windows tests are initially non-blocking while cross-platform
-    # quirks are triaged and fixed. Dropped in a follow-up once Windows is green.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:

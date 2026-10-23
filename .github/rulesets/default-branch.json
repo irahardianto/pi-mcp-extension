@@ -41,6 +41,7 @@
           { "context": "check (22)" },
           { "context": "check (24)" },
           { "context": "test (macos-latest)" },
+          { "context": "test (windows-latest)" },
           { "context": "workflow-lint" },
           { "context": "pr-title" },
           { "context": "gitleaks" },

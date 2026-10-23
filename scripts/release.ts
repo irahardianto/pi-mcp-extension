@@ -155,8 +155,9 @@ const RUN_POLL_SECONDS = 15;
 /**
  * The workflows whose `pull_request` runs the release PR records. Together they
  * produce exactly the check contexts required by `.github/rulesets/default-branch.json`:
- * `check (22)`, `check (24)`, and `test (macos-latest)` (ci.yml), `workflow-lint`,
- * `pr-title`, `gitleaks` (secret-scan.yml), `semgrep`, and `dependency-review`.
+ * `check (22)`, `check (24)`, `test (macos-latest)`, and `test (windows-latest)`
+ * (ci.yml), `workflow-lint`, `pr-title`, `gitleaks` (secret-scan.yml), `semgrep`,
+ * and `dependency-review`.
  * Keep this list in step with the ruleset's required checks; `tests/repo-policy.test.ts`
  * fails when a required context has no workflow whose run the flow approves.
  */

@@ -55,6 +55,7 @@ const REQUIRED_CONTEXTS = [
   "pr-title",
   "semgrep",
   "test (macos-latest)",
+  "test (windows-latest)",
   "workflow-lint",
 ] as const;
 

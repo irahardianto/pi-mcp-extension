@@ -71,6 +71,7 @@ const CONTEXT_WORKFLOWS: Readonly<Record<string, string>> = {
   "check (22)": "ci.yml",
   "check (24)": "ci.yml",
   "test (macos-latest)": "ci.yml",
+  "test (windows-latest)": "ci.yml",
   "workflow-lint": "workflow-lint.yml",
   "pr-title": "pr-title.yml",
   "gitleaks": "secret-scan.yml",
@@ -110,8 +111,11 @@ describe("default-branch ruleset policy", () => {
     assert.deepEqual(requiredContexts(readRuleset()).sort(), [...EXPECTED_REQUIRED_CONTEXTS]);
   });
 
-  it("does not require the non-blocking windows test", () => {
-    assert.ok(!requiredContexts(readRuleset()).includes("test (windows-latest)"));
+  it("requires the windows test now that it is blocking", () => {
+    assert.ok(requiredContexts(readRuleset()).includes("test (windows-latest)"));
+    // WHY: a job-level `continue-on-error` would make the required check pass while
+    // the Windows leg is actually failing, silently restoring the issue #54 exemption.
+    assert.ok(!readRepoFile(".github/workflows/ci.yml").includes("continue-on-error"));
   });
 
   it("has no bypass actors", () => {
