@@ -5,12 +5,12 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { ServerManager } from "../src/server-manager.js";
 import {
-  ServerManager,
   classifyConnectFailure,
   RETRY_DELAYS_MS,
   type ConnectFailureAction,
-} from "../src/server-manager.js";
+} from "../src/connect-policy.js";
 import { ToolBridge, type PiExtensionAPI } from "../src/tool-bridge.js";
 import type { McpConfig } from "../src/config.js";
 import { McpError, AuthCancelledError } from "../src/errors.js";

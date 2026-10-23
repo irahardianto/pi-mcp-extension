@@ -54,7 +54,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow (`authorize`) and browser launcher (`openBrowser`, `browserOpenCommand`) |
 | `src/authorize-dialog.ts` | Interactive OAuth callback dialog waiter (`waitForOAuthCallback`, `OAuthPasteOptions`) and dialog option constants (`authRetryOption`, `authPasteOption`, `authCancelOption`) |
-| `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), pure connect-failure classification (`classifyConnectFailure`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
+| `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
+| `src/connect-policy.ts` | Pure connect-failure classification (`classifyConnectFailure`), OAuth 401/403 detection (`isOAuthUnauthorizedError`), and retry backoff schedule (`RETRY_DELAYS_MS`) |
 | `src/transport-factory.ts` | SDK transport construction (`stdio`, `streamable-http`, `sse`), environment resolution (`resolveEnv`), silent OAuth provider wiring, and transport-level SDK workarounds (`createTransport`) |
 | `src/stdio-process.ts` | Stdio child-process supervision (`isPidAlive`, `ensurePidTerminated`, `instrumentStdioTransport`, injectable `StdioProcessDeps`) and `StringDecoder` stderr line splitting (`createLineSplitter`) |
 | `src/tool-bridge.ts` | Tool naming/hashing/collisions (`buildToolName`), MCP content conversion (`convertMcpContent`), Pi tool registration and `callTool` (`ToolBridge`) |
