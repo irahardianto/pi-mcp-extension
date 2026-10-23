@@ -342,7 +342,8 @@ describe("compareVersions", () => {
 });
 
 describe("selectDispatchedRun", () => {
-  const run = (databaseId: number): WorkflowRun => ({ databaseId });
+  const run = (databaseId: number, headSha?: string): WorkflowRun =>
+    headSha === undefined ? { databaseId } : { databaseId, headSha };
 
   it("returns the run created by the dispatch", () => {
     assert.deepEqual(selectDispatchedRun([run(11), run(12)], 11), run(12));
@@ -362,6 +363,25 @@ describe("selectDispatchedRun", () => {
 
   it("prefers the newest run when several appeared", () => {
     assert.deepEqual(selectDispatchedRun([run(13), run(12), run(14)], 11), run(14));
+  });
+
+  it("ignores a run above the baseline whose head is not the dispatched head", () => {
+    // WHY: the baseline is a snapshot of `gh run list`; a stale run that registers
+    // after the snapshot has an id above the baseline but still carries the old
+    // branch head, because a retry force-pushes the branch before re-dispatching.
+    const stale = run(12, "old-head");
+    assert.equal(selectDispatchedRun([stale], 11, "new-head"), undefined);
+    assert.deepEqual(selectDispatchedRun([stale, run(13, "new-head")], 11, "new-head"), run(13, "new-head"));
+  });
+
+  it("prefers the newest run on the dispatched head when several match", () => {
+    const runs = [run(12, "new-head"), run(13, "old-head"), run(14, "new-head")];
+    assert.deepEqual(selectDispatchedRun(runs, 11, "new-head"), run(14, "new-head"));
+  });
+
+  it("matches by id alone when the dispatched head is unknown", () => {
+    assert.deepEqual(selectDispatchedRun([run(12)], 11), run(12));
+    assert.deepEqual(selectDispatchedRun([run(12, "any-head")], 11), run(12, "any-head"));
   });
 });
 

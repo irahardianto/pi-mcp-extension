@@ -172,9 +172,10 @@ export function releaseBranchName(version: string): string {
   return `release/v${version}`;
 }
 
-/** The subset of `gh run list --json databaseId` this module needs. */
+/** The subset of `gh run list --json databaseId,headSha` this module needs. */
 export interface WorkflowRun {
   readonly databaseId: number;
+  readonly headSha?: string;
 }
 
 /**
@@ -182,23 +183,31 @@ export interface WorkflowRun {
  *
  * A retried release re-dispatches the same workflows onto the same branch, so a run
  * from an earlier attempt — including one still in progress — must never satisfy this
- * attempt's required checks. Only runs with a higher database id than the newest run
- * observed when the workflow was dispatched count, because the id is assigned by
- * GitHub and never moves backwards.
+ * attempt's required checks. A run counts only when both hold:
+ *
+ * - its id is above the newest run observed when the workflow was dispatched (the id is
+ *   assigned by GitHub and never moves backwards), and
+ * - when the dispatched head is known, its head is that head. A retry force-pushes the
+ *   branch to a new commit before dispatching, so an earlier attempt's runs carry a
+ *   different head — this closes the window where a stale run registers in
+ *   `gh run list` *after* the baseline snapshot and would otherwise slip past the id
+ *   check.
  */
 export function selectDispatchedRun(
   runs: readonly WorkflowRun[],
   baselineDatabaseId: number,
+  dispatchedHeadSha?: string,
 ): WorkflowRun | undefined {
   let newest: WorkflowRun | undefined;
   for (const run of runs) {
     if (run.databaseId <= baselineDatabaseId) continue;
+    if (dispatchedHeadSha !== undefined && run.headSha !== dispatchedHeadSha) continue;
     if (newest === undefined || run.databaseId > newest.databaseId) newest = run;
   }
   return newest;
 }
 
-/** Decode `gh run list --json databaseId` output, ignoring anything malformed. */
+/** Decode `gh run list --json databaseId,headSha` output, ignoring anything malformed. */
 function parseWorkflowRuns(raw: string): WorkflowRun[] {
   let decoded: unknown;
   try {
@@ -212,7 +221,11 @@ function parseWorkflowRuns(raw: string): WorkflowRun[] {
   for (const entry of decoded) {
     if (!isJsonObject(entry)) continue;
     const databaseId = entry["databaseId"];
-    if (typeof databaseId === "number") runs.push({ databaseId });
+    if (typeof databaseId !== "number") continue;
+    const headSha = entry["headSha"];
+    // WHY: a run without a head cannot be proven to belong to this dispatch when a
+    // head filter is requested, so keep it only for the id-only case.
+    runs.push(typeof headSha === "string" ? { databaseId, headSha } : { databaseId });
   }
   return runs;
 }
@@ -528,10 +541,14 @@ export function createPullRequests(cwd: string): PullRequestPort {
     }
     return result.stdout.trim();
   };
-  // WHY: the newest run id each branch/workflow had when it was dispatched. A retried
-  // release dispatches the same workflows again, and the completed runs of the failed
-  // attempt must not be mistaken for this attempt's results.
+  // WHY: the newest run id each branch/workflow had when it was dispatched, plus the
+  // head each branch was pushed to. A retried release dispatches the same workflows
+  // again onto the same branch name, and the completed (or still-running) runs of the
+  // failed attempt must not be mistaken for this attempt's results — neither by id
+  // (nothing at or below the dispatch baseline counts) nor by head (a stale run that
+  // registers late carries the old branch head, not the one this dispatch targets).
   const dispatchBaselines = new Map<string, number>();
+  const pushedHeads = new Map<string, string>();
   const runKey = (branch: string, workflow: string): string => `${branch}\u0000${workflow}`;
   const listRuns = (workflow: string, branch: string): WorkflowRun[] =>
     parseWorkflowRuns(
@@ -545,12 +562,13 @@ export function createPullRequests(cwd: string): PullRequestPort {
         "--limit",
         "50",
         "--json",
-        "databaseId",
+        "databaseId,headSha",
       ]),
     );
 
   return {
     pushReleaseBranch(version: string, sha: string): void {
+      pushedHeads.set(releaseBranchName(version), sha);
       // WHY: --force: a previously failed attempt may have left the branch behind;
       // release/* branches are not protected by any ruleset.
       run("git", ["push", "--force", "origin", `${sha}:refs/heads/${releaseBranchName(version)}`], {
@@ -614,11 +632,13 @@ export function createPullRequests(cwd: string): PullRequestPort {
           throw new Error(`workflow ${workflow} was not dispatched on ${branch}`);
         }
         // WHY: a dispatched run can take a few seconds to register; poll until the run
-        // this dispatch created (an id above the baseline) shows up. A completed run
-        // left behind by an earlier attempt is deliberately ignored.
+        // this dispatch created (an id above the baseline, on the pushed head) shows
+        // up. A completed run left behind by an earlier attempt is deliberately
+        // ignored, including one that registers after the baseline was recorded.
+        const dispatchedHead = pushedHeads.get(branch);
         let runId: number | undefined;
         for (let attempt = 0; attempt < RUN_APPEAR_ATTEMPTS && runId === undefined; attempt += 1) {
-          runId = selectDispatchedRun(listRuns(workflow, branch), baseline)?.databaseId;
+          runId = selectDispatchedRun(listRuns(workflow, branch), baseline, dispatchedHead)?.databaseId;
           if (runId === undefined) sleep(RUN_POLL_SECONDS);
         }
         if (runId === undefined) {
