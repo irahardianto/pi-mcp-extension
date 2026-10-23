@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-10-23
+
 ### Fixed
 
 - Release tooling: the automated release now fetches the squash-merge commit of its release PR before creating the `vX.Y.Z` tag (the runner's clone has never seen that commit, so the tag previously failed after the merge and only the next run repaired it).
