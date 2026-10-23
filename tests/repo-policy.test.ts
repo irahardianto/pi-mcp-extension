@@ -121,7 +121,7 @@ describe("default-branch ruleset policy", () => {
   });
 });
 
-describe("release workflow dispatch coverage", () => {
+describe("release workflow approval coverage", () => {
   it("maps every required context to a workflow", () => {
     for (const context of requiredContexts(readRuleset())) {
       assert.ok(
@@ -131,19 +131,21 @@ describe("release workflow dispatch coverage", () => {
     }
   });
 
-  it("dispatches every workflow that produces a required context", () => {
+  it("approves every workflow that produces a required context", () => {
     for (const [context, workflow] of Object.entries(CONTEXT_WORKFLOWS)) {
       assert.ok(
         REQUIRED_WORKFLOWS.includes(workflow),
-        `"${context}" comes from ${workflow}, which REQUIRED_WORKFLOWS does not dispatch`,
+        `"${context}" comes from ${workflow}, which REQUIRED_WORKFLOWS does not approve`,
       );
     }
   });
 
-  it("only dispatches workflows that can be dispatched by hand", () => {
+  it("approves only workflows that record pull_request runs", () => {
+    // WHY: only pull_request runs attach their check runs to the release PR, so the
+    // approve step is meaningless for a workflow without a pull_request trigger.
     for (const workflow of REQUIRED_WORKFLOWS) {
       const contents = readRepoFile(`.github/workflows/${workflow}`);
-      assert.match(contents, /^ {2}workflow_dispatch:/m, `${workflow} must declare workflow_dispatch`);
+      assert.match(contents, /^ {2}pull_request:/m, `${workflow} must declare pull_request`);
     }
   });
 

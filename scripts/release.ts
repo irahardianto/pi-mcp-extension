@@ -13,15 +13,14 @@
  * user-owned repo the GitHub Actions app cannot be a ruleset bypass actor (the API
  * returns 422). The release therefore pushes `release/v<version>`, opens
  * `chore: release v<version>`, and squash-merges the PR once the required workflows
- * passed on the branch. A PR created with `GITHUB_TOKEN` never *executes*
- * `pull_request` workflows, but GitHub still records those runs (conclusion
- * `action_required`, no jobs, no check runs), so the required workflows are
- * dispatched onto the branch by `PullRequestPort.dispatchRequiredWorkflows` and each
- * attempt waits only for the `workflow_dispatch` runs its own dispatch created: a
- * phantom `pull_request` record can never be watched (its `action_required`
- * conclusion fails `gh run watch --exit-status`), and neither can a completed run
- * from a failed attempt. Their check runs land on the PR head sha and satisfy the
- * ruleset at merge time.
+ * passed on the branch. Only `pull_request`-event runs attach their check runs to a
+ * PR, and the release PR is created by the job's `GITHUB_TOKEN`: GitHub records the
+ * PR's `pull_request` workflow runs but never executes them (conclusion
+ * `action_required`, no check runs), and `GITHUB_TOKEN` may not approve a workflow
+ * run. `PullRequestPort.approveRequiredWorkflows` therefore approves each of those
+ * runs with a dedicated PAT (`RELEASE_APPROVE_TOKEN`) so they execute and their
+ * check runs satisfy the ruleset; the flow waits for exactly the run on the pushed
+ * head, so an earlier attempt's run can never stand in for the current one.
  *
  * The squash merge creates a new commit on GitHub that this clone has never seen, so
  * the flow fetches again before creating the tag: `git tag v<version>` fails on an
@@ -114,10 +113,10 @@ export interface PullRequestPort {
   pushReleaseBranch(version: string, sha: string): void;
   /** Open the `chore: release v<version>` PR, or reuse the open PR for the branch (retitled); returns its number. */
   openReleasePullRequest(version: string): number;
-  /** Dispatch the required workflows onto the release branch. */
-  dispatchRequiredWorkflows(branch: string): void;
-  /** Wait until every dispatched workflow run finished successfully. Throws otherwise. */
-  waitForRequiredChecks(branch: string): void;
+  /** Approve the `pull_request` runs the release PR's bot authorship leaves pending, so they execute and attach to the PR. */
+  approveRequiredWorkflows(branch: string, headSha: string): void;
+  /** Wait until every approved workflow run finished successfully. Throws otherwise. */
+  waitForRequiredChecks(branch: string, headSha: string): void;
   /** Squash-merge the release PR (deleting the branch) and return the merge commit sha on `main`. */
   mergeReleasePullRequest(prNumber: number, version: string): string;
 }
@@ -148,18 +147,18 @@ export interface ReleaseOutcome {
 
 const DEFAULT_MAX_PUSH_ATTEMPTS = 3;
 const RELEASE_COMMIT_PREFIX = "chore: release v";
-/** How often the thin `gh` adapter polls for a dispatched workflow run to appear. */
+/** How often the thin `gh` adapter polls for a recorded workflow run to settle. */
 const RUN_APPEAR_ATTEMPTS = 20;
-/** Poll interval (seconds) for dispatched workflow runs. */
+/** Poll interval (seconds) for the release PR's workflow runs. */
 const RUN_POLL_SECONDS = 15;
 
 /**
- * The workflows dispatched onto the release branch. Together they produce exactly
- * the check contexts required by `.github/rulesets/default-branch.json`:
+ * The workflows whose `pull_request` runs the release PR records. Together they
+ * produce exactly the check contexts required by `.github/rulesets/default-branch.json`:
  * `check (22)`, `check (24)`, and `test (macos-latest)` (ci.yml), `workflow-lint`,
  * `pr-title`, `gitleaks` (secret-scan.yml), `semgrep`, and `dependency-review`.
  * Keep this list in step with the ruleset's required checks; `tests/repo-policy.test.ts`
- * fails when a required context has no dispatched workflow.
+ * fails when a required context has no workflow whose run the flow approves.
  */
 export const REQUIRED_WORKFLOWS: readonly string[] = [
   "ci.yml",
@@ -175,50 +174,57 @@ export function releaseBranchName(version: string): string {
   return `release/v${version}`;
 }
 
-/** The subset of `gh run list --json databaseId,headSha,event` this module needs. */
+/** The subset of `gh run list --json databaseId,headSha,event,status,conclusion` this module needs. */
 export interface WorkflowRun {
   readonly databaseId: number;
   readonly headSha?: string;
   readonly event?: string;
+  readonly status?: string;
+  readonly conclusion?: string;
 }
 
 /**
- * Pick the run created by the current dispatch.
+ * Pick the run the release PR's own activity recorded for `headSha`.
  *
- * A retried release re-dispatches the same workflows onto the same branch, and a PR
- * created with `GITHUB_TOKEN` leaves `pull_request` runs recorded on that branch
- * (conclusion `action_required`, never executed, no check runs). Neither kind of run
- * may ever satisfy this attempt's required checks, so a run counts only when all of
- * these hold:
- *
- * - its event is `workflow_dispatch` — the only event `gh workflow run` creates, and
- *   the phantom `pull_request` records are not dispatched by anyone. Production hit
- *   this on the first real release: the phantom CI run was the newest run on the
- *   branch and `gh run watch --exit-status` on it exited 1.
- * - its id is above the newest run observed when the workflow was dispatched (the id
- *   is assigned by GitHub and never moves backwards), and
- * - when the dispatched head is known, its head is that head. A retry force-pushes the
- *   branch to a new commit before dispatching, so an earlier attempt's runs carry a
- *   different head — this closes the window where a stale run registers in
- *   `gh run list` *after* the baseline snapshot and would otherwise slip past the id
- *   check.
+ * Only `pull_request`-event runs attach their check runs to the release PR, and the
+ * flow's branch push / PR creation records exactly one of them per required workflow
+ * on the pushed head. The head pins the attempt: a retried release force-pushes a new
+ * commit before it can merge, so an earlier attempt's run — or a manually dispatched
+ * `workflow_dispatch` run — can never stand in for this attempt's checks.
  */
-export function selectDispatchedRun(
+export function selectPullRequestRun(
   runs: readonly WorkflowRun[],
-  baselineDatabaseId: number,
-  dispatchedHeadSha?: string,
+  headSha: string,
 ): WorkflowRun | undefined {
   let newest: WorkflowRun | undefined;
   for (const run of runs) {
-    if (run.event !== "workflow_dispatch") continue;
-    if (run.databaseId <= baselineDatabaseId) continue;
-    if (dispatchedHeadSha !== undefined && run.headSha !== dispatchedHeadSha) continue;
+    if (run.event !== "pull_request") continue;
+    if (run.headSha !== headSha) continue;
     if (newest === undefined || run.databaseId > newest.databaseId) newest = run;
   }
   return newest;
 }
 
-/** Decode `gh run list --json databaseId,headSha,event` output, ignoring anything malformed. */
+/**
+ * Whether a run is one GitHub recorded but never executes: the `pull_request` runs a
+ * `GITHUB_TOKEN`-authored PR leaves pending, in `action_required` until a PAT
+ * approves them (which `GITHUB_TOKEN` may not do).
+ */
+export function isAwaitingApproval(run: WorkflowRun): boolean {
+  return run.conclusion === "action_required";
+}
+
+/**
+ * Whether a recorded run has settled into a state the flow can act on: it is queued
+ * or running (someone already approved it), or completed with a real conclusion.
+ * A freshly recorded run may briefly report neither.
+ */
+export function isSettled(run: WorkflowRun): boolean {
+  if (run.status === undefined || run.status === "") return false;
+  return run.status !== "completed" || (run.conclusion !== undefined && run.conclusion !== "");
+}
+
+/** Decode `gh run list` JSON output, ignoring anything malformed. */
 function parseWorkflowRuns(raw: string): WorkflowRun[] {
   let decoded: unknown;
   try {
@@ -233,13 +239,23 @@ function parseWorkflowRuns(raw: string): WorkflowRun[] {
     if (!isJsonObject(entry)) continue;
     const databaseId = entry["databaseId"];
     if (typeof databaseId !== "number") continue;
-    // WHY: a run missing its head or event cannot be proven to be the dispatched run
-    // once those filters are requested, so keep only what was actually returned.
-    const run: { databaseId: number; headSha?: string; event?: string } = { databaseId };
+    // WHY: a run missing its head or event cannot be proven to be the run this flow
+    // must approve, so keep only what was actually returned.
+    const run: {
+      databaseId: number;
+      headSha?: string;
+      event?: string;
+      status?: string;
+      conclusion?: string;
+    } = { databaseId };
     const headSha = entry["headSha"];
     if (typeof headSha === "string") run.headSha = headSha;
     const event = entry["event"];
     if (typeof event === "string") run.event = event;
+    const status = entry["status"];
+    if (typeof status === "string") run.status = status;
+    const conclusion = entry["conclusion"];
+    if (typeof conclusion === "string") run.conclusion = conclusion;
     runs.push(run);
   }
   return runs;
@@ -556,17 +572,11 @@ export function createPullRequests(cwd: string): PullRequestPort {
     }
     return result.stdout.trim();
   };
-  // WHY: the newest run id each branch/workflow had when it was dispatched, plus the
-  // head each branch was pushed to. A retried release dispatches the same workflows
-  // again onto the same branch name, and the completed (or still-running) runs of the
-  // failed attempt must not be mistaken for this attempt's results — neither by event
-  // (only `workflow_dispatch` runs were dispatched; the `pull_request` records a
-  // `GITHUB_TOKEN` PR leaves behind conclude `action_required` and never execute), by
-  // id (nothing at or below the dispatch baseline counts), nor by head (a stale run
-  // that registers late carries the old branch head, not the one this dispatch
-  // targets).
-  const dispatchBaselines = new Map<string, number>();
-  const pushedHeads = new Map<string, string>();
+  // WHY: the run each branch/workflow approved, keyed for the wait step. The head sha
+  // pins the attempt, so no baseline bookkeeping is needed: a retried release
+  // force-pushes a new commit, and only this attempt's `pull_request` run on the
+  // pushed head counts.
+  const approvedRuns = new Map<string, number>();
   const runKey = (branch: string, workflow: string): string => `${branch}\u0000${workflow}`;
   const listRuns = (workflow: string, branch: string): WorkflowRun[] =>
     parseWorkflowRuns(
@@ -580,13 +590,34 @@ export function createPullRequests(cwd: string): PullRequestPort {
         "--limit",
         "50",
         "--json",
-        "databaseId,headSha,event",
+        "databaseId,headSha,event,status,conclusion",
       ]),
     );
+  // WHY: approving a workflow run needs a PAT — GitHub rejects GITHUB_TOKEN (a
+  // workflow must never approve runs, including its own PR's), and RELEASE_TOKEN *is*
+  // the job's GITHUB_TOKEN. The token must not reach the npm CLI (see
+  // pushEnvironment); it is only ever passed to `gh`.
+  const approveToken = process.env["RELEASE_APPROVE_TOKEN"];
+  const approveRun = (runId: number): void => {
+    if (approveToken === undefined) {
+      throw new Error(
+        "RELEASE_APPROVE_TOKEN is not set: the release PR's pull_request runs cannot be approved (a fine-grained PAT with Actions write access is required; GITHUB_TOKEN may not approve workflow runs)",
+      );
+    }
+    const result = run(
+      "gh",
+      ["api", "--method", "POST", `repos/${repoSlug(cwd)}/actions/runs/${runId}/approve`],
+      { cwd, env: { ...process.env, GH_TOKEN: approveToken }, allowFailure: true },
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `\`gh api repos/${repoSlug(cwd)}/actions/runs/${runId}/approve\` failed with exit code ${result.status}: ${result.stderr.trim()}`,
+      );
+    }
+  };
 
   return {
     pushReleaseBranch(version: string, sha: string): void {
-      pushedHeads.set(releaseBranchName(version), sha);
       // WHY: --force: a previously failed attempt may have left the branch behind;
       // release/* branches are not protected by any ruleset.
       run("git", ["push", "--force", "origin", `${sha}:refs/heads/${releaseBranchName(version)}`], {
@@ -598,7 +629,7 @@ export function createPullRequests(cwd: string): PullRequestPort {
       const title = `${RELEASE_COMMIT_PREFIX}${version}`;
       // WHY: the body is static; the release commit itself carries the version bump.
       const body =
-        "Automated release PR. The publish workflow dispatches the required status checks onto this branch and squash-merges once they pass.";
+        "Automated release PR. The publish workflow approves this branch's required status-check runs (they sit pending because the PR is opened with GITHUB_TOKEN) and squash-merges once they pass.";
       const created = gh(
         ["pr", "create", "--base", "main", "--head", releaseBranchName(version), "--title", title, "--body", body],
         true,
@@ -633,34 +664,33 @@ export function createPullRequests(cwd: string): PullRequestPort {
       ok(["pr", "edit", String(prNumber), "--title", title, "--body", body]);
       return prNumber;
     },
-    dispatchRequiredWorkflows(branch: string): void {
+    approveRequiredWorkflows(branch: string, headSha: string): void {
       for (const workflow of REQUIRED_WORKFLOWS) {
-        let baseline = 0;
-        for (const run of listRuns(workflow, branch)) {
-          if (run.databaseId > baseline) baseline = run.databaseId;
+        // WHY: the run is recorded a second or two after the PR activity that caused
+        // it; poll until the run on the pushed head settles into a state the flow can
+        // act on.
+        let run: WorkflowRun | undefined;
+        for (let attempt = 0; attempt < RUN_APPEAR_ATTEMPTS && run === undefined; attempt += 1) {
+          const candidate = selectPullRequestRun(listRuns(workflow, branch), headSha);
+          if (candidate !== undefined && isSettled(candidate)) run = candidate;
+          else sleep(RUN_POLL_SECONDS);
         }
-        dispatchBaselines.set(runKey(branch, workflow), baseline);
-        ok(["workflow", "run", workflow, "--ref", branch]);
+        if (run === undefined) {
+          throw new Error(
+            `workflow ${workflow} has no pull_request run on ${branch} at ${headSha.slice(0, 8)} — the release PR's checks cannot be satisfied`,
+          );
+        }
+        approvedRuns.set(runKey(branch, workflow), run.databaseId);
+        // WHY: only a run GitHub recorded but never executes needs approving; one
+        // already queued, running, or completed is watched as-is.
+        if (isAwaitingApproval(run)) approveRun(run.databaseId);
       }
     },
-    waitForRequiredChecks(branch: string): void {
+    waitForRequiredChecks(branch: string, headSha: string): void {
       for (const workflow of REQUIRED_WORKFLOWS) {
-        const baseline = dispatchBaselines.get(runKey(branch, workflow));
-        if (baseline === undefined) {
-          throw new Error(`workflow ${workflow} was not dispatched on ${branch}`);
-        }
-        // WHY: a dispatched run can take a few seconds to register; poll until the run
-        // this dispatch created (an id above the baseline, on the pushed head) shows
-        // up. A completed run left behind by an earlier attempt is deliberately
-        // ignored, including one that registers after the baseline was recorded.
-        const dispatchedHead = pushedHeads.get(branch);
-        let runId: number | undefined;
-        for (let attempt = 0; attempt < RUN_APPEAR_ATTEMPTS && runId === undefined; attempt += 1) {
-          runId = selectDispatchedRun(listRuns(workflow, branch), baseline, dispatchedHead)?.databaseId;
-          if (runId === undefined) sleep(RUN_POLL_SECONDS);
-        }
+        const runId = approvedRuns.get(runKey(branch, workflow));
         if (runId === undefined) {
-          throw new Error(`dispatched workflow ${workflow} never started on ${branch}`);
+          throw new Error(`workflow ${workflow} on ${branch}@${headSha.slice(0, 8)} was not approved`);
         }
         // WHY: --exit-status fails this step when the run fails.
         ok(["run", "watch", String(runId), "--exit-status", "--interval", String(RUN_POLL_SECONDS)]);
@@ -781,8 +811,8 @@ function landReleaseOnMain(
     const branch = releaseBranchName(version);
     pullRequests.pushReleaseBranch(version, sha);
     const prNumber = pullRequests.openReleasePullRequest(version);
-    pullRequests.dispatchRequiredWorkflows(branch);
-    pullRequests.waitForRequiredChecks(branch);
+    pullRequests.approveRequiredWorkflows(branch, sha);
+    pullRequests.waitForRequiredChecks(branch, sha);
     let mergeSha: string;
     try {
       mergeSha = pullRequests.mergeReleasePullRequest(prNumber, version);

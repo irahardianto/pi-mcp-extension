@@ -8,8 +8,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Release tooling: the automated release now fetches the squash-merge commit of its release PR before creating the `vX.Y.Z` tag (the runner's clone has never seen that commit, so the tag previously failed after the merge and only the next run repaired it), and a retried release waits for the check runs it dispatched instead of accepting a completed run left by the earlier attempt.
-- Release tooling: waiting for the dispatched checks now selects only `workflow_dispatch` runs. A release PR created with `GITHUB_TOKEN` still leaves `pull_request` workflow runs recorded as `action_required` (never executed, no check runs), and watching the newest of those — exactly what the first real release run did — fails the release before the merge.
+- Release tooling: the automated release now fetches the squash-merge commit of its release PR before creating the `vX.Y.Z` tag (the runner's clone has never seen that commit, so the tag previously failed after the merge and only the next run repaired it).
+- Release tooling: the release PR's required checks are now satisfied by approving and awaiting the `pull_request` runs the PR itself records. The release PR is opened with `GITHUB_TOKEN`, so GitHub records those runs but never executes them (`action_required`), and `GITHUB_TOKEN` may not approve a workflow run — while check runs from a dispatched `workflow_dispatch` run never attach to the PR at all, so the first real release failed at the merge with "the base branch policy prohibits the merge". The approval uses the new `RELEASE_APPROVE_TOKEN` secret (a fine-grained PAT with Actions write access), and the wait watches exactly the run recorded on the pushed head, so a retried attempt can never accept an earlier attempt's checks.
 
 ## [1.10.0] - 2026-10-20
 

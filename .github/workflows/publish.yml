@@ -78,8 +78,8 @@ jobs:
       contents: write # WHY: push the release branch and tag, and merge the release PR
       id-token: write # WHY: mint Sigstore provenance attestations for npm OIDC Trusted Publishing
       pull-requests: write # WHY: open, retitle and squash-merge the release PR (required status checks on main block direct pushes)
-      actions: write # WHY: dispatch the required workflows onto the release branch (a GITHUB_TOKEN PR leaves pull_request runs recorded as action_required but never executes them)
-    # WHY: the release PR waits for the dispatched required workflows (CI matrix plus
+      actions: read # WHY: list and watch the release PR's workflow runs; approving them uses the RELEASE_APPROVE_TOKEN PAT (GITHUB_TOKEN may not approve runs)
+    # WHY: the release PR waits for its approved required workflows (CI matrix plus
     # OS tests), which take longer than the checks the job runs itself.
     timeout-minutes: 30
     env:
@@ -147,4 +147,10 @@ jobs:
         # installs dependencies (no `npm ci` with a write token).
         env:
           RELEASE_TOKEN: ${{ github.token }}
+          # WHY: a fine-grained PAT with Actions write access. The release PR is opened
+          # by GITHUB_TOKEN, so GitHub records its pull_request workflows but never
+          # executes them (action_required); approving a run is forbidden to
+          # GITHUB_TOKEN, so this PAT is the only thing that lets the required checks
+          # actually run on the release PR.
+          RELEASE_APPROVE_TOKEN: ${{ secrets.RELEASE_APPROVE_TOKEN }}
         run: node scripts/release.ts

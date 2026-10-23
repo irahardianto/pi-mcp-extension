@@ -20,7 +20,9 @@ import {
   detectBump,
   runRelease,
   REQUIRED_WORKFLOWS,
-  selectDispatchedRun,
+  selectPullRequestRun,
+  isAwaitingApproval,
+  isSettled,
   type CommitInfo,
   type GitPort,
   type NpmPort,
@@ -179,8 +181,9 @@ function gitAllowFailure(cwd: string, args: string[]): { status: number; stderr:
  */
 class FakePullRequests implements PullRequestPort {
   readonly pushedBranches: string[] = [];
+  readonly pushedHeads: string[] = [];
   readonly openedTitles: string[] = [];
-  readonly dispatched: string[] = [];
+  readonly approvals: string[] = [];
   readonly waited: string[] = [];
   readonly merges: string[] = [];
   mergeAttempts = 0;
@@ -204,6 +207,7 @@ class FakePullRequests implements PullRequestPort {
 
   pushReleaseBranch(version: string, sha: string): void {
     this.pushedBranches.push(`release/v${version}`);
+    this.pushedHeads.push(sha);
     this.branchHeads.set(version, sha);
     // The PR is opened against the `main` tip the release was based on.
     this.branchBases.set(version, git(this.cwd, ["rev-parse", "origin/main"]).trim());
@@ -215,14 +219,14 @@ class FakePullRequests implements PullRequestPort {
     return this.nextNumber++;
   }
 
-  dispatchRequiredWorkflows(branch: string): void {
+  approveRequiredWorkflows(branch: string, headSha: string): void {
     for (const workflow of REQUIRED_WORKFLOWS) {
-      this.dispatched.push(`${workflow}@${branch}`);
+      this.approvals.push(`${workflow}@${branch}@${headSha.slice(0, 8)}`);
     }
   }
 
-  waitForRequiredChecks(branch: string): void {
-    this.waited.push(branch);
+  waitForRequiredChecks(branch: string, headSha: string): void {
+    this.waited.push(`${branch}@${headSha.slice(0, 8)}`);
     if (this.rejectChecks) {
       throw new Error(`required checks failed on ${branch}`);
     }
@@ -341,66 +345,73 @@ describe("compareVersions", () => {
   });
 });
 
-describe("selectDispatchedRun", () => {
-  const run = (databaseId: number, headSha?: string, event = "workflow_dispatch"): WorkflowRun =>
-    headSha === undefined ? { databaseId, event } : { databaseId, headSha, event };
+describe("selectPullRequestRun", () => {
+  const run = (databaseId: number, headSha: string, event = "pull_request"): WorkflowRun =>
+    ({ databaseId, headSha, event });
 
-  it("returns the run created by the dispatch", () => {
-    assert.deepEqual(selectDispatchedRun([run(11), run(12)], 11), run(12));
+  it("returns the pull_request run the PR's activity recorded on the pushed head", () => {
+    const pending = run(12, "new-head");
+    assert.deepEqual(selectPullRequestRun([run(11, "other-head"), pending], "new-head"), pending);
   });
 
-  it("returns nothing until a run newer than the dispatch baseline exists", () => {
-    assert.equal(selectDispatchedRun([], 11), undefined);
-    assert.equal(selectDispatchedRun([run(10), run(11)], 11), undefined);
+  it("prefers the newest pull_request run on the head when several exist", () => {
+    const runs = [run(12, "new-head"), run(13, "new-head"), run(14, "new-head")];
+    assert.deepEqual(selectPullRequestRun(runs, "new-head"), run(14, "new-head"));
   });
 
-  it("never accepts a completed run left by an earlier attempt", () => {
-    // WHY: a retried release re-dispatches on the same branch. The runs of the failed
-    // attempt are exactly the ones a retry must not mistake for its own checks.
-    const stale = [run(7), run(8), run(9)];
-    assert.equal(selectDispatchedRun(stale, 9), undefined);
+  it("ignores runs on other heads, as a retried release must", () => {
+    // WHY: a retried release force-pushes a new commit before it can merge, so the
+    // failed attempt's runs carry a different head and must not stand in for this
+    // attempt's checks.
+    const stale = [run(7, "old-head"), run(8, "old-head"), run(9, "old-head")];
+    assert.equal(selectPullRequestRun(stale, "new-head"), undefined);
   });
 
-  it("prefers the newest run when several appeared", () => {
-    assert.deepEqual(selectDispatchedRun([run(13), run(12), run(14)], 11), run(14));
+  it("ignores runs of other events, as a manually dispatched run must not", () => {
+    // WHY: only pull_request runs attach their check runs to the release PR; a
+    // workflow_dispatch run on the same branch satisfies nothing at merge time (the
+    // first real release failed exactly there).
+    const dispatched = run(15, "new-head", "workflow_dispatch");
+    assert.equal(selectPullRequestRun([dispatched], "new-head"), undefined);
   });
 
-  it("ignores a run above the baseline whose head is not the dispatched head", () => {
-    // WHY: the baseline is a snapshot of `gh run list`; a stale run that registers
-    // after the snapshot has an id above the baseline but still carries the old
-    // branch head, because a retry force-pushes the branch before re-dispatching.
-    const stale = run(12, "old-head");
-    assert.equal(selectDispatchedRun([stale], 11, "new-head"), undefined);
-    assert.deepEqual(selectDispatchedRun([stale, run(13, "new-head")], 11, "new-head"), run(13, "new-head"));
+  it("returns nothing while no run exists for the head", () => {
+    assert.equal(selectPullRequestRun([], "new-head"), undefined);
+    assert.equal(selectPullRequestRun([{ databaseId: 12 }], "new-head"), undefined);
+  });
+});
+
+describe("isAwaitingApproval", () => {
+  it("marks the runs GitHub records but never executes", () => {
+    // WHY: a PR opened by GITHUB_TOKEN leaves its pull_request runs in
+    // "action_required" forever — GITHUB_TOKEN may not approve them — and only an
+    // approved run executes and attaches check runs to the PR.
+    const pending: WorkflowRun = { databaseId: 12, conclusion: "action_required" };
+    assert.equal(isAwaitingApproval(pending), true);
+    const running: WorkflowRun = { databaseId: 12, status: "in_progress", conclusion: "" };
+    assert.equal(isAwaitingApproval(running), false);
+    const failed: WorkflowRun = { databaseId: 12, status: "completed", conclusion: "failure" };
+    assert.equal(isAwaitingApproval(failed), false);
+  });
+});
+
+describe("isSettled", () => {
+  it("accepts a queued, running, or concluded run", () => {
+    // WHY: the approve step must act on the run's settled state: queued or running
+    // (already approved — watch it), completed (concluded — watch it), or
+    // action_required (approve it first).
+    assert.equal(isSettled({ databaseId: 12, status: "queued", conclusion: "" }), true);
+    assert.equal(isSettled({ databaseId: 12, status: "in_progress", conclusion: "" }), true);
+    assert.equal(isSettled({ databaseId: 12, status: "completed", conclusion: "success" }), true);
+    assert.equal(isSettled({ databaseId: 12, status: "completed", conclusion: "action_required" }), true);
   });
 
-  it("prefers the newest run on the dispatched head when several match", () => {
-    const runs = [run(12, "new-head"), run(13, "old-head"), run(14, "new-head")];
-    assert.deepEqual(selectDispatchedRun(runs, 11, "new-head"), run(14, "new-head"));
-  });
-
-  it("matches by id alone when the dispatched head is unknown", () => {
-    assert.deepEqual(selectDispatchedRun([run(12)], 11), run(12));
-    assert.deepEqual(selectDispatchedRun([run(12, "any-head")], 11), run(12, "any-head"));
-  });
-
-  it("ignores a pull_request run recorded above the baseline on the dispatched head", () => {
-    // WHY: a PR created with GITHUB_TOKEN never executes pull_request workflows, but
-    // GitHub still records them (conclusion "action_required", no jobs, no check
-    // runs), and they appear in `gh run list` after the dispatch baseline was taken.
-    // Production hit this on the first real release: the phantom CI run was the
-    // newest run on the branch, `gh run watch --exit-status` on it exited 1, and the
-    // release failed before merging. Only a workflow_dispatch run can be the run this
-    // flow's dispatch created.
-    const dispatched = run(15, "new-head");
-    const phantom = run(16, "new-head", "pull_request");
-    assert.deepEqual(selectDispatchedRun([dispatched, phantom], 11, "new-head"), dispatched);
-    assert.equal(selectDispatchedRun([phantom], 11, "new-head"), undefined);
-  });
-
-  it("ignores a run without an event field", () => {
-    // WHY: a malformed `gh run list` entry cannot be proven to be a dispatched run.
-    assert.equal(selectDispatchedRun([{ databaseId: 12 }], 11), undefined);
+  it("rejects a freshly recorded run that has not settled yet", () => {
+    // WHY: `gh run list` can briefly report a run without status; acting on it would
+    // skip the approval a still-registering run needs.
+    assert.equal(isSettled({ databaseId: 12 }), false);
+    assert.equal(isSettled({ databaseId: 12, status: "" }), false);
+    assert.equal(isSettled({ databaseId: 12, status: "completed", conclusion: "" }), false);
   });
 });
 
@@ -423,14 +434,18 @@ describe("runRelease", () => {
       assert.equal(npm.publishCount, 1);
       assert.deepEqual([...npm.published], ["1.1.0"]);
 
-      // The release landed through a PR: pushed branch, dispatched checks, one merge.
+      // The release landed through a PR: pushed branch, approved checks, one merge.
+      // The approvals and the wait are pinned to the pushed head: only the
+      // pull_request run on that exact commit can satisfy this attempt's checks.
+      const head = pullRequests.pushedHeads[0];
+      assert.ok(head !== undefined, "the release branch was pushed");
       assert.deepEqual(pullRequests.pushedBranches, ["release/v1.1.0"]);
       assert.deepEqual(pullRequests.openedTitles, ["chore: release v1.1.0"]);
       assert.deepEqual(
-        pullRequests.dispatched,
-        REQUIRED_WORKFLOWS.map((workflow) => `${workflow}@release/v1.1.0`),
+        pullRequests.approvals,
+        REQUIRED_WORKFLOWS.map((workflow) => `${workflow}@release/v1.1.0@${head.slice(0, 8)}`),
       );
-      assert.deepEqual(pullRequests.waited, ["release/v1.1.0"]);
+      assert.deepEqual(pullRequests.waited, [`release/v1.1.0@${head.slice(0, 8)}`]);
       assert.deepEqual(pullRequests.merges, ["#1 v1.1.0"]);
       // The merged release branch is deleted, like --delete-branch.
       assert.deepEqual(remoteBranches(fixture.remote), ["main"]);
@@ -637,7 +652,7 @@ describe("runRelease", () => {
       // No second release was created for the same commits, and no PR was needed:
       // the release commit is already on main.
       assert.deepEqual(pullRequests.merges, []);
-      assert.deepEqual(pullRequests.dispatched, []);
+      assert.deepEqual(pullRequests.approvals, []);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0", "v1.1.0"]);
       assert.equal(
         git(fixture.remote, ["rev-list", "--count", "main"]).trim(),
@@ -668,7 +683,7 @@ describe("runRelease", () => {
       assert.equal(npm.publishCount, 0);
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
       // No release PR was opened for a non-release.
-      assert.deepEqual(pullRequests.dispatched, []);
+      assert.deepEqual(pullRequests.approvals, []);
       assert.deepEqual(pullRequests.merges, []);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -695,7 +710,7 @@ describe("runRelease", () => {
       assert.deepEqual(remoteTags(fixture.remote), ["v1.0.0"]);
       assert.equal(remoteVersion(fixture.remote), "1.0.0");
       // The rehearsal opens no pull request.
-      assert.deepEqual(pullRequests.dispatched, []);
+      assert.deepEqual(pullRequests.approvals, []);
       assert.deepEqual(pullRequests.merges, []);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
