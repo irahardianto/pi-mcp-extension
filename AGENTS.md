@@ -62,6 +62,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, refresh rotation, credential invalidation |
 | `src/oauth-state-store.ts` | Persisted OAuth state: Zod schemas (`StoredStateSchema`), URL canonicalization and origin-binding checks (`canonicalServerUrl`, `urlsMatch`, `isResourceCompatibleWithServerUrl`), atomic `0o600` load/save (`loadState`, `saveState`, `loadStoredRedirectUrisSync`) |
 | `src/auth-lock.ts` | Cross-process `<hash>.json.lock` with heartbeat and stale-lock reclaim; injectable `AuthLockDeps` |
+| `src/auth-lock-policy.ts` | Pure lock-record schema and staleness policy (`LockRecordSchema`, `parseLockRecord`, `isLockStale`, `formatHolderDetails`, `HEARTBEAT_MS`, `STALE_MS`) |
 | `src/callback-server.ts`, `src/callback-url.ts` | Instance-scoped `CallbackServer` loopback OAuth callback listener; pure redirect/callback URL validation (`callbackServerConfigFromRedirectUrl`) and headless paste-back parsing |
 | `src/auth-challenge.ts` | `WWW-Authenticate` discovery (RFC 9728 `resource_metadata`, `scope`) |
 | `src/terminal-text.ts` | Pure terminal/notification text sanitization (`sanitizeTerminalText`): strips ANSI/OSC/DCS/C1 escape sequences and C0/C1 control characters, collapses line breaks, and bounds string length on code-point boundaries |
