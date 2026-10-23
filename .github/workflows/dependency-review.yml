@@ -18,7 +18,7 @@ permissions:
 
 concurrency:
   group: dependency-review-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   dependency-review:
@@ -65,7 +65,8 @@ jobs:
       # WHY: actions/checkout is intentionally omitted. actions/dependency-review-action v5.0.0
       # compares dependency manifests using GitHub's Dependency Review API. Local workspace
       # files are not read when configuration is inline; the comparison refs come from the
-      # resolve step (the PR event payload on pull_request, the release PR on dispatch).
+      # resolve step (the PR event payload on pull_request, the merge_group payload in a
+      # merge queue, or the release PR on workflow_dispatch).
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:

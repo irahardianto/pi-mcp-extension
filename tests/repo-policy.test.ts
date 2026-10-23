@@ -149,6 +149,24 @@ describe("release workflow approval coverage", () => {
     }
   });
 
+  it("declares merge_group and merge-queue-safe concurrency on every required workflow", () => {
+    // WHY: when a merge queue is enabled (e.g. if the repo moves to an organization,
+    // issue #138; omitted from default-branch.json while under a personal User account
+    // because the GitHub rulesets API rejects merge_queue with HTTP 422 there), every
+    // required status check must report on merge_group, key concurrency with github.ref
+    // so non-PR events do not collapse to an empty group, and only cancel-in-progress
+    // on pull_request so queued merge_group runs are not cancelled mid-flight.
+    for (const workflow of REQUIRED_WORKFLOWS) {
+      const contents = readRepoFile(`.github/workflows/${workflow}`);
+      assert.match(contents, /^ {2}merge_group:/m, `${workflow} must declare merge_group`);
+      assert.match(
+        contents,
+        /^concurrency:\n(?: {2}#.*\n)* {2}group: .*github\.ref.*\n(?: {2}#.*\n)* {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/m,
+        `${workflow} concurrency must include github.ref in group and gate cancel-in-progress on pull_request`,
+      );
+    }
+  });
+
   it("documents every required context in AGENTS.md", () => {
     const agents = readRepoFile("AGENTS.md");
     for (const context of requiredContexts(readRuleset())) {
