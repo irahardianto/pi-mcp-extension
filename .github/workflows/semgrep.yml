@@ -6,6 +6,7 @@ on:
   # WHY: no `branches:` filter. Stacked PRs (AGENTS.md -> Commits & release) target another
   # PR's branch, not `main`, and must be checked before they land on `main` one by one.
   pull_request:
+  merge_group:
   schedule:
     # Weekly Sunday midnight scan for newly published rules / vulnerability disclosures.
     - cron: "0 0 * * 0"

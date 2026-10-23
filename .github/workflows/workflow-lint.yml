@@ -8,6 +8,7 @@ on:
   # WHY: no `paths:` filter. Required status checks in branch rulesets stay pending
   # forever on PRs that do not touch the filtered paths. Linting takes seconds.
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 # Least privilege for every job: this workflow only reads repository contents by default.

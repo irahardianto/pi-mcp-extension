@@ -3,6 +3,7 @@ name: pr-title
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  merge_group:
   # WHY: publish.yml dispatches this workflow onto the release branch: a PR created
   # with GITHUB_TOKEN triggers no pull_request workflows, so the release PR gets its
   # `pr-title` check run this way instead.
@@ -12,7 +13,7 @@ permissions:
   contents: read # WHY: default workflow-level read access
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -34,6 +35,12 @@ jobs:
           HEAD_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            # WHY: merge queue re-runs this check on the staged merge, where no single PR
+            # title applies; title validation already happened on the PR. No-op success.
+            printf 'number=0\ntitle=\nbody<<PR_BODY_EOF\n\nPR_BODY_EOF\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             # WHY: dispatched runs carry no pull_request payload; resolve the open PR
             # for the branch instead.
@@ -60,6 +67,12 @@ jobs:
           BODY: ${{ steps.pr.outputs.body }}
         run: |
           set -euo pipefail
+
+          if [ "${PR_NUMBER:-0}" = "0" ]; then
+            # WHY: merge_group no-op (see resolve step); nothing to validate.
+            printf '::notice::merge_group context: skipping PR title validation.\n'
+            exit 0
+          fi
 
           CR=$'\r'
           LF=$'\n'

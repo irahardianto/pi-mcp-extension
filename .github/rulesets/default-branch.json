@@ -49,6 +49,19 @@
         ],
         "strict_required_status_checks_policy": true
       }
+    },
+    {
+      "type": "merge_queue",
+      "parameters": {
+        "actor_controlled_merging": false,
+        "check_response_timeout_minutes": 60,
+        "grouping_strategy": "ALLGREEN",
+        "max_entries_to_build": 2,
+        "max_entries_to_merge": 1,
+        "merge_method": "SQUASH",
+        "min_entries_to_merge": 1,
+        "min_entries_to_merge_wait_minutes": 5
+      }
     }
   ],
   "bypass_actors": []

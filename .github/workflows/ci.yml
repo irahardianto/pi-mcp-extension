@@ -6,6 +6,7 @@ on:
   # WHY: no `branches:` filter. Stacked PRs (AGENTS.md -> Commits & release) target another
   # PR's branch, not `main`, and must be checked before they land on `main` one by one.
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 # Least privilege for every job: this workflow only reads the repository.

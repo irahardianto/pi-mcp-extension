@@ -4,6 +4,7 @@ on:
   # WHY: no `branches:` filter. Stacked PRs target another PR's branch,
   # not `main`, and must be checked before merging into their base.
   pull_request:
+  merge_group:
   # WHY: publish.yml dispatches this workflow onto the release branch: a PR created
   # with GITHUB_TOKEN triggers no pull_request workflows, so the release PR gets its
   # `dependency-review` check run this way instead.
@@ -36,6 +37,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
           HEAD_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -48,6 +51,11 @@ jobs:
               printf '::error::No open pull request for branch %s to review dependencies for.\n' "$HEAD_REF"
               exit 1
             fi
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # WHY: merge queue stages the PR onto the current main; compare the staged
+            # merge commit's base/head SHAs provided by the merge_group payload.
+            BASE_REF="$MG_BASE"
+            HEAD_REF_SHA="$MG_HEAD"
           else
             BASE_REF="$PR_BASE"
             HEAD_REF_SHA="$PR_HEAD"
