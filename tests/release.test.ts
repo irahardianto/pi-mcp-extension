@@ -342,8 +342,8 @@ describe("compareVersions", () => {
 });
 
 describe("selectDispatchedRun", () => {
-  const run = (databaseId: number, headSha?: string): WorkflowRun =>
-    headSha === undefined ? { databaseId } : { databaseId, headSha };
+  const run = (databaseId: number, headSha?: string, event = "workflow_dispatch"): WorkflowRun =>
+    headSha === undefined ? { databaseId, event } : { databaseId, headSha, event };
 
   it("returns the run created by the dispatch", () => {
     assert.deepEqual(selectDispatchedRun([run(11), run(12)], 11), run(12));
@@ -382,6 +382,25 @@ describe("selectDispatchedRun", () => {
   it("matches by id alone when the dispatched head is unknown", () => {
     assert.deepEqual(selectDispatchedRun([run(12)], 11), run(12));
     assert.deepEqual(selectDispatchedRun([run(12, "any-head")], 11), run(12, "any-head"));
+  });
+
+  it("ignores a pull_request run recorded above the baseline on the dispatched head", () => {
+    // WHY: a PR created with GITHUB_TOKEN never executes pull_request workflows, but
+    // GitHub still records them (conclusion "action_required", no jobs, no check
+    // runs), and they appear in `gh run list` after the dispatch baseline was taken.
+    // Production hit this on the first real release: the phantom CI run was the
+    // newest run on the branch, `gh run watch --exit-status` on it exited 1, and the
+    // release failed before merging. Only a workflow_dispatch run can be the run this
+    // flow's dispatch created.
+    const dispatched = run(15, "new-head");
+    const phantom = run(16, "new-head", "pull_request");
+    assert.deepEqual(selectDispatchedRun([dispatched, phantom], 11, "new-head"), dispatched);
+    assert.equal(selectDispatchedRun([phantom], 11, "new-head"), undefined);
+  });
+
+  it("ignores a run without an event field", () => {
+    // WHY: a malformed `gh run list` entry cannot be proven to be a dispatched run.
+    assert.equal(selectDispatchedRun([{ databaseId: 12 }], 11), undefined);
   });
 });
 

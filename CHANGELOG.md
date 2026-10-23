@@ -9,6 +9,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Release tooling: the automated release now fetches the squash-merge commit of its release PR before creating the `vX.Y.Z` tag (the runner's clone has never seen that commit, so the tag previously failed after the merge and only the next run repaired it), and a retried release waits for the check runs it dispatched instead of accepting a completed run left by the earlier attempt.
+- Release tooling: waiting for the dispatched checks now selects only `workflow_dispatch` runs. A release PR created with `GITHUB_TOKEN` still leaves `pull_request` workflow runs recorded as `action_required` (never executed, no check runs), and watching the newest of those — exactly what the first real release run did — fails the release before the merge.
 
 ## [1.10.0] - 2026-10-20
 

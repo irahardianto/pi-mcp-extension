@@ -13,12 +13,15 @@
  * user-owned repo the GitHub Actions app cannot be a ruleset bypass actor (the API
  * returns 422). The release therefore pushes `release/v<version>`, opens
  * `chore: release v<version>`, and squash-merges the PR once the required workflows
- * passed on the branch. A PR created with `GITHUB_TOKEN` triggers no `pull_request`
- * workflows, so the required workflows are dispatched onto the branch by
- * `PullRequestPort.dispatchRequiredWorkflows`; their check runs land on the PR head
- * sha and satisfy the ruleset at merge time. Each attempt waits only for the runs its
- * own dispatch created, so a completed run from a failed attempt can never stand in
- * for the current head.
+ * passed on the branch. A PR created with `GITHUB_TOKEN` never *executes*
+ * `pull_request` workflows, but GitHub still records those runs (conclusion
+ * `action_required`, no jobs, no check runs), so the required workflows are
+ * dispatched onto the branch by `PullRequestPort.dispatchRequiredWorkflows` and each
+ * attempt waits only for the `workflow_dispatch` runs its own dispatch created: a
+ * phantom `pull_request` record can never be watched (its `action_required`
+ * conclusion fails `gh run watch --exit-status`), and neither can a completed run
+ * from a failed attempt. Their check runs land on the PR head sha and satisfy the
+ * ruleset at merge time.
  *
  * The squash merge creates a new commit on GitHub that this clone has never seen, so
  * the flow fetches again before creating the tag: `git tag v<version>` fails on an
@@ -172,21 +175,28 @@ export function releaseBranchName(version: string): string {
   return `release/v${version}`;
 }
 
-/** The subset of `gh run list --json databaseId,headSha` this module needs. */
+/** The subset of `gh run list --json databaseId,headSha,event` this module needs. */
 export interface WorkflowRun {
   readonly databaseId: number;
   readonly headSha?: string;
+  readonly event?: string;
 }
 
 /**
  * Pick the run created by the current dispatch.
  *
- * A retried release re-dispatches the same workflows onto the same branch, so a run
- * from an earlier attempt — including one still in progress — must never satisfy this
- * attempt's required checks. A run counts only when both hold:
+ * A retried release re-dispatches the same workflows onto the same branch, and a PR
+ * created with `GITHUB_TOKEN` leaves `pull_request` runs recorded on that branch
+ * (conclusion `action_required`, never executed, no check runs). Neither kind of run
+ * may ever satisfy this attempt's required checks, so a run counts only when all of
+ * these hold:
  *
- * - its id is above the newest run observed when the workflow was dispatched (the id is
- *   assigned by GitHub and never moves backwards), and
+ * - its event is `workflow_dispatch` — the only event `gh workflow run` creates, and
+ *   the phantom `pull_request` records are not dispatched by anyone. Production hit
+ *   this on the first real release: the phantom CI run was the newest run on the
+ *   branch and `gh run watch --exit-status` on it exited 1.
+ * - its id is above the newest run observed when the workflow was dispatched (the id
+ *   is assigned by GitHub and never moves backwards), and
  * - when the dispatched head is known, its head is that head. A retry force-pushes the
  *   branch to a new commit before dispatching, so an earlier attempt's runs carry a
  *   different head — this closes the window where a stale run registers in
@@ -200,6 +210,7 @@ export function selectDispatchedRun(
 ): WorkflowRun | undefined {
   let newest: WorkflowRun | undefined;
   for (const run of runs) {
+    if (run.event !== "workflow_dispatch") continue;
     if (run.databaseId <= baselineDatabaseId) continue;
     if (dispatchedHeadSha !== undefined && run.headSha !== dispatchedHeadSha) continue;
     if (newest === undefined || run.databaseId > newest.databaseId) newest = run;
@@ -207,7 +218,7 @@ export function selectDispatchedRun(
   return newest;
 }
 
-/** Decode `gh run list --json databaseId,headSha` output, ignoring anything malformed. */
+/** Decode `gh run list --json databaseId,headSha,event` output, ignoring anything malformed. */
 function parseWorkflowRuns(raw: string): WorkflowRun[] {
   let decoded: unknown;
   try {
@@ -222,10 +233,14 @@ function parseWorkflowRuns(raw: string): WorkflowRun[] {
     if (!isJsonObject(entry)) continue;
     const databaseId = entry["databaseId"];
     if (typeof databaseId !== "number") continue;
+    // WHY: a run missing its head or event cannot be proven to be the dispatched run
+    // once those filters are requested, so keep only what was actually returned.
+    const run: { databaseId: number; headSha?: string; event?: string } = { databaseId };
     const headSha = entry["headSha"];
-    // WHY: a run without a head cannot be proven to belong to this dispatch when a
-    // head filter is requested, so keep it only for the id-only case.
-    runs.push(typeof headSha === "string" ? { databaseId, headSha } : { databaseId });
+    if (typeof headSha === "string") run.headSha = headSha;
+    const event = entry["event"];
+    if (typeof event === "string") run.event = event;
+    runs.push(run);
   }
   return runs;
 }
@@ -544,9 +559,12 @@ export function createPullRequests(cwd: string): PullRequestPort {
   // WHY: the newest run id each branch/workflow had when it was dispatched, plus the
   // head each branch was pushed to. A retried release dispatches the same workflows
   // again onto the same branch name, and the completed (or still-running) runs of the
-  // failed attempt must not be mistaken for this attempt's results — neither by id
-  // (nothing at or below the dispatch baseline counts) nor by head (a stale run that
-  // registers late carries the old branch head, not the one this dispatch targets).
+  // failed attempt must not be mistaken for this attempt's results — neither by event
+  // (only `workflow_dispatch` runs were dispatched; the `pull_request` records a
+  // `GITHUB_TOKEN` PR leaves behind conclude `action_required` and never execute), by
+  // id (nothing at or below the dispatch baseline counts), nor by head (a stale run
+  // that registers late carries the old branch head, not the one this dispatch
+  // targets).
   const dispatchBaselines = new Map<string, number>();
   const pushedHeads = new Map<string, string>();
   const runKey = (branch: string, workflow: string): string => `${branch}\u0000${workflow}`;
@@ -562,7 +580,7 @@ export function createPullRequests(cwd: string): PullRequestPort {
         "--limit",
         "50",
         "--json",
-        "databaseId,headSha",
+        "databaseId,headSha,event",
       ]),
     );
 

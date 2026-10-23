@@ -78,7 +78,7 @@ jobs:
       contents: write # WHY: push the release branch and tag, and merge the release PR
       id-token: write # WHY: mint Sigstore provenance attestations for npm OIDC Trusted Publishing
       pull-requests: write # WHY: open, retitle and squash-merge the release PR (required status checks on main block direct pushes)
-      actions: write # WHY: dispatch the required workflows onto the release branch (a GITHUB_TOKEN PR triggers no pull_request workflows)
+      actions: write # WHY: dispatch the required workflows onto the release branch (a GITHUB_TOKEN PR leaves pull_request runs recorded as action_required but never executes them)
     # WHY: the release PR waits for the dispatched required workflows (CI matrix plus
     # OS tests), which take longer than the checks the job runs itself.
     timeout-minutes: 30
