@@ -226,17 +226,19 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.match(gitignore, /^!\.qlty\/qlty\.toml$/m, ".gitignore must preserve .qlty/qlty.toml");
   });
 
-  it("uploads lcov.info in ci.yml via SHA-pinned qltysh/qlty-action/coverage with skip-errors enabled", () => {
+  it("uploads lcov.info in ci.yml via SHA-pinned qltysh/qlty-action/coverage over OIDC with skip-errors enabled", () => {
     const ci = readRepoFile(".github/workflows/ci.yml");
     assert.match(
       ci,
       /uses: qltysh\/qlty-action\/coverage@[0-9a-f]{40} # v\d+\.\d+\.\d+/,
       "ci.yml must pin qltysh/qlty-action/coverage with a 40-char SHA and version comment",
     );
+    assert.match(ci, /id-token: write/, "check job must grant id-token: write for OIDC coverage upload");
+    assert.match(ci, /oidc: true/, "coverage upload must authenticate via OIDC");
     assert.match(ci, /files: lcov\.info/, "coverage upload must specify lcov.info");
     assert.match(ci, /format: lcov/, "coverage upload must specify lcov format");
+    assert.match(ci, /strip-prefix: \$\{\{ github\.workspace \}\}/, "coverage upload must strip github.workspace prefix");
     assert.match(ci, /skip-errors: true/, "coverage upload must set skip-errors: true");
-    assert.match(ci, /token: \$\{\{ secrets\.QLTY_COVERAGE_TOKEN \}\}/, "coverage upload must pass QLTY_COVERAGE_TOKEN secret");
   });
 
   it("keeps third-party linters disabled in .qlty/qlty.toml so CI workflows remain the single source of truth", () => {

@@ -14,5 +14,3 @@ lcov.info
 # Qlty local cache and results (keep configuration tracked)
 .qlty/*
 !.qlty/qlty.toml
-.qlty/out/
-.qlty/results/

@@ -22,6 +22,9 @@ jobs:
   check:
     name: check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # WHY: required for the Qlty coverage upload to authenticate over OIDC (no token secret)
     timeout-minutes: 15
     strategy:
       # Let every Node version finish so a failure shows whether it's version-specific.
@@ -64,13 +67,16 @@ jobs:
 
       - name: Upload coverage to Qlty
         # WHY: Run only on the Node 22 leg where test:coverage generates lcov.info,
-        # and skip on fork PRs where secrets / OIDC are unavailable.
+        # and skip on fork PRs where GitHub provides no OIDC token.
         if: matrix.node-version == 22 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: qltysh/qlty-action/coverage@ebcd284bf32e36a030afe15f1e136c7be08b9506 # v2.5.0
         with:
+          oidc: true
           files: lcov.info
           format: lcov
-          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
+          # WHY: harmless when the reporter writes repository-relative paths; strips the
+          # runner workspace if it ever writes absolute ones, which Qlty would reject.
+          strip-prefix: ${{ github.workspace }}
           skip-errors: true
 
       - name: Test

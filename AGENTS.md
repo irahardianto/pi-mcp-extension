@@ -157,7 +157,7 @@ Workflows live in `.github/workflows/`. The required workflows below run on ever
 
 | Workflow | Job | What it enforces |
 |---|---|---|
-| `ci.yml` | `check` (Node 22, 24) | `npm audit signatures`, `npm audit --omit=dev --audit-level=high` (Node 22), lint, typecheck, tests (coverage floor on Node 22; emits `lcov.info` and uploads to Qlty on same-repo runs), `npm pack --dry-run` |
+| `ci.yml` | `check` (Node 22, 24) | `npm audit signatures`, `npm audit --omit=dev --audit-level=high` (Node 22), lint, typecheck, tests (coverage floor on Node 22; emits `lcov.info` and uploads to Qlty over OIDC on same-repo runs), `npm pack --dry-run` |
 | `ci.yml` | `test (macos-latest)`, `test (windows-latest)` | `npm test` on Node 22. Both legs are blocking: Windows became blocking once its runs were reliably green (#137) |
 | `workflow-lint.yml` | `workflow-lint` | `actionlint` (syntax, expressions, shellcheck of `run:` scripts) and `zizmor` (Actions security: injection, pinning, permissions, credentials), failing on any finding of low severity or above. Also runs on `workflow_dispatch` (manual runs) |
 | `secret-scan.yml` | `gitleaks` | No secrets in the PR's or merge group's commits (pushes to `main`: the pushed range; weekly and on dispatch: full history). Output is redacted |
