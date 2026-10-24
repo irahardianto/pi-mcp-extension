@@ -80,6 +80,443 @@ function withSchemaOptions(schema: TSchema, opts: Record<string, unknown>): TSch
  *   - allOf → TypeBox Intersect
  * Falls back to Type.Any() for unresolvable $ref, recursive cycles, or missing type.
  */
+interface ConversionContext {
+  rootDefs: Record<string, Record<string, unknown>>;
+  effectiveRoot: Record<string, unknown>;
+  seenRefs: ReadonlySet<string>;
+}
+
+function convertRefSchema(
+  ref: string,
+  schema: Record<string, unknown>,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema {
+  if (ctx.seenRefs.has(ref)) {
+    // WHY: Break recursive $ref cycles along the active resolution path to prevent
+    // stack overflow or exponential blowup on self-referential schemas.
+    return Type.Any(opts);
+  }
+
+  const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
+  if (!resolved) {
+    return Type.Any(opts);
+  }
+
+  // Merge sibling metadata from the $ref site into the resolved schema
+  const merged: Record<string, unknown> = { ...resolved };
+  if (typeof schema["description"] === "string") {
+    merged["description"] = schema["description"];
+  }
+  if (typeof schema["title"] === "string") {
+    merged["title"] = schema["title"];
+  }
+  if ("default" in schema && schema["default"] !== undefined) {
+    merged["default"] = schema["default"];
+  }
+
+  const nextSeen = new Set(ctx.seenRefs);
+  nextSeen.add(ref);
+  return convertJsonSchemaToTypebox(merged, ctx.rootDefs, ctx.effectiveRoot, nextSeen);
+}
+
+function convertConstSchema(val: unknown, opts: Record<string, unknown>): TSchema {
+  if (val === null) {
+    return Type.Null(opts);
+  }
+  if (typeof val === "string" || typeof val === "number" || typeof val === "boolean") {
+    return Type.Literal(val, opts);
+  }
+  return Type.Any(opts);
+}
+
+function convertEnumSchema(schema: Record<string, unknown>, opts: Record<string, unknown>): TSchema {
+  const enumVals = schema["enum"] as unknown[];
+  const members: TSchema[] = [];
+  let hasNullMember = false;
+  for (const v of enumVals) {
+    if (v === null) {
+      members.push(Type.Null());
+      hasNullMember = true;
+    } else if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+      members.push(Type.Literal(v));
+    }
+  }
+  if (Array.isArray(schema["type"]) && schema["type"].includes("null") && !hasNullMember) {
+    members.push(Type.Null());
+  }
+  if (members.length === 0) {
+    return Type.Any(opts);
+  }
+  const ordered = orderUnionMembers(members);
+  if (ordered.length === 1) {
+    return withSchemaOptions(ordered[0]!, opts);
+  }
+  return Type.Union(ordered, opts);
+}
+
+function convertPreTypeSchema(
+  schema: Record<string, unknown>,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema | null {
+  if (typeof schema["$ref"] === "string") {
+    return convertRefSchema(schema["$ref"], schema, opts, ctx);
+  }
+  if ("const" in schema && schema["const"] !== undefined) {
+    return convertConstSchema(schema["const"], opts);
+  }
+  if (Array.isArray(schema["enum"])) {
+    return convertEnumSchema(schema, opts);
+  }
+  return null;
+}
+
+function inheritCombinatorType(sub: unknown, rawType: unknown): Record<string, unknown> {
+  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+    return sub as Record<string, unknown>;
+  }
+  const subObj = sub as Record<string, unknown>;
+  if (
+    typeof rawType === "string" &&
+    subObj["type"] === undefined &&
+    subObj["$ref"] === undefined &&
+    subObj["const"] === undefined &&
+    subObj["enum"] === undefined &&
+    subObj["oneOf"] === undefined &&
+    subObj["anyOf"] === undefined &&
+    subObj["allOf"] === undefined
+  ) {
+    return { type: rawType, ...subObj };
+  }
+  return subObj;
+}
+
+function wrapCombinatorMembers(
+  members: TSchema[],
+  opts: Record<string, unknown>,
+  combine: (m: TSchema[]) => TSchema,
+): TSchema {
+  if (members.length === 0) return Type.Any(opts);
+  if (members.length === 1) return withSchemaOptions(members[0]!, opts);
+  return combine(members);
+}
+
+function convertCombinatorSchema(
+  schema: Record<string, unknown>,
+  rawType: unknown,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema | undefined {
+  if (Array.isArray(schema["oneOf"]) || Array.isArray(schema["anyOf"])) {
+    const list = (schema["oneOf"] ?? schema["anyOf"]) as unknown[];
+    const members = orderUnionMembers(
+      list.map((sub) =>
+        convertJsonSchemaToTypebox(
+          inheritCombinatorType(sub, rawType),
+          ctx.rootDefs,
+          ctx.effectiveRoot,
+          ctx.seenRefs,
+        ),
+      ),
+    );
+    return wrapCombinatorMembers(members, opts, (m) => Type.Union(m, opts));
+  }
+
+  if (Array.isArray(schema["allOf"])) {
+    const members = (schema["allOf"] as unknown[]).map((sub) =>
+      convertJsonSchemaToTypebox(
+        inheritCombinatorType(sub, rawType),
+        ctx.rootDefs,
+        ctx.effectiveRoot,
+        ctx.seenRefs,
+      ),
+    );
+    return wrapCombinatorMembers(members, opts, (m) => Type.Intersect(m, opts));
+  }
+
+  return undefined;
+}
+
+function convertMultiTypeSchema(
+  schema: Record<string, unknown>,
+  rawType: readonly unknown[],
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema {
+  const typeList = rawType.filter((t): t is string => typeof t === "string");
+  const hasNull = typeList.includes("null");
+  const nonNull = typeList.filter((t) => t !== "null");
+
+  if (nonNull.length === 0) {
+    return hasNull ? Type.Null(opts) : Type.Any(opts);
+  }
+  if (nonNull.length === 1) {
+    const inner = convertJsonSchemaToTypebox(
+      { ...schema, type: nonNull[0] },
+      ctx.rootDefs,
+      ctx.effectiveRoot,
+      ctx.seenRefs,
+    );
+    return hasNull ? Type.Union(orderUnionMembers([Type.Null(), inner]), opts) : inner;
+  }
+  const members: TSchema[] = nonNull.map((t) =>
+    convertJsonSchemaToTypebox(
+      { ...schema, type: t },
+      ctx.rootDefs,
+      ctx.effectiveRoot,
+      ctx.seenRefs,
+    ),
+  );
+  if (hasNull) {
+    members.unshift(Type.Null());
+  }
+  return Type.Union(orderUnionMembers(members), opts);
+}
+
+function convertArraySchema(
+  schema: Record<string, unknown>,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema {
+  const tupleItems = Array.isArray(schema["prefixItems"])
+    ? (schema["prefixItems"] as unknown[])
+    : Array.isArray(schema["items"])
+      ? (schema["items"] as unknown[])
+      : undefined;
+  if (tupleItems) {
+    return Type.Tuple(
+      tupleItems.map((item) =>
+        convertJsonSchemaToTypebox(
+          item as Record<string, unknown>,
+          ctx.rootDefs,
+          ctx.effectiveRoot,
+          ctx.seenRefs,
+        ),
+      ),
+      opts,
+    );
+  }
+  const items = schema["items"];
+  return Type.Array(
+    items && typeof items === "object" && !Array.isArray(items)
+      ? convertJsonSchemaToTypebox(
+          items as Record<string, unknown>,
+          ctx.rootDefs,
+          ctx.effectiveRoot,
+          ctx.seenRefs,
+        )
+      : Type.Unknown(),
+    opts,
+  );
+}
+
+function mergeAllOfSubSchema(
+  sub: unknown,
+  rawProperties: Record<string, unknown>,
+  required: Set<string>,
+  ctx: ConversionContext,
+): void {
+  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+    return;
+  }
+  const subObj = sub as Record<string, unknown>;
+  const resolvedSub =
+    typeof subObj["$ref"] === "string" && !ctx.seenRefs.has(subObj["$ref"])
+      ? (resolveRefTarget(subObj["$ref"], ctx.rootDefs, ctx.effectiveRoot) ?? subObj)
+      : subObj;
+
+  const props = resolvedSub["properties"];
+  if (typeof props === "object" && props !== null && !Array.isArray(props)) {
+    for (const [k, v] of Object.entries(props as Record<string, unknown>)) {
+      if (!(k in rawProperties)) {
+        rawProperties[k] = v;
+      }
+    }
+  }
+
+  const req = resolvedSub["required"];
+  if (Array.isArray(req)) {
+    for (const reqKey of req) {
+      if (typeof reqKey === "string") {
+        required.add(reqKey);
+      }
+    }
+  }
+}
+
+function convertObjectSchema(
+  schema: Record<string, unknown>,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema {
+  const rawProperties: Record<string, unknown> =
+    typeof schema["properties"] === "object" &&
+    schema["properties"] !== null &&
+    !Array.isArray(schema["properties"])
+      ? { ...(schema["properties"] as Record<string, unknown>) }
+      : {};
+  const required = new Set<string>(
+    Array.isArray(schema["required"])
+      ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
+      : [],
+  );
+  const additionalProperties = schema["additionalProperties"];
+
+  let allOfSchemas: TSchema[] | undefined;
+  if (Array.isArray(schema["allOf"])) {
+    allOfSchemas = (schema["allOf"] as unknown[]).map((sub) =>
+      convertJsonSchemaToTypebox(
+        sub as Record<string, unknown>,
+        ctx.rootDefs,
+        ctx.effectiveRoot,
+        ctx.seenRefs,
+      ),
+    );
+    for (const sub of schema["allOf"] as unknown[]) {
+      mergeAllOfSubSchema(sub, rawProperties, required, ctx);
+    }
+  }
+
+  const props: Record<string, TSchema> = {};
+  for (const [key, value] of Object.entries(rawProperties)) {
+    const converted = convertJsonSchemaToTypebox(
+      value as Record<string, unknown>,
+      ctx.rootDefs,
+      ctx.effectiveRoot,
+      ctx.seenRefs,
+    );
+    props[key] = required.has(key) ? converted : Type.Optional(converted);
+  }
+
+  const objOpts: Record<string, unknown> = { ...opts };
+  if (typeof additionalProperties === "boolean") {
+    objOpts["additionalProperties"] = additionalProperties;
+  } else if (
+    typeof additionalProperties === "object" &&
+    additionalProperties !== null &&
+    !Array.isArray(additionalProperties)
+  ) {
+    objOpts["additionalProperties"] = convertJsonSchemaToTypebox(
+      additionalProperties as Record<string, unknown>,
+      ctx.rootDefs,
+      ctx.effectiveRoot,
+      ctx.seenRefs,
+    );
+  }
+
+  if (required.size > 0) {
+    objOpts["required"] = Array.from(required);
+  }
+
+  if (Array.isArray(schema["oneOf"])) {
+    objOpts["oneOf"] = orderUnionMembers(
+      (schema["oneOf"] as unknown[]).map((sub) =>
+        convertJsonSchemaToTypebox(
+          sub as Record<string, unknown>,
+          ctx.rootDefs,
+          ctx.effectiveRoot,
+          ctx.seenRefs,
+        ),
+      ),
+    );
+  }
+  if (Array.isArray(schema["anyOf"])) {
+    objOpts["anyOf"] = orderUnionMembers(
+      (schema["anyOf"] as unknown[]).map((sub) =>
+        convertJsonSchemaToTypebox(
+          sub as Record<string, unknown>,
+          ctx.rootDefs,
+          ctx.effectiveRoot,
+          ctx.seenRefs,
+        ),
+      ),
+    );
+  }
+  if (allOfSchemas) {
+    objOpts["allOf"] = allOfSchemas;
+  }
+
+  // WHY: Always emit Type.Object(props, objOpts) even when `props` is empty (`{}`)
+  // so empty object schemas serialize as `{ type: "object", properties: {} }`
+  // rather than `Type.Record` (`patternProperties`), which Gemini and OpenAI reject.
+  return Type.Object(props, objOpts);
+}
+
+const PRIMITIVE_FACTORIES: Record<string, (opts: Record<string, unknown>) => TSchema> = {
+  string: Type.String,
+  number: Type.Number,
+  integer: Type.Integer,
+  boolean: Type.Boolean,
+  null: Type.Null,
+};
+
+function convertTypedSchema(
+  type: string | undefined,
+  schema: Record<string, unknown>,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema {
+  if (type && type in PRIMITIVE_FACTORIES) {
+    return PRIMITIVE_FACTORIES[type]!(opts);
+  }
+  if (type === "array") {
+    return convertArraySchema(schema, opts, ctx);
+  }
+  if (type === "object") {
+    return convertObjectSchema(schema, opts, ctx);
+  }
+  return Type.Any(opts);
+}
+
+function resolveNonTypedSchema(
+  schema: Record<string, unknown>,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): TSchema | null {
+  const preType = convertPreTypeSchema(schema, opts, ctx);
+  if (preType) {
+    return preType;
+  }
+  const rawType = schema["type"];
+  if (Array.isArray(rawType)) {
+    return convertMultiTypeSchema(schema, rawType, opts, ctx);
+  }
+  const hasObjectKeywords =
+    (typeof schema["properties"] === "object" &&
+      schema["properties"] !== null &&
+      !Array.isArray(schema["properties"])) ||
+    Array.isArray(schema["required"]) ||
+    schema["additionalProperties"] !== undefined ||
+    typeof schema["minProperties"] === "number" ||
+    typeof schema["maxProperties"] === "number";
+
+  const hasArrayKeywords =
+    schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
+
+  if (
+    !hasObjectKeywords &&
+    !hasArrayKeywords &&
+    rawType !== "object" &&
+    rawType !== "array"
+  ) {
+    return convertCombinatorSchema(schema, rawType, opts, ctx) ?? null;
+  }
+  return null;
+}
+
+/**
+ * Convert a JSON Schema object to a TypeBox schema.
+ * Handles the common subset used by real-world MCP servers:
+ *   - Primitives (string, number, integer, boolean, null)
+ *   - Arrays, tuples (prefixItems / array items), objects (with required/optional/additionalProperties)
+ *   - Enums and const (string, numeric, boolean, and nullable enums → Union of Literals)
+ *   - Nullable and multi-type arrays ("type": ["string", "null"]) with Type.Null() ordered first
+ *   - Cycle-safe $ref (#, #/$defs/, #/definitions/, and arbitrary RFC 6901 JSON Pointers)
+ *   - oneOf / anyOf → TypeBox Union
+ *   - allOf → TypeBox Intersect
+ * Falls back to Type.Any() for unresolvable $ref, recursive cycles, or missing type.
+ */
 export function convertJsonSchemaToTypebox(
   schema: Record<string, unknown>,
   defs?: Record<string, Record<string, unknown>>,
@@ -102,75 +539,13 @@ export function convertJsonSchemaToTypebox(
     ...defs,
   };
 
-  // ── Handle $ref ──────────────────────────────────────────────────────────
-  if (typeof schema["$ref"] === "string") {
-    const ref = schema["$ref"];
-    if (seenRefs.has(ref)) {
-      // WHY: Break recursive $ref cycles along the active resolution path to prevent
-      // stack overflow or exponential blowup on self-referential schemas.
-      return Type.Any(opts);
-    }
-
-    const resolved = resolveRefTarget(ref, rootDefs, effectiveRoot);
-    if (!resolved) {
-      return Type.Any(opts);
-    }
-
-    // Merge sibling metadata from the $ref site into the resolved schema
-    const merged: Record<string, unknown> = { ...resolved };
-    if (typeof schema["description"] === "string") {
-      merged["description"] = schema["description"];
-    }
-    if (typeof schema["title"] === "string") {
-      merged["title"] = schema["title"];
-    }
-    if ("default" in schema && schema["default"] !== undefined) {
-      merged["default"] = schema["default"];
-    }
-
-    const nextSeen = new Set(seenRefs);
-    nextSeen.add(ref);
-    return convertJsonSchemaToTypebox(merged, rootDefs, effectiveRoot, nextSeen);
+  const ctx: ConversionContext = { rootDefs, effectiveRoot, seenRefs };
+  const nonTyped = resolveNonTypedSchema(schema, opts, ctx);
+  if (nonTyped) {
+    return nonTyped;
   }
 
-  // ── Handle const ─────────────────────────────────────────────────────────
-  if ("const" in schema && schema["const"] !== undefined) {
-    const val = schema["const"];
-    if (val === null) {
-      return Type.Null(opts);
-    }
-    if (typeof val === "string" || typeof val === "number" || typeof val === "boolean") {
-      return Type.Literal(val, opts);
-    }
-    return Type.Any(opts);
-  }
-
-  // ── Handle enum (untyped, string, number, boolean, or nullable) ──────────
-  if (Array.isArray(schema["enum"])) {
-    const enumVals = schema["enum"] as unknown[];
-    const members: TSchema[] = [];
-    let hasNullMember = false;
-    for (const v of enumVals) {
-      if (v === null) {
-        members.push(Type.Null());
-        hasNullMember = true;
-      } else if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
-        members.push(Type.Literal(v));
-      }
-    }
-    if (Array.isArray(schema["type"]) && schema["type"].includes("null") && !hasNullMember) {
-      members.push(Type.Null());
-    }
-    if (members.length === 0) {
-      return Type.Any(opts);
-    }
-    const ordered = orderUnionMembers(members);
-    if (ordered.length === 1) {
-      return withSchemaOptions(ordered[0]!, opts);
-    }
-    return Type.Union(ordered, opts);
-  }
-
+  const rawType = schema["type"];
   const hasObjectKeywords =
     (typeof schema["properties"] === "object" &&
       schema["properties"] !== null &&
@@ -183,103 +558,6 @@ export function convertJsonSchemaToTypebox(
   const hasArrayKeywords =
     schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
 
-  const rawType = schema["type"];
-
-  // ── Handle non-object combinators (oneOf / anyOf / allOf) ────────────────
-  if (
-    !hasObjectKeywords &&
-    !hasArrayKeywords &&
-    rawType !== "object" &&
-    rawType !== "array" &&
-    !Array.isArray(rawType)
-  ) {
-    const inheritType = (sub: unknown): Record<string, unknown> => {
-      if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
-        return sub as Record<string, unknown>;
-      }
-      const subObj = sub as Record<string, unknown>;
-      if (
-        typeof rawType === "string" &&
-        subObj["type"] === undefined &&
-        subObj["$ref"] === undefined &&
-        subObj["const"] === undefined &&
-        subObj["enum"] === undefined &&
-        subObj["oneOf"] === undefined &&
-        subObj["anyOf"] === undefined &&
-        subObj["allOf"] === undefined
-      ) {
-        return { type: rawType, ...subObj };
-      }
-      return subObj;
-    };
-
-    if (Array.isArray(schema["oneOf"])) {
-      const members = orderUnionMembers(
-        (schema["oneOf"] as unknown[]).map((sub) =>
-          convertJsonSchemaToTypebox(inheritType(sub), rootDefs, effectiveRoot, seenRefs),
-        ),
-      );
-      if (members.length === 0) return Type.Any(opts);
-      return members.length === 1
-        ? withSchemaOptions(members[0]!, opts)
-        : Type.Union(members, opts);
-    }
-
-    if (Array.isArray(schema["anyOf"])) {
-      const members = orderUnionMembers(
-        (schema["anyOf"] as unknown[]).map((sub) =>
-          convertJsonSchemaToTypebox(inheritType(sub), rootDefs, effectiveRoot, seenRefs),
-        ),
-      );
-      if (members.length === 0) return Type.Any(opts);
-      return members.length === 1
-        ? withSchemaOptions(members[0]!, opts)
-        : Type.Union(members, opts);
-    }
-
-    if (Array.isArray(schema["allOf"])) {
-      const members = (schema["allOf"] as unknown[]).map((sub) =>
-        convertJsonSchemaToTypebox(inheritType(sub), rootDefs, effectiveRoot, seenRefs),
-      );
-      if (members.length === 0) return Type.Any(opts);
-      return members.length === 1
-        ? withSchemaOptions(members[0]!, opts)
-        : Type.Intersect(members, opts);
-    }
-  }
-
-  // ── Handle multi-type arrays: { "type": ["string", "null"] } ─────────────
-  if (Array.isArray(rawType)) {
-    const typeList = rawType.filter((t): t is string => typeof t === "string");
-    const hasNull = typeList.includes("null");
-    const nonNull = typeList.filter((t) => t !== "null");
-
-    if (nonNull.length === 0) {
-      return hasNull ? Type.Null(opts) : Type.Any(opts);
-    }
-    if (nonNull.length === 1) {
-      const inner = convertJsonSchemaToTypebox(
-        { ...schema, type: nonNull[0] },
-        rootDefs,
-        effectiveRoot,
-        seenRefs,
-      );
-      return hasNull ? Type.Union(orderUnionMembers([Type.Null(), inner]), opts) : inner;
-    }
-    const members: TSchema[] = nonNull.map((t) =>
-      convertJsonSchemaToTypebox(
-        { ...schema, type: t },
-        rootDefs,
-        effectiveRoot,
-        seenRefs,
-      ),
-    );
-    if (hasNull) {
-      members.unshift(Type.Null());
-    }
-    return Type.Union(orderUnionMembers(members), opts);
-  }
-
   const type =
     typeof rawType === "string"
       ? rawType
@@ -289,168 +567,5 @@ export function convertJsonSchemaToTypebox(
           ? "array"
           : undefined;
 
-  switch (type) {
-    case "string":
-      return Type.String(opts);
-    case "number":
-      return Type.Number(opts);
-    case "integer":
-      return Type.Integer(opts);
-    case "boolean":
-      return Type.Boolean(opts);
-    case "null":
-      return Type.Null(opts);
-    case "array": {
-      const tupleItems = Array.isArray(schema["prefixItems"])
-        ? (schema["prefixItems"] as unknown[])
-        : Array.isArray(schema["items"])
-          ? (schema["items"] as unknown[])
-          : undefined;
-      if (tupleItems) {
-        return Type.Tuple(
-          tupleItems.map((item) =>
-            convertJsonSchemaToTypebox(
-              item as Record<string, unknown>,
-              rootDefs,
-              effectiveRoot,
-              seenRefs,
-            ),
-          ),
-          opts,
-        );
-      }
-      const items = schema["items"];
-      return Type.Array(
-        items && typeof items === "object" && !Array.isArray(items)
-          ? convertJsonSchemaToTypebox(
-              items as Record<string, unknown>,
-              rootDefs,
-              effectiveRoot,
-              seenRefs,
-            )
-          : Type.Unknown(),
-        opts,
-      );
-    }
-    case "object": {
-      const rawProperties: Record<string, unknown> =
-        typeof schema["properties"] === "object" &&
-        schema["properties"] !== null &&
-        !Array.isArray(schema["properties"])
-          ? { ...(schema["properties"] as Record<string, unknown>) }
-          : {};
-      const required = new Set<string>(
-        Array.isArray(schema["required"])
-          ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
-          : [],
-      );
-      const additionalProperties = schema["additionalProperties"];
-
-      let allOfSchemas: TSchema[] | undefined;
-      if (Array.isArray(schema["allOf"])) {
-        allOfSchemas = (schema["allOf"] as unknown[]).map((sub) =>
-          convertJsonSchemaToTypebox(
-            sub as Record<string, unknown>,
-            rootDefs,
-            effectiveRoot,
-            seenRefs,
-          ),
-        );
-        for (const sub of schema["allOf"] as unknown[]) {
-          if (sub && typeof sub === "object" && !Array.isArray(sub)) {
-            const subObj = sub as Record<string, unknown>;
-            const resolvedSub =
-              typeof subObj["$ref"] === "string" && !seenRefs.has(subObj["$ref"])
-                ? (resolveRefTarget(subObj["$ref"], rootDefs, effectiveRoot) ?? subObj)
-                : subObj;
-            if (
-              typeof resolvedSub["properties"] === "object" &&
-              resolvedSub["properties"] !== null &&
-              !Array.isArray(resolvedSub["properties"])
-            ) {
-              for (const [k, v] of Object.entries(resolvedSub["properties"] as Record<string, unknown>)) {
-                if (!(k in rawProperties)) {
-                  rawProperties[k] = v;
-                }
-              }
-            }
-            if (Array.isArray(resolvedSub["required"])) {
-              for (const reqKey of resolvedSub["required"]) {
-                if (typeof reqKey === "string") {
-                  required.add(reqKey);
-                }
-              }
-            }
-          }
-        }
-      }
-
-      const props: Record<string, TSchema> = {};
-      for (const [key, value] of Object.entries(rawProperties)) {
-        const converted = convertJsonSchemaToTypebox(
-          value as Record<string, unknown>,
-          rootDefs,
-          effectiveRoot,
-          seenRefs,
-        );
-        props[key] = required.has(key) ? converted : Type.Optional(converted);
-      }
-
-      const objOpts: Record<string, unknown> = { ...opts };
-      if (typeof additionalProperties === "boolean") {
-        objOpts["additionalProperties"] = additionalProperties;
-      } else if (
-        typeof additionalProperties === "object" &&
-        additionalProperties !== null &&
-        !Array.isArray(additionalProperties)
-      ) {
-        objOpts["additionalProperties"] = convertJsonSchemaToTypebox(
-          additionalProperties as Record<string, unknown>,
-          rootDefs,
-          effectiveRoot,
-          seenRefs,
-        );
-      }
-
-      if (required.size > 0) {
-        objOpts["required"] = Array.from(required);
-      }
-
-      if (Array.isArray(schema["oneOf"])) {
-        objOpts["oneOf"] = orderUnionMembers(
-          (schema["oneOf"] as unknown[]).map((sub) =>
-            convertJsonSchemaToTypebox(
-              sub as Record<string, unknown>,
-              rootDefs,
-              effectiveRoot,
-              seenRefs,
-            ),
-          ),
-        );
-      }
-      if (Array.isArray(schema["anyOf"])) {
-        objOpts["anyOf"] = orderUnionMembers(
-          (schema["anyOf"] as unknown[]).map((sub) =>
-            convertJsonSchemaToTypebox(
-              sub as Record<string, unknown>,
-              rootDefs,
-              effectiveRoot,
-              seenRefs,
-            ),
-          ),
-        );
-      }
-      if (allOfSchemas) {
-        objOpts["allOf"] = allOfSchemas;
-      }
-
-      // WHY: Always emit Type.Object(props, objOpts) even when `props` is empty (`{}`)
-      // so empty object schemas serialize as `{ type: "object", properties: {} }`
-      // rather than `Type.Record` (`patternProperties`), which Gemini and OpenAI reject.
-      return Type.Object(props, objOpts);
-    }
-    case undefined:
-    default:
-      return Type.Any(opts);
-  }
+  return convertTypedSchema(type, schema, opts, ctx);
 }

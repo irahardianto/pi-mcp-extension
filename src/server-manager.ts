@@ -653,6 +653,109 @@ export class ServerManager {
     }, server.config.healthCheckIntervalMs);
   }
 
+  // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
+  // stream drops via transport.onerror (forwarded to client.onerror) rather than
+  // transport.onclose. Crucially, StreamableHTTPClientTransport.send() invokes
+  // this.onerror(error) synchronously BEFORE `throw error` rejects the send()
+  // promise; deferring _recover() via setImmediate lets Protocol.request() and
+  // ToolBridge.execute() observe the original transport/401 error (and run
+  // handleUnauthorizedServerError if applicable) before client.close() rejects
+  // pending requests with "Connection closed".
+  private _scheduleErrorRecovery(
+    server: ManagedServer,
+    client: Client,
+    signal: AbortSignal,
+    cwd: string,
+  ): void {
+    const errorGeneration = server.generation ?? 0;
+    setImmediate(() => {
+      if (
+        (server.generation ?? 0) !== errorGeneration ||
+        server.state !== "ready" ||
+        signal.aborted ||
+        server.client !== client
+      ) {
+        return;
+      }
+      void this._recover(server, server.cwd ?? cwd);
+    });
+  }
+
+  private _handleStreamableHttpError(
+    server: ManagedServer,
+    client: Client,
+    signal: AbortSignal,
+    cwd: string,
+    err: unknown,
+  ): void {
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    const msg = sanitizeTerminalText(rawMsg);
+    if (isOAuthUnauthorizedError(err)) {
+      reportDiagnostic({
+        level: "warn",
+        event: "server.auth_error",
+        server: server.name,
+        message: `Server ${server.name} HTTP auth error, recovering: ${msg}`,
+        fields: { transport: "streamable-http" },
+      });
+      this._scheduleErrorRecovery(server, client, signal, cwd);
+      return;
+    }
+    // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
+    // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
+    // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
+    // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
+    // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
+    // stream drops on established streams report "SSE stream disconnected" or
+    // "Maximum reconnection attempts (0) exceeded." instead.
+    if (/Failed to open SSE stream:/i.test(rawMsg)) {
+      return;
+    }
+    reportDiagnostic({
+      level: "warn",
+      event: "server.stream_error",
+      server: server.name,
+      message: `Server ${server.name} HTTP stream error, reconnecting: ${msg}`,
+      fields: { transport: "streamable-http" },
+    });
+    this._scheduleErrorRecovery(server, client, signal, cwd);
+  }
+
+  private _handleClientError(
+    server: ManagedServer,
+    client: Client,
+    signal: AbortSignal,
+    cwd: string,
+    err: unknown,
+  ): void {
+    if (server.state !== "ready" || signal.aborted || server.client !== client) {
+      return;
+    }
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    if (
+      /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
+        rawMsg,
+      )
+    ) {
+      return;
+    }
+    const msg = sanitizeTerminalText(rawMsg);
+    if (server.config.transport === "sse") {
+      reportDiagnostic({
+        level: "warn",
+        event: "server.stream_error",
+        server: server.name,
+        message: `Server ${server.name} SSE stream error, reconnecting: ${msg}`,
+        fields: { transport: "sse" },
+      });
+      this._scheduleErrorRecovery(server, client, signal, cwd);
+      return;
+    }
+    if (server.config.transport === "streamable-http") {
+      this._handleStreamableHttpError(server, client, signal, cwd, err);
+    }
+  }
+
   private _wireDisconnectRecovery(
     server: ManagedServer,
     client: Client,
@@ -674,83 +777,9 @@ export class ServerManager {
       });
       void this._recover(server, server.cwd ?? cwd);
     };
-    // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
-    // stream drops via transport.onerror (forwarded to client.onerror) rather than
-    // transport.onclose. Crucially, StreamableHTTPClientTransport.send() invokes
-    // this.onerror(error) synchronously BEFORE `throw error` rejects the send()
-    // promise; deferring _recover() via setImmediate lets Protocol.request() and
-    // ToolBridge.execute() observe the original transport/401 error (and run
-    // handleUnauthorizedServerError if applicable) before client.close() rejects
-    // pending requests with "Connection closed".
-    const scheduleErrorRecovery = () => {
-      const errorGeneration = server.generation ?? 0;
-      setImmediate(() => {
-        if (
-          (server.generation ?? 0) !== errorGeneration ||
-          server.state !== "ready" ||
-          signal.aborted ||
-          server.client !== client
-        ) {
-          return;
-        }
-        void this._recover(server, server.cwd ?? cwd);
-      });
-    };
+
     client.onerror = (err) => {
-      if (server.state !== "ready" || signal.aborted || server.client !== client) {
-        return;
-      }
-      const rawMsg = err instanceof Error ? err.message : String(err);
-      if (
-        /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
-          rawMsg,
-        )
-      ) {
-        return;
-      }
-      const msg = sanitizeTerminalText(rawMsg);
-      if (server.config.transport === "sse") {
-        reportDiagnostic({
-          level: "warn",
-          event: "server.stream_error",
-          server: server.name,
-          message: `Server ${server.name} SSE stream error, reconnecting: ${msg}`,
-          fields: { transport: "sse" },
-        });
-        scheduleErrorRecovery();
-        return;
-      }
-      if (server.config.transport === "streamable-http") {
-        if (isOAuthUnauthorizedError(err)) {
-          reportDiagnostic({
-            level: "warn",
-            event: "server.auth_error",
-            server: server.name,
-            message: `Server ${server.name} HTTP auth error, recovering: ${msg}`,
-            fields: { transport: "streamable-http" },
-          });
-          scheduleErrorRecovery();
-          return;
-        }
-        // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
-        // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
-        // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
-        // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
-        // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
-        // stream drops on established streams report "SSE stream disconnected" or
-        // "Maximum reconnection attempts (0) exceeded." instead.
-        if (/Failed to open SSE stream:/i.test(rawMsg)) {
-          return;
-        }
-        reportDiagnostic({
-          level: "warn",
-          event: "server.stream_error",
-          server: server.name,
-          message: `Server ${server.name} HTTP stream error, reconnecting: ${msg}`,
-          fields: { transport: "streamable-http" },
-        });
-        scheduleErrorRecovery();
-      }
+      this._handleClientError(server, client, signal, cwd, err);
     };
   }
 

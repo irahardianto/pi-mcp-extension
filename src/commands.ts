@@ -6,11 +6,7 @@
 import type { RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
 import { parseRegisteredServerConfig, type McpConfig, type ServerConfig } from "./config.js";
 
-/** Resolve exact server names before interpreting the optional reset flag. */
-export function parseAuthArguments(args = "", serverNames: string[] = []): { name: string; reset: boolean } {
-  const name = args.trim();
-  if (!name) return { name: "", reset: false };
-  if (serverNames.includes(name)) return { name, reset: false };
+function stripResetFlag(name: string): { name: string; reset: boolean } {
   // WHY: Support standalone `--reset` as well as leading (`--reset <name>`) and trailing (`<name> --reset`)
   // flag positions so `/mcp:auth --reset` prints the usage message rather than looking up a server named "--reset".
   if (name === "--reset") return { name: "", reset: true };
@@ -21,6 +17,14 @@ export function parseAuthArguments(args = "", serverNames: string[] = []): { nam
     return { name: name.replace(/^--reset\s+/, "").trimStart(), reset: true };
   }
   return { name, reset: false };
+}
+
+/** Resolve exact server names before interpreting the optional reset flag. */
+export function parseAuthArguments(args = "", serverNames: string[] = []): { name: string; reset: boolean } {
+  const name = args.trim();
+  if (!name) return { name: "", reset: false };
+  if (serverNames.includes(name)) return { name, reset: false };
+  return stripResetFlag(name);
 }
 
 export interface ServerCompletionEntry {

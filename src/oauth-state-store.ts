@@ -243,6 +243,33 @@ export async function saveState(
   }
 }
 
+function isStoredStateOriginCompatible(
+  state: { serverUrl?: string | undefined; discoveryState?: unknown },
+  expectedServerUrl: string,
+): boolean {
+  if (state.serverUrl !== undefined) {
+    return urlsMatch(state.serverUrl, expectedServerUrl);
+  }
+  const discoveryState = state.discoveryState as OAuthDiscoveryState | undefined;
+  const resource = (discoveryState?.resourceMetadata as { resource?: unknown } | undefined)?.resource;
+  if (typeof resource === "string") {
+    return isResourceCompatibleWithServerUrl(resource, expectedServerUrl);
+  }
+  return true;
+}
+
+function readAndParseStoredStateSync(path: string): z.output<typeof StoredStateSchema> | undefined {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const json: unknown = JSON.parse(raw);
+    const parsed = StoredStateSchema.safeParse(json);
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    // WHY: State file may not exist yet (ENOENT), directory may be inaccessible, or JSON is malformed; return undefined.
+    return undefined;
+  }
+}
+
 /**
  * Synchronously load stored DCR redirect URIs from disk if valid and origin-compatible.
  * Used by silent McpOAuthProvider to report registered redirect_uris synchronously.
@@ -252,38 +279,14 @@ export function loadStoredRedirectUrisSync(
   storageDir?: string,
   serverUrl?: string,
 ): string[] | undefined {
-  const path = statePath(serverName, storageDir);
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    // WHY: State file may not exist yet (ENOENT) or directory may be inaccessible; return undefined.
+  const data = readAndParseStoredStateSync(statePath(serverName, storageDir));
+  if (!data) return undefined;
+  if (serverUrl !== undefined && !isStoredStateOriginCompatible(data, serverUrl)) {
     return undefined;
   }
-
-  try {
-    const json: unknown = JSON.parse(raw);
-    const parsed = StoredStateSchema.safeParse(json);
-    if (!parsed.success) return undefined;
-    if (serverUrl !== undefined) {
-      if (parsed.data.serverUrl !== undefined && !urlsMatch(parsed.data.serverUrl, serverUrl)) {
-        return undefined;
-      }
-      if (parsed.data.serverUrl === undefined) {
-        const discoveryState = parsed.data.discoveryState as OAuthDiscoveryState | undefined;
-        const resource = (discoveryState?.resourceMetadata as { resource?: unknown } | undefined)?.resource;
-        if (typeof resource === "string" && !isResourceCompatibleWithServerUrl(resource, serverUrl)) {
-          return undefined;
-        }
-      }
-    }
-    const uris = parsed.data.clientInfo?.redirect_uris;
-    if (Array.isArray(uris) && uris.length > 0) {
-      return uris.map(String);
-    }
-  } catch {
-    // WHY: Malformed JSON or parse failure; async loadState handles backup/reporting.
-    return undefined;
+  const uris = data.clientInfo?.redirect_uris;
+  if (Array.isArray(uris) && uris.length > 0) {
+    return uris.map(String);
   }
   return undefined;
 }

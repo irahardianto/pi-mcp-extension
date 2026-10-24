@@ -12,57 +12,48 @@ import { McpError, AuthCancelledError } from "./errors.js";
 import { AuthRequiredError } from "./oauth-provider.js";
 import type { ServerConfig } from "./config.js";
 
-export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>()): boolean {
-  if (!error || seen.has(error)) {
-    return false;
-  }
-  if (typeof error === "object") {
-    seen.add(error);
-  }
-
-  if (error instanceof AuthRequiredError || error instanceof UnauthorizedError) {
+function isHttpStatusCodeUnauthorized(numericCode: number, error: unknown): boolean {
+  if (numericCode === 401) return true;
+  const msg = error instanceof Error ? error.message : String(error);
+  if (numericCode === 403 && /\b(insufficient_scope|trying upscoping)\b/i.test(msg)) {
     return true;
   }
+  return false;
+}
 
+function isObjectRecordUnauthorized(
+  error: object,
+  seen: Set<unknown>,
+): boolean | undefined {
   if (error instanceof McpError) {
     // WHY: Tool-level application errors (`isError: true`) come from tool execution logic
     // (e.g. "found 401 items in database") and must never trigger MCP OAuth re-authentication.
     if (error.code === "tool") {
       return false;
     }
-    if (error.cause !== undefined && isOAuthUnauthorizedError(error.cause, seen)) {
-      return true;
-    }
   }
 
-  if (typeof error === "object") {
-    const rec = error as { code?: unknown; status?: unknown; statusCode?: unknown; cause?: unknown };
-    if (rec.cause !== undefined && isOAuthUnauthorizedError(rec.cause, seen)) {
-      return true;
-    }
-    const numericCode =
-      typeof rec.code === "number"
-        ? rec.code
-        : typeof rec.status === "number"
-          ? rec.status
-          : typeof rec.statusCode === "number"
-            ? rec.statusCode
-            : undefined;
-    // WHY: Only treat 100..599 as HTTP status codes so negative JSON-RPC error codes
-    // (e.g. -32000) still inspect the error message for wrapped HTTP 401/403 status text.
-    if (numericCode !== undefined && numericCode >= 100 && numericCode <= 599) {
-      if (numericCode === 401) return true;
-      const msg = error instanceof Error ? error.message : String(error);
-      if (numericCode === 403 && /\b(insufficient_scope|trying upscoping)\b/i.test(msg)) {
-        return true;
-      }
-      return false;
-    }
+  const rec = error as { code?: unknown; status?: unknown; statusCode?: unknown; cause?: unknown };
+  if (rec.cause !== undefined && isOAuthUnauthorizedError(rec.cause, seen)) {
+    return true;
   }
+  const numericCode =
+    typeof rec.code === "number"
+      ? rec.code
+      : typeof rec.status === "number"
+        ? rec.status
+        : typeof rec.statusCode === "number"
+          ? rec.statusCode
+          : undefined;
+  // WHY: Only treat 100..599 as HTTP status codes so negative JSON-RPC error codes
+  // (e.g. -32000) still inspect the error message for wrapped HTTP 401/403 status text.
+  if (numericCode !== undefined && numericCode >= 100 && numericCode <= 599) {
+    return isHttpStatusCodeUnauthorized(numericCode, error);
+  }
+  return undefined;
+}
 
-  const msg = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  if (!msg) return false;
-
+function isUnauthorizedErrorMessage(msg: string): boolean {
   // Reject messages that explicitly report a non-401/403 HTTP status code
   const httpStatusMatch = msg.match(
     /\b(?:HTTP(?:\/\d(?:\.\d)?)?\s+|status(?:\s+code)?[:\s]+|(?:POSTing|GETting|connecting)\s+to\s+\S+:\s*|(?:Non-200\s+status\s+code\s*\())(\d{3})\b/i,
@@ -94,14 +85,33 @@ export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>
     return true;
   }
 
-  if (
+  return (
     /\b(403|Forbidden)\b/i.test(msg) &&
     /\b(insufficient_scope|trying upscoping)\b/i.test(msg)
-  ) {
+  );
+}
+
+export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>()): boolean {
+  if (!error || seen.has(error)) {
+    return false;
+  }
+  if (typeof error === "object") {
+    seen.add(error);
+  }
+
+  if (error instanceof AuthRequiredError || error instanceof UnauthorizedError) {
     return true;
   }
 
-  return false;
+  if (typeof error === "object" && error !== null) {
+    const objectResult = isObjectRecordUnauthorized(error, seen);
+    if (objectResult !== undefined) {
+      return objectResult;
+    }
+  }
+
+  const msg = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return msg ? isUnauthorizedErrorMessage(msg) : false;
 }
 
 /** Fixed retry delay schedule — predictable, no jitter math needed. */
@@ -128,18 +138,27 @@ export interface ClassifyConnectFailureInput {
   serverName?: string;
 }
 
-/**
- * Pure failure classifier for connection attempts.
- * Classifies failure into cancelled, retry-corrupt-state, auth-required, fail (fast-fail),
- * give-up (retries exhausted), or retry with a specific delay.
- */
-export function classifyConnectFailure(input: ClassifyConnectFailureInput): ConnectFailureAction {
-  if (input.aborted || input.error instanceof AuthCancelledError) {
-    return { kind: "cancelled" };
+function classifyOAuthFailure(
+  input: ClassifyConnectFailureInput,
+  error: Error,
+): ConnectFailureAction | null {
+  if (error instanceof AuthRequiredError) {
+    return { kind: "auth-required", invalidateTokens: false };
   }
+  if (input.hasAuth && input.transport !== "stdio" && isOAuthUnauthorizedError(input.error)) {
+    // WHY: Check OAuth unauthorized errors BEFORE the generic `error.code === "protocol"`
+    // fast-fail so 401/403 failures during initial tools/list (`onToolRefresh`) are
+    // classified as `AuthRequiredError` rather than raw protocol failures, and stale
+    // tokens on disk are invalidated before interactive re-authorization runs.
+    return { kind: "auth-required", invalidateTokens: true };
+  }
+  return null;
+}
 
-  const error = input.error instanceof Error ? input.error : new Error(String(input.error));
-
+function classifyPreRetryFailure(
+  input: ClassifyConnectFailureInput,
+  error: Error,
+): ConnectFailureAction | null {
   if (
     !input.corruptStateRecovered &&
     error instanceof McpError &&
@@ -152,22 +171,20 @@ export function classifyConnectFailure(input: ClassifyConnectFailureInput): Conn
     return { kind: "retry-corrupt-state" };
   }
 
-  if (error instanceof AuthRequiredError) {
-    return { kind: "auth-required", invalidateTokens: false };
-  }
-
-  if (input.hasAuth && input.transport !== "stdio" && isOAuthUnauthorizedError(input.error)) {
-    // WHY: Check OAuth unauthorized errors BEFORE the generic `error.code === "protocol"`
-    // fast-fail so 401/403 failures during initial tools/list (`onToolRefresh`) are
-    // classified as `AuthRequiredError` rather than raw protocol failures, and stale
-    // tokens on disk are invalidated before interactive re-authorization runs.
-    return { kind: "auth-required", invalidateTokens: true };
-  }
+  const oauthAction = classifyOAuthFailure(input, error);
+  if (oauthAction) return oauthAction;
 
   if (error instanceof McpError && (error.code === "protocol" || error.code === "config")) {
     return { kind: "fail", error };
   }
 
+  return null;
+}
+
+function classifyRetryOrGiveUp(
+  input: ClassifyConnectFailureInput,
+  error: Error,
+): ConnectFailureAction {
   if (input.retryCount >= input.maxRetries) {
     const serverName = input.serverName ?? (error instanceof McpError ? error.server : "");
     const code = error instanceof McpError && error.code === "timeout" ? "timeout" : "connection";
@@ -184,4 +201,23 @@ export function classifyConnectFailure(input: ClassifyConnectFailureInput): Conn
 
   const delayMs = RETRY_DELAYS_MS[Math.min(input.retryCount, RETRY_DELAYS_MS.length - 1)] ?? 30000;
   return { kind: "retry", delayMs };
+}
+
+/**
+ * Pure failure classifier for connection attempts.
+ * Classifies failure into cancelled, retry-corrupt-state, auth-required, fail (fast-fail),
+ * give-up (retries exhausted), or retry with a specific delay.
+ */
+export function classifyConnectFailure(input: ClassifyConnectFailureInput): ConnectFailureAction {
+  if (input.aborted || input.error instanceof AuthCancelledError) {
+    return { kind: "cancelled" };
+  }
+
+  const error = input.error instanceof Error ? input.error : new Error(String(input.error));
+  const preRetryAction = classifyPreRetryFailure(input, error);
+  if (preRetryAction) {
+    return preRetryAction;
+  }
+
+  return classifyRetryOrGiveUp(input, error);
 }

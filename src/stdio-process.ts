@@ -146,6 +146,31 @@ export function isPidAlive(
   }
 }
 
+async function signalAndWaitForExit(
+  pid: number,
+  signal: NodeJS.Signals,
+  timeoutMs: number,
+  d: StdioProcessDeps,
+): Promise<boolean> {
+  try {
+    d.kill(pid, signal);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+      return true;
+    }
+  }
+
+  const deadline = d.now() + timeoutMs;
+  while (d.now() < deadline) {
+    if (!isPidAlive(pid, d)) {
+      return true;
+    }
+    await d.sleep(25);
+  }
+
+  return !isPidAlive(pid, d);
+}
+
 export async function ensurePidTerminated(
   pid: number | null | undefined,
   deps?: Partial<StdioProcessDeps>,
@@ -155,39 +180,10 @@ export async function ensurePidTerminated(
     return;
   }
 
-  try {
-    d.kill(pid, "SIGTERM");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-      return;
-    }
-  }
-
-  const sigtermDeadline = d.now() + 500;
-  while (d.now() < sigtermDeadline) {
-    if (!isPidAlive(pid, d)) {
-      return;
-    }
-    await d.sleep(25);
-  }
-
-  if (!isPidAlive(pid, d)) {
+  if (await signalAndWaitForExit(pid, "SIGTERM", 500, d)) {
     return;
   }
 
-  try {
-    d.kill(pid, "SIGKILL");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-      return;
-    }
-  }
-
-  const sigkillDeadline = d.now() + 200;
-  while (d.now() < sigkillDeadline) {
-    if (!isPidAlive(pid, d)) {
-      return;
-    }
-    await d.sleep(25);
-  }
+  await signalAndWaitForExit(pid, "SIGKILL", 200, d);
 }
+

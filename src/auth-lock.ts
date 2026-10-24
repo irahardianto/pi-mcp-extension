@@ -184,6 +184,203 @@ async function readLockRecordWithRetry(
   return null;
 }
 
+interface LockContext {
+  serverName: string;
+  path: string;
+  myRecord: LockRecord;
+  deps: AuthLockDeps;
+  usingRealFs: boolean;
+  onLost?: (() => void) | undefined;
+}
+
+async function runHeartbeatTick(
+  ctx: LockContext,
+  isStateActive: () => boolean,
+  markLost: () => void,
+): Promise<void> {
+  const { path, myRecord, deps, usingRealFs } = ctx;
+  if (!isStateActive()) return;
+  const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
+  if (!isStateActive()) return;
+  if (!current || current.nonce !== myRecord.nonce) {
+    markLost();
+    return;
+  }
+  const nowSec = deps.clock.now() / 1000;
+  try {
+    await deps.fs.utimes(path, nowSec, nowSec);
+  } catch {
+    if (isStateActive()) {
+      const after = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
+      if (!after || after.nonce !== myRecord.nonce) {
+        markLost();
+      } else {
+        await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
+          // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
+          if (isStateActive()) markLost();
+        });
+      }
+    }
+  }
+}
+
+function createLockHandle(ctx: LockContext): AuthLockHandle {
+  const { serverName, path, myRecord, deps, usingRealFs, onLost } = ctx;
+  let released = false;
+  let lost = false;
+  let heartbeatTimer: ReturnType<typeof setInterval> | AuthLockTimer | null = null;
+
+  const stopHeartbeat = () => {
+    if (heartbeatTimer !== null) {
+      deps.clock.clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const onExit = () => {
+    // WHY: Do not skip cleanup when `lost` is true — if a contender restored our
+    // lock file via `link()` after a transient rename, we must still unlink our own nonce.
+    if (released || !usingRealFs) return;
+    try {
+      const raw = readFileSync(path, "utf8");
+      const current = parseLockRecord(raw);
+      if (current && current.nonce === myRecord.nonce) {
+        unlinkSync(path);
+      }
+    } catch {
+      // WHY: Best-effort synchronous cleanup on process exit; lock file may already be unlinked.
+    }
+  };
+
+  const markLost = () => {
+    if (lost || released) return;
+    lost = true;
+    stopHeartbeat();
+    onLost?.();
+  };
+
+  process.once("exit", onExit);
+
+  heartbeatTimer = deps.clock.setInterval(() => {
+    void runHeartbeatTick(ctx, () => !released && !lost, markLost);
+  }, HEARTBEAT_MS);
+  heartbeatTimer.unref?.();
+
+  const assertHeld = async (): Promise<void> => {
+    if (lost || released) {
+      throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+    }
+    const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
+    if (!current || current.nonce !== myRecord.nonce) {
+      markLost();
+      throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+    }
+  };
+
+  const unlock = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    stopHeartbeat();
+    process.removeListener("exit", onExit);
+    // WHY: Always check and unlink if the file on disk still carries our nonce, even if
+    // `lost` was set during a contender's temporary stale-check rename+link window.
+    const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
+    if (current && current.nonce === myRecord.nonce) {
+      await deps.fs.unlink(path).catch(() => {
+        // WHY: Best-effort lock removal on unlock; ignore ENOENT if concurrently removed.
+      });
+    }
+  };
+
+  return Object.assign(unlock, {
+    unlock,
+    assertHeld,
+    isLost: () => lost,
+  });
+}
+
+async function inspectAndReclaimStaleLock(
+  serverName: string,
+  path: string,
+  deps: AuthLockDeps,
+): Promise<"reclaimed" | "retry"> {
+  // Lock file already exists — inspect and check staleness
+  let statResult: { mtimeMs: number };
+  try {
+    statResult = await deps.fs.stat(path);
+  } catch (statErr) {
+    if ((statErr as NodeJS.ErrnoException).code === "ENOENT") {
+      return "retry";
+    }
+    throw statErr;
+  }
+
+  let record: LockRecord | null = null;
+  try {
+    const raw = await deps.fs.readFile(path, "utf8");
+    record = parseLockRecord(raw);
+  } catch (readErr) {
+    if ((readErr as NodeJS.ErrnoException).code === "ENOENT") {
+      return "retry";
+    }
+    record = null;
+  }
+
+  const stale = isLockStale(record, statResult.mtimeMs, deps.clock.now(), {
+    hostname: deps.hostname,
+    isPidAlive: deps.isPidAlive,
+  });
+  if (!stale) {
+    throw new AuthLockError(serverName, formatHolderDetails(record));
+  }
+
+  // Reclaim protocol: move stale candidate aside, verify identity, then delete or restore
+  const movedPath = `${path}.stale-${randomUUID()}`;
+  try {
+    await deps.fs.rename(path, movedPath);
+  } catch (renameErr) {
+    if ((renameErr as NodeJS.ErrnoException).code === "ENOENT") {
+      return "retry";
+    }
+    throw renameErr;
+  }
+
+  let movedRecord: LockRecord | null = null;
+  try {
+    const movedRaw = await deps.fs.readFile(movedPath, "utf8");
+    movedRecord = parseLockRecord(movedRaw);
+  } catch {
+    movedRecord = null;
+  }
+
+  let matchesStale = false;
+  if (record !== null) {
+    matchesStale = movedRecord !== null && movedRecord.nonce === record.nonce;
+  } else {
+    try {
+      const movedStat = await deps.fs.stat(movedPath);
+      matchesStale = movedRecord === null && movedStat.mtimeMs === statResult.mtimeMs;
+    } catch {
+      matchesStale = false;
+    }
+  }
+
+  if (matchesStale) {
+    await deps.fs.unlink(movedPath).catch(() => {
+      // WHY: Best-effort removal of reclaimed stale lock file.
+    });
+    return "reclaimed";
+  }
+
+  await deps.fs.link(movedPath, path).catch(() => {
+    // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
+  });
+  await deps.fs.unlink(movedPath).catch(() => {
+    // WHY: Best-effort cleanup of temporary stale-check file.
+  });
+  throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
+}
+
 export async function acquireAuthLock(
   serverName: string,
   storageDir?: string,
@@ -229,182 +426,23 @@ export async function acquireAuthLock(
       }
       await file.close();
 
-      let released = false;
-      let lost = false;
-      let heartbeatTimer: ReturnType<typeof setInterval> | AuthLockTimer | null = null;
-
-      const stopHeartbeat = () => {
-        if (heartbeatTimer !== null) {
-          deps.clock.clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
-      };
-
-      const onExit = () => {
-        // WHY: Do not skip cleanup when `lost` is true — if a contender restored our
-        // lock file via `link()` after a transient rename, we must still unlink our own nonce.
-        if (released || !usingRealFs) return;
-        try {
-          const raw = readFileSync(path, "utf8");
-          const current = parseLockRecord(raw);
-          if (current && current.nonce === myRecord.nonce) {
-            unlinkSync(path);
-          }
-        } catch {
-          // WHY: Best-effort synchronous cleanup on process exit; lock file may already be unlinked.
-        }
-      };
-
-      const markLost = () => {
-        if (lost || released) return;
-        lost = true;
-        stopHeartbeat();
-        options?.onLost?.();
-      };
-
-      process.once("exit", onExit);
-
-      const heartbeatTick = async (): Promise<void> => {
-        if (released || lost) return;
-        const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-        if (released || lost) return;
-        if (!current || current.nonce !== myRecord.nonce) {
-          markLost();
-          return;
-        }
-        const nowSec = deps.clock.now() / 1000;
-        try {
-          await deps.fs.utimes(path, nowSec, nowSec);
-        } catch {
-          if (!released && !lost) {
-            const after = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-            if (!after || after.nonce !== myRecord.nonce) {
-              markLost();
-            } else {
-              await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
-                // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
-                if (!released && !lost) markLost();
-              });
-            }
-          }
-        }
-      };
-      heartbeatTimer = deps.clock.setInterval(() => {
-        void heartbeatTick();
-      }, HEARTBEAT_MS);
-      heartbeatTimer.unref?.();
-
-      const assertHeld = async (): Promise<void> => {
-        if (lost || released) {
-          throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
-        }
-        const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-        if (!current || current.nonce !== myRecord.nonce) {
-          markLost();
-          throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
-        }
-      };
-
-      const unlock = async (): Promise<void> => {
-        if (released) return;
-        released = true;
-        stopHeartbeat();
-        process.removeListener("exit", onExit);
-        // WHY: Always check and unlink if the file on disk still carries our nonce, even if
-        // `lost` was set during a contender's temporary stale-check rename+link window.
-        const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-        if (current && current.nonce === myRecord.nonce) {
-          await deps.fs.unlink(path).catch(() => {
-            // WHY: Best-effort lock removal on unlock; ignore ENOENT if concurrently removed.
-          });
-        }
-      };
-
-      return Object.assign(unlock, {
-        unlock,
-        assertHeld,
-        isLost: () => lost,
+      return createLockHandle({
+        serverName,
+        path,
+        myRecord,
+        deps,
+        usingRealFs,
+        onLost: options?.onLost,
       });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         throw err;
       }
 
-      // Lock file already exists — inspect and check staleness
-      let statResult: { mtimeMs: number };
-      try {
-        statResult = await deps.fs.stat(path);
-      } catch (statErr) {
-        if ((statErr as NodeJS.ErrnoException).code === "ENOENT") {
-          continue;
-        }
-        throw statErr;
-      }
-
-      let record: LockRecord | null = null;
-      try {
-        const raw = await deps.fs.readFile(path, "utf8");
-        record = parseLockRecord(raw);
-      } catch (readErr) {
-        if ((readErr as NodeJS.ErrnoException).code === "ENOENT") {
-          continue;
-        }
-        record = null;
-      }
-
-      const stale = isLockStale(record, statResult.mtimeMs, deps.clock.now(), {
-        hostname: deps.hostname,
-        isPidAlive: deps.isPidAlive,
-      });
-      if (!stale) {
-        throw new AuthLockError(serverName, formatHolderDetails(record));
-      }
-
-      // Reclaim protocol: move stale candidate aside, verify identity, then delete or restore
-      const movedPath = `${path}.stale-${randomUUID()}`;
-      try {
-        await deps.fs.rename(path, movedPath);
-      } catch (renameErr) {
-        if ((renameErr as NodeJS.ErrnoException).code === "ENOENT") {
-          continue;
-        }
-        throw renameErr;
-      }
-
-      let movedRecord: LockRecord | null = null;
-      try {
-        const movedRaw = await deps.fs.readFile(movedPath, "utf8");
-        movedRecord = parseLockRecord(movedRaw);
-      } catch {
-        movedRecord = null;
-      }
-
-      let matchesStale = false;
-      if (record !== null) {
-        matchesStale = movedRecord !== null && movedRecord.nonce === record.nonce;
-      } else {
-        try {
-          const movedStat = await deps.fs.stat(movedPath);
-          matchesStale = movedRecord === null && movedStat.mtimeMs === statResult.mtimeMs;
-        } catch {
-          matchesStale = false;
-        }
-      }
-
-      if (matchesStale) {
-        await deps.fs.unlink(movedPath).catch(() => {
-          // WHY: Best-effort removal of reclaimed stale lock file.
-        });
+      const outcome = await inspectAndReclaimStaleLock(serverName, path, deps);
+      if (outcome === "retry" || outcome === "reclaimed") {
         continue;
       }
-
-      await deps.fs.link(movedPath, path).catch(() => {
-        // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
-      });
-      await deps.fs.unlink(movedPath).catch(() => {
-        // WHY: Best-effort cleanup of temporary stale-check file.
-      });
-      throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
     }
   }
 

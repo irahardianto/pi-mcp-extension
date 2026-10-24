@@ -26,6 +26,20 @@ function stepJsonPointer(curr: unknown, part: string): unknown {
   return (curr as Record<string, unknown>)[part];
 }
 
+function walkJsonPointer(root: unknown, segments: readonly string[]): Record<string, unknown> | undefined {
+  let curr: unknown = root;
+  for (const part of segments) {
+    curr = stepJsonPointer(curr, part);
+    if (curr === undefined) {
+      return undefined;
+    }
+  }
+  if (curr && typeof curr === "object" && !Array.isArray(curr)) {
+    return curr as Record<string, unknown>;
+  }
+  return undefined;
+}
+
 /**
  * Resolve a JSON Schema `$ref` against the root schema's `$defs`/`definitions`
  * and the root schema itself.
@@ -53,31 +67,11 @@ export function resolveRefTarget(
     rootDefs &&
     Object.prototype.hasOwnProperty.call(rootDefs, parts[1]!)
   ) {
-    const defEntry = rootDefs[parts[1]!];
-    if (defEntry && typeof defEntry === "object" && !Array.isArray(defEntry)) {
-      if (parts.length === 2) {
-        return defEntry;
-      }
-      let curr: unknown = defEntry;
-      for (let i = 2; i < parts.length; i++) {
-        curr = stepJsonPointer(curr, parts[i]!);
-        if (curr === undefined) break;
-      }
-      if (curr && typeof curr === "object" && !Array.isArray(curr)) {
-        return curr as Record<string, unknown>;
-      }
+    const defTarget = walkJsonPointer(rootDefs[parts[1]!], parts.slice(2));
+    if (defTarget) {
+      return defTarget;
     }
   }
 
-  let curr: unknown = rootSchema;
-  for (const part of parts) {
-    curr = stepJsonPointer(curr, part);
-    if (curr === undefined) {
-      return undefined;
-    }
-  }
-  if (curr && typeof curr === "object" && !Array.isArray(curr)) {
-    return curr as Record<string, unknown>;
-  }
-  return undefined;
+  return walkJsonPointer(rootSchema, parts);
 }
