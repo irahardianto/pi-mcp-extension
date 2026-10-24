@@ -9,11 +9,11 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { convertJsonSchemaToTypebox } from "../src/schema-convert.js";
+import { listAllTools } from "../src/tool-discovery.js";
 import {
   buildToolName,
   convertMcpContent,
   ToolBridge,
-  listAllTools,
 } from "../src/tool-bridge.js";
 
 type SchemaTuple = [SchemaJson, SchemaJson, SchemaJson, SchemaJson, ...SchemaJson[]];
