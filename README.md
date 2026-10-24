@@ -1,12 +1,12 @@
 # pi-mcp-extension
 
 [![npm version](https://img.shields.io/npm/v/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
+[![license](https://img.shields.io/npm/l/pi-mcp-extension.svg)](https://github.com/irahardianto/pi-mcp-extension/blob/main/LICENSE)
 [![CI](https://github.com/irahardianto/pi-mcp-extension/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/irahardianto/pi-mcp-extension/actions/workflows/ci.yml)
-[![Maintainability](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg)](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension)
 [![Code Coverage](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/coverage.svg)](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension)
+[![Maintainability](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg)](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension)<br>
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/irahardianto/pi-mcp-extension/badge)](https://scorecard.dev/viewer/?uri=github.com/irahardianto/pi-mcp-extension)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15659/badge)](https://www.bestpractices.dev/projects/15659)
-[![license](https://img.shields.io/npm/l/pi-mcp-extension.svg)](https://github.com/irahardianto/pi-mcp-extension/blob/main/LICENSE)
 
 **Connect [Pi](https://pi.dev) to any MCP server.** Supabase, DeepSource, Playwright, Context7, filesystem, databases — if it speaks [MCP](https://modelcontextprotocol.io), Pi can use it.
 
