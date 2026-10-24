@@ -49,7 +49,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 |---|---|
 | `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; `mcp_status` / `mcp_connect` tools |
 | `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash-command registration (`registerCommands`) |
-| `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, startup auth prompts, eager server starts, session teardown) |
+| `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, eager server starts, session teardown) |
+| `src/startup-auth.ts` | Abort-aware auth-queue turn waiter (`waitForQueueTurn`), startup authorization prompt (`promptStartupAuth`, `startupAuthNowOption`, `startupAuthLaterOption`), and error message formatting (`formatErrorMessage`) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow (`authorize`), browser launcher (`openBrowser`, `browserOpenCommand`), callback waiter (`waitForOAuthCallback`), and dialog option constants |
 | `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), pure connect-failure classification (`classifyConnectFailure`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |

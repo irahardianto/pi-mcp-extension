@@ -12,15 +12,14 @@ import type { ServerManager } from "./server-manager.js";
 import type { ToolBridge } from "./tool-bridge.js";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { AuthRequiredError } from "./oauth-provider.js";
-import { sanitizeTerminalText } from "./terminal-text.js";
+import {
+  formatErrorMessage,
+  promptStartupAuth,
+  startupAuthNowOption,
+  waitForQueueTurn,
+} from "./startup-auth.js";
 
-export const startupAuthNowOption = "Authorize now";
-export const startupAuthLaterOption = "Not now";
-
-export function formatErrorMessage(err: unknown): string {
-  const msg = err instanceof McpError ? err.userMessage : err instanceof Error ? err.message : String(err);
-  return sanitizeTerminalText(msg.replace(/^AuthRequiredError:\s*/, ""));
-}
+export { formatErrorMessage, startupAuthLaterOption, startupAuthNowOption } from "./startup-auth.js";
 
 export interface ConnectionCoordinatorDeps {
   manager: ServerManager;
@@ -68,34 +67,6 @@ export class ConnectionCoordinator {
     return this.connectAttempts.size;
   }
 
-  // WHY: Allow an aborted waiter on authQueue to wake up and reject immediately without breaking
-  // the sequential promise chain for subsequent non-aborted waiters.
-  private waitForQueueTurn(previous: Promise<void>, signal: AbortSignal, serverName: string): Promise<void> {
-    if (signal.aborted) {
-      return Promise.reject(new AuthCancelledError(serverName));
-    }
-    return new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        reject(new AuthCancelledError(serverName));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      previous.then(
-        () => {
-          signal.removeEventListener("abort", onAbort);
-          if (signal.aborted) {
-            reject(new AuthCancelledError(serverName));
-          } else {
-            resolve();
-          }
-        },
-        (err: unknown) => {
-          signal.removeEventListener("abort", onAbort);
-          reject(err);
-        },
-      );
-    });
-  }
-
   private async runSerializedAuth(
     serverName: string,
     signal: AbortSignal,
@@ -108,7 +79,7 @@ export class ConnectionCoordinator {
     });
     this.authQueue = previous.then(() => gate);
     try {
-      await this.waitForQueueTurn(previous, signal, serverName);
+      await waitForQueueTurn(previous, signal, serverName);
       await fn();
     } finally {
       release();
@@ -213,7 +184,7 @@ export class ConnectionCoordinator {
     void (async () => {
       let currentTurn: { serverName: string; handoffPromise?: Promise<void> } | null = null;
       try {
-        await this.waitForQueueTurn(previous, promptController.signal, name);
+        await waitForQueueTurn(previous, promptController.signal, name);
         if (
           promptController.signal.aborted ||
           this.declinedStartupAuth.has(name) ||
@@ -226,31 +197,7 @@ export class ConnectionCoordinator {
         this.activeStartupTurn = currentTurn;
         let choice: string | undefined;
         try {
-          choice = await new Promise<string | undefined>((resolve, reject) => {
-            if (promptController.signal.aborted) {
-              resolve(undefined);
-              return;
-            }
-            const onAbort = () => resolve(undefined);
-            promptController.signal.addEventListener("abort", onAbort, { once: true });
-            ctx.ui
-              .select(
-                `${name} needs authorization`,
-                [startupAuthNowOption, startupAuthLaterOption],
-                { signal: promptController.signal },
-              )
-              .then(
-                (value) => {
-                  promptController.signal.removeEventListener("abort", onAbort);
-                  resolve(value);
-                },
-                (err: unknown) => {
-                  promptController.signal.removeEventListener("abort", onAbort);
-                  if (promptController.signal.aborted) resolve(undefined);
-                  else reject(err);
-                },
-              );
-          });
+          choice = await promptStartupAuth(name, ctx, promptController.signal);
         } finally {
           if (this.startupPromptControllers.get(name) === promptController) {
             this.startupPromptControllers.delete(name);
