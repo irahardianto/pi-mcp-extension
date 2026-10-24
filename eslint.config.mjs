@@ -55,6 +55,10 @@ export default tseslint.config(
       ],
       "@typescript-eslint/switch-exhaustiveness-check": "error",
       "@typescript-eslint/no-unnecessary-type-assertion": "error",
+      // WHY: mirrors Qlty's function-parameters threshold (5) so `npm run lint`
+      // catches a 6-parameter function before Qlty does. max: 5 (not 4) keeps
+      // the third-party ToolDefinition.execute 5-argument callback signature legal.
+      "@typescript-eslint/max-params": ["error", { max: 5 }],
       "no-empty": ["error", { allowEmptyCatch: false }],
       "@typescript-eslint/no-empty-function": "error",
       "@typescript-eslint/no-explicit-any": "error",
@@ -71,6 +75,9 @@ export default tseslint.config(
     rules: {
       "no-console": "off",
       "@typescript-eslint/no-empty-function": "off",
+      // WHY: max-params mirrors Qlty for shipped code; test helpers may bundle
+      // fixture arguments more loosely (see tests/fuzz.test.ts).
+      "@typescript-eslint/max-params": "off",
     },
   },
 );

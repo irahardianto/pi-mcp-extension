@@ -558,12 +558,15 @@ export class ServerManager {
 
   private async _handshakeAndDiscover(
     server: ManagedServer,
-    client: Client,
-    transport: Transport,
-    timeoutMs: number,
-    signal: AbortSignal,
-    currentCwd: string,
+    context: {
+      client: Client;
+      transport: Transport;
+      timeoutMs: number;
+      signal: AbortSignal;
+      currentCwd: string;
+    },
   ): Promise<void> {
+    const { client, transport, timeoutMs, signal, currentCwd } = context;
     await this._connectWithTimeoutAndSignal(client, transport, timeoutMs, signal, server.name);
     if (signal.aborted) throw new AuthCancelledError(server.name);
     if (transport instanceof StdioClientTransport && !server.childPid) {
@@ -826,7 +829,13 @@ export class ServerManager {
     server.client = client;
 
     try {
-      await this._handshakeAndDiscover(server, client, transport, timeoutMs, signal, currentCwd);
+      await this._handshakeAndDiscover(server, {
+        client,
+        transport,
+        timeoutMs,
+        signal,
+        currentCwd,
+      });
       this._startHealthCheck(server, timeoutMs, signal, cwd);
       this._wireDisconnectRecovery(server, client, signal, cwd);
     } catch (err) {
