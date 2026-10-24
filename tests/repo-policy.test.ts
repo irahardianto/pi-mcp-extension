@@ -249,8 +249,9 @@ describe("coverage and Qlty maintainability policy", () => {
     }
   });
 
-  it("includes Qlty Maintainability and Code Coverage badges in README.md", () => {
+  it("includes CI, Qlty Maintainability, and Code Coverage badges in README.md", () => {
     const readme = readRepoFile("README.md");
+    assert.ok(readme.includes("actions/workflows/ci.yml/badge.svg?branch=main"), "README.md must include CI status badge");
     assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg"));
     assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/coverage.svg"));
   });
