@@ -49,6 +49,14 @@ function getFunctionName(node) {
   return "<anonymous>";
 }
 
+export const CONTROL_FLOW_NODE =
+  ":matches(IfStatement:not(IfStatement > IfStatement.alternate), ForStatement, ForInStatement, ForOfStatement, WhileStatement, DoWhileStatement, SwitchStatement, TryStatement, ConditionalExpression)";
+
+export const MAX_CONTROL_FLOW_DEPTH_SELECTOR = Array.from(
+  { length: 5 },
+  () => CONTROL_FLOW_NODE,
+).join(" ");
+
 export const maxReturnStatementsRule = {
   meta: {
     type: "suggestion",
@@ -172,6 +180,20 @@ export default tseslint.config(
       "no-empty": ["error", { allowEmptyCatch: false }],
       "@typescript-eslint/no-empty-function": "error",
       "@typescript-eslint/no-explicit-any": "error",
+    },
+  },
+  {
+    files: ["src/**/*.ts", "scripts/**/*.ts"],
+    rules: {
+      "max-depth": ["error", 4],
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: MAX_CONTROL_FLOW_DEPTH_SELECTOR,
+          message:
+            "Control flow is nested too deeply (level >= 5). Decompose into focused helper functions or flatten branches with early returns.",
+        },
+      ],
     },
   },
   {

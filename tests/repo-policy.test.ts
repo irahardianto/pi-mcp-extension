@@ -351,4 +351,75 @@ describe("coverage and Qlty maintainability policy", () => {
       ],
     });
   });
+
+  it("configures [smells.nested_control_flow] with threshold 4 in .qlty/qlty.toml", () => {
+    const qltyToml = readRepoFile(".qlty/qlty.toml");
+    assert.match(
+      qltyToml,
+      /\[smells\.nested_control_flow\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*4/,
+      ".qlty/qlty.toml must configure [smells.nested_control_flow] with enabled = true and threshold = 4",
+    );
+  });
+
+  it("configures max-depth and 5-level control-flow AST guard on src and scripts in eslint.config.mjs", () => {
+    const eslintConfig = readRepoFile("eslint.config.mjs");
+    assert.match(
+      eslintConfig,
+      /"max-depth":\s*\[\s*"error",\s*4\s*\]/,
+      "eslint.config.mjs must configure max-depth with 4 as error",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts",\s*"scripts\/\*\*\/\*\.ts"\][\s\S]*?"max-depth"/,
+      "eslint.config.mjs must scope max-depth to src/**/*.ts and scripts/**/*.ts",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts",\s*"scripts\/\*\*\/\*\.ts"\][\s\S]*?"no-restricted-syntax"/,
+      "eslint.config.mjs must scope no-restricted-syntax to src/**/*.ts and scripts/**/*.ts",
+    );
+    assert.match(
+      eslintConfig,
+      /MAX_CONTROL_FLOW_DEPTH_SELECTOR/,
+      "eslint.config.mjs must reference MAX_CONTROL_FLOW_DEPTH_SELECTOR in no-restricted-syntax rule",
+    );
+  });
+
+  it("enforces 5-level control-flow depth policy on blocks and chained ternaries via Linter", async () => {
+    const { Linter } = await import("eslint");
+    // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
+    const { MAX_CONTROL_FLOW_DEPTH_SELECTOR } = (await import("../eslint.config.mjs")) as {
+      MAX_CONTROL_FLOW_DEPTH_SELECTOR: string;
+    };
+    const linter = new Linter({ configType: "flat" });
+    const config = [
+      {
+        rules: {
+          "max-depth": ["error", 4] as ["error", number],
+          "no-restricted-syntax": [
+            "error",
+            { selector: MAX_CONTROL_FLOW_DEPTH_SELECTOR, message: "too deep" },
+          ] as ["error", unknown],
+        },
+      },
+    ];
+
+    // Valid: 4 levels of blocks
+    const validBlocks = linter.verify("if (a) { if (b) { if (c) { if (d) { x(); } } } }", config);
+    assert.equal(validBlocks.length, 0);
+
+    // Valid: 4 levels of chained ternaries
+    const validTernary = linter.verify("const x = a ? (b ? (c ? (d ? 1 : 2) : 3) : 4) : 5;", config);
+    assert.equal(validTernary.length, 0);
+
+    // Invalid: 5 levels of blocks
+    const invalidBlocks = linter.verify("if (a) { if (b) { if (c) { if (d) { if (e) { x(); } } } } }", config);
+    assert.ok(invalidBlocks.length > 0);
+    assert.ok(invalidBlocks.some((m) => m.ruleId === "max-depth" || m.ruleId === "no-restricted-syntax"));
+
+    // Invalid: 5 levels of chained ternaries (reaches level 5 control flow)
+    const invalidTernary = linter.verify("const x = a ? (b ? (c ? (d ? (e ? 1 : 2) : 3) : 4) : 5) : 6;", config);
+    assert.ok(invalidTernary.length > 0);
+    assert.ok(invalidTernary.some((m) => m.ruleId === "no-restricted-syntax" && m.message === "too deep"));
+  });
 });

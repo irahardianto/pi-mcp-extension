@@ -318,6 +318,61 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   registerManagementTools(pi, { manager, coordinator, bridge });
 }
 
+function formatStatusAuth(
+  authConfig: ServerConfig["auth"] | undefined,
+  authCorrupt: boolean,
+  hasTokens: boolean | undefined,
+): string {
+  if (!authConfig) return "not configured";
+  if (authCorrupt) return "corrupt state file backed up (re-auth required)";
+  if (hasTokens) return "credentials stored";
+  return "authorization may be required";
+}
+
+function formatStatusError(lastError: unknown): string | undefined {
+  if (!lastError) return undefined;
+  if (lastError instanceof AuthRequiredError) {
+    return "Authorization required: use mcp_connect in an interactive Pi session";
+  }
+  const code = lastError instanceof McpError ? lastError.code : "failed";
+  return `Connection ${code}; use mcp_connect to retry`;
+}
+
+interface McpConnectErrorOptions {
+  aborted: boolean;
+  serverExists: boolean;
+  hasUI: boolean;
+}
+
+function formatMcpAuthError(err: unknown, hasUI: boolean): string | undefined {
+  if (err instanceof AuthLockError) {
+    return "Another Pi process is authorizing this server. Retry after it finishes.";
+  }
+  if (err instanceof AuthRequiredError) {
+    return hasUI
+      ? "MCP authorization required. Retry with mcp_connect or /mcp:auth."
+      : "MCP authorization requires an interactive Pi session.";
+  }
+  return undefined;
+}
+
+function formatMcpProtocolOrGenericError(err: unknown): string {
+  if (err instanceof McpError && err.code === "protocol") {
+    return "MCP tool discovery failed. Check the server and retry.";
+  }
+  return "MCP connection failed. Check the server configuration and retry.";
+}
+
+function formatMcpConnectError(err: unknown, options: McpConnectErrorOptions): string {
+  if (options.aborted || err instanceof AuthCancelledError) {
+    return "MCP connection cancelled. Retry when ready.";
+  }
+  if (!options.serverExists) {
+    return "Unknown MCP server name. Use mcp_status to list configured servers.";
+  }
+  return formatMcpAuthError(err, options.hasUI) ?? formatMcpProtocolOrGenericError(err);
+}
+
 function registerManagementTools(
   pi: ExtensionAPI,
   deps: { manager: ServerManager; coordinator: ConnectionCoordinator; bridge: ToolBridge },
@@ -354,18 +409,8 @@ function registerManagementTools(
         return {
           name: server.name, lifecycle: server.config.lifecycle, state: server.state,
           tools: bridge.getToolActivity(server.name),
-          auth: server.config.auth
-            ? authCorrupt
-              ? "corrupt state file backed up (re-auth required)"
-              : auth?.hasTokens
-                ? "credentials stored"
-                : "authorization may be required"
-            : "not configured",
-          error: server.lastError
-            ? server.lastError instanceof AuthRequiredError
-              ? "Authorization required: use mcp_connect in an interactive Pi session"
-              : `Connection ${server.lastError instanceof McpError ? server.lastError.code : "failed"}; use mcp_connect to retry`
-            : undefined,
+          auth: formatStatusAuth(server.config.auth, authCorrupt, auth?.hasTokens),
+          error: formatStatusError(server.lastError),
         };
       }));
       return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
@@ -382,19 +427,11 @@ function registerManagementTools(
       try {
         await coordinator.connect(name, ctx, { signal });
       } catch (err) {
-        const message = signal?.aborted || err instanceof AuthCancelledError
-          ? "MCP connection cancelled. Retry when ready."
-          : !manager.getServer(name)
-            ? "Unknown MCP server name. Use mcp_status to list configured servers."
-            : err instanceof AuthLockError
-              ? "Another Pi process is authorizing this server. Retry after it finishes."
-              : err instanceof AuthRequiredError
-                ? ctx.hasUI
-                  ? "MCP authorization required. Retry with mcp_connect or /mcp:auth."
-                  : "MCP authorization requires an interactive Pi session."
-                : err instanceof McpError && err.code === "protocol"
-                  ? "MCP tool discovery failed. Check the server and retry."
-                  : "MCP connection failed. Check the server configuration and retry.";
+        const message = formatMcpConnectError(err, {
+          aborted: Boolean(signal?.aborted),
+          serverExists: Boolean(manager.getServer(name)),
+          hasUI: ctx.hasUI,
+        });
         throw new Error(message);
       }
       const activity = bridge.getToolActivity(name);
