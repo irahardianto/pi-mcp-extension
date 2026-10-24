@@ -22,6 +22,9 @@ jobs:
   check:
     name: check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for the Qlty coverage upload to authenticate over OIDC (no token secret)
     timeout-minutes: 15
     strategy:
       # Let every Node version finish so a failure shows whether it's version-specific.
@@ -61,6 +64,18 @@ jobs:
       - name: Test with coverage
         if: matrix.node-version == 22
         run: npm run test:coverage
+
+      - name: Upload coverage to Qlty
+        # WHY: only the Node 22 leg produces lcov.info, and fork pull requests get no
+        # OIDC token from GitHub, so the upload would fail there.
+        if: matrix.node-version == 22 && !github.event.pull_request.head.repo.fork
+        uses: qltysh/qlty-action/coverage@v2
+        with:
+          oidc: true
+          files: lcov.info
+          # WHY: harmless when the reporter writes repository-relative paths; strips the
+          # runner workspace if it ever writes absolute ones, which Qlty would reject.
+          strip-prefix: ${{ github.workspace }}
 
       - name: Test
         if: matrix.node-version != 22

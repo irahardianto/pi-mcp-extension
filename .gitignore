@@ -2,6 +2,9 @@ node_modules/
 *.tgz
 .env
 
+# Coverage report written by `npm run test:coverage` (uploaded to Qlty in CI)
+lcov.info
+
 .pi/
 
 # Pathfinder LSP cache isolation
