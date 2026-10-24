@@ -241,8 +241,17 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.match(ci, /skip-errors: true/, "coverage upload must set skip-errors: true");
   });
 
-  it("keeps third-party linters disabled in .qlty/qlty.toml so CI workflows remain the single source of truth", () => {
+  it("declares the default plugin source and keeps third-party linters disabled in .qlty/qlty.toml", () => {
     const qltyToml = readRepoFile(".qlty/qlty.toml");
+    assert.ok(
+      qltyToml.includes('[[source]]\nname = "default"\ndefault = true'),
+      '.qlty/qlty.toml must declare [[source]] name = "default" default = true so plugin definitions resolve',
+    );
+    assert.ok(
+      qltyToml.includes("[smells.file_complexity]"),
+      ".qlty/qlty.toml must configure [smells.file_complexity] rather than unsupported [rules]",
+    );
+    assert.ok(!qltyToml.includes("[rules]"), ".qlty/qlty.toml must not contain unsupported [rules] table");
     for (const linter of ["eslint", "semgrep", "gitleaks", "actionlint", "trufflehog", "osv-scanner"]) {
       assert.ok(
         qltyToml.includes(`name = "${linter}"\nmode = "disabled"`),
