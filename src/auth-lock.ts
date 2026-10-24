@@ -210,16 +210,15 @@ async function runHeartbeatTick(
   try {
     await deps.fs.utimes(path, nowSec, nowSec);
   } catch {
-    if (isStateActive()) {
-      const after = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-      if (!after || after.nonce !== myRecord.nonce) {
-        markLost();
-      } else {
-        await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
-          // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
-          if (isStateActive()) markLost();
-        });
-      }
+    if (!isStateActive()) return;
+    const after = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
+    if (!after || after.nonce !== myRecord.nonce) {
+      markLost();
+    } else {
+      await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
+        // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
+        if (isStateActive()) markLost();
+      });
     }
   }
 }
@@ -303,14 +302,14 @@ async function inspectAndReclaimStaleLock(
   serverName: string,
   path: string,
   deps: AuthLockDeps,
-): Promise<"reclaimed" | "retry"> {
+): Promise<void> {
   // Lock file already exists — inspect and check staleness
   let statResult: { mtimeMs: number };
   try {
     statResult = await deps.fs.stat(path);
   } catch (statErr) {
     if ((statErr as NodeJS.ErrnoException).code === "ENOENT") {
-      return "retry";
+      return;
     }
     throw statErr;
   }
@@ -321,7 +320,7 @@ async function inspectAndReclaimStaleLock(
     record = parseLockRecord(raw);
   } catch (readErr) {
     if ((readErr as NodeJS.ErrnoException).code === "ENOENT") {
-      return "retry";
+      return;
     }
     record = null;
   }
@@ -340,7 +339,7 @@ async function inspectAndReclaimStaleLock(
     await deps.fs.rename(path, movedPath);
   } catch (renameErr) {
     if ((renameErr as NodeJS.ErrnoException).code === "ENOENT") {
-      return "retry";
+      return;
     }
     throw renameErr;
   }
@@ -369,7 +368,7 @@ async function inspectAndReclaimStaleLock(
     await deps.fs.unlink(movedPath).catch(() => {
       // WHY: Best-effort removal of reclaimed stale lock file.
     });
-    return "reclaimed";
+    return;
   }
 
   await deps.fs.link(movedPath, path).catch(() => {
@@ -439,10 +438,7 @@ export async function acquireAuthLock(
         throw err;
       }
 
-      const outcome = await inspectAndReclaimStaleLock(serverName, path, deps);
-      if (outcome === "retry" || outcome === "reclaimed") {
-        continue;
-      }
+      await inspectAndReclaimStaleLock(serverName, path, deps);
     }
   }
 

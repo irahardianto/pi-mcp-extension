@@ -200,6 +200,14 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.equal(schema.anyOf.length, 2);
     assert.equal(schema.anyOf[0].type, "null");
     assert.equal(schema.anyOf[1].type, "boolean");
+
+    const withNonArrayOneOf = convertJsonSchemaToTypebox({
+      oneOf: "invalid-non-array",
+      anyOf: [{ type: "string" }, { type: "null" }],
+    }) as SchemaJson;
+    assert.equal(withNonArrayOneOf.anyOf.length, 2);
+    assert.equal(withNonArrayOneOf.anyOf[0].type, "null");
+    assert.equal(withNonArrayOneOf.anyOf[1].type, "string");
   });
 
   it("converts allOf to Intersect", () => {

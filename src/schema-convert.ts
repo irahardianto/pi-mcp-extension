@@ -68,18 +68,25 @@ function withSchemaOptions(schema: TSchema, opts: Record<string, unknown>): TSch
   return Object.assign(clone, opts);
 }
 
-/**
- * Convert a JSON Schema object to a TypeBox schema.
- * Handles the common subset used by real-world MCP servers:
- *   - Primitives (string, number, integer, boolean, null)
- *   - Arrays, tuples (prefixItems / array items), objects (with required/optional/additionalProperties)
- *   - Enums and const (string, numeric, boolean, and nullable enums → Union of Literals)
- *   - Nullable and multi-type arrays ("type": ["string", "null"]) with Type.Null() ordered first
- *   - Cycle-safe $ref (#, #/$defs/, #/definitions/, and arbitrary RFC 6901 JSON Pointers)
- *   - oneOf / anyOf → TypeBox Union
- *   - allOf → TypeBox Intersect
- * Falls back to Type.Any() for unresolvable $ref, recursive cycles, or missing type.
- */
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
+function hasObjectSchemaKeywords(schema: Record<string, unknown>): boolean {
+  if (isPlainObject(schema["properties"]) || Array.isArray(schema["required"])) {
+    return true;
+  }
+  return (
+    schema["additionalProperties"] !== undefined ||
+    typeof schema["minProperties"] === "number" ||
+    typeof schema["maxProperties"] === "number"
+  );
+}
+
+function hasArraySchemaKeywords(schema: Record<string, unknown>): boolean {
+  return schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
+}
+
 interface ConversionContext {
   rootDefs: Record<string, Record<string, unknown>>;
   effectiveRoot: Record<string, unknown>;
@@ -172,24 +179,27 @@ function convertPreTypeSchema(
   return null;
 }
 
+const EXPLICIT_SCHEMA_TYPE_KEYS = [
+  "type",
+  "$ref",
+  "const",
+  "enum",
+  "oneOf",
+  "anyOf",
+  "allOf",
+] as const;
+
 function inheritCombinatorType(sub: unknown, rawType: unknown): Record<string, unknown> {
-  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+  if (!isPlainObject(sub)) {
     return sub as Record<string, unknown>;
   }
-  const subObj = sub as Record<string, unknown>;
   if (
     typeof rawType === "string" &&
-    subObj["type"] === undefined &&
-    subObj["$ref"] === undefined &&
-    subObj["const"] === undefined &&
-    subObj["enum"] === undefined &&
-    subObj["oneOf"] === undefined &&
-    subObj["anyOf"] === undefined &&
-    subObj["allOf"] === undefined
+    EXPLICIT_SCHEMA_TYPE_KEYS.every((key) => sub[key] === undefined)
   ) {
-    return { type: rawType, ...subObj };
+    return { type: rawType, ...sub };
   }
-  return subObj;
+  return sub;
 }
 
 function wrapCombinatorMembers(
@@ -209,7 +219,9 @@ function convertCombinatorSchema(
   ctx: ConversionContext,
 ): TSchema | undefined {
   if (Array.isArray(schema["oneOf"]) || Array.isArray(schema["anyOf"])) {
-    const list = (schema["oneOf"] ?? schema["anyOf"]) as unknown[];
+    const list = Array.isArray(schema["oneOf"])
+      ? (schema["oneOf"] as unknown[])
+      : (schema["anyOf"] as unknown[]);
     const members = orderUnionMembers(
       list.map((sub) =>
         convertJsonSchemaToTypebox(
@@ -299,9 +311,9 @@ function convertArraySchema(
   }
   const items = schema["items"];
   return Type.Array(
-    items && typeof items === "object" && !Array.isArray(items)
+    isPlainObject(items)
       ? convertJsonSchemaToTypebox(
-          items as Record<string, unknown>,
+          items,
           ctx.rootDefs,
           ctx.effectiveRoot,
           ctx.seenRefs,
@@ -317,18 +329,17 @@ function mergeAllOfSubSchema(
   required: Set<string>,
   ctx: ConversionContext,
 ): void {
-  if (!sub || typeof sub !== "object" || Array.isArray(sub)) {
+  if (!isPlainObject(sub)) {
     return;
   }
-  const subObj = sub as Record<string, unknown>;
   const resolvedSub =
-    typeof subObj["$ref"] === "string" && !ctx.seenRefs.has(subObj["$ref"])
-      ? (resolveRefTarget(subObj["$ref"], ctx.rootDefs, ctx.effectiveRoot) ?? subObj)
-      : subObj;
+    typeof sub["$ref"] === "string" && !ctx.seenRefs.has(sub["$ref"])
+      ? (resolveRefTarget(sub["$ref"], ctx.rootDefs, ctx.effectiveRoot) ?? sub)
+      : sub;
 
   const props = resolvedSub["properties"];
-  if (typeof props === "object" && props !== null && !Array.isArray(props)) {
-    for (const [k, v] of Object.entries(props as Record<string, unknown>)) {
+  if (isPlainObject(props)) {
+    for (const [k, v] of Object.entries(props)) {
       if (!(k in rawProperties)) {
         rawProperties[k] = v;
       }
@@ -350,12 +361,9 @@ function convertObjectSchema(
   opts: Record<string, unknown>,
   ctx: ConversionContext,
 ): TSchema {
-  const rawProperties: Record<string, unknown> =
-    typeof schema["properties"] === "object" &&
-    schema["properties"] !== null &&
-    !Array.isArray(schema["properties"])
-      ? { ...(schema["properties"] as Record<string, unknown>) }
-      : {};
+  const rawProperties: Record<string, unknown> = isPlainObject(schema["properties"])
+    ? { ...schema["properties"] }
+    : {};
   const required = new Set<string>(
     Array.isArray(schema["required"])
       ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
@@ -392,13 +400,9 @@ function convertObjectSchema(
   const objOpts: Record<string, unknown> = { ...opts };
   if (typeof additionalProperties === "boolean") {
     objOpts["additionalProperties"] = additionalProperties;
-  } else if (
-    typeof additionalProperties === "object" &&
-    additionalProperties !== null &&
-    !Array.isArray(additionalProperties)
-  ) {
+  } else if (isPlainObject(additionalProperties)) {
     objOpts["additionalProperties"] = convertJsonSchemaToTypebox(
-      additionalProperties as Record<string, unknown>,
+      additionalProperties,
       ctx.rootDefs,
       ctx.effectiveRoot,
       ctx.seenRefs,
@@ -482,21 +486,9 @@ function resolveNonTypedSchema(
   if (Array.isArray(rawType)) {
     return convertMultiTypeSchema(schema, rawType, opts, ctx);
   }
-  const hasObjectKeywords =
-    (typeof schema["properties"] === "object" &&
-      schema["properties"] !== null &&
-      !Array.isArray(schema["properties"])) ||
-    Array.isArray(schema["required"]) ||
-    schema["additionalProperties"] !== undefined ||
-    typeof schema["minProperties"] === "number" ||
-    typeof schema["maxProperties"] === "number";
-
-  const hasArrayKeywords =
-    schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
-
   if (
-    !hasObjectKeywords &&
-    !hasArrayKeywords &&
+    !hasObjectSchemaKeywords(schema) &&
+    !hasArraySchemaKeywords(schema) &&
     rawType !== "object" &&
     rawType !== "array"
   ) {
@@ -523,7 +515,7 @@ export function convertJsonSchemaToTypebox(
   rootSchema?: Record<string, unknown>,
   seenRefs: ReadonlySet<string> = new Set(),
 ): TSchema {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+  if (!isPlainObject(schema)) {
     return Type.Any();
   }
 
@@ -535,7 +527,7 @@ export function convertJsonSchemaToTypebox(
     | Record<string, Record<string, unknown>>
     | undefined;
   const rootDefs: Record<string, Record<string, unknown>> = {
-    ...(localDefs && typeof localDefs === "object" && !Array.isArray(localDefs) ? localDefs : {}),
+    ...(isPlainObject(localDefs) ? localDefs : {}),
     ...defs,
   };
 
@@ -546,24 +538,12 @@ export function convertJsonSchemaToTypebox(
   }
 
   const rawType = schema["type"];
-  const hasObjectKeywords =
-    (typeof schema["properties"] === "object" &&
-      schema["properties"] !== null &&
-      !Array.isArray(schema["properties"])) ||
-    Array.isArray(schema["required"]) ||
-    schema["additionalProperties"] !== undefined ||
-    typeof schema["minProperties"] === "number" ||
-    typeof schema["maxProperties"] === "number";
-
-  const hasArrayKeywords =
-    schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
-
   const type =
     typeof rawType === "string"
       ? rawType
-      : hasObjectKeywords
+      : hasObjectSchemaKeywords(schema)
         ? "object"
-        : hasArrayKeywords
+        : hasArraySchemaKeywords(schema)
           ? "array"
           : undefined;
 
