@@ -8,17 +8,14 @@ import {
   acquireAuthLock,
   AuthLockError,
   defaultIsPidAlive,
-  HEARTBEAT_MS,
-  isLockStale,
   lockPath,
-  STALE_MS,
   statePath,
   type AuthLockClock,
   type AuthLockDeps,
   type AuthLockFs,
   type AuthLockTimer,
-  type LockRecord,
 } from "../src/auth-lock.js";
+import { HEARTBEAT_MS, isLockStale, STALE_MS, type LockRecord } from "../src/auth-lock-policy.js";
 import { getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { McpError } from "../src/errors.js";
 

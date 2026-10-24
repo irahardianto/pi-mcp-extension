@@ -47,7 +47,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 
 | File | Owns |
 |---|---|
-| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`; `mcp_status` / `mcp_connect` tools |
+| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; `mcp_status` / `mcp_connect` tools |
+| `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash-command registration (`registerCommands`) |
 | `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, startup auth prompts, eager server starts, session teardown) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow (`authorize`), browser launcher (`openBrowser`, `browserOpenCommand`), callback waiter (`waitForOAuthCallback`), and dialog option constants |
@@ -63,6 +64,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, refresh rotation, credential invalidation |
 | `src/oauth-state-store.ts` | Persisted OAuth state: Zod schemas (`StoredStateSchema`), URL canonicalization and origin-binding checks (`canonicalServerUrl`, `urlsMatch`, `isResourceCompatibleWithServerUrl`), atomic `0o600` load/save (`loadState`, `saveState`, `loadStoredRedirectUrisSync`) |
 | `src/auth-lock.ts` | Cross-process `<hash>.json.lock` with heartbeat and stale-lock reclaim; injectable `AuthLockDeps` |
+| `src/auth-lock-policy.ts` | Pure lock-record schema and staleness policy (`LockRecordSchema`, `parseLockRecord`, `isLockStale`, `formatHolderDetails`, `HEARTBEAT_MS`, `STALE_MS`) |
 | `src/callback-server.ts`, `src/callback-url.ts` | Instance-scoped `CallbackServer` loopback OAuth callback listener; pure redirect/callback URL validation (`callbackServerConfigFromRedirectUrl`) and headless paste-back parsing |
 | `src/auth-challenge.ts` | `WWW-Authenticate` discovery (RFC 9728 `resource_metadata`, `scope`) |
 | `src/terminal-text.ts` | Pure terminal/notification text sanitization (`sanitizeTerminalText`): strips ANSI/OSC/DCS/C1 escape sequences and C0/C1 control characters, collapses line breaks, and bounds string length on code-point boundaries |
