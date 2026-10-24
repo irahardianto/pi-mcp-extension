@@ -201,9 +201,8 @@ async function runHeartbeatTick(
   const { path, myRecord, deps, usingRealFs } = ctx;
   if (!isStateActive()) return;
   const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-  if (!isStateActive()) return;
-  if (!current || current.nonce !== myRecord.nonce) {
-    markLost();
+  if (!isStateActive() || !current || current.nonce !== myRecord.nonce) {
+    if (isStateActive()) markLost();
     return;
   }
   const nowSec = deps.clock.now() / 1000;
@@ -214,12 +213,12 @@ async function runHeartbeatTick(
     const after = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
     if (!after || after.nonce !== myRecord.nonce) {
       markLost();
-    } else {
-      await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
-        // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
-        if (isStateActive()) markLost();
-      });
+      return;
     }
+    await deps.fs.utimes(path, nowSec, nowSec).catch(() => {
+      // WHY: If utimes still fails after verifying the restored lock nonce, mark lock lost.
+      if (isStateActive()) markLost();
+    });
   }
 }
 

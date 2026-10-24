@@ -24,6 +24,10 @@ default = true
 enabled = true
 threshold = 1000
 
+[smells.nested_control_flow]
+enabled = true
+threshold = 4
+
 # Disable third-party linters so CI workflows (.github/workflows/ci.yml, semgrep.yml,
 # secret-scan.yml, workflow-lint.yml) remain the single source of truth.
 [[plugin]]
