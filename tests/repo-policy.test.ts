@@ -352,12 +352,12 @@ describe("coverage and Qlty maintainability policy", () => {
     });
   });
 
-  it("configures [smells.nested_control_flow] with threshold 4 in .qlty/qlty.toml", () => {
+  it("configures [smells.nested_control_flow] with threshold 5 in .qlty/qlty.toml", () => {
     const qltyToml = readRepoFile(".qlty/qlty.toml");
     assert.match(
       qltyToml,
-      /\[smells\.nested_control_flow\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*4/,
-      ".qlty/qlty.toml must configure [smells.nested_control_flow] with enabled = true and threshold = 4",
+      /\[smells\.nested_control_flow\](?:\s*#[^\n]*)*\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*5/,
+      ".qlty/qlty.toml must configure [smells.nested_control_flow] with enabled = true and threshold = 5",
     );
   });
 
