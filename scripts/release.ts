@@ -798,11 +798,14 @@ export function createNpm(cwd: string): NpmPort {
 function landReleaseOnMain(
   git: GitPort,
   pullRequests: PullRequestPort,
-  version: string,
-  date: string,
-  attempts: number,
-  log: (message: string) => void,
+  options: {
+    version: string;
+    date: string;
+    attempts: number;
+    log: (message: string) => void;
+  },
 ): string {
+  const { version, date, attempts, log } = options;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     git.fetch();
     const base = git.baseSha();
@@ -924,7 +927,12 @@ export function runRelease(options: ReleaseOptions): ReleaseOutcome {
     log(`npm has ${ahead} but git has no tag for it — repairing the git history`);
     // WHY: the repair commit must also land through a PR (required status checks on
     // `main` block direct pushes).
-    const mergeSha = landReleaseOnMain(git, options.pullRequests, ahead, date, maxPushAttempts, log);
+    const mergeSha = landReleaseOnMain(git, options.pullRequests, {
+      version: ahead,
+      date,
+      attempts: maxPushAttempts,
+      log,
+    });
     pushTagWithRetry(git, ahead, mergeSha, maxPushAttempts, log);
     tags.add(`v${ahead}`);
     tipVersion = ahead;
@@ -969,7 +977,12 @@ export function runRelease(options: ReleaseOptions): ReleaseOutcome {
       // The release commit and its tag land on `main` before anything is published.
       // WHY: the version is computed once; a commit that lands on `main` mid-release
       // is picked up by the next run's scan instead of recomputing the bump here.
-      const mergeSha = landReleaseOnMain(git, options.pullRequests, target, date, maxPushAttempts, log);
+      const mergeSha = landReleaseOnMain(git, options.pullRequests, {
+      version: target,
+      date,
+      attempts: maxPushAttempts,
+      log,
+    });
       pushTagWithRetry(git, target, mergeSha, maxPushAttempts, log);
 
       // Phase 3b — the commit and its tag are on `main`; publishing now keeps npm and

@@ -10,6 +10,7 @@ For a behavioral overview of how the runtime fits together (lifecycle, coordinat
 
 ```bash
 npm run lint                                         # eslint . (type-aware flat config)
+                                                     # max-params is capped at 5 (Qlty's threshold); group extra arguments into an options object
 npm run typecheck                                    # tsc --noEmit (strict, exactOptionalPropertyTypes, noUncheckedIndexedAccess, unused/return/override/fallthrough)
 npm test                                             # all suites: node --import tsx/esm --test ./tests/*.test.ts
 npm run test:coverage                                # all suites with coverage floor (95% lines / 85% branches / 83% functions)

@@ -267,3 +267,17 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/coverage.svg"));
   });
 });
+
+describe("eslint max-params policy (issue #174)", () => {
+  it("keeps the max-params rule in eslint.config.mjs at Qlty's threshold", () => {
+    const config = readRepoFile("eslint.config.mjs");
+    assert.ok(
+      config.includes('"@typescript-eslint/max-params"'),
+      "eslint.config.mjs must enforce @typescript-eslint/max-params so npm run lint catches a 6-parameter function before Qlty does",
+    );
+    assert.ok(
+      config.includes('"@typescript-eslint/max-params": ["error", { max: 5 }]'),
+      "the max must stay at 5: it mirrors Qlty's function-parameters threshold and keeps the 5-argument ToolDefinition.execute callback legal",
+    );
+  });
+});
