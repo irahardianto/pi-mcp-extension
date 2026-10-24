@@ -315,6 +315,15 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       reset,
     );
 
+  registerManagementTools(pi, { manager, coordinator, bridge });
+}
+
+function registerManagementTools(
+  pi: ExtensionAPI,
+  deps: { manager: ServerManager; coordinator: ConnectionCoordinator; bridge: ToolBridge },
+): void {
+  const { manager, coordinator, bridge } = deps;
+
   pi.registerTool({
     name: "mcp_status",
     label: "MCP status",

@@ -99,6 +99,7 @@ User-facing docs and repository policies to keep in sync with behavior changes: 
 - **Validate every external input with Zod**: `mcp.json`, stored OAuth state, lock records, DCR/discovery metadata. Never `JSON.parse(x) as T`. Config errors are `McpError(..., "config")` and include the file path.
 - **Classify errors.** New user-facing failures use an `McpError` kind (`config | connection | auth | timeout | protocol`) or an auth subclass (`AuthRequiredError`, `AuthLockError`, `AuthCancelledError`), not a bare `Error`, so callers and `mcp_status` can tell them apart.
 - **Timeouts and cancellation.** The effective timeout is `server.config.requestTimeoutMs ?? settings.requestTimeoutMs`. Pass `{ timeout, signal }` to SDK calls (`connect`, `ping`, `listTools`, `callTool`) and to OAuth discovery fetches, and check `signal.aborted` between async steps.
+- **Function-level structural simplicity.** Keep functions and methods focused (`<= 4` `return` statements per top-level function or method, enforced by `npm run lint` and Qlty's `return_statements` check). When a function grows beyond 4 returns—or defines multiple inline callbacks with early returns—decompose it into named pure helpers or handler functions, or deduplicate repeated loops/checks. Never work around the limit by replacing idiomatic guard clauses with a mutable `let result` variable or deep `if / else` nesting.
 
 ## Invariants: don't regress
 
@@ -150,6 +151,7 @@ Self-review before finishing:
 - Does anything write to stdout or swallow errors?
 - Is external input Zod-validated and are URLs scheme-checked?
 - Are credentials origin-bound and written `0o600`?
+- Does every new or modified function in `src/` stay within the `<= 4` return statement bound via clean helper decomposition (verified by `npm run lint`)?
 
 ## CI
 

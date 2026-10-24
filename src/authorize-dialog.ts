@@ -50,6 +50,84 @@ export interface OAuthPasteOptions {
   onPasteResolved?: (() => void) | undefined;
 }
 
+function parsePastedUrl(
+  rawValue: string,
+  _serverName: string,
+  context: { ui: Partial<Pick<ExtensionUIContext, "notify">> },
+  pasteOptions?: OAuthPasteOptions,
+): string | undefined {
+  if (!rawValue.trim()) return undefined;
+  let parsed: ReturnType<typeof parseCallbackUrl>;
+  try {
+    parsed = parseCallbackUrl(rawValue, {
+      redirectUrl: pasteOptions?.redirectUrl,
+      expectedState: pasteOptions?.expectedState,
+    });
+  } catch (err) {
+    if (err instanceof CallbackUrlValidationError) {
+      context.ui.notify?.(`pi-mcp: Invalid redirect URL — ${sanitizeTerminalText(err.message)}`, "error");
+      return undefined;
+    }
+    throw err;
+  }
+
+  pasteOptions?.onPasteResolved?.();
+  if ("error" in parsed) {
+    throw new Error(parsed.error);
+  }
+  return parsed.code;
+}
+
+function promptUserForPaste(
+  serverName: string,
+  inputFn: NonNullable<ExtensionUIContext["input"]>,
+  abortController: AbortController,
+): Promise<OAuthInputWaitResult> {
+  return inputFn(
+    `Paste redirect URL for ${serverName}`,
+    "http://127.0.0.1:19876/callback?code=...&state=...",
+    { signal: abortController.signal },
+  )
+    .then((value): OAuthUserInputResult => ({ type: "input", value }))
+    .catch((error): OAuthDialogAbortedResult => {
+      if (abortController.signal.aborted) {
+        return { type: "dialogAborted" };
+      }
+      throw error;
+    });
+}
+
+async function handlePasteChoice(
+  serverName: string,
+  callbackResultPromise: Promise<OAuthCallbackResult | OAuthCallbackErrorResult>,
+  context: {
+    hasUI: boolean;
+    ui: Pick<ExtensionUIContext, "select"> & Partial<Pick<ExtensionUIContext, "input" | "notify">>;
+  },
+  pasteOptions?: OAuthPasteOptions,
+): Promise<string | undefined> {
+  if (!context.ui.input) return undefined;
+  const inputAbortController = new AbortController();
+  const inputPromise = promptUserForPaste(serverName, context.ui.input, inputAbortController);
+  const inputResult = await Promise.race([callbackResultPromise, inputPromise]);
+
+  if (inputResult.type === "callback") {
+    inputAbortController.abort();
+    return inputResult.code;
+  }
+
+  if (inputResult.type === "callbackError") {
+    inputAbortController.abort();
+    throw inputResult.error;
+  }
+
+  if (inputResult.type === "dialogAborted" || !inputResult.value) {
+    return undefined;
+  }
+
+  return parsePastedUrl(inputResult.value, serverName, context, pasteOptions);
+}
+
 export async function waitForOAuthCallback(
   serverName: string,
   callbackPromise: Promise<string>,
@@ -106,59 +184,12 @@ export async function waitForOAuthCallback(
     }
 
     if (result.choice === authPasteOption) {
-      if (!context.ui.input) {
-        continue;
+      const pastedCode = await handlePasteChoice(serverName, callbackResultPromise, context, pasteOptions);
+      if (pastedCode !== undefined) {
+        dialogAbortController.abort();
+        return pastedCode;
       }
-      const inputAbortController = new AbortController();
-      const inputPromise: Promise<OAuthInputWaitResult> = context.ui
-        .input(
-          `Paste redirect URL for ${serverName}`,
-          "http://127.0.0.1:19876/callback?code=...&state=...",
-          { signal: inputAbortController.signal },
-        )
-        .then((value): OAuthUserInputResult => ({ type: "input", value }))
-        .catch((error): OAuthDialogAbortedResult => {
-          if (inputAbortController.signal.aborted) {
-            return { type: "dialogAborted" };
-          }
-          throw error;
-        });
-
-      const inputResult = await Promise.race([callbackResultPromise, inputPromise]);
-
-      if (inputResult.type === "callback") {
-        inputAbortController.abort();
-        return inputResult.code;
-      }
-
-      if (inputResult.type === "callbackError") {
-        inputAbortController.abort();
-        throw inputResult.error;
-      }
-
-      if (inputResult.type === "dialogAborted" || !inputResult.value?.trim()) {
-        continue;
-      }
-
-      let parsed: ReturnType<typeof parseCallbackUrl>;
-      try {
-        parsed = parseCallbackUrl(inputResult.value, {
-          redirectUrl: pasteOptions?.redirectUrl,
-          expectedState: pasteOptions?.expectedState,
-        });
-      } catch (err) {
-        if (err instanceof CallbackUrlValidationError) {
-          context.ui.notify?.(`pi-mcp: Invalid redirect URL — ${sanitizeTerminalText(err.message)}`, "error");
-          continue;
-        }
-        throw err;
-      }
-
-      pasteOptions?.onPasteResolved?.();
-      if ("error" in parsed) {
-        throw new Error(parsed.error);
-      }
-      return parsed.code;
+      continue;
     }
 
     dialogAbortController.abort();

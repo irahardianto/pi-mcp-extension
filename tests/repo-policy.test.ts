@@ -266,4 +266,89 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg"));
     assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/coverage.svg"));
   });
+
+  it("configures pi-mcp/max-return-statements with max 4 on src/**/*.ts in eslint.config.mjs", () => {
+    const eslintConfig = readRepoFile("eslint.config.mjs");
+    assert.match(
+      eslintConfig,
+      /"pi-mcp\/max-return-statements":\s*\[\s*"error",\s*\{\s*max:\s*4\s*\}\s*\]/,
+      "eslint.config.mjs must configure pi-mcp/max-return-statements with max: 4 as error",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts"\],[\s\S]*?"pi-mcp\/max-return-statements"/,
+      "eslint.config.mjs must scope pi-mcp/max-return-statements to src/**/*.ts",
+    );
+  });
+
+  it("enforces max-return-statements AST policy on direct returns and nested callbacks", async () => {
+    const { RuleTester } = await import("eslint");
+    // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
+    const { maxReturnStatementsRule } = (await import("../eslint.config.mjs")) as {
+      maxReturnStatementsRule: import("eslint").Rule.RuleModule;
+    };
+    const ruleTester = new RuleTester();
+    ruleTester.run("pi-mcp/max-return-statements", maxReturnStatementsRule, {
+      valid: [
+        {
+          code: "function ok() { if (a) return 1; if (b) return 2; if (c) return 3; return 4; }",
+          options: [{ max: 4 }],
+        },
+        {
+          code: "const okArrow = () => { if (a) return 1; return 2; };",
+          options: [{ max: 4 }],
+        },
+        {
+          code: "class Service { run() { if (a) return 1; if (b) return 2; return 3; } }",
+          options: [{ max: 4 }],
+        },
+        {
+          code: "function okWithCallbacks() { [].map(() => { return 1; return 2; }); return 3; return 4; }",
+          options: [{ max: 4 }],
+        },
+      ],
+      invalid: [
+        {
+          code: "function tooManyDirect() { if (a) return 1; if (b) return 2; if (c) return 3; if (d) return 4; return 5; }",
+          options: [{ max: 4 }],
+          errors: [
+            {
+              message:
+                "Function 'tooManyDirect' has too many return statements (5). Maximum allowed is 4. Extract cohesive helper functions or named handlers instead of accumulating branches or inline callbacks.",
+            },
+          ],
+        },
+        {
+          code: "function outerWithCallbacks() { [].map(() => { return 1; }); [].map(() => { return 2; }); [].map(() => { return 3; }); [].map(() => { return 4; }); [].map(() => { return 5; }); }",
+          options: [{ max: 4 }],
+          errors: [
+            {
+              message:
+                "Function 'outerWithCallbacks' has too many return statements (5). Maximum allowed is 4. Extract cohesive helper functions or named handlers instead of accumulating branches or inline callbacks.",
+            },
+          ],
+        },
+        {
+          code: "class C { method() { if (a) return 1; if (b) return 2; if (c) return 3; if (d) return 4; return 5; } }",
+          options: [{ max: 4 }],
+          errors: [
+            {
+              message:
+                "Function 'method' has too many return statements (5). Maximum allowed is 4. Extract cohesive helper functions or named handlers instead of accumulating branches or inline callbacks.",
+            },
+          ],
+        },
+        {
+          code: "const arrowTooMany = () => { if (a) return 1; if (b) return 2; if (c) return 3; if (d) return 4; return 5; };",
+          options: [{ max: 4 }],
+          errors: [
+            {
+              message:
+                "Function 'arrowTooMany' has too many return statements (5). Maximum allowed is 4. Extract cohesive helper functions or named handlers instead of accumulating branches or inline callbacks.",
+            },
+          ],
+        },
+      ],
+    });
+  });
 });

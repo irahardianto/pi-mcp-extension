@@ -29,16 +29,20 @@ export function urlsMatch(storedUrl: string, expectedUrl: string): boolean {
   return canonicalServerUrl(storedUrl) === canonicalServerUrl(expectedUrl);
 }
 
+function isUrlPrefixCompatible(req: URL, cfg: URL): boolean {
+  if (req.origin !== cfg.origin) return false;
+  if (req.pathname.length < cfg.pathname.length) return false;
+  const reqPath = req.pathname.endsWith("/") ? req.pathname : `${req.pathname}/`;
+  const cfgPath = cfg.pathname.endsWith("/") ? cfg.pathname : `${cfg.pathname}/`;
+  return reqPath.startsWith(cfgPath);
+}
+
 export function isResourceCompatibleWithServerUrl(resource: string, expectedServerUrl: string): boolean {
   if (urlsMatch(resource, expectedServerUrl)) return true;
   try {
     const req = new URL(canonicalServerUrl(expectedServerUrl));
     const cfg = new URL(canonicalServerUrl(resource));
-    if (req.origin !== cfg.origin) return false;
-    if (req.pathname.length < cfg.pathname.length) return false;
-    const reqPath = req.pathname.endsWith("/") ? req.pathname : `${req.pathname}/`;
-    const cfgPath = cfg.pathname.endsWith("/") ? cfg.pathname : `${cfg.pathname}/`;
-    return reqPath.startsWith(cfgPath);
+    return isUrlPrefixCompatible(req, cfg);
   } catch {
     // WHY: new URL() throws TypeError per WHATWG URL spec if canonicalServerUrl produced
     // an invalid or relative URL. If either URL cannot be parsed into an absolute URL,

@@ -69,38 +69,50 @@ export function buildToolName(
 type PiTextContent = { type: "text"; text: string };
 type PiImageContent = { type: "image"; data: string; mimeType: string };
 
+function convertResourceContent(obj: Record<string, unknown>): PiTextContent {
+  const r = obj["resource"] as Record<string, unknown> | undefined;
+  // WHY: Check `typeof r?.["text"] === "string"` rather than truthiness so
+  // empty text resources (`text: ""`) are preserved as `""` instead of `[Resource: uri]`.
+  if (typeof r?.["text"] === "string") return { type: "text", text: r["text"] };
+  if (r?.["blob"]) return { type: "text", text: `[Resource blob: ${String(r["uri"])}]` };
+  return { type: "text", text: `[Resource: ${String(r?.["uri"] ?? "unknown")}]` };
+}
+
+function convertNonTextContent(obj: Record<string, unknown>): PiImageContent | PiTextContent | undefined {
+  if (obj["type"] === "image") {
+    return {
+      type: "image",
+      data: String(obj["data"] ?? ""),
+      mimeType: String(obj["mimeType"] ?? "image/png"),
+    };
+  }
+  if (obj["type"] === "audio") {
+    return {
+      type: "text",
+      text: `[Audio: ${String(obj["mimeType"] ?? "unknown")}, base64 encoded]`,
+    };
+  }
+  if (obj["type"] === "resource") {
+    return convertResourceContent(obj);
+  }
+  return undefined;
+}
+
+function convertMcpContentItem(item: unknown): PiTextContent | PiImageContent {
+  if (!item || typeof item !== "object") {
+    return { type: "text", text: String(item) };
+  }
+  const obj = item as Record<string, unknown>;
+  const nonText = convertNonTextContent(obj);
+  if (nonText) return nonText;
+  if (obj["type"] === "text") {
+    return { type: "text", text: String(obj["text"] ?? "") };
+  }
+  return { type: "text", text: JSON.stringify(item) };
+}
+
 export function convertMcpContent(items: unknown[]): (PiTextContent | PiImageContent)[] {
-  return items.map((item: unknown) => {
-    if (!item || typeof item !== "object") {
-      return { type: "text", text: String(item) };
-    }
-    const obj = item as Record<string, unknown>;
-    switch (obj["type"]) {
-      case "text":
-        return { type: "text", text: String(obj["text"] ?? "") };
-      case "image":
-        return {
-          type: "image",
-          data: String(obj["data"] ?? ""),
-          mimeType: String(obj["mimeType"] ?? "image/png"),
-        };
-      case "audio":
-        return {
-          type: "text",
-          text: `[Audio: ${String(obj["mimeType"] ?? "unknown")}, base64 encoded]`,
-        };
-      case "resource": {
-        const r = obj["resource"] as Record<string, unknown> | undefined;
-        // WHY: Check `typeof r?.["text"] === "string"` rather than truthiness so
-        // empty text resources (`text: ""`) are preserved as `""` instead of `[Resource: uri]`.
-        if (typeof r?.["text"] === "string") return { type: "text", text: r["text"] };
-        if (r?.["blob"]) return { type: "text", text: `[Resource blob: ${String(r["uri"])}]` };
-        return { type: "text", text: `[Resource: ${String(r?.["uri"] ?? "unknown")}]` };
-      }
-      default:
-        return { type: "text", text: JSON.stringify(item) };
-    }
-  });
+  return items.map(convertMcpContentItem);
 }
 
 // ─── Tool Listing ─────────────────────────────────────────────────────────────
@@ -272,36 +284,44 @@ export class ToolBridge {
 
   // ─── Internal ───────────────────────────────────────────────────────────────
 
+  private _isToolNameTaken(name: string, serverName: string, seenInBatch: ReadonlySet<string>): boolean {
+    if (seenInBatch.has(name)) return true;
+    const owner = this.toolOwners.get(name);
+    return owner !== undefined && owner !== serverName;
+  }
+
+  private _findSuffixedToolName(
+    hashedCandidate: string,
+    serverName: string,
+    seenInBatch: ReadonlySet<string>,
+  ): string {
+    let suffix = 2;
+    while (true) {
+      const tag = `_${suffix}`;
+      const candidate = `${hashedCandidate.slice(0, MAX_TOOL_NAME_LEN - tag.length)}${tag}`;
+      if (!this._isToolNameTaken(candidate, serverName, seenInBatch)) {
+        return candidate;
+      }
+      suffix++;
+    }
+  }
+
   private _resolveUniqueToolName(
     serverName: string,
     rawToolName: string,
     seenInBatch: ReadonlySet<string>,
   ): string {
-    const isTaken = (name: string): boolean => {
-      if (seenInBatch.has(name)) return true;
-      const owner = this.toolOwners.get(name);
-      return owner !== undefined && owner !== serverName;
-    };
-
     const baseCandidate = buildToolName(this.settings.toolPrefix, serverName, rawToolName, false);
-    if (!isTaken(baseCandidate)) {
+    if (!this._isToolNameTaken(baseCandidate, serverName, seenInBatch)) {
       return baseCandidate;
     }
 
     const hashedCandidate = buildToolName(this.settings.toolPrefix, serverName, rawToolName, true);
-    if (!isTaken(hashedCandidate)) {
+    if (!this._isToolNameTaken(hashedCandidate, serverName, seenInBatch)) {
       return hashedCandidate;
     }
 
-    let suffix = 2;
-    while (true) {
-      const tag = `_${suffix}`;
-      const candidate = `${hashedCandidate.slice(0, MAX_TOOL_NAME_LEN - tag.length)}${tag}`;
-      if (!isTaken(candidate)) {
-        return candidate;
-      }
-      suffix++;
-    }
+    return this._findSuffixedToolName(hashedCandidate, serverName, seenInBatch);
   }
 
   private _registerTool(

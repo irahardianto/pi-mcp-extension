@@ -35,12 +35,16 @@ export interface ConnectOptions {
   alreadyQueued?: boolean | undefined;
 }
 
+type ConnectAttemptEntry = {
+  promise: Promise<void>;
+  controller: AbortController;
+  reset: boolean;
+  waiters: number;
+};
+
 export class ConnectionCoordinator {
   private readonly deps: ConnectionCoordinatorDeps;
-  private readonly connectAttempts = new Map<
-    string,
-    { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }
-  >();
+  private readonly connectAttempts = new Map<string, ConnectAttemptEntry>();
   private readonly declinedStartupAuth = new Set<string>();
   private readonly startupPromptControllers = new Map<string, AbortController>();
   private authQueue: Promise<void> = Promise.resolve();
@@ -291,6 +295,53 @@ export class ConnectionCoordinator {
     }
   }
 
+  private async _waitForConnectAttempt(
+    serverName: string,
+    entry: ConnectAttemptEntry,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    entry.waiters++;
+    let released = false;
+    const releaseWaiter = () => {
+      if (!released) {
+        released = true;
+        entry.waiters--;
+      }
+    };
+    if (!signal) {
+      try {
+        return await entry.promise;
+      } finally {
+        releaseWaiter();
+      }
+    }
+    let stopPromise: Promise<unknown> | undefined;
+    let onAbort!: () => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => {
+        releaseWaiter();
+        if (entry.waiters === 0) {
+          if (this.connectAttempts.get(serverName) === entry) {
+            this.connectAttempts.delete(serverName);
+          }
+          entry.controller.abort();
+          stopPromise = this.deps.manager.stopServer(serverName);
+          void stopPromise.finally(() => reject(new AuthCancelledError(serverName)));
+        } else {
+          reject(new AuthCancelledError(serverName));
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([entry.promise, aborted]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      releaseWaiter();
+      await stopPromise;
+    }
+  }
+
   async connect(
     serverName: string,
     ctx: ExtensionContext,
@@ -310,53 +361,10 @@ export class ConnectionCoordinator {
     const inheritedStartupTurn =
       !alreadyQueued && this.activeStartupTurn?.serverName === serverName ? this.activeStartupTurn : null;
 
-    const waitForAttempt = async (entry: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number }): Promise<void> => {
-      entry.waiters++;
-      let released = false;
-      const releaseWaiter = () => {
-        if (!released) {
-          released = true;
-          entry.waiters--;
-        }
-      };
-      if (!signal) {
-        try {
-          return await entry.promise;
-        } finally {
-          releaseWaiter();
-        }
-      }
-      let stopPromise: Promise<unknown> | undefined;
-      let onAbort!: () => void;
-      const aborted = new Promise<never>((_resolve, reject) => {
-        onAbort = () => {
-          releaseWaiter();
-          if (entry.waiters === 0) {
-            if (this.connectAttempts.get(serverName) === entry) {
-              this.connectAttempts.delete(serverName);
-            }
-            entry.controller.abort();
-            stopPromise = this.deps.manager.stopServer(serverName);
-            void stopPromise.finally(() => reject(new AuthCancelledError(serverName)));
-          } else {
-            reject(new AuthCancelledError(serverName));
-          }
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-      try {
-        return await Promise.race([entry.promise, aborted]);
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-        releaseWaiter();
-        await stopPromise;
-      }
-    };
-
     const existing = this.connectAttempts.get(serverName);
     // All requests join an in-flight reset. A reset supersedes a normal connect.
     if (existing && !existing.controller.signal.aborted && (!reset || existing.reset)) {
-      return await waitForAttempt(existing);
+      return await this._waitForConnectAttempt(serverName, existing, signal);
     }
 
     const controller = new AbortController();
@@ -364,7 +372,7 @@ export class ConnectionCoordinator {
       existing.controller.abort();
       void this.deps.manager.stopServer(serverName);
     }
-    let entry!: { promise: Promise<void>; controller: AbortController; reset: boolean; waiters: number };
+    let entry!: ConnectAttemptEntry;
     const task = (async () => {
       // Wait for a superseded connect to release its callback listener and auth lock.
       if (existing) {
@@ -423,6 +431,6 @@ export class ConnectionCoordinator {
     }
     entry = { promise: task, controller, reset, waiters: 0 };
     this.connectAttempts.set(serverName, entry);
-    return await waitForAttempt(entry);
+    return await this._waitForConnectAttempt(serverName, entry, signal);
   }
 }

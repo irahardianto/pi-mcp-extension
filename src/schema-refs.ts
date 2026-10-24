@@ -9,16 +9,20 @@ function unescapeJsonPointer(segment: string): string {
   return segment.replace(/~1/g, "/").replace(/~0/g, "~");
 }
 
+function stepArrayPointer(curr: unknown[], part: string): unknown {
+  if (!/^(?:0|[1-9][0-9]*)$/.test(part)) {
+    return undefined;
+  }
+  const idx = Number(part);
+  return idx >= 0 && idx < curr.length ? curr[idx] : undefined;
+}
+
 function stepJsonPointer(curr: unknown, part: string): unknown {
   if (!curr || typeof curr !== "object") {
     return undefined;
   }
   if (Array.isArray(curr)) {
-    if (!/^(?:0|[1-9][0-9]*)$/.test(part)) {
-      return undefined;
-    }
-    const idx = Number(part);
-    return idx >= 0 && idx < curr.length ? curr[idx] : undefined;
+    return stepArrayPointer(curr, part);
   }
   if (!Object.prototype.hasOwnProperty.call(curr, part)) {
     return undefined;

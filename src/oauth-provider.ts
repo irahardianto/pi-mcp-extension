@@ -26,6 +26,7 @@ import {
   loadState,
   loadStoredRedirectUrisSync,
   saveState,
+  type StoredClientInfo,
   type StoredState,
   type StoredTokens,
 } from "./oauth-state-store.js";
@@ -169,62 +170,69 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   // --- clientInformation ---
 
+  private async _staticClientInformation(): Promise<OAuthClientInformationMixed> {
+    const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
+    const boundIssuer =
+      state.clientInfo?.client_id === this.authConfig.clientId ? state.clientInfo?.issuer : undefined;
+    return {
+      client_id: this.authConfig.clientId!,
+      ...(this.authConfig.clientSecret && { client_secret: this.authConfig.clientSecret }),
+      ...(boundIssuer !== undefined && { issuer: boundIssuer }),
+    };
+  }
+
+  private _resolveStoredClientInfo(info: StoredClientInfo): OAuthClientInformationMixed | undefined {
+    if (Array.isArray(info.redirect_uris) && info.redirect_uris.length > 0) {
+      this._storedRedirectUris = info.redirect_uris;
+    }
+    if (
+      info.client_secret !== undefined &&
+      typeof info.client_secret_expires_at === "number" &&
+      info.client_secret_expires_at > 0 &&
+      info.client_secret_expires_at * 1000 <= Date.now()
+    ) {
+      if (this.silent) {
+        throw new AuthRequiredError(
+          this.serverName,
+          "Stored OAuth client secret has expired; interactive re-authentication required",
+        );
+      }
+      return undefined;
+    }
+    if (
+      !this.silent &&
+      Array.isArray(info.redirect_uris) &&
+      info.redirect_uris.length > 0 &&
+      !info.redirect_uris.includes(String(this.redirectUrl))
+    ) {
+      // WHY: If the callback port or configured redirectUrl changed since DCR,
+      // return undefined in interactive mode so the SDK re-registers with the new redirect_uri.
+      return undefined;
+    }
+    return {
+      client_id: info.client_id,
+      ...(info.client_secret !== undefined && { client_secret: info.client_secret }),
+      ...(info.client_id_issued_at !== undefined && { client_id_issued_at: info.client_id_issued_at }),
+      ...(info.client_secret_expires_at !== undefined && {
+        client_secret_expires_at: info.client_secret_expires_at,
+      }),
+      ...(info.token_endpoint_auth_method !== undefined && {
+        token_endpoint_auth_method: info.token_endpoint_auth_method,
+      }),
+      ...(info.redirect_uris !== undefined && { redirect_uris: info.redirect_uris }),
+      ...(info.issuer !== undefined && { issuer: info.issuer }),
+    };
+  }
+
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
     // If static credentials provided, use those
     if (this.authConfig.clientId) {
-      const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-      const boundIssuer =
-        state.clientInfo?.client_id === this.authConfig.clientId ? state.clientInfo.issuer : undefined;
-      return {
-        client_id: this.authConfig.clientId,
-        ...(this.authConfig.clientSecret && { client_secret: this.authConfig.clientSecret }),
-        ...(boundIssuer !== undefined && { issuer: boundIssuer }),
-      };
+      return this._staticClientInformation();
     }
     // Otherwise load from persisted DCR state
     const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    const info = state.clientInfo;
-    if (info) {
-      if (Array.isArray(info.redirect_uris) && info.redirect_uris.length > 0) {
-        this._storedRedirectUris = info.redirect_uris;
-      }
-      if (
-        info.client_secret !== undefined &&
-        typeof info.client_secret_expires_at === "number" &&
-        info.client_secret_expires_at > 0 &&
-        info.client_secret_expires_at * 1000 <= Date.now()
-      ) {
-        if (this.silent) {
-          throw new AuthRequiredError(
-            this.serverName,
-            "Stored OAuth client secret has expired; interactive re-authentication required",
-          );
-        }
-        return undefined;
-      }
-      if (
-        !this.silent &&
-        Array.isArray(info.redirect_uris) &&
-        info.redirect_uris.length > 0 &&
-        !info.redirect_uris.includes(String(this.redirectUrl))
-      ) {
-        // WHY: If the callback port or configured redirectUrl changed since DCR,
-        // return undefined in interactive mode so the SDK re-registers with the new redirect_uri.
-        return undefined;
-      }
-      return {
-        client_id: info.client_id,
-        ...(info.client_secret !== undefined && { client_secret: info.client_secret }),
-        ...(info.client_id_issued_at !== undefined && { client_id_issued_at: info.client_id_issued_at }),
-        ...(info.client_secret_expires_at !== undefined && {
-          client_secret_expires_at: info.client_secret_expires_at,
-        }),
-        ...(info.token_endpoint_auth_method !== undefined && {
-          token_endpoint_auth_method: info.token_endpoint_auth_method,
-        }),
-        ...(info.redirect_uris !== undefined && { redirect_uris: info.redirect_uris }),
-        ...(info.issuer !== undefined && { issuer: info.issuer }),
-      };
+    if (state.clientInfo) {
+      return this._resolveStoredClientInfo(state.clientInfo);
     }
     if (this.silent) throw new AuthRequiredError(this.serverName);
     return undefined;
