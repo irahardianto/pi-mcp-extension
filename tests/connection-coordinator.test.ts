@@ -1,11 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { ConnectionCoordinator } from "../src/connection-coordinator.js";
 import {
-  ConnectionCoordinator,
   formatErrorMessage,
   startupAuthNowOption,
   startupAuthLaterOption,
-} from "../src/connection-coordinator.js";
+} from "../src/startup-auth.js";
 import { McpError, AuthCancelledError } from "../src/errors.js";
 import { AuthRequiredError } from "../src/oauth-provider.js";
 import { createMockContext } from "./helpers/mock-extension.js";

@@ -9,19 +9,21 @@ import {
   DEBUG_LOG_FILE_NAME,
   DEBUG_LOG_MAX_BYTES,
   DebugLog,
+  getDebugLog,
+  isDebugLogEnabled,
+  reportDiagnostic,
+  setDebugLog,
+  setDiagnosticUi,
+  type DebugLogFs,
+} from "../src/debug-log.js";
+import {
   buildLogEntry,
   describeError,
   formatLogLine,
-  isDebugLogEnabled,
   redactSecrets,
-  reportDiagnostic,
   sanitizeLogFields,
   sanitizeLogText,
-  setDebugLog,
-  setDiagnosticUi,
-  getDebugLog,
-  type DebugLogFs,
-} from "../src/debug-log.js";
+} from "../src/debug-log-format.js";
 import { McpError } from "../src/errors.js";
 import { createMockContext, createMockExtension } from "./helpers/mock-extension.js";
 
