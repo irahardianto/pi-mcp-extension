@@ -24,10 +24,10 @@ default = true
 enabled = true
 threshold = 1000
 
-[smells.nested_control_flow]
 # WHY: Qlty's `threshold` is the minimum offending nesting level (`level >= threshold`, default 5).
 # Setting `threshold = 5` allows `<= 4` levels and flags `level >= 5`, matching ESLint's
 # `"max-depth": ["error", 4]` and 5-level `MAX_CONTROL_FLOW_DEPTH_SELECTOR`.
+[smells.nested_control_flow]
 enabled = true
 threshold = 5
 

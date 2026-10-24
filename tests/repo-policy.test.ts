@@ -356,7 +356,7 @@ describe("coverage and Qlty maintainability policy", () => {
     const qltyToml = readRepoFile(".qlty/qlty.toml");
     assert.match(
       qltyToml,
-      /\[smells\.nested_control_flow\](?:\s*#[^\n]*)*\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*5/,
+      /\[smells\.nested_control_flow\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*5/,
       ".qlty/qlty.toml must configure [smells.nested_control_flow] with enabled = true and threshold = 5",
     );
   });
