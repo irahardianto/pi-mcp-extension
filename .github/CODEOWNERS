@@ -24,9 +24,20 @@
 
 # OAuth 2.1 interactive flow, state persistence, and cross-process locks
 /src/authorize-flow.ts @irahardianto
+/src/authorize-dialog.ts @irahardianto
 /src/oauth-provider.ts @irahardianto
+/src/oauth-status.ts @irahardianto
 /src/oauth-state-store.ts @irahardianto
 /src/auth-lock.ts @irahardianto
+/src/auth-lock-policy.ts @irahardianto
+/src/auth-challenge.ts @irahardianto
+/src/startup-auth.ts @irahardianto
+/src/connect-policy.ts @irahardianto
 
 # Loopback OAuth callback listener and URL validation
 /src/callback-*.ts @irahardianto
+
+# Diagnostic log file writer, field allow-listing, and secret redaction
+/src/debug-log.ts @irahardianto
+/src/debug-log-format.ts @irahardianto
+/src/terminal-text.ts @irahardianto

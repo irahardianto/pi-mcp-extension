@@ -90,7 +90,7 @@ Release tooling lives outside `src/` (it is not shipped to npm and must not depe
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/*.json` (branch and tag protection rulesets). `.github/CODEOWNERS` lists the security-sensitive paths.
 
 > [!NOTE]
-> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~1100 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
+> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~970 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
 
 ## Architecture
 
