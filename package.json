@@ -57,7 +57,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx/esm --test ./tests/*.test.ts",
-    "test:coverage": "node --import tsx/esm --test --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-lines=95 --test-coverage-branches=85 --test-coverage-functions=83 ./tests/*.test.ts",
+    "test:coverage": "node --import tsx/esm --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=lcov.info --test-coverage-include='src/**' --test-coverage-lines=95 --test-coverage-branches=85 --test-coverage-functions=83 ./tests/*.test.ts",
     "test:integration": "node --import tsx/esm --test ./tests/server-manager.test.ts"
   }
 }

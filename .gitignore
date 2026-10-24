@@ -7,3 +7,12 @@ node_modules/
 # Pathfinder LSP cache isolation
 .pathfinder/
 .agents
+
+# Test coverage
+lcov.info
+
+# Qlty local cache and results (keep configuration tracked)
+.qlty/*
+!.qlty/qlty.toml
+.qlty/out/
+.qlty/results/

@@ -62,6 +62,17 @@ jobs:
         if: matrix.node-version == 22
         run: npm run test:coverage
 
+      - name: Upload coverage to Qlty
+        # WHY: Run only on the Node 22 leg where test:coverage generates lcov.info,
+        # and skip on fork PRs where secrets / OIDC are unavailable.
+        if: matrix.node-version == 22 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: qltysh/qlty-action/coverage@ebcd284bf32e36a030afe15f1e136c7be08b9506 # v2.5.0
+        with:
+          files: lcov.info
+          format: lcov
+          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
+          skip-errors: true
+
       - name: Test
         if: matrix.node-version != 22
         run: npm test

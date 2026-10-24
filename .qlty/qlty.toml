@@ -1,0 +1,46 @@
+# Qlty static analysis configuration
+# https://docs.qlty.sh
+
+config_version = "0"
+
+exclude_patterns = [
+  "**/node_modules/**",
+  "scripts/**",
+  "tests/**"
+]
+
+test_patterns = [
+  "tests/**/*.test.ts"
+]
+
+[rules]
+# WHY: Several existing modules exceed 400 lines (e.g. server-manager.ts at ~970 lines).
+# AGENTS.md explicitly states not to split oversized modules opportunistically; modularization
+# is tracked in planned refactoring issues (#136).
+file-lines = { enabled = true, threshold = 1000 }
+
+# Disable third-party linters so CI workflows (.github/workflows/ci.yml, semgrep.yml,
+# secret-scan.yml, workflow-lint.yml) remain the single source of truth.
+[[plugin]]
+name = "eslint"
+mode = "disabled"
+
+[[plugin]]
+name = "semgrep"
+mode = "disabled"
+
+[[plugin]]
+name = "gitleaks"
+mode = "disabled"
+
+[[plugin]]
+name = "actionlint"
+mode = "disabled"
+
+[[plugin]]
+name = "trufflehog"
+mode = "disabled"
+
+[[plugin]]
+name = "osv-scanner"
+mode = "disabled"

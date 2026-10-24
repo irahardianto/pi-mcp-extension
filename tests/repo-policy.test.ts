@@ -204,3 +204,54 @@ describe("release flow never writes main directly", () => {
     }
   });
 });
+
+describe("coverage and Qlty maintainability policy", () => {
+  it("configures test:coverage in package.json to emit both spec to stdout and lcov to lcov.info", () => {
+    const pkg = JSON.parse(readRepoFile("package.json")) as { scripts: Record<string, string> };
+    const coverageScript = pkg.scripts["test:coverage"];
+    assert.ok(coverageScript !== undefined, "package.json must declare a test:coverage script");
+    assert.ok(coverageScript.includes("--test-reporter=spec"), "test:coverage must declare spec reporter");
+    assert.ok(coverageScript.includes("--test-reporter-destination=stdout"), "spec reporter must output to stdout");
+    assert.ok(coverageScript.includes("--test-reporter=lcov"), "test:coverage must declare lcov reporter");
+    assert.ok(coverageScript.includes("--test-reporter-destination=lcov.info"), "lcov reporter must output to lcov.info");
+    assert.ok(coverageScript.includes("--test-coverage-lines=95"), "coverage lines floor must stay 95%");
+    assert.ok(coverageScript.includes("--test-coverage-branches=85"), "coverage branches floor must stay 85%");
+    assert.ok(coverageScript.includes("--test-coverage-functions=83"), "coverage functions floor must stay 83%");
+  });
+
+  it("ignores lcov.info and Qlty cache directories in .gitignore", () => {
+    const gitignore = readRepoFile(".gitignore");
+    assert.match(gitignore, /^lcov\.info$/m, ".gitignore must ignore lcov.info");
+    assert.match(gitignore, /^\.qlty\/\*$/m, ".gitignore must ignore .qlty/*");
+    assert.match(gitignore, /^!\.qlty\/qlty\.toml$/m, ".gitignore must preserve .qlty/qlty.toml");
+  });
+
+  it("uploads lcov.info in ci.yml via SHA-pinned qltysh/qlty-action/coverage with skip-errors enabled", () => {
+    const ci = readRepoFile(".github/workflows/ci.yml");
+    assert.match(
+      ci,
+      /uses: qltysh\/qlty-action\/coverage@[0-9a-f]{40} # v\d+\.\d+\.\d+/,
+      "ci.yml must pin qltysh/qlty-action/coverage with a 40-char SHA and version comment",
+    );
+    assert.match(ci, /files: lcov\.info/, "coverage upload must specify lcov.info");
+    assert.match(ci, /format: lcov/, "coverage upload must specify lcov format");
+    assert.match(ci, /skip-errors: true/, "coverage upload must set skip-errors: true");
+    assert.match(ci, /token: \$\{\{ secrets\.QLTY_COVERAGE_TOKEN \}\}/, "coverage upload must pass QLTY_COVERAGE_TOKEN secret");
+  });
+
+  it("keeps third-party linters disabled in .qlty/qlty.toml so CI workflows remain the single source of truth", () => {
+    const qltyToml = readRepoFile(".qlty/qlty.toml");
+    for (const linter of ["eslint", "semgrep", "gitleaks", "actionlint", "trufflehog", "osv-scanner"]) {
+      assert.ok(
+        qltyToml.includes(`name = "${linter}"\nmode = "disabled"`),
+        `.qlty/qlty.toml must disable ${linter} to avoid duplicate linter runs`,
+      );
+    }
+  });
+
+  it("includes Qlty Maintainability and Code Coverage badges in README.md", () => {
+    const readme = readRepoFile("README.md");
+    assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg"));
+    assert.ok(readme.includes("https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/coverage.svg"));
+  });
+});
