@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-10-26
+
 ### Added
 - Pi 1.3.0 `McpStdioServerConfig.cwd` is honored for stdio servers (`pi mcp add --cwd <dir>`), so a server can be spawned in its own working directory: a relative path resolves against the session working directory and a leading `~` expands to your home directory. A `cwd` on a `streamable-http` or `sse` entry is rejected at load time.
 - Pi 1.3.0 `oauth.clientName` (also accepted as `auth.clientName`) sets the `client_name` sent with Dynamic Client Registration (default `pi-mcp/<server name>`), for authorization servers that only accept known clients.
