@@ -47,6 +47,12 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
   behavior-preserving refactoring already covered by existing tests), explain
   why in the PR.
   See [`AGENTS.md`](./AGENTS.md#testing--bug-fix-workflow) for the full policy.
+- `npm run lint` enforces Qlty-aligned structural complexity limits on
+  `src/**/*.ts`: `<= 15` cyclomatic complexity (`complexity`), `<= 15` cognitive
+  complexity (`pi-mcp/max-cognitive-complexity`), `<= 4` return statements, and
+  `<= 4` control-flow nesting levels. Qlty's `function_complexity`,
+  `return_statements`, and `nested_control_flow` smells use the same thresholds;
+  keep `qlty smells --all` clean when you touch `src/`.
 - Work on a branch and open a PR. Do not push to `main`; every push to `main`
   can publish to npm.
 - Use a [Conventional Commit](https://www.conventionalcommits.org/) **PR title**.

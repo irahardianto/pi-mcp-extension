@@ -423,6 +423,160 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.ok(invalidTernary.some((m) => m.ruleId === "no-restricted-syntax" && m.message === "too deep"));
   });
 
+  it("configures Qlty-aligned function complexity limits in eslint.config.mjs and .qlty/qlty.toml", () => {
+    const eslintConfig = readRepoFile("eslint.config.mjs");
+    assert.match(
+      eslintConfig,
+      /complexity:\s*\[\s*"error",\s*\{\s*max:\s*15\s*\}\s*\]/,
+      "eslint.config.mjs must enable the built-in complexity rule with max: 15",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts"\],[^\n]*\n(?:.*\n)*?\s*complexity:\s*\[\s*"error",\s*\{\s*max:\s*15\s*\}\s*\]/,
+      "eslint.config.mjs must scope the complexity rule to src/**/*.ts",
+    );
+    assert.match(
+      eslintConfig,
+      /"pi-mcp\/max-cognitive-complexity":\s*\[\s*"error",\s*\{\s*max:\s*15\s*\}\s*\]/,
+      "eslint.config.mjs must configure pi-mcp/max-cognitive-complexity with max: 15 as error",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts"\],[^\n]*\n(?:.*\n)*?\s*"pi-mcp\/max-cognitive-complexity"/,
+      "eslint.config.mjs must scope pi-mcp/max-cognitive-complexity to src/**/*.ts",
+    );
+
+    const qltyToml = readRepoFile(".qlty/qlty.toml");
+    assert.match(
+      qltyToml,
+      /\[smells\.function_complexity\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*15/,
+      ".qlty/qlty.toml must configure [smells.function_complexity] with enabled = true and threshold = 15",
+    );
+    const excludes = /exclude_patterns\s*=\s*\[([\s\S]*?)\]/.exec(qltyToml)?.[1] ?? "";
+    assert.match(excludes, /"\.semgrep\/\*\*"/, ".qlty/qlty.toml must exclude .semgrep/** fixtures from analysis");
+    assert.match(excludes, /"\*\.mjs"/, ".qlty/qlty.toml must exclude *.mjs build-time config from analysis");
+  });
+
+  it("enforces Qlty-aligned cognitive complexity on branches, nesting, closures, and recursion", async () => {
+    const { RuleTester } = await import("eslint");
+    // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
+    const { maxCognitiveComplexityRule } = (await import("../eslint.config.mjs")) as {
+      maxCognitiveComplexityRule: import("eslint").Rule.RuleModule;
+    };
+    const ruleTester = new RuleTester();
+    ruleTester.run("pi-mcp/max-cognitive-complexity", maxCognitiveComplexityRule, {
+      valid: [
+        {
+          code: "function flat(a, b, c) { if (a) return 1; if (b) return 2; if (c) return 3; return 0; }",
+          options: [{ max: 15 }],
+        },
+        {
+          code: "function fallbackChain(a) { if (a === 1) return 1; else if (a === 2) return 2; else if (a === 3) return 3; return 0; }",
+          options: [{ max: 3 }],
+        },
+        {
+          code: "function pick(cfg) { return cfg.a && cfg.b && cfg.c; }",
+          options: [{ max: 1 }],
+        },
+        {
+          code: "function walk(n) { if (n > 0) return 1; return 0; }",
+          options: [{ max: 1 }],
+        },
+        {
+          code: "export default function () { if (a) {} if (b) {} if (c) {} if (d) {} }",
+          options: [{ max: 1 }],
+        },
+      ],
+      invalid: [
+        {
+          code:
+            "function tooComplex(a) {" +
+            " if (a === 1) {} if (a === 2) {} if (a === 3) {} if (a === 4) {} if (a === 5) {}" +
+            " if (a === 6) {} if (a === 7) {} if (a === 8) {} if (a === 9) {} if (a === 10) {}" +
+            " if (a === 11) {} if (a === 12) {} if (a === 13) {} if (a === 14) {} if (a === 15) {}" +
+            " if (a === 16) {} }",
+          options: [{ max: 15 }],
+          errors: [
+            {
+              message:
+                "Function 'tooComplex' has cognitive complexity 16, above the maximum of 15. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function nested(a, b) { for (const x of a) { if (x) { if (b) { if (a) { if (b) { if (a) {} } } } } } }",
+          options: [{ max: 15 }],
+          errors: [
+            {
+              message:
+                "Function 'nested' has cognitive complexity 21, above the maximum of 15. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function outer(a) { const run = () => { if (a) { return 1; } return 0; }; return run(); }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'outer' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function sequences(a, b, c, d) { return (a && b) || (c ?? d); }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'sequences' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function walk(n) { if (n > 0) { return walk(n - 1); } return 0; }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'walk' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "class Service { run(a) { if (a) {} else { if (a) {} } } }",
+          options: [{ max: 3 }],
+          errors: [
+            {
+              message:
+                "Function 'run' has cognitive complexity 4, above the maximum of 3. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("documents the function-complexity standard in AGENTS.md and CONTRIBUTING.md", () => {
+    const agents = readRepoFile("AGENTS.md");
+    assert.match(
+      agents,
+      /cognitive and cyclomatic complexity `<= 15`/,
+      "AGENTS.md must document the <= 15 cognitive and cyclomatic complexity limit",
+    );
+    assert.match(
+      agents,
+      /pi-mcp\/max-cognitive-complexity/,
+      "AGENTS.md must name the pi-mcp/max-cognitive-complexity rule",
+    );
+    const contributing = readRepoFile("CONTRIBUTING.md");
+    assert.match(
+      contributing,
+      /npm run lint` enforces Qlty-aligned structural complexity limits on\s+`src\/\*\*\/\*\.ts`/,
+      "CONTRIBUTING.md must note that npm run lint enforces structural complexity limits on src/**/*.ts",
+    );
+  });
+
   it("keeps typescript within typescript-eslint's supported peer range and ignores >= 7.0.0 in dependabot.yml", () => {
     const pkg = JSON.parse(readRepoFile("package.json")) as {
       devDependencies: Record<string, string>;

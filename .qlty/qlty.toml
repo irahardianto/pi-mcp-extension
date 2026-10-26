@@ -6,7 +6,13 @@ config_version = "0"
 exclude_patterns = [
   "**/node_modules/**",
   "scripts/**",
-  "tests/**"
+  "tests/**",
+  # Semgrep rule fixtures are deliberately bad code; the rules' own `semgrep --test` fixtures are
+  # not production TypeScript and must not drive complexity or duplication metrics.
+  ".semgrep/**",
+  # The ESLint flat config is a build-time artifact, not shipped `src/`; keep smells scoped to
+  # production TypeScript modules (`AGENTS.md` → Function complexity & decomposition).
+  "*.mjs"
 ]
 
 test_patterns = [
@@ -30,6 +36,14 @@ threshold = 1000
 [smells.nested_control_flow]
 enabled = true
 threshold = 5
+
+# WHY: `threshold = 15` flags functions at or above 15, matching ESLint's
+# `complexity: ["error", { max: 15 }]` and `pi-mcp/max-cognitive-complexity` (see AGENTS.md →
+# Function complexity & decomposition). The ESLint rule is the blocking gate; this smell is the
+# source of truth for the metric on the Qlty dashboard.
+[smells.function_complexity]
+enabled = true
+threshold = 15
 
 # Disable third-party linters so CI workflows (.github/workflows/ci.yml, semgrep.yml,
 # secret-scan.yml, workflow-lint.yml) remain the single source of truth.

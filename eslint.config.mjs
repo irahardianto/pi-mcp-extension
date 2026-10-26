@@ -57,6 +57,163 @@ export const MAX_CONTROL_FLOW_DEPTH_SELECTOR = Array.from(
   () => CONTROL_FLOW_NODE,
 ).join(" ");
 
+const COGNITIVE_CONTROL_NODES = [
+  "IfStatement",
+  "SwitchStatement",
+  "ForStatement",
+  "ForInStatement",
+  "ForOfStatement",
+  "WhileStatement",
+  "DoWhileStatement",
+  "CatchClause",
+  "ConditionalExpression",
+];
+
+const COGNITIVE_FUNCTION_NODES = [
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+];
+
+function isElseIfStatement(node) {
+  const parent = node.parent;
+  return parent?.type === "IfStatement" && parent.alternate === node;
+}
+
+function hasFinalElseClause(node) {
+  return node.alternate !== null && node.alternate !== undefined && node.alternate.type !== "IfStatement";
+}
+
+function isSameOperatorSequenceMember(node) {
+  const parent = node.parent;
+  return parent?.type === "LogicalExpression" && parent.operator === node.operator;
+}
+
+function calledName(callee) {
+  if (callee?.type === "Identifier") return callee.name;
+  if (callee?.type === "MemberExpression" && callee.property?.type === "Identifier") {
+    return callee.property.name;
+  }
+  return undefined;
+}
+
+/**
+ * Cognitive complexity in the style Qlty's `function_complexity` smell reports: control-flow
+ * structures cost `1 + nestingDepth`, `else`/`else if` branches add 1 without deepening nesting,
+ * each contiguous run of identical `&&` / `||` / `??` operators adds 1, and direct recursion adds
+ * 1. Nested closures deepen nesting and roll their own complexity up into the enclosing function,
+ * so a helper that only exists to dodge the limit does not hide the complexity.
+ */
+export const maxCognitiveComplexityRule = {
+  meta: {
+    type: "suggestion",
+    schema: [
+      {
+        type: "object",
+        properties: { max: { type: "integer", minimum: 1 } },
+        additionalProperties: false,
+      },
+    ],
+    messages: {
+      tooComplex:
+        "Function '{{name}}' has cognitive complexity {{count}}, above the maximum of {{max}}. Extract nested branches, loops, and inline callbacks into named helper functions.",
+    },
+  },
+  create(context) {
+    const max = context.options[0]?.max ?? 15;
+    const frames = [];
+
+    function currentFrame() {
+      return frames[frames.length - 1];
+    }
+
+    function enterFunction(node) {
+      const parent = currentFrame();
+      frames.push({
+        node,
+        name: getFunctionName(node),
+        score: 0,
+        depth: parent ? parent.depth + 1 : 0,
+      });
+    }
+
+    function exitFunction() {
+      const frame = frames.pop();
+      if (!frame) return;
+      const parent = currentFrame();
+      if (parent) {
+        parent.score += frame.score;
+        return;
+      }
+      // WHY: Qlty attributes a nested closure's complexity to its enclosing function and does not
+      // report anonymous/default-exported functions at all; skip them here too so `npm run lint`
+      // and `qlty:function-complexity` agree, instead of failing the extension entry point that
+      // Qlty never flags.
+      if (frame.name === "<anonymous>" || frame.name === "<default export>") return;
+      if (frame.score > max) {
+        context.report({
+          node: frame.node,
+          messageId: "tooComplex",
+          data: {
+            name: frame.name,
+            count: String(frame.score),
+            max: String(max),
+          },
+        });
+      }
+    }
+
+    function enterControlFlow(node) {
+      const frame = currentFrame();
+      if (!frame) return;
+      if (isElseIfStatement(node)) {
+        frame.score += 1;
+        return;
+      }
+      frame.score += 1 + frame.depth;
+      if (node.type === "IfStatement" && hasFinalElseClause(node)) {
+        frame.score += 1;
+      }
+      frame.depth += 1;
+    }
+
+    function exitControlFlow(node) {
+      const frame = currentFrame();
+      if (!frame || isElseIfStatement(node)) return;
+      frame.depth -= 1;
+    }
+
+    const visitors = {
+      "FunctionDeclaration:exit": exitFunction,
+      "FunctionExpression:exit": exitFunction,
+      "ArrowFunctionExpression:exit": exitFunction,
+      LogicalExpression(node) {
+        const frame = currentFrame();
+        if (!frame || isSameOperatorSequenceMember(node)) return;
+        frame.score += 1;
+      },
+      CallExpression(node) {
+        const frame = currentFrame();
+        if (!frame) return;
+        if (calledName(node.callee) === frame.name) {
+          frame.score += 1;
+        }
+      },
+    };
+
+    for (const type of COGNITIVE_FUNCTION_NODES) {
+      visitors[type] = enterFunction;
+    }
+
+    for (const type of COGNITIVE_CONTROL_NODES) {
+      visitors[type] = enterControlFlow;
+      visitors[`${type}:exit`] = exitControlFlow;
+    }
+
+    return visitors;
+  },
+};
+
 export const maxReturnStatementsRule = {
   meta: {
     type: "suggestion",
@@ -202,12 +359,15 @@ export default tseslint.config(
       "pi-mcp": {
         rules: {
           "max-return-statements": maxReturnStatementsRule,
+          "max-cognitive-complexity": maxCognitiveComplexityRule,
         },
       },
     },
     rules: {
       "no-console": ["error", { allow: ["error"] }],
       "pi-mcp/max-return-statements": ["error", { max: 4 }],
+      "pi-mcp/max-cognitive-complexity": ["error", { max: 15 }],
+      complexity: ["error", { max: 15 }],
     },
   },
   {
