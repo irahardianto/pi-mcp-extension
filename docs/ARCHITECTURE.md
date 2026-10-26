@@ -310,7 +310,7 @@ flowchart TD
 
 Behavior:
 
-- **Bootstrap** calls `loadConfig()` with `includeProjectConfig: false`, so the global
+- **Bootstrap** calls the loader with `includeProjectConfig: false`, so the global
   file is read but a project file never is, before trust is resolved.
 - **`session_start`** sets `includeProjectConfig` from `ctx.isProjectTrusted()`.
 - **JSONC.** `//` and `/* ... */` comments are stripped in a single pass that preserves
@@ -333,6 +333,13 @@ Behavior:
 - **Extension-registered servers** from `pi.registerMcpServer()` are collected on
   bootstrap and on every `mcp_servers_change`; a same-named `mcp.json` entry takes
   precedence.
+- **Provenance.** `loadConfigWithOrigins()` returns the merged config plus the winning
+  file origin per server (`global` or `project`); the entry merges in the registered
+  extension server names (`withExtensionServers`) and keeps that record for the current
+  session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
+  skipped project config renders as `Project config: not loaded (<path>)` instead of
+  silently missing servers. `loadConfig()` remains the thin wrapper that returns only
+  the merged config.
 
 ---
 

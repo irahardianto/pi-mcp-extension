@@ -47,14 +47,15 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 
 | File | Owns |
 |---|---|
-| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; `mcp_status` / `mcp_connect` tools |
-| `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash-command registration (`registerCommands`) |
+| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; file-level config provenance tracking; `mcp_status` / `mcp_connect` tools |
+| `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash-command registration (`registerCommands`), including the enriched `/mcp <name>` detail view |
 | `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, eager server starts, session teardown) |
 | `src/startup-auth.ts` | Abort-aware auth-queue turn waiter (`waitForQueueTurn`), startup authorization prompt (`promptStartupAuth`, `startupAuthNowOption`, `startupAuthLaterOption`), and error message formatting (`formatErrorMessage`) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow (`authorize`) and browser launcher (`openBrowser`, `browserOpenCommand`) |
 | `src/authorize-dialog.ts` | Interactive OAuth callback dialog waiter (`waitForOAuthCallback`, `OAuthPasteOptions`) and dialog option constants (`authRetryOption`, `authPasteOption`, `authCancelOption`) |
 | `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
+| `src/server-status.ts` | Per-server status snapshot shared by `/mcp <name>` and `mcp_status` (`collectServerStatus`), OAuth credential summary and failure-hint formatting (`formatStatusAuth`, `classifyFailure`, `formatFailureHint`), detail renderer (`formatServerDetail`), and tool row (`toStatusRow`) |
 | `src/connect-policy.ts` | Pure connect-failure classification (`classifyConnectFailure`), OAuth 401/403 detection (`isOAuthUnauthorizedError`), and retry backoff schedule (`RETRY_DELAYS_MS`) |
 | `src/transport-factory.ts` | SDK transport construction (`stdio`, `streamable-http`, `sse`), environment resolution (`resolveEnv`), silent OAuth provider wiring, and transport-level SDK workarounds (`createTransport`) |
 | `src/stdio-process.ts` | Stdio child-process supervision (`isPidAlive`, `ensurePidTerminated`, `instrumentStdioTransport`, injectable `StdioProcessDeps`) and `StringDecoder` stderr line splitting (`createLineSplitter`) |
@@ -63,7 +64,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/schema-convert.ts` | Pure MCP JSON Schema → TypeBox conversion (`convertJsonSchemaToTypebox`, `orderUnionMembers`) |
 | `src/schema-refs.ts` | Pure JSON Pointer (`$ref`) resolution for schema conversion (`resolveRefTarget`, `unescapeJsonPointer`, `stepJsonPointer`) |
 | `src/jsonc.ts` | Pure JSONC text utility (`stripJsonComments`): single-pass `//` line and `/* */` block comment removal outside of double-quoted strings, preserving `\n`/`\r` so `JSON.parse` error line numbers stay accurate. Used by `src/config.ts` (runtime `mcp.json`), `scripts/ruleset-audit.ts` (`.github/rulesets/*.json`), and, as the single canonical import path, the test suites (`tests/config.test.ts`, `tests/fuzz.test.ts`, `tests/repo-policy.test.ts` for `.github/rulesets/default-branch.json`) |
-| `src/config.ts` | Zod schemas, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases |
+| `src/config.ts` | Zod schemas, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases, and per-server file origins (`loadConfigWithOrigins`, `FileConfigOrigin`) |
+| `src/server-provenance.ts` | Pure per-server config provenance (`withExtensionServers`, `ServerConfigSource`): which file or extension supplied each server, plus the skipped-project-config note |
 | `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, refresh rotation, credential invalidation |
 | `src/oauth-status.ts` | Stored OAuth state inspection (`getAuthStatus`), credential reset (`resetAuth`), and best-effort token invalidation (`invalidateStoredTokens`) |
 | `src/oauth-state-store.ts` | Persisted OAuth state: Zod schemas (`StoredStateSchema`), URL canonicalization and origin-binding checks (`canonicalServerUrl`, `urlsMatch`, `isResourceCompatibleWithServerUrl`), atomic `0o600` load/save (`loadState`, `saveState`, `loadStoredRedirectUrisSync`) |
@@ -120,7 +122,7 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - Project trust: never read `<cwd>/.pi/mcp.json` during bootstrap or when `ctx.isProjectTrusted()` is false (`loadConfig` with `includeProjectConfig: false`).
 - OAuth state is origin-bound. The state file records `serverUrl` and is rejected on load if it doesn't match the configured URL (`urlsMatch`), so a project server that reuses a global server's name can't receive its tokens. Preserve DCR `token_endpoint_auth_method` and `redirect_uris`.
 - OAuth state is also bound to the authorization server: persist and return the SDK's `issuer` on stored tokens and client information unchanged (including in silent mode and peer reloads), never re-bind a stamped client to another issuer, and never write a config-supplied `client_secret` to disk (GHSA-6qxp-vccf-f47h).
-- Sensitive files (`<hash>.json`, `<hash>.json.lock`) are written `0o600` inside `0o700` directories via temp file + `rename`. Corrupt state for one server must not break `mcp_status` for the others.
+- Sensitive files (`<hash>.json`, `<hash>.json.lock`) are written `0o600` inside `0o700` directories via temp file + `rename`. Corrupt state for one server must not break `mcp_status` or `/mcp <name>` for the others: both go through `collectServerStatus`, which reports the backed-up file instead of throwing.
 - Refresh tokens are single-use. Before invalidating tokens, reload them from disk once in case a peer process already rotated them, and coordinate interactive writes through the auth lock.
 - Trigger OAuth only on a genuine HTTP 401 (during `initialize` **and** `tools/list`) or a 403 with `insufficient_scope`. Never substring-match `"401"` in error messages. The only exception is the anchored message fallback inside `isOAuthUnauthorizedError`, after its structured checks; Semgrep `pi-mcp.no-401-substring` enforces this everywhere else.
 - Redirect URLs are loopback `http:`/`https:` with an explicit port. Validate callback `state` on success **and** on `?error=` responses. Only `http:`/`https:` authorization URLs reach the OS browser opener, and unvalidated strings never reach a shell.

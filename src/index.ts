@@ -13,13 +13,25 @@ import type {
   RegisteredMcpServer,
 } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
-import { loadConfig, type McpConfig, type ServerConfig, agentDir } from "./config.js";
+import {
+  agentDir,
+  loadConfigWithOrigins,
+  type LoadedConfig,
+  type McpConfig,
+  type ServerConfig,
+} from "./config.js";
+import type { ConfigProvenanceInput } from "./server-provenance.js";
 import {
   collectRegisteredServers,
   mergeWithRegisteredServers,
 } from "./commands.js";
 import { registerCommands } from "./register-commands.js";
-import { ServerManager } from "./server-manager.js";
+import { ServerManager, type ManagedServer } from "./server-manager.js";
+import {
+  collectServerStatus,
+  toStatusRow,
+  type ServerStatusRow,
+} from "./server-status.js";
 import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
@@ -63,10 +75,20 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     settings: { ...DEFAULT_SETTINGS },
     mcpServers: {},
   };
+  // Where each configured server came from. The bootstrap load skips the project
+  // config (trust is unknown before session_start), so this is replaced on the
+  // first session_start with the provenance of the config actually in effect.
+  let fileProvenance: ConfigProvenanceInput = {
+    origins: {},
+    projectConfigPath: join(paths.bootstrapCwd ?? process.cwd(), ".pi", "mcp.json"),
+    projectConfigIncluded: false,
+  };
   try {
-    fileConfig = await loadConfig(paths.bootstrapCwd ?? process.cwd(), paths.globalConfigPath, {
+    const loaded = await loadConfigWithOrigins(paths.bootstrapCwd ?? process.cwd(), paths.globalConfigPath, {
       includeProjectConfig: false,
     });
+    fileConfig = loaded.config;
+    fileProvenance = loaded;
   } catch (err) {
     // Can't notify yet (no ctx), so the diagnostic goes to stderr (and to the
     // debug log when it is enabled). The session_start handler will re-try with
@@ -158,12 +180,19 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         ? (ctx as { isProjectTrusted: () => boolean }).isProjectTrusted()
         : true;
 
-    let nextFileConfig: McpConfig;
+    let nextLoaded: LoadedConfig;
     try {
-      nextFileConfig = await loadConfig(ctx.cwd, paths.globalConfigPath, { includeProjectConfig });
+      nextLoaded = await loadConfigWithOrigins(ctx.cwd, paths.globalConfigPath, { includeProjectConfig });
     } catch (err) {
       const msg = formatErrorMessage(err);
       ctx.ui.notify(`pi-mcp: Config error — ${msg}`, "error");
+      // WHY: A config that failed to parse still supplies no server origins, so the
+      // provenance must not keep pointing at the previous session's file entries.
+      fileProvenance = {
+        origins: {},
+        projectConfigPath: join(ctx.cwd, ".pi", "mcp.json"),
+        projectConfigIncluded: includeProjectConfig,
+      };
       // WHY: Switching sessions into a directory with an invalid config must tear down stale
       // servers, tools, prompts, and status from the previous session rather than leaving them active.
       await coordinator.teardown(ctx);
@@ -191,7 +220,8 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       return;
     }
 
-    fileConfig = nextFileConfig;
+    fileConfig = nextLoaded.config;
+    fileProvenance = nextLoaded;
     extensionServers = collectRegisteredServers(
       getRegisteredEntries(),
       fileConfig.mcpServers,
@@ -298,7 +328,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   });
 
   // ── 4. Slash commands ───────────────────────────────────────────────────
-  registerCommands(pi, { manager, coordinator, bridge });
+  registerCommands(pi, { manager, coordinator, bridge, getFileProvenance: () => fileProvenance });
 
   const authorize = (serverName: string, ctx: ExtensionContext, signal: AbortSignal, reset: boolean) =>
     runAuthorize(
@@ -315,27 +345,26 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       reset,
     );
 
-  registerManagementTools(pi, { manager, coordinator, bridge });
+  registerManagementTools(pi, { manager, coordinator, bridge, getFileProvenance: () => fileProvenance });
 }
 
-function formatStatusAuth(
-  authConfig: ServerConfig["auth"] | undefined,
-  authCorrupt: boolean,
-  hasTokens: boolean | undefined,
-): string {
-  if (!authConfig) return "not configured";
-  if (authCorrupt) return "corrupt state file backed up (re-auth required)";
-  if (hasTokens) return "credentials stored";
-  return "authorization may be required";
+interface ManagementToolDeps {
+  manager: ServerManager;
+  coordinator: ConnectionCoordinator;
+  bridge: ToolBridge;
+  getFileProvenance: () => ConfigProvenanceInput;
 }
 
-function formatStatusError(lastError: unknown): string | undefined {
-  if (!lastError) return undefined;
-  if (lastError instanceof AuthRequiredError) {
-    return "Authorization required: use mcp_connect in an interactive Pi session";
-  }
-  const code = lastError instanceof McpError ? lastError.code : "failed";
-  return `Connection ${code}; use mcp_connect to retry`;
+/** One `mcp_status` row: state, tool counts, credential summary, error hint, and config source. */
+function collectStatusRow(server: ManagedServer, deps: ManagementToolDeps): Promise<ServerStatusRow> {
+  const provenance = deps.getFileProvenance();
+  return collectServerStatus({
+    server,
+    tools: deps.bridge.getToolActivity(server.name),
+    source: provenance.origins[server.name] ?? "extension",
+    recentOutput: deps.manager.getServerLogs(server.name),
+    readAuthStatus: (name) => deps.manager.getServerAuthStatus(name),
+  }).then(toStatusRow);
 }
 
 interface McpConnectErrorOptions {
@@ -375,7 +404,7 @@ function formatMcpConnectError(err: unknown, options: McpConnectErrorOptions): s
 
 function registerManagementTools(
   pi: ExtensionAPI,
-  deps: { manager: ServerManager; coordinator: ConnectionCoordinator; bridge: ToolBridge },
+  deps: ManagementToolDeps,
 ): void {
   const { manager, coordinator, bridge } = deps;
 
@@ -386,33 +415,9 @@ function registerManagementTools(
     promptSnippet: "Inspect configured MCP servers, their connection state, discovered tools, and authentication status.",
     parameters: Type.Object({}),
     async execute() {
-      const rows = await Promise.all(manager.getAllServers().map(async (server) => {
-        let auth: Awaited<ReturnType<typeof manager.getServerAuthStatus>> = null;
-        let authCorrupt = false;
-        if (server.config.auth) {
-          try {
-            auth = await manager.getServerAuthStatus(server.name);
-          } catch (err) {
-            // WHY: Never let a single server's corrupt state file abort mcp_status for all servers.
-            // getAuthStatus() already backed up and deleted the corrupt file before throwing.
-            const { kind, message } = describeError(err);
-            reportDiagnostic({
-              level: "error",
-              event: "oauth.state_corrupt",
-              server: server.name,
-              message,
-              fields: { kind },
-            });
-            authCorrupt = true;
-          }
-        }
-        return {
-          name: server.name, lifecycle: server.config.lifecycle, state: server.state,
-          tools: bridge.getToolActivity(server.name),
-          auth: formatStatusAuth(server.config.auth, authCorrupt, auth?.hasTokens),
-          error: formatStatusError(server.lastError),
-        };
-      }));
+      const rows = await Promise.all(
+        manager.getAllServers().map((server) => collectStatusRow(server, deps)),
+      );
       return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
     },
   });

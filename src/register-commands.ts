@@ -15,7 +15,9 @@ import {
   formatErrorMessage,
 } from "./connection-coordinator.js";
 import { AuthCancelledError } from "./errors.js";
-import type { ServerManager } from "./server-manager.js";
+import type { ManagedServer, ServerManager } from "./server-manager.js";
+import { withExtensionServers, type ConfigProvenanceInput } from "./server-provenance.js";
+import { collectServerStatus, formatServerDetail } from "./server-status.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import type { ToolBridge } from "./tool-bridge.js";
 
@@ -23,34 +25,43 @@ export interface RegisterCommandsDeps {
   manager: ServerManager;
   coordinator: ConnectionCoordinator;
   bridge: ToolBridge;
+  /** File-level config provenance; registered server names are folded in on demand. */
+  getFileProvenance: () => ConfigProvenanceInput;
 }
 
-function handleMcpStatus(args: string, ctx: ExtensionCommandContext, manager: ServerManager): void {
+/** Enriched `/mcp <name>` view: provenance, tool counts, credentials, failure hints, output. */
+async function buildServerDetail(server: ManagedServer, deps: RegisterCommandsDeps): Promise<string> {
+  const { manager } = deps;
+  const serverName = server.name;
+  const fileProvenance = deps.getFileProvenance();
+  const snapshot = await collectServerStatus({
+    server,
+    tools: deps.bridge.getToolActivity(serverName),
+    source: fileProvenance.origins[serverName] ?? "extension",
+    recentOutput: manager.getServerLogs(serverName),
+    readAuthStatus: (name) => manager.getServerAuthStatus(name),
+  });
+  const provenance = withExtensionServers(
+    fileProvenance,
+    manager.getAllServers().map((entry) => entry.name),
+  );
+  return formatServerDetail(snapshot, provenance);
+}
+
+async function handleMcpStatus(args: string, ctx: ExtensionCommandContext, deps: RegisterCommandsDeps): Promise<void> {
+  const { manager } = deps;
   const serverName = args.trim();
-  if (serverName) {
-    // Detailed view: status + recent stderr
-    const server = manager.getServer(serverName);
-    if (!server) {
-      ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
-      return;
-    }
-    const logs = manager.getServerLogs(serverName);
-    const detail = [
-      `Server: ${serverName}`,
-      `State:  ${server.state}`,
-      `Retries: ${server.retryCount}`,
-      server.lastError ? `Last error: ${sanitizeTerminalText(server.lastError.message)}` : null,
-      "",
-      "Recent output:",
-      logs,
-    ]
-      .filter(Boolean)
-      .join("\n");
-    ctx.ui.notify(detail, "info");
-  } else {
+  if (!serverName) {
     // Summary view: all servers
     ctx.ui.notify(manager.getStatusSummary(), "info");
+    return;
   }
+  const server = manager.getServer(serverName);
+  if (!server) {
+    ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
+    return;
+  }
+  ctx.ui.notify(await buildServerDetail(server, deps), "info");
 }
 
 async function handleMcpStop(
@@ -143,7 +154,7 @@ export function registerCommands(pi: ExtensionAPI, deps: RegisterCommandsDeps): 
     description:
       "Show MCP server status. Usage: /mcp [server-name] for detail.",
     handler: async (args, ctx) => {
-      handleMcpStatus(args, ctx, manager);
+      await handleMcpStatus(args, ctx, deps);
     },
     getArgumentCompletions: (prefix) => serverNameCompletions(prefix, manager.getAllServers()),
   });

@@ -185,13 +185,39 @@ Server-name arguments provide autocomplete suggestions from the configured MCP s
 | Command | Description |
 |---|---|
 | `/mcp` | Show status summary of all configured servers |
-| `/mcp <name>` | Show detailed status and stderr log for a specific server |
+| `/mcp <name>` | Show detailed status for one server: config source, transport/lifecycle, tool activation, OAuth credential status, failure hint, and stderr log |
 | `/mcp:start <name>` | Connect a server and wait for tool discovery |
 | `/mcp:stop <name>` | Cancel a pending connection, startup prompt, or authorization, or stop a running server and deactivate its tools |
 | `/mcp:auth <name>` | Connect with stored OAuth credentials and client registration; request browser authorization only if needed |
 | `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization |
 
-Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, discovered and active tool counts, credential presence, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text.
+Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, discovered and active tool counts, credential presence, config source, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text.
+
+### Inspecting one server (`/mcp <name>`)
+
+`/mcp <name>` answers "why is this server in this state?" without leaving Pi:
+
+```text
+Server: supabase
+State:  stopped
+Retries: 5
+Transport: streamable-http
+Lifecycle: lazy
+Source: global
+Tools: 0/0 active
+OAuth: credentials stored
+Last error: Connection timed out after 30000ms
+Hint: run with PI_MCP_DEBUG=1 pi to log redacted diagnostics, or report server issues at https://github.com/irahardianto/pi-mcp-extension/issues
+
+Recent output:
+(no stderr output from supabase)
+```
+
+- `Source` is the entry that won: `global` (`<agent dir>/mcp.json`), `project` (`<cwd>/.pi/mcp.json`), or `extension` (`pi.registerMcpServer()`). `mcp_status` reports the same value as `source` on each row.
+- When the project is untrusted, `Source` never says `project` and a `Project config: not loaded (<path>)` line explains why `mcp.json` in the workspace is not in effect.
+- `Tools` compares discovered tools with the ones Pi has active; a server can be `ready` with `0/N active` when another extension restricts tools.
+- `OAuth` appears only for servers with an `auth` config: `credentials stored`, `authorization may be required`, or `corrupt state file backed up (re-auth required)` (the corrupt file is backed up and the view still renders).
+- A failed server adds one `Hint:` line: `/mcp:auth <name>` (plus `--reset` when stored credentials expired) for a missing/expired authorization, waiting for another Pi process holding the auth lock, or `PI_MCP_DEBUG=1 pi` plus the issue tracker for a connection failure.
 
 ### OAuth startup, headless/SSH, and concurrency behavior
 

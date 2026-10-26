@@ -8,7 +8,8 @@ The table names the supported line as `major.minor.x`, so it stays accurate acro
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.10.x  | :white_check_mark: |
+| 1.11.x  | :white_check_mark: |
+| 1.10.x  | :x:                |
 | < 1.10  | :x:                |
 
 This table is maintained by hand: the release workflow bumps `package.json` and `CHANGELOG.md` automatically, so a `feat:` (minor) or breaking (major) change must update it in the same pull request (see [AGENTS.md](AGENTS.md#commits--release)).

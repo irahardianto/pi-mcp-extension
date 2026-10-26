@@ -249,6 +249,20 @@ export type ServerConfig = z.output<typeof ServerConfigSchema>;
 export type Settings = z.output<typeof SettingsSchema>;
 export type McpConfig = z.output<typeof McpConfigSchema>;
 
+/** Which config file supplied a server entry. */
+export type FileConfigOrigin = "global" | "project";
+
+/** A loaded config plus where each server entry came from. */
+export interface LoadedConfig {
+  config: McpConfig;
+  /** Winning origin per configured server name (project entries override global ones). */
+  origins: Record<string, FileConfigOrigin>;
+  /** Path of the project config file for the loaded cwd, read or not. */
+  projectConfigPath: string;
+  /** Whether the project config was read (`includeProjectConfig !== false`). */
+  projectConfigIncluded: boolean;
+}
+
 export interface LoadConfigOptions {
   /**
    * Whether to read project-level `<cwd>/.pi/mcp.json`.
@@ -373,6 +387,54 @@ export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".pi", "agent");
 }
 
+/** Winning file origin per server name: a project entry replaces a global entry of the same name. */
+function originsOf(
+  globalCfg: McpConfig,
+  projectCfg: ProjectConfig | undefined,
+): Record<string, FileConfigOrigin> {
+  const origins: Record<string, FileConfigOrigin> = {};
+  for (const name of Object.keys(globalCfg.mcpServers)) {
+    origins[name] = "global";
+  }
+  for (const name of Object.keys(projectCfg?.mcpServers ?? {})) {
+    origins[name] = "project";
+  }
+  return origins;
+}
+
+/**
+ * Load and merge global and project configs, reporting where every server entry came from.
+ * Same validation, precedence, and error behavior as `loadConfig`.
+ */
+export async function loadConfigWithOrigins(
+  cwd: string,
+  globalPath = join(agentDir(), "mcp.json"),
+  options?: LoadConfigOptions,
+): Promise<LoadedConfig> {
+  const projectConfigIncluded = options?.includeProjectConfig !== false;
+  const projectConfigPath = join(cwd, ".pi", "mcp.json");
+
+  const [globalRaw, projectRaw] = await Promise.all([
+    readJsonFile(globalPath),
+    projectConfigIncluded ? readJsonFile(projectConfigPath) : Promise.resolve(undefined),
+  ]);
+
+  const globalCfg = globalRaw !== undefined
+    ? parseConfig(globalRaw, globalPath)
+    : McpConfigSchema.parse({});
+
+  const projectCfg = projectRaw === undefined
+    ? undefined
+    : parseWith(ProjectConfigSchema, projectRaw, projectConfigPath);
+
+  return {
+    config: projectCfg === undefined ? globalCfg : mergeConfigs(globalCfg, projectCfg),
+    origins: originsOf(globalCfg, projectCfg),
+    projectConfigPath,
+    projectConfigIncluded,
+  };
+}
+
 /**
  * Load and merge global (<agent dir>/mcp.json) and project (<cwd>/.pi/mcp.json) configs.
  * Project config takes precedence over global config when `options.includeProjectConfig !== false`.
@@ -383,25 +445,6 @@ export async function loadConfig(
   globalPath = join(agentDir(), "mcp.json"),
   options?: LoadConfigOptions,
 ): Promise<McpConfig> {
-  const includeProjectConfig = options?.includeProjectConfig !== false;
-  const projectPath = join(cwd, ".pi", "mcp.json");
-
-  const [globalRaw, projectRaw] = await Promise.all([
-    readJsonFile(globalPath),
-    includeProjectConfig ? readJsonFile(projectPath) : Promise.resolve(undefined),
-  ]);
-
-  // If neither file exists, return an empty valid config
-  if (globalRaw === undefined && projectRaw === undefined) {
-    return McpConfigSchema.parse({});
-  }
-
-  const globalCfg = globalRaw !== undefined
-    ? parseConfig(globalRaw, globalPath)
-    : McpConfigSchema.parse({});
-
-  if (projectRaw === undefined) return globalCfg;
-
-  const projectCfg = parseWith(ProjectConfigSchema, projectRaw, projectPath);
-  return mergeConfigs(globalCfg, projectCfg);
+  const loaded = await loadConfigWithOrigins(cwd, globalPath, options);
+  return loaded.config;
 }
