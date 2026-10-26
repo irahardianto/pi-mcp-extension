@@ -139,15 +139,17 @@ interface ToolCallResponse {
 }
 
 /** Append the tool's annotation hints to its description so the LLM sees them. */
-function buildToolDescription(tool: McpToolDefinition): string {
+function buildToolDescription(
+  tool: McpToolDefinition,
+  annotations: McpToolDefinition["annotations"],
+): string {
   const description = tool.description ?? `MCP tool: ${tool.name}`;
-  const ann = tool.annotations;
-  if (!ann) return description;
+  if (!annotations) return description;
   const hints: string[] = [];
-  if (ann.readOnlyHint) hints.push("read-only");
-  if (ann.destructiveHint) hints.push("⚠️ destructive");
-  if (ann.idempotentHint) hints.push("idempotent");
-  if (ann.openWorldHint) hints.push("may have side effects");
+  if (annotations.readOnlyHint) hints.push("read-only");
+  if (annotations.destructiveHint) hints.push("⚠️ destructive");
+  if (annotations.idempotentHint) hints.push("idempotent");
+  if (annotations.openWorldHint) hints.push("may have side effects");
   return hints.length > 0 ? `${description} [${hints.join(", ")}]` : description;
 }
 
@@ -344,10 +346,10 @@ export class ToolBridge {
   private _recordServerTimeout(serverName: string, explicitTimeoutMs: number | undefined): number {
     if (explicitTimeoutMs !== undefined) {
       this.serverTimeouts.set(serverName, explicitTimeoutMs);
-      return explicitTimeoutMs;
+    } else {
+      this.serverTimeouts.delete(serverName);
     }
-    this.serverTimeouts.delete(serverName);
-    return this.settings.requestTimeoutMs;
+    return explicitTimeoutMs ?? this.settings.requestTimeoutMs;
   }
 
   /**
@@ -459,19 +461,20 @@ export class ToolBridge {
     tool: McpToolDefinition,
     client: Client,
   ): void {
-    const description = buildToolDescription(tool);
+    const annotations = tool.annotations;
+    const description = buildToolDescription(tool, annotations);
     const notifyAuthError = (err: unknown) => this.onAuthError?.(serverName, err);
     const runTool = (params: unknown, signal: AbortSignal | undefined) =>
       this._executeToolCall(serverName, tool.name, client, params, signal);
 
     this.pi.registerTool({
       name: piName,
-      label: tool.annotations?.title ?? tool.name,
+      label: annotations?.title ?? tool.name,
       description,
       promptSnippet: description.slice(0, 120),
       parameters: convertJsonSchemaToTypebox(tool.inputSchema),
 
-      async execute(_toolCallId, params, signal) {
+      async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
         try {
           return await runTool(params, signal);
         } catch (err) {

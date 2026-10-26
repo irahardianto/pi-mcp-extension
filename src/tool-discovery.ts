@@ -131,9 +131,15 @@ export async function listAllTools(
       break;
     }
 
-    const page = await fetchToolsPageAbortable(client, cursor, requestTimeoutMs, signal, serverName);
-    tools.push(...(page.tools as McpToolDefinition[]));
-    cursor = page.nextCursor;
+    const result = await fetchToolsPageAbortable(
+      client,
+      cursor,
+      requestTimeoutMs,
+      signal,
+      serverName,
+    );
+    tools.push(...(result.tools as McpToolDefinition[]));
+    cursor = result.nextCursor;
     pageCount++;
   } while (cursor);
 
