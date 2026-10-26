@@ -32,9 +32,17 @@ updates:
     # WHY: Keep version requirement unchanged if already satisfied (increase-if-necessary).
     # dependabot-core does not parse peerDependencies as direct manifest update targets, and
     # under increase-if-necessary any '*' range is already satisfied so it is never rewritten.
-    # An explicit ignore: list is intentionally omitted because it would also suppress automated
-    # security advisory PRs for lockfile copies of those dependencies.
+    # An explicit ignore: list for peerDependencies is intentionally omitted because it would
+    # also suppress automated security advisory PRs for lockfile copies of those dependencies.
     versioning-strategy: increase-if-necessary
+    ignore:
+      # WHY: typescript-eslint 8.x declares peerDependencies `typescript: >=4.8.4 <6.1.0`
+      # and throws at runtime on TypeScript 7.0 (typescript-go), which causes `npm ci`
+      # (ERESOLVE) and `npm run lint` to fail. Remove once typescript-eslint supports
+      # TypeScript >=7.1 (https://github.com/typescript-eslint/typescript-eslint/issues/10940).
+      - dependency-name: "typescript"
+        versions:
+          - ">= 7.0.0"
     groups:
       # Group runtime/production dependencies into one PR
       production-dependencies:

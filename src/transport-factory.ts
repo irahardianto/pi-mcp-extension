@@ -101,7 +101,7 @@ export function createTransport(
             reconnectionDelayGrowFactor: 1,
           },
         },
-      ) as unknown as Transport;
+      );
     case "sse": {
       const transport = new SSEClientTransport(
         new URL(config.url!),

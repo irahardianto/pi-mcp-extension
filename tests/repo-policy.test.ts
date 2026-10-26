@@ -422,4 +422,24 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.ok(invalidTernary.length > 0);
     assert.ok(invalidTernary.some((m) => m.ruleId === "no-restricted-syntax" && m.message === "too deep"));
   });
+
+  it("keeps typescript within typescript-eslint's supported peer range and ignores >= 7.0.0 in dependabot.yml", () => {
+    const pkg = JSON.parse(readRepoFile("package.json")) as {
+      devDependencies: Record<string, string>;
+    };
+    const tsRange = pkg.devDependencies["typescript"];
+    assert.ok(tsRange !== undefined, "package.json must declare typescript in devDependencies");
+    assert.match(
+      tsRange,
+      /^[~^]?6\.0\./,
+      "devDependencies.typescript must stay on 6.0.x while typescript-eslint requires >=4.8.4 <6.1.0",
+    );
+
+    const dependabot = readRepoFile(".github/dependabot.yml");
+    assert.match(
+      dependabot,
+      /ignore:\s*\n(?:\s*#.*\n)*\s*-\s*dependency-name:\s*"typescript"\s*\n\s*versions:\s*\n\s*-\s*">= 7\.0\.0"/m,
+      ".github/dependabot.yml must ignore typescript >= 7.0.0 until typescript-eslint supports TypeScript >=7.1",
+    );
+  });
 });
