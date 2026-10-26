@@ -16,7 +16,7 @@ import {
 } from "./connection-coordinator.js";
 import { AuthCancelledError } from "./errors.js";
 import type { ManagedServer, ServerManager } from "./server-manager.js";
-import { withExtensionServers, type ConfigProvenanceInput } from "./server-provenance.js";
+import { lookupServerSource, type ConfigProvenance } from "./server-provenance.js";
 import { collectServerStatus, formatServerDetail } from "./server-status.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import type { ToolBridge } from "./tool-bridge.js";
@@ -25,26 +25,22 @@ export interface RegisterCommandsDeps {
   manager: ServerManager;
   coordinator: ConnectionCoordinator;
   bridge: ToolBridge;
-  /** File-level config provenance; registered server names are folded in on demand. */
-  getFileProvenance: () => ConfigProvenanceInput;
+  /** Session config provenance (file origins merged with extension-registered servers). */
+  getProvenance: () => ConfigProvenance;
 }
 
 /** Enriched `/mcp <name>` view: provenance, tool counts, credentials, failure hints, output. */
 async function buildServerDetail(server: ManagedServer, deps: RegisterCommandsDeps): Promise<string> {
   const { manager } = deps;
   const serverName = server.name;
-  const fileProvenance = deps.getFileProvenance();
+  const provenance = deps.getProvenance();
   const snapshot = await collectServerStatus({
     server,
     tools: deps.bridge.getToolActivity(serverName),
-    source: fileProvenance.origins[serverName] ?? "extension",
+    source: lookupServerSource(provenance, serverName),
     recentOutput: manager.getServerLogs(serverName),
     readAuthStatus: (name) => manager.getServerAuthStatus(name),
   });
-  const provenance = withExtensionServers(
-    fileProvenance,
-    manager.getAllServers().map((entry) => entry.name),
-  );
   return formatServerDetail(snapshot, provenance);
 }
 

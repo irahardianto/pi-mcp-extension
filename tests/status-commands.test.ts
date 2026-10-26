@@ -44,7 +44,10 @@ async function readStatusRows(
 it("reports config provenance, tool activation, and an untrusted project in /mcp <name> and mcp_status", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-status-provenance-"));
   const mockExt = createMockExtension({
-    mcpServers: [{ name: "ext-srv", config: stdioServer(), extensionPath: "/ext/a.ts" }],
+    mcpServers: [
+      { name: "ext-srv", config: stdioServer(), extensionPath: "/ext/a.ts" },
+      { name: "shared-srv", config: stdioServer(), extensionPath: "/ext/a.ts" },
+    ],
   });
   const commands = mockExt.commands;
   const tools = mockExt.tools;
@@ -62,11 +65,17 @@ it("reports config provenance, tool activation, and an untrusted project in /mcp
     await mkdir(join(dir, ".pi"));
     await writeFile(
       join(dir, "global.json"),
-      JSON.stringify({ settings: { maxRetries: 0 }, mcpServers: { "global-srv": stdioServer() } }),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: { "global-srv": stdioServer(), "shared-srv": stdioServer() },
+      }),
     );
     await writeFile(
       join(dir, ".pi", "mcp.json"),
-      JSON.stringify({ settings: { maxRetries: 0 }, mcpServers: { "project-srv": stdioServer() } }),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: { "project-srv": stdioServer(), "shared-srv": stdioServer() },
+      }),
     );
 
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "global.json") });
@@ -78,12 +87,18 @@ it("reports config provenance, tool activation, and an untrusted project in /mcp
     assert.match(projectDetail, /^Lifecycle: lazy$/m);
     assert.match(projectDetail, /^Tools: 0\/0 active$/m);
     assert.match(await detail("global-srv", ctx), /^Source: global$/m);
+    assert.match(await detail("shared-srv", ctx), /^Source: project$/m);
     assert.match(await detail("ext-srv", ctx), /^Source: extension$/m);
 
     const rows = await readStatusRows(tools, ctx);
     assert.deepEqual(
       Object.fromEntries(rows.map((row) => [row.name, row.source])),
-      { "global-srv": "global", "project-srv": "project", "ext-srv": "extension" },
+      {
+        "global-srv": "global",
+        "project-srv": "project",
+        "shared-srv": "project",
+        "ext-srv": "extension",
+      },
     );
 
     // A connected server reports its live activation counts in the detail view.
@@ -95,17 +110,22 @@ it("reports config provenance, tool activation, and an untrusted project in /mcp
     assert.match(connectedDetail, /^State:  ready$/m);
     assert.doesNotMatch(connectedDetail, /^OAuth:/m);
 
-    // An untrusted project drops its servers and the detail view explains why.
+    // An untrusted project drops its servers, falls back to the global entry for a shared name,
+    // and explains in the detail view why .pi/mcp.json was not loaded.
     const untrusted = createMockContext({ cwd: dir, hasUI: true, isProjectTrusted: false, ui });
     await events.get("session_start")({}, untrusted);
     const untrustedDetail = await detail("global-srv", untrusted);
     assert.match(untrustedDetail, /^Project config: not loaded .*not trusted/m);
+    assert.match(await detail("shared-srv", untrusted), /^Source: global$/m);
 
     messages.length = 0;
     await commands.get("mcp").handler("project-srv", untrusted);
     assert.ok(messages.some((message) => /No server named "project-srv"/.test(message)));
     const untrustedRows = await readStatusRows(tools, untrusted);
-    assert.equal(untrustedRows.some((row) => row.name === "project-srv"), false);
+    assert.deepEqual(
+      Object.fromEntries(untrustedRows.map((row) => [row.name, row.source])),
+      { "global-srv": "global", "shared-srv": "global", "ext-srv": "extension" },
+    );
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });

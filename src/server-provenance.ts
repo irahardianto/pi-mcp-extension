@@ -8,6 +8,7 @@
  */
 
 import type { FileConfigOrigin } from "./config.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 
 /** Where a configured server's winning entry came from. */
 export type ServerConfigSource = FileConfigOrigin | "extension";
@@ -42,7 +43,7 @@ export function withExtensionServers(
     sources[name] = origin;
   }
   for (const name of extensionServerNames) {
-    if (sources[name] === undefined) {
+    if (!Object.hasOwn(sources, name)) {
       sources[name] = "extension";
     }
   }
@@ -51,6 +52,16 @@ export function withExtensionServers(
     projectConfigPath: input.projectConfigPath,
     projectConfigIncluded: input.projectConfigIncluded,
   };
+}
+
+/** Recorded source for `serverName`, or `undefined` when it is not in `provenance.sources`. */
+export function lookupServerSource(
+  provenance: ConfigProvenance,
+  serverName: string,
+): ServerConfigSource | undefined {
+  return Object.hasOwn(provenance.sources, serverName)
+    ? provenance.sources[serverName]
+    : undefined;
 }
 
 /** Source shown for a server, or `"unknown"` when it is not in the loaded config. */
@@ -63,5 +74,5 @@ export function formatProjectConfigNote(provenance: ConfigProvenance): string | 
   if (provenance.projectConfigIncluded) {
     return undefined;
   }
-  return `Project config: not loaded (${provenance.projectConfigPath}) — this project is not trusted, so its mcp.json is never read`;
+  return `Project config: not loaded (${sanitizeTerminalText(provenance.projectConfigPath)}) — this project is not trusted, so its mcp.json is never read`;
 }

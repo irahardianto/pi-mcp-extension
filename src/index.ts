@@ -20,7 +20,12 @@ import {
   type McpConfig,
   type ServerConfig,
 } from "./config.js";
-import type { ConfigProvenanceInput } from "./server-provenance.js";
+import {
+  lookupServerSource,
+  withExtensionServers,
+  type ConfigProvenance,
+  type ConfigProvenanceInput,
+} from "./server-provenance.js";
 import {
   collectRegisteredServers,
   mergeWithRegisteredServers,
@@ -328,7 +333,9 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   });
 
   // ── 4. Slash commands ───────────────────────────────────────────────────
-  registerCommands(pi, { manager, coordinator, bridge, getFileProvenance: () => fileProvenance });
+  const getProvenance = (): ConfigProvenance =>
+    withExtensionServers(fileProvenance, Object.keys(extensionServers));
+  registerCommands(pi, { manager, coordinator, bridge, getProvenance });
 
   const authorize = (serverName: string, ctx: ExtensionContext, signal: AbortSignal, reset: boolean) =>
     runAuthorize(
@@ -345,24 +352,26 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       reset,
     );
 
-  registerManagementTools(pi, { manager, coordinator, bridge, getFileProvenance: () => fileProvenance });
+  registerManagementTools(pi, { manager, coordinator, bridge, getProvenance });
 }
 
 interface ManagementToolDeps {
   manager: ServerManager;
   coordinator: ConnectionCoordinator;
   bridge: ToolBridge;
-  getFileProvenance: () => ConfigProvenanceInput;
+  getProvenance: () => ConfigProvenance;
 }
 
 /** One `mcp_status` row: state, tool counts, credential summary, error hint, and config source. */
-function collectStatusRow(server: ManagedServer, deps: ManagementToolDeps): Promise<ServerStatusRow> {
-  const provenance = deps.getFileProvenance();
+function collectStatusRow(
+  server: ManagedServer,
+  deps: ManagementToolDeps,
+  provenance: ConfigProvenance,
+): Promise<ServerStatusRow> {
   return collectServerStatus({
     server,
     tools: deps.bridge.getToolActivity(server.name),
-    source: provenance.origins[server.name] ?? "extension",
-    recentOutput: deps.manager.getServerLogs(server.name),
+    source: lookupServerSource(provenance, server.name),
     readAuthStatus: (name) => deps.manager.getServerAuthStatus(name),
   }).then(toStatusRow);
 }
@@ -415,8 +424,9 @@ function registerManagementTools(
     promptSnippet: "Inspect configured MCP servers, their connection state, discovered tools, and authentication status.",
     parameters: Type.Object({}),
     async execute() {
+      const provenance = deps.getProvenance();
       const rows = await Promise.all(
-        manager.getAllServers().map((server) => collectStatusRow(server, deps)),
+        manager.getAllServers().map((server) => collectStatusRow(server, deps, provenance)),
       );
       return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
     },

@@ -7,6 +7,7 @@ import type { ManagedServer } from "../src/server-manager.js";
 import {
   formatProjectConfigNote,
   formatServerSource,
+  lookupServerSource,
   withExtensionServers,
   type ConfigProvenanceInput,
 } from "../src/server-provenance.js";
@@ -78,28 +79,38 @@ function snapshot(overrides: Partial<ServerStatusSnapshot> = {}): ServerStatusSn
 }
 
 describe("config provenance", () => {
-  it("records extension servers while file origins stay authoritative", () => {
+  it("records extension servers while file origins stay authoritative and ignores Object.prototype keys", () => {
     const provenance = withExtensionServers(
       provenanceInput({ origins: { shared: "project", "global-only": "global" } }),
-      ["shared", "ext-only"],
+      ["shared", "ext-only", "toString"],
     );
 
-    assert.equal(formatServerSource(provenance.sources["ext-only"]), "extension");
-    assert.equal(formatServerSource(undefined), "unknown");
+    assert.equal(formatServerSource(lookupServerSource(provenance, "ext-only")), "extension");
+    assert.equal(formatServerSource(lookupServerSource(provenance, "toString")), "extension");
+    assert.equal(lookupServerSource(provenance, "constructor"), undefined);
+    assert.equal(formatServerSource(lookupServerSource(provenance, "constructor")), "unknown");
     assert.equal(formatProjectConfigNote(provenance), undefined);
     assert.deepEqual(provenance.sources, {
       shared: "project",
       "global-only": "global",
       "ext-only": "extension",
+      toString: "extension",
     });
   });
 
-  it("explains a skipped project config instead of silently omitting it", () => {
-    const provenance = withExtensionServers(provenanceInput({ projectConfigIncluded: false }), []);
+  it("explains a skipped project config instead of silently omitting it and sanitizes the path", () => {
+    const provenance = withExtensionServers(
+      provenanceInput({
+        projectConfigPath: "/work/evil\u001b[31mproj/.pi/mcp.json",
+        projectConfigIncluded: false,
+      }),
+      [],
+    );
 
     const note = formatProjectConfigNote(provenance);
     assert.ok(note);
-    assert.match(note, /Project config: not loaded \(\/work\/proj\/\.pi\/mcp\.json\)/);
+    assert.equal(note.includes("\u001b"), false);
+    assert.match(note, /Project config: not loaded \(\/work\/evilproj\/\.pi\/mcp\.json\)/);
     assert.match(note, /not trusted/);
   });
 });
@@ -235,12 +246,12 @@ describe("collectServerStatus", () => {
       server,
       tools: { discovered: 0, active: 0 },
       source: "global",
-      recentOutput: "",
       readAuthStatus: async () => null,
     });
 
     assert.equal(withTokens.auth, "credentials stored");
     assert.equal(withoutState.auth, "authorization may be required");
+    assert.equal(withoutState.recentOutput, "");
   });
 
   it("isolates a corrupt stored-state file instead of rejecting the status view", async () => {

@@ -54,7 +54,7 @@ export interface CollectServerStatusParams {
   server: ManagedServer;
   tools: { discovered: number; active: number };
   source: ServerConfigSource | undefined;
-  recentOutput: string;
+  recentOutput?: string | undefined;
   /** Reads stored OAuth state for a server; injected so tests avoid disk I/O. */
   readAuthStatus: (serverName: string) => Promise<StoredAuthStatus | null>;
 }
@@ -179,6 +179,6 @@ export async function collectServerStatus(params: CollectServerStatusParams): Pr
     tools: params.tools,
     auth: await summarizeAuth(params),
     lastError: server.lastError,
-    recentOutput: params.recentOutput,
+    recentOutput: params.recentOutput ?? "",
   };
 }
