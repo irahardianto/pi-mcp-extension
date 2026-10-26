@@ -40,25 +40,49 @@ export function orderUnionMembers(members: TSchema[]): TSchema[] {
   return [...nulls, ...nonNulls];
 }
 
+type SchemaOptionKind = "string" | "number" | "boolean" | "defined";
+
+// WHY: Order matters for byte-stable serialized schemas — keep this table in the
+// same sequence the hand-written checks used before it became a lookup loop.
+const SCHEMA_OPTION_KEYS: ReadonlyArray<readonly [string, SchemaOptionKind]> = [
+  ["description", "string"],
+  ["title", "string"],
+  ["default", "defined"],
+  ["format", "string"],
+  ["pattern", "string"],
+  ["minLength", "number"],
+  ["maxLength", "number"],
+  ["minimum", "number"],
+  ["maximum", "number"],
+  ["exclusiveMinimum", "number"],
+  ["exclusiveMaximum", "number"],
+  ["multipleOf", "number"],
+  ["minItems", "number"],
+  ["maxItems", "number"],
+  ["uniqueItems", "boolean"],
+  ["minProperties", "number"],
+  ["maxProperties", "number"],
+];
+
+function hasSchemaOptionValue(
+  schema: Record<string, unknown>,
+  key: string,
+  kind: SchemaOptionKind,
+): boolean {
+  const value = schema[key];
+  if (kind === "defined") {
+    return key in schema && value !== undefined;
+  }
+  return typeof value === kind;
+}
+
 function extractSchemaOptions(schema: Record<string, unknown>): Record<string, unknown> {
   const opts: Record<string, unknown> = {};
-  if (typeof schema["description"] === "string") opts["description"] = schema["description"];
-  if (typeof schema["title"] === "string") opts["title"] = schema["title"];
-  if ("default" in schema && schema["default"] !== undefined) opts["default"] = schema["default"];
-  if (typeof schema["format"] === "string") opts["format"] = schema["format"];
-  if (typeof schema["pattern"] === "string") opts["pattern"] = schema["pattern"];
-  if (typeof schema["minLength"] === "number") opts["minLength"] = schema["minLength"];
-  if (typeof schema["maxLength"] === "number") opts["maxLength"] = schema["maxLength"];
-  if (typeof schema["minimum"] === "number") opts["minimum"] = schema["minimum"];
-  if (typeof schema["maximum"] === "number") opts["maximum"] = schema["maximum"];
-  if (typeof schema["exclusiveMinimum"] === "number") opts["exclusiveMinimum"] = schema["exclusiveMinimum"];
-  if (typeof schema["exclusiveMaximum"] === "number") opts["exclusiveMaximum"] = schema["exclusiveMaximum"];
-  if (typeof schema["multipleOf"] === "number") opts["multipleOf"] = schema["multipleOf"];
-  if (typeof schema["minItems"] === "number") opts["minItems"] = schema["minItems"];
-  if (typeof schema["maxItems"] === "number") opts["maxItems"] = schema["maxItems"];
-  if (typeof schema["uniqueItems"] === "boolean") opts["uniqueItems"] = schema["uniqueItems"];
-  if (typeof schema["minProperties"] === "number") opts["minProperties"] = schema["minProperties"];
-  if (typeof schema["maxProperties"] === "number") opts["maxProperties"] = schema["maxProperties"];
+  for (const [key, kind] of SCHEMA_OPTION_KEYS) {
+    if (hasSchemaOptionValue(schema, key, kind)) {
+      opts[key] = schema[key];
+    }
+  }
   return opts;
 }
 

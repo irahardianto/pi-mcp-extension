@@ -30,7 +30,14 @@ function stepJsonPointer(curr: unknown, part: string): unknown {
   return (curr as Record<string, unknown>)[part];
 }
 
-function walkJsonPointer(root: unknown, segments: readonly string[]): Record<string, unknown> | undefined {
+function isSchemaRecord(val: unknown): val is Record<string, unknown> {
+  return Boolean(val) && typeof val === "object" && !Array.isArray(val);
+}
+
+function walkJsonPointer(
+  root: unknown,
+  segments: readonly string[],
+): Record<string, unknown> | undefined {
   let curr: unknown = root;
   for (const part of segments) {
     curr = stepJsonPointer(curr, part);
@@ -38,10 +45,25 @@ function walkJsonPointer(root: unknown, segments: readonly string[]): Record<str
       return undefined;
     }
   }
-  if (curr && typeof curr === "object" && !Array.isArray(curr)) {
-    return curr as Record<string, unknown>;
+  return isSchemaRecord(curr) ? curr : undefined;
+}
+
+function isDefsPointer(parts: readonly string[]): boolean {
+  return parts[0] === "$defs" || parts[0] === "definitions";
+}
+
+function resolveFromRootDefs(
+  parts: readonly string[],
+  rootDefs: Record<string, Record<string, unknown>> | undefined,
+): Record<string, unknown> | undefined {
+  const defName = parts[1];
+  if (!rootDefs || defName === undefined) {
+    return undefined;
   }
-  return undefined;
+  if (!Object.prototype.hasOwnProperty.call(rootDefs, defName)) {
+    return undefined;
+  }
+  return walkJsonPointer(rootDefs[defName], parts.slice(2));
 }
 
 /**
@@ -65,13 +87,8 @@ export function resolveRefTarget(
 
   const parts = ref.slice(2).split("/").map(unescapeJsonPointer);
 
-  if (
-    (parts[0] === "$defs" || parts[0] === "definitions") &&
-    parts.length >= 2 &&
-    rootDefs &&
-    Object.prototype.hasOwnProperty.call(rootDefs, parts[1]!)
-  ) {
-    const defTarget = walkJsonPointer(rootDefs[parts[1]!], parts.slice(2));
+  if (isDefsPointer(parts)) {
+    const defTarget = resolveFromRootDefs(parts, rootDefs);
     if (defTarget) {
       return defTarget;
     }

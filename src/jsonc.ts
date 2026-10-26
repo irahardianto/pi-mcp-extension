@@ -14,6 +14,70 @@
  * on a misplaced comma is a more honest signal than silent acceptance.
  */
 
+interface ConsumedChunk {
+  /** Text to append to the output for the span that was consumed. */
+  chunk: string;
+  /** Index of the first character after the consumed span. */
+  nextIndex: number;
+}
+
+/**
+ * Copy a double-quoted string literal verbatim, starting at its opening quote.
+ * Backslash escapes are skipped in pairs so an escaped `"` never closes the string.
+ */
+function consumeDoubleQuotedString(text: string, start: number): ConsumedChunk {
+  let index = start + 1;
+  while (index < text.length) {
+    const ch = text[index]!;
+    if (ch === '"') {
+      return { chunk: text.slice(start, index + 1), nextIndex: index + 1 };
+    }
+    index += ch === "\\" ? 2 : 1;
+  }
+  // WHY: An unterminated string literal is copied verbatim; JSON.parse then reports
+  // the syntax error instead of this helper silently dropping the rest of the file.
+  return { chunk: text.slice(start), nextIndex: text.length };
+}
+
+/**
+ * Advance past a `//` line comment, stopping before `\n` (or before `\r` in `\r\n`)
+ * so the line break itself is copied through to the output.
+ */
+function skipLineComment(text: string, start: number): number {
+  let index = start + 2;
+  while (index < text.length) {
+    if (text[index] === "\n") break;
+    if (text[index] === "\r" && text[index + 1] === "\n") break;
+    index += 1;
+  }
+  return index;
+}
+
+/**
+ * Replace every code unit of a block comment with a space, keeping `\n` and `\r`
+ * so line numbers in subsequent `JSON.parse` errors stay accurate.
+ */
+function maskBlockComment(comment: string): string {
+  return comment.replace(/[^\r\n]/g, " ");
+}
+
+/**
+ * Consume a `/* ... *\/` block comment, starting at its opening `/*`.
+ * Unterminated comments are returned intact.
+ */
+function consumeBlockComment(text: string, start: number): ConsumedChunk {
+  const closeIdx = text.indexOf("*/", start + 2);
+  if (closeIdx === -1) {
+    // WHY: Leave unterminated block comments intact so JSON.parse fails with a
+    // SyntaxError rather than silently truncating the rest of the file.
+    return { chunk: text.slice(start), nextIndex: text.length };
+  }
+  return {
+    chunk: maskBlockComment(text.slice(start, closeIdx + 2)),
+    nextIndex: closeIdx + 2,
+  };
+}
+
 /**
  * Strip `//` line comments and `/* ... *\/` block comments outside of double-quoted
  * JSON strings in a single character-by-character pass.
@@ -30,65 +94,32 @@
  */
 export function stripJsonComments(text: string): string {
   let out = "";
-  let inString = false;
-  let i = 0;
+  let index = 0;
 
-  while (i < text.length) {
-    const ch = text[i]!;
-
-    if (inString) {
-      if (ch === "\\") {
-        out += ch;
-        if (i + 1 < text.length) {
-          out += text[i + 1]!;
-          i += 2;
-        } else {
-          i += 1;
-        }
-        continue;
-      }
-      if (ch === '"') {
-        inString = false;
-      }
-      out += ch;
-      i += 1;
-      continue;
-    }
+  while (index < text.length) {
+    const ch = text[index]!;
 
     if (ch === '"') {
-      inString = true;
-      out += ch;
-      i += 1;
+      const string = consumeDoubleQuotedString(text, index);
+      out += string.chunk;
+      index = string.nextIndex;
       continue;
     }
 
-    if (ch === "/" && text[i + 1] === "/") {
-      i += 2;
-      while (i < text.length && text[i] !== "\n") {
-        if (text[i] === "\r" && text[i + 1] === "\n") break;
-        i += 1;
-      }
+    if (ch === "/" && text[index + 1] === "/") {
+      index = skipLineComment(text, index);
       continue;
     }
 
-    if (ch === "/" && text[i + 1] === "*") {
-      const closeIdx = text.indexOf("*/", i + 2);
-      if (closeIdx === -1) {
-        // WHY: Leave unterminated block comments intact so JSON.parse fails with a
-        // SyntaxError rather than silently truncating the rest of the file.
-        out += text.slice(i);
-        break;
-      }
-      for (let j = i; j < closeIdx + 2; j += 1) {
-        const commentCh = text[j]!;
-        out += commentCh === "\n" || commentCh === "\r" ? commentCh : " ";
-      }
-      i = closeIdx + 2;
+    if (ch === "/" && text[index + 1] === "*") {
+      const comment = consumeBlockComment(text, index);
+      out += comment.chunk;
+      index = comment.nextIndex;
       continue;
     }
 
     out += ch;
-    i += 1;
+    index += 1;
   }
 
   return out;
