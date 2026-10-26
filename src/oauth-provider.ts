@@ -62,6 +62,99 @@ export interface AuthConfig {
 const DEFAULT_CALLBACK_PORT = 19876;
 const DEFAULT_REDIRECT_URL = `http://127.0.0.1:${DEFAULT_CALLBACK_PORT}/callback`;
 
+// ─── Pure Client-Information Helpers ──────────────────────────────────────────
+
+interface ClientInformationExtras {
+  client_id_issued_at: number;
+  client_secret_expires_at: number;
+  token_endpoint_auth_method: string;
+  redirect_uris: Array<string | URL>;
+}
+
+function isClientSecretExpired(info: StoredClientInfo): boolean {
+  if (info.client_secret === undefined) return false;
+  if (typeof info.client_secret_expires_at !== "number") return false;
+  if (info.client_secret_expires_at <= 0) return false;
+  return info.client_secret_expires_at * 1000 <= Date.now();
+}
+
+function hasRedirectUriMismatch(info: StoredClientInfo, redirectUrl: string): boolean {
+  if (!Array.isArray(info.redirect_uris) || info.redirect_uris.length === 0) return false;
+  return !info.redirect_uris.includes(redirectUrl);
+}
+
+function toOAuthClientInformation(info: StoredClientInfo): OAuthClientInformationMixed {
+  return {
+    client_id: info.client_id,
+    ...(info.client_secret !== undefined && { client_secret: info.client_secret }),
+    ...(info.client_id_issued_at !== undefined && { client_id_issued_at: info.client_id_issued_at }),
+    ...(info.client_secret_expires_at !== undefined && {
+      client_secret_expires_at: info.client_secret_expires_at,
+    }),
+    ...(info.token_endpoint_auth_method !== undefined && {
+      token_endpoint_auth_method: info.token_endpoint_auth_method,
+    }),
+    ...(info.redirect_uris !== undefined && { redirect_uris: info.redirect_uris }),
+    ...(info.issuer !== undefined && { issuer: info.issuer }),
+  };
+}
+
+function withoutStaticClientId<T>(hasStaticClientId: boolean, value: T | undefined): T | undefined {
+  return hasStaticClientId ? undefined : value;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function redirectUrisOrUndefined(value: unknown): string[] | undefined {
+  return Array.isArray(value) ? value.map((uri) => String(uri)) : undefined;
+}
+
+function buildInteractiveStoredClientInfo(
+  clientInformation: OAuthClientInformationMixed,
+  hasStaticClientId: boolean,
+  issuerToBind: string | undefined,
+): StoredClientInfo {
+  const fullInfo = clientInformation as Partial<ClientInformationExtras>;
+  return {
+    client_id: clientInformation.client_id,
+    client_secret: withoutStaticClientId(hasStaticClientId, clientInformation.client_secret),
+    client_id_issued_at: withoutStaticClientId(
+      hasStaticClientId,
+      numberOrUndefined(fullInfo.client_id_issued_at),
+    ),
+    client_secret_expires_at: withoutStaticClientId(
+      hasStaticClientId,
+      numberOrUndefined(fullInfo.client_secret_expires_at),
+    ),
+    token_endpoint_auth_method: withoutStaticClientId(
+      hasStaticClientId,
+      stringOrUndefined(fullInfo.token_endpoint_auth_method),
+    ),
+    redirect_uris: withoutStaticClientId(
+      hasStaticClientId,
+      redirectUrisOrUndefined(fullInfo.redirect_uris),
+    ),
+    issuer: issuerToBind,
+  };
+}
+
+function isPeerRotatedTokens(
+  diskTokens: StoredTokens | undefined,
+  lastReadTokens: StoredTokens | undefined,
+): diskTokens is StoredTokens {
+  if (!diskTokens) return false;
+  return (
+    diskTokens.refresh_token !== lastReadTokens?.refresh_token ||
+    diskTokens.access_token !== lastReadTokens?.access_token
+  );
+}
+
 export interface McpOAuthProviderOptions {
   serverName: string;
   authConfig: AuthConfig;
@@ -181,16 +274,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
     };
   }
 
-  private _resolveStoredClientInfo(info: StoredClientInfo): OAuthClientInformationMixed | undefined {
+  private _cacheStoredRedirectUris(info: StoredClientInfo): void {
     if (Array.isArray(info.redirect_uris) && info.redirect_uris.length > 0) {
       this._storedRedirectUris = info.redirect_uris;
     }
-    if (
-      info.client_secret !== undefined &&
-      typeof info.client_secret_expires_at === "number" &&
-      info.client_secret_expires_at > 0 &&
-      info.client_secret_expires_at * 1000 <= Date.now()
-    ) {
+  }
+
+  private _resolveStoredClientInfo(info: StoredClientInfo): OAuthClientInformationMixed | undefined {
+    this._cacheStoredRedirectUris(info);
+    if (isClientSecretExpired(info)) {
       if (this.silent) {
         throw new AuthRequiredError(
           this.serverName,
@@ -199,29 +291,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
       }
       return undefined;
     }
-    if (
-      !this.silent &&
-      Array.isArray(info.redirect_uris) &&
-      info.redirect_uris.length > 0 &&
-      !info.redirect_uris.includes(String(this.redirectUrl))
-    ) {
+    if (!this.silent && hasRedirectUriMismatch(info, String(this.redirectUrl))) {
       // WHY: If the callback port or configured redirectUrl changed since DCR,
       // return undefined in interactive mode so the SDK re-registers with the new redirect_uri.
       return undefined;
     }
-    return {
-      client_id: info.client_id,
-      ...(info.client_secret !== undefined && { client_secret: info.client_secret }),
-      ...(info.client_id_issued_at !== undefined && { client_id_issued_at: info.client_id_issued_at }),
-      ...(info.client_secret_expires_at !== undefined && {
-        client_secret_expires_at: info.client_secret_expires_at,
-      }),
-      ...(info.token_endpoint_auth_method !== undefined && {
-        token_endpoint_auth_method: info.token_endpoint_auth_method,
-      }),
-      ...(info.redirect_uris !== undefined && { redirect_uris: info.redirect_uris }),
-      ...(info.issuer !== undefined && { issuer: info.issuer }),
-    };
+    return toOAuthClientInformation(info);
   }
 
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
@@ -243,137 +318,139 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async saveClientInformation(clientInformation: OAuthClientInformationMixed): Promise<void> {
     const issuerToBind =
       typeof clientInformation.issuer === "string" ? clientInformation.issuer : undefined;
-
     if (this.silent) {
-      const knownClientId = this.authConfig.clientId;
-      let handle: AuthLockHandle | undefined;
-      try {
-        handle = await acquireAuthLock(this.serverName, this.storageDir);
-        const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-        const storedClient = state.clientInfo;
-        const matchingId = knownClientId ?? storedClient?.client_id;
-        if (!matchingId || clientInformation.client_id !== matchingId) {
-          // WHY: Silent background connections must never execute Dynamic Client Registration
-          // for a new or different client_id without interactive user consent.
-          throw new AuthRequiredError(this.serverName);
-        }
-        if (storedClient?.issuer !== undefined && issuerToBind !== undefined && storedClient.issuer !== issuerToBind) {
-          // WHY: A stored client already bound to an authorization server issuer must never be
-          // re-bound to a different issuer. Switching authorization servers requires an explicit reset.
-          throw new McpError(
-            `OAuth client for "${this.serverName}" is already bound to authorization server ${storedClient.issuer} and cannot be bound to ${issuerToBind}. Run /mcp:auth ${this.serverName} --reset to re-authorize.`,
-            this.serverName,
-            "auth",
-          );
-        }
-        if (this.serverUrl) {
-          state.serverUrl = canonicalServerUrl(this.serverUrl);
-        }
-        if (storedClient) {
-          // WHY: Mirror silent saveTokens: pure issuer binding of the already-known client
-          // preserves all stored credentials and DCR metadata on disk while stamping issuer.
-          if (this.authConfig.clientId) {
-            storedClient.client_secret = undefined;
-          }
-          storedClient.issuer = issuerToBind ?? storedClient.issuer;
-        } else {
-          state.clientInfo = {
-            client_id: clientInformation.client_id,
-            client_secret: this.authConfig.clientId
-              ? undefined
-              : (this.authConfig.clientSecret ?? clientInformation.client_secret),
-            client_id_issued_at: undefined,
-            client_secret_expires_at: undefined,
-            token_endpoint_auth_method: undefined,
-            redirect_uris: undefined,
-            issuer: issuerToBind,
-          };
-        }
-        await saveState(this.serverName, state, this.storageDir, this.isCancelled);
-        reportDiagnostic({
-          level: "info",
-          event: "oauth.client_info_saved",
-          server: this.serverName,
-          message: `Stored OAuth client information for "${this.serverName}"`,
-          fields: { outcome: "saved" },
-        });
-      } catch (err) {
-        if (err instanceof AuthRequiredError || err instanceof McpError) {
-          throw err;
-        }
-        // WHY: When another process holds the interactive auth lock (e.g. during an interactive
-        // /mcp:auth or --reset), acquireAuthLock fails fast. We skip this background binding
-        // without failing the refresh — the SDK will bind client information again on the next refresh.
-        if (!(err instanceof AuthLockError)) {
-          const { kind, message } = describeError(err);
-          reportDiagnostic({
-            level: "error",
-            event: "oauth.client_info_persist_failed",
-            server: this.serverName,
-            message: `Failed to persist OAuth client info for "${this.serverName}": ${message}`,
-            fields: { kind },
-          });
-        }
-      } finally {
-        await handle?.();
-      }
+      await this._saveClientInformationSilent(clientInformation, issuerToBind);
       return;
     }
+    await this._saveClientInformationInteractive(clientInformation, issuerToBind);
+  }
 
+  private _assertIssuerBindingCompatible(
+    existingIssuer: string | undefined,
+    nextIssuer: string | undefined,
+  ): void {
+    if (existingIssuer === undefined || nextIssuer === undefined || existingIssuer === nextIssuer) {
+      return;
+    }
+    // WHY: A stored client already bound to an authorization server issuer must never be
+    // re-bound to a different issuer. Switching authorization servers requires an explicit reset.
+    throw new McpError(
+      `OAuth client for "${this.serverName}" is already bound to authorization server ${existingIssuer} and cannot be bound to ${nextIssuer}. Run /mcp:auth ${this.serverName} --reset to re-authorize.`,
+      this.serverName,
+      "auth",
+    );
+  }
+
+  private _mergeSilentClientInfo(
+    storedClient: StoredClientInfo,
+    issuerToBind: string | undefined,
+  ): StoredClientInfo {
+    // WHY: Mirror silent saveTokens: pure issuer binding of the already-known client
+    // preserves all stored credentials and DCR metadata on disk while stamping issuer.
+    return {
+      ...storedClient,
+      client_secret: this.authConfig.clientId ? undefined : storedClient.client_secret,
+      issuer: issuerToBind ?? storedClient.issuer,
+    };
+  }
+
+  private _newSilentClientInfo(
+    clientInformation: OAuthClientInformationMixed,
+    issuerToBind: string | undefined,
+  ): StoredClientInfo {
+    return {
+      client_id: clientInformation.client_id,
+      client_secret: this.authConfig.clientId
+        ? undefined
+        : (this.authConfig.clientSecret ?? clientInformation.client_secret),
+      client_id_issued_at: undefined,
+      client_secret_expires_at: undefined,
+      token_endpoint_auth_method: undefined,
+      redirect_uris: undefined,
+      issuer: issuerToBind,
+    };
+  }
+
+  private _reportClientInfoSaved(): void {
+    reportDiagnostic({
+      level: "info",
+      event: "oauth.client_info_saved",
+      server: this.serverName,
+      message: `Stored OAuth client information for "${this.serverName}"`,
+      fields: { outcome: "saved" },
+    });
+  }
+
+  private _reportClientInfoPersistFailure(err: unknown): void {
+    if (err instanceof AuthRequiredError || err instanceof McpError) {
+      throw err;
+    }
+    // WHY: When another process holds the interactive auth lock (e.g. during an interactive
+    // /mcp:auth or --reset), acquireAuthLock fails fast. We skip this background binding
+    // without failing the refresh — the SDK will bind client information again on the next refresh.
+    if (err instanceof AuthLockError) return;
+    const { kind, message } = describeError(err);
+    reportDiagnostic({
+      level: "error",
+      event: "oauth.client_info_persist_failed",
+      server: this.serverName,
+      message: `Failed to persist OAuth client info for "${this.serverName}": ${message}`,
+      fields: { kind },
+    });
+  }
+
+  private async _saveClientInformationSilent(
+    clientInformation: OAuthClientInformationMixed,
+    issuerToBind: string | undefined,
+  ): Promise<void> {
+    let handle: AuthLockHandle | undefined;
+    try {
+      handle = await acquireAuthLock(this.serverName, this.storageDir);
+      const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
+      const storedClient = state.clientInfo;
+      const matchingId = this.authConfig.clientId ?? storedClient?.client_id;
+      if (!matchingId || clientInformation.client_id !== matchingId) {
+        // WHY: Silent background connections must never execute Dynamic Client Registration
+        // for a new or different client_id without interactive user consent.
+        throw new AuthRequiredError(this.serverName);
+      }
+      this._assertIssuerBindingCompatible(storedClient?.issuer, issuerToBind);
+      if (this.serverUrl) {
+        state.serverUrl = canonicalServerUrl(this.serverUrl);
+      }
+      state.clientInfo = storedClient
+        ? this._mergeSilentClientInfo(storedClient, issuerToBind)
+        : this._newSilentClientInfo(clientInformation, issuerToBind);
+      await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+      this._reportClientInfoSaved();
+    } catch (err) {
+      this._reportClientInfoPersistFailure(err);
+    } finally {
+      await handle?.();
+    }
+  }
+
+  private async _saveClientInformationInteractive(
+    clientInformation: OAuthClientInformationMixed,
+    issuerToBind: string | undefined,
+  ): Promise<void> {
     if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
     await this.assertLockHeld?.();
     const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    if (
-      state.clientInfo?.client_id === clientInformation.client_id &&
-      state.clientInfo.issuer !== undefined &&
-      issuerToBind !== undefined &&
-      state.clientInfo.issuer !== issuerToBind
-    ) {
-      // WHY: A stamped client is never re-stamped with a different authorization server issuer.
-      // To switch authorization servers, credentials must be explicitly reset via /mcp:auth <server> --reset.
-      throw new McpError(
-        `OAuth client for "${this.serverName}" is already bound to authorization server ${state.clientInfo.issuer} and cannot be bound to ${issuerToBind}. Run /mcp:auth ${this.serverName} --reset to re-authorize.`,
-        this.serverName,
-        "auth",
-      );
+    const storedClient = state.clientInfo;
+    if (storedClient?.client_id === clientInformation.client_id) {
+      this._assertIssuerBindingCompatible(storedClient.issuer, issuerToBind);
     }
     if (this.serverUrl) {
       state.serverUrl = canonicalServerUrl(this.serverUrl);
     }
-    const fullInfo = clientInformation as Partial<{
-      client_id_issued_at: number;
-      client_secret_expires_at: number;
-      token_endpoint_auth_method: string;
-      redirect_uris: Array<string | URL>;
-    }>;
-    state.clientInfo = {
-      client_id: clientInformation.client_id,
-      client_secret: this.authConfig.clientId ? undefined : clientInformation.client_secret,
-      client_id_issued_at: this.authConfig.clientId
-        ? undefined
-        : typeof fullInfo.client_id_issued_at === "number"
-          ? fullInfo.client_id_issued_at
-          : undefined,
-      client_secret_expires_at: this.authConfig.clientId
-        ? undefined
-        : typeof fullInfo.client_secret_expires_at === "number"
-          ? fullInfo.client_secret_expires_at
-          : undefined,
-      token_endpoint_auth_method: this.authConfig.clientId
-        ? undefined
-        : typeof fullInfo.token_endpoint_auth_method === "string"
-          ? fullInfo.token_endpoint_auth_method
-          : undefined,
-      redirect_uris: this.authConfig.clientId
-        ? undefined
-        : Array.isArray(fullInfo.redirect_uris)
-          ? fullInfo.redirect_uris.map((u) => String(u))
-          : undefined,
-      issuer: issuerToBind,
-    };
-    if (Array.isArray(state.clientInfo?.redirect_uris) && state.clientInfo.redirect_uris.length > 0) {
-      this._storedRedirectUris = state.clientInfo.redirect_uris;
-    }
+    const storedClientInfo = buildInteractiveStoredClientInfo(
+      clientInformation,
+      Boolean(this.authConfig.clientId),
+      issuerToBind,
+    );
+    state.clientInfo = storedClientInfo;
+    this._cacheStoredRedirectUris(storedClientInfo);
     await this.assertLockHeld?.();
     await saveState(this.serverName, state, this.storageDir, this.isCancelled);
   }
@@ -608,79 +685,95 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return changedDisk;
   }
 
-  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
-    if (this.silent) {
-      if (scope === "tokens" && !this._reloadedPeerTokens) {
-        let diskState: StoredState | undefined;
-        try {
-          diskState = await loadState(this.serverName, this.storageDir, this.serverUrl);
-        } catch {
-          // WHY: If disk state is unreadable, fall through to invalidation and AuthRequiredError.
-          diskState = undefined;
-        }
-        if (
-          diskState?.tokens &&
-          (diskState.tokens.refresh_token !== this._lastReadTokens?.refresh_token ||
-            diskState.tokens.access_token !== this._lastReadTokens?.access_token)
-        ) {
-          // WHY: Another Pi process rotated the single-use refresh token on disk while
-          // our refresh request was in flight. Reload the peer's tokens instead of deleting
-          // them or throwing AuthRequiredError so the SDK's auth() retry succeeds.
-          this._cachedTokens = diskState.tokens;
-          this._lastReadTokens = diskState.tokens;
-          this._reloadedPeerTokens = true;
-          reportDiagnostic({
-            level: "info",
-            event: "oauth.refresh",
-            server: this.serverName,
-            message: `Reloaded OAuth tokens rotated by another Pi process for "${this.serverName}"`,
-            fields: { outcome: "peer_reloaded", peerReloaded: true },
-          });
-          return;
-        }
-      }
+  private async _readDiskStateForPeerReload(): Promise<StoredState | undefined> {
+    try {
+      return await loadState(this.serverName, this.storageDir, this.serverUrl);
+    } catch {
+      // WHY: If disk state is unreadable, fall through to invalidation and AuthRequiredError.
+      return undefined;
+    }
+  }
 
-      this._cachedTokens = undefined;
-      this._reloadedPeerTokens = false;
-      if (scope === "verifier") {
-        this._codeVerifier = undefined;
-        throw new AuthRequiredError(this.serverName);
+  private async _tryReloadPeerRotatedTokens(): Promise<boolean> {
+    if (this._reloadedPeerTokens) return false;
+    const diskTokens = (await this._readDiskStateForPeerReload())?.tokens;
+    if (!isPeerRotatedTokens(diskTokens, this._lastReadTokens)) return false;
+    // WHY: Another Pi process rotated the single-use refresh token on disk while
+    // our refresh request was in flight. Reload the peer's tokens instead of deleting
+    // them or throwing AuthRequiredError so the SDK's auth() retry succeeds.
+    this._cachedTokens = diskTokens;
+    this._lastReadTokens = diskTokens;
+    this._reloadedPeerTokens = true;
+    reportDiagnostic({
+      level: "info",
+      event: "oauth.refresh",
+      server: this.serverName,
+      message: `Reloaded OAuth tokens rotated by another Pi process for "${this.serverName}"`,
+      fields: { outcome: "peer_reloaded", peerReloaded: true },
+    });
+    return true;
+  }
+
+  private async _removeCredentialsFromDisk(
+    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+  ): Promise<void> {
+    let handle: AuthLockHandle | undefined;
+    try {
+      handle = await acquireAuthLock(this.serverName, this.storageDir);
+      const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
+      const changedDisk = this._applyInvalidation(state, scope);
+      if (!changedDisk) return;
+      if (this.serverUrl) {
+        state.serverUrl = canonicalServerUrl(this.serverUrl);
       }
-      let handle: AuthLockHandle | undefined;
-      try {
-        handle = await acquireAuthLock(this.serverName, this.storageDir);
-        const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-        const changedDisk = this._applyInvalidation(state, scope);
-        if (changedDisk) {
-          if (this.serverUrl) {
-            state.serverUrl = canonicalServerUrl(this.serverUrl);
-          }
-          await saveState(this.serverName, state, this.storageDir, this.isCancelled);
-        }
-      } catch {
-        // WHY: Best-effort cleanup of rejected credentials on disk; if another process
-        // holds the lock or disk is unavailable, still throw AuthRequiredError.
-      } finally {
-        await handle?.();
-      }
+      await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+    } catch {
+      // WHY: Best-effort cleanup of rejected credentials on disk; if another process
+      // holds the lock or disk is unavailable, still throw AuthRequiredError.
+    } finally {
+      await handle?.();
+    }
+  }
+
+  private async _invalidateCredentialsSilent(
+    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+  ): Promise<void> {
+    if (scope === "tokens" && (await this._tryReloadPeerRotatedTokens())) return;
+    this._cachedTokens = undefined;
+    this._reloadedPeerTokens = false;
+    if (scope === "verifier") {
+      this._codeVerifier = undefined;
       throw new AuthRequiredError(this.serverName);
     }
+    await this._removeCredentialsFromDisk(scope);
+    throw new AuthRequiredError(this.serverName);
+  }
 
+  private async _invalidateCredentialsInteractive(
+    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+  ): Promise<void> {
     await this.assertLockHeld?.();
     if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
     const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
     const changedDisk = this._applyInvalidation(state, scope);
     await this.assertLockHeld?.();
     if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
-    if (changedDisk) {
-      // WHY: Only write back to disk when stored state for this serverUrl actually had
-      // credentials to clear, preventing a cancelled or unauthenticated project override
-      // from overwriting another server URL's state file before new credentials are saved.
-      if (this.serverUrl) {
-        state.serverUrl = canonicalServerUrl(this.serverUrl);
-      }
-      await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+    if (!changedDisk) return;
+    // WHY: Only write back to disk when stored state for this serverUrl actually had
+    // credentials to clear, preventing a cancelled or unauthenticated project override
+    // from overwriting another server URL's state file before new credentials are saved.
+    if (this.serverUrl) {
+      state.serverUrl = canonicalServerUrl(this.serverUrl);
     }
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+  }
+
+  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    if (this.silent) {
+      await this._invalidateCredentialsSilent(scope);
+      return;
+    }
+    await this._invalidateCredentialsInteractive(scope);
   }
 }
 

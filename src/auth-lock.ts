@@ -222,78 +222,91 @@ async function runHeartbeatTick(
   }
 }
 
-function createLockHandle(ctx: LockContext): AuthLockHandle {
-  const { serverName, path, myRecord, deps, usingRealFs, onLost } = ctx;
-  let released = false;
-  let lost = false;
-  let heartbeatTimer: ReturnType<typeof setInterval> | AuthLockTimer | null = null;
+interface LockLifecycleState {
+  released: boolean;
+  lost: boolean;
+  heartbeatTimer: ReturnType<typeof setInterval> | AuthLockTimer | null;
+}
 
-  const stopHeartbeat = () => {
-    if (heartbeatTimer !== null) {
-      deps.clock.clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
+function stopHeartbeat(ctx: LockContext, state: LockLifecycleState): void {
+  if (state.heartbeatTimer === null) return;
+  ctx.deps.clock.clearInterval(state.heartbeatTimer);
+  state.heartbeatTimer = null;
+}
+
+function unlinkOwnLockFileSync(ctx: LockContext, state: LockLifecycleState): void {
+  // WHY: Do not skip cleanup when `lost` is true — if a contender restored our
+  // lock file via `link()` after a transient rename, we must still unlink our own nonce.
+  if (state.released || !ctx.usingRealFs) return;
+  try {
+    const raw = readFileSync(ctx.path, "utf8");
+    const current = parseLockRecord(raw);
+    if (current && current.nonce === ctx.myRecord.nonce) {
+      unlinkSync(ctx.path);
     }
-  };
+  } catch {
+    // WHY: Best-effort synchronous cleanup on process exit; lock file may already be unlinked.
+  }
+}
 
-  const onExit = () => {
-    // WHY: Do not skip cleanup when `lost` is true — if a contender restored our
-    // lock file via `link()` after a transient rename, we must still unlink our own nonce.
-    if (released || !usingRealFs) return;
-    try {
-      const raw = readFileSync(path, "utf8");
-      const current = parseLockRecord(raw);
-      if (current && current.nonce === myRecord.nonce) {
-        unlinkSync(path);
-      }
-    } catch {
-      // WHY: Best-effort synchronous cleanup on process exit; lock file may already be unlinked.
-    }
-  };
+function markLockLost(ctx: LockContext, state: LockLifecycleState): void {
+  if (state.lost || state.released) return;
+  state.lost = true;
+  stopHeartbeat(ctx, state);
+  ctx.onLost?.();
+}
 
-  const markLost = () => {
-    if (lost || released) return;
-    lost = true;
-    stopHeartbeat();
-    onLost?.();
-  };
-
-  process.once("exit", onExit);
-
-  heartbeatTimer = deps.clock.setInterval(() => {
-    void runHeartbeatTick(ctx, () => !released && !lost, markLost);
+function startHeartbeat(ctx: LockContext, state: LockLifecycleState): void {
+  state.heartbeatTimer = ctx.deps.clock.setInterval(() => {
+    void runHeartbeatTick(
+      ctx,
+      () => !state.released && !state.lost,
+      () => markLockLost(ctx, state),
+    );
   }, HEARTBEAT_MS);
-  heartbeatTimer.unref?.();
+  state.heartbeatTimer.unref?.();
+}
 
-  const assertHeld = async (): Promise<void> => {
-    if (lost || released) {
-      throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
-    }
-    const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-    if (!current || current.nonce !== myRecord.nonce) {
-      markLost();
-      throw new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
-    }
-  };
+function lostLockError(serverName: string): AuthLockError {
+  return new AuthLockError(serverName, `Authorization lock lost for ${serverName}; retry`);
+}
 
-  const unlock = async (): Promise<void> => {
-    if (released) return;
-    released = true;
-    stopHeartbeat();
-    process.removeListener("exit", onExit);
-    // WHY: Always check and unlink if the file on disk still carries our nonce, even if
-    // `lost` was set during a contender's temporary stale-check rename+link window.
-    const current = await readLockRecordWithRetry(deps.fs, path, usingRealFs);
-    if (current && current.nonce === myRecord.nonce) {
-      await deps.fs.unlink(path).catch(() => {
-        // WHY: Best-effort lock removal on unlock; ignore ENOENT if concurrently removed.
-      });
-    }
-  };
+async function assertLockHeldFor(ctx: LockContext, state: LockLifecycleState): Promise<void> {
+  if (state.lost || state.released) throw lostLockError(ctx.serverName);
+  const current = await readLockRecordWithRetry(ctx.deps.fs, ctx.path, ctx.usingRealFs);
+  if (current && current.nonce === ctx.myRecord.nonce) return;
+  markLockLost(ctx, state);
+  throw lostLockError(ctx.serverName);
+}
 
+async function releaseLock(
+  ctx: LockContext,
+  state: LockLifecycleState,
+  onExit: () => void,
+): Promise<void> {
+  if (state.released) return;
+  state.released = true;
+  stopHeartbeat(ctx, state);
+  process.removeListener("exit", onExit);
+  // WHY: Always check and unlink if the file on disk still carries our nonce, even if
+  // `lost` was set during a contender's temporary stale-check rename+link window.
+  const current = await readLockRecordWithRetry(ctx.deps.fs, ctx.path, ctx.usingRealFs);
+  if (!current || current.nonce !== ctx.myRecord.nonce) return;
+  await ctx.deps.fs.unlink(ctx.path).catch(() => {
+    // WHY: Best-effort lock removal on unlock; ignore ENOENT if concurrently removed.
+  });
+}
+
+function createLockHandle(ctx: LockContext): AuthLockHandle {
+  const state: LockLifecycleState = { released: false, lost: false, heartbeatTimer: null };
+  const onExit = () => unlinkOwnLockFileSync(ctx, state);
+  process.once("exit", onExit);
+  startHeartbeat(ctx, state);
+  const unlock = async (): Promise<void> => releaseLock(ctx, state, onExit);
   return Object.assign(unlock, {
     unlock,
-    assertHeld,
-    isLost: () => lost,
+    assertHeld: () => assertLockHeldFor(ctx, state),
+    isLost: () => state.lost,
   });
 }
 
@@ -379,66 +392,92 @@ async function inspectAndReclaimStaleLock(
   throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
 }
 
+function resolveAuthLockDeps(options?: AcquireAuthLockOptions): AuthLockDeps {
+  const overrides = options?.deps ?? {};
+  const defaults = createDefaultAuthLockDeps();
+  return {
+    fs: overrides.fs ?? defaults.fs,
+    clock: overrides.clock ?? defaults.clock,
+    pid: overrides.pid ?? defaults.pid,
+    hostname: overrides.hostname ?? defaults.hostname,
+    isPidAlive: overrides.isPidAlive ?? defaults.isPidAlive,
+  };
+}
+
+async function prepareAuthDirectory(
+  deps: AuthLockDeps,
+  serverName: string,
+  storageDir?: string,
+): Promise<string> {
+  const directory = authDir(storageDir);
+  await deps.fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  await deps.fs.chmod(directory, 0o700);
+  return lockPath(serverName, storageDir);
+}
+
+async function writeExclusiveLockFile(
+  fs: AuthLockFs,
+  path: string,
+  record: LockRecord,
+): Promise<void> {
+  const file = await fs.open(path, "wx", 0o600);
+  try {
+    await file.writeFile(JSON.stringify(record));
+    await file.sync();
+  } catch (writeErr) {
+    await file.close().catch(() => {
+      // WHY: Best-effort file handle close after write failure.
+    });
+    await fs.unlink(path).catch(() => {
+      // WHY: Best-effort cleanup of partially written lock file before rethrowing writeErr.
+    });
+    throw writeErr;
+  }
+  await file.close();
+}
+
+function createLockRecord(deps: AuthLockDeps): LockRecord {
+  return {
+    v: 1,
+    pid: deps.pid,
+    hostname: deps.hostname,
+    nonce: randomUUID(),
+    createdAt: deps.clock.now(),
+  };
+}
+
+type LockAcquisitionContext = Omit<LockContext, "myRecord">;
+
+async function tryCreateLock(ctx: LockAcquisitionContext): Promise<AuthLockHandle | null> {
+  const myRecord = createLockRecord(ctx.deps);
+  try {
+    await writeExclusiveLockFile(ctx.deps.fs, ctx.path, myRecord);
+    return createLockHandle({ ...ctx, myRecord });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    await inspectAndReclaimStaleLock(ctx.serverName, ctx.path, ctx.deps);
+    return null;
+  }
+}
+
 export async function acquireAuthLock(
   serverName: string,
   storageDir?: string,
   options?: AcquireAuthLockOptions,
 ): Promise<AuthLockHandle> {
-  const defaults = createDefaultAuthLockDeps();
-  const deps: AuthLockDeps = {
-    fs: options?.deps?.fs ?? defaults.fs,
-    clock: options?.deps?.clock ?? defaults.clock,
-    pid: options?.deps?.pid ?? defaults.pid,
-    hostname: options?.deps?.hostname ?? defaults.hostname,
-    isPidAlive: options?.deps?.isPidAlive ?? defaults.isPidAlive,
+  const deps = resolveAuthLockDeps(options);
+  const path = await prepareAuthDirectory(deps, serverName, storageDir);
+  const ctx: LockAcquisitionContext = {
+    serverName,
+    path,
+    deps,
+    usingRealFs: options?.deps?.fs === undefined,
+    onLost: options?.onLost,
   };
-  const usingRealFs = options?.deps?.fs === undefined;
-
-  const directory = authDir(storageDir);
-  await deps.fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  await deps.fs.chmod(directory, 0o700);
-  const path = lockPath(serverName, storageDir);
 
   for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
-    const myRecord: LockRecord = {
-      v: 1,
-      pid: deps.pid,
-      hostname: deps.hostname,
-      nonce: randomUUID(),
-      createdAt: deps.clock.now(),
-    };
-
-    try {
-      const file = await deps.fs.open(path, "wx", 0o600);
-      try {
-        await file.writeFile(JSON.stringify(myRecord));
-        await file.sync();
-      } catch (writeErr) {
-        await file.close().catch(() => {
-          // WHY: Best-effort file handle close after write failure.
-        });
-        await deps.fs.unlink(path).catch(() => {
-          // WHY: Best-effort cleanup of partially written lock file before rethrowing writeErr.
-        });
-        throw writeErr;
-      }
-      await file.close();
-
-      return createLockHandle({
-        serverName,
-        path,
-        myRecord,
-        deps,
-        usingRealFs,
-        onLost: options?.onLost,
-      });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw err;
-      }
-
-      await inspectAndReclaimStaleLock(serverName, path, deps);
-    }
+    const handle = await tryCreateLock(ctx);
+    if (handle) return handle;
   }
 
   throw new AuthLockError(serverName);

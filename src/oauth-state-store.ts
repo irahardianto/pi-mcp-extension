@@ -115,31 +115,32 @@ export const StoredStateSchema = z.object({
 
 // ─── File helpers ─────────────────────────────────────────────────────────────
 
-export async function loadState(
+type ParsedStoredState = z.output<typeof StoredStateSchema>;
+
+function emptyStoredState(expectedServerUrl?: string): StoredState {
+  return {
+    serverUrl: expectedServerUrl ? canonicalServerUrl(expectedServerUrl) : undefined,
+    clientInfo: undefined,
+    tokens: undefined,
+    discoveryState: undefined,
+  };
+}
+
+async function readStoredStateFile(
+  path: string,
   serverName: string,
-  storageDir?: string,
-  expectedServerUrl?: string,
-): Promise<StoredState> {
-  const path = statePath(serverName, storageDir);
+): Promise<ParsedStoredState | null> {
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return {
-        serverUrl: expectedServerUrl ? canonicalServerUrl(expectedServerUrl) : undefined,
-        clientInfo: undefined,
-        tokens: undefined,
-        discoveryState: undefined,
-      };
-    }
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
 
-  let parsed: z.output<typeof StoredStateSchema>;
   try {
     const json: unknown = JSON.parse(raw);
-    parsed = StoredStateSchema.parse(json);
+    return StoredStateSchema.parse(json);
   } catch (err) {
     const backupPath = `${path}.corrupt-${Date.now()}`;
     await rename(path, backupPath);
@@ -150,64 +151,93 @@ export async function loadState(
       err,
     );
   }
+}
 
-  let discoveryState = parsed.discoveryState as OAuthDiscoveryState | undefined;
+function cachedDiscoveryResource(parsed: ParsedStoredState): unknown {
+  const discoveryState = parsed.discoveryState as OAuthDiscoveryState | undefined;
+  const metadata = discoveryState?.resourceMetadata as { resource?: unknown } | undefined;
+  return metadata?.resource;
+}
 
-  if (expectedServerUrl !== undefined) {
-    // WHY: Bind OAuth state to the canonical server URL so a project config with the same
-    // server name cannot inherit global Bearer tokens for a different origin/path.
-    if (parsed.serverUrl !== undefined && !urlsMatch(parsed.serverUrl, expectedServerUrl)) {
-      return {
-        serverUrl: canonicalServerUrl(expectedServerUrl),
-        clientInfo: undefined,
-        tokens: undefined,
-        discoveryState: undefined,
-      };
-    }
+function hasCompatibleCachedResource(parsed: ParsedStoredState, expectedServerUrl: string): boolean {
+  const resource = cachedDiscoveryResource(parsed);
+  return typeof resource !== "string" || isResourceCompatibleWithServerUrl(resource, expectedServerUrl);
+}
 
-    const resource = (discoveryState?.resourceMetadata as { resource?: unknown } | undefined)?.resource;
-    if (typeof resource === "string" && !isResourceCompatibleWithServerUrl(resource, expectedServerUrl)) {
-      if (parsed.serverUrl === undefined) {
-        // Legacy state file without top-level serverUrl whose cached resourceMetadata belongs to another server URL
-        return {
-          serverUrl: canonicalServerUrl(expectedServerUrl),
-          clientInfo: undefined,
-          tokens: undefined,
-          discoveryState: undefined,
-        };
-      }
-      // WHY: Discard mismatched discoveryState so the MCP SDK's selectResourceURL()
-      // never throws "Protected resource ... does not match expected".
-      discoveryState = undefined;
-    }
+function shouldDiscardStoredState(parsed: ParsedStoredState, expectedServerUrl: string): boolean {
+  // WHY: Bind OAuth state to the canonical server URL so a project config with the same
+  // server name cannot inherit global Bearer tokens for a different origin/path.
+  if (parsed.serverUrl !== undefined && !urlsMatch(parsed.serverUrl, expectedServerUrl)) {
+    return true;
   }
+  // Legacy state file without top-level serverUrl whose cached resourceMetadata belongs to another server URL.
+  return parsed.serverUrl === undefined && !hasCompatibleCachedResource(parsed, expectedServerUrl);
+}
 
+function cachedDiscoveryStateFor(
+  parsed: ParsedStoredState,
+  expectedServerUrl: string,
+): OAuthDiscoveryState | undefined {
+  if (!hasCompatibleCachedResource(parsed, expectedServerUrl)) {
+    // WHY: Discard mismatched discoveryState so the MCP SDK's selectResourceURL()
+    // never throws "Protected resource ... does not match expected".
+    return undefined;
+  }
+  return parsed.discoveryState as OAuthDiscoveryState | undefined;
+}
+
+function toStoredClientInfo(info: NonNullable<ParsedStoredState["clientInfo"]>): StoredClientInfo {
+  return {
+    client_id: info.client_id,
+    client_secret: info.client_secret,
+    client_id_issued_at: info.client_id_issued_at,
+    client_secret_expires_at: info.client_secret_expires_at,
+    token_endpoint_auth_method: info.token_endpoint_auth_method,
+    redirect_uris: info.redirect_uris,
+    issuer: info.issuer,
+  };
+}
+
+function toStoredTokens(tokens: NonNullable<ParsedStoredState["tokens"]>): StoredTokens {
+  return {
+    access_token: tokens.access_token,
+    token_type: tokens.token_type,
+    refresh_token: tokens.refresh_token,
+    expires_in: tokens.expires_in,
+    scope: tokens.scope,
+    saved_at: tokens.saved_at,
+    issuer: tokens.issuer,
+  };
+}
+
+function normalizeStoredState(
+  parsed: ParsedStoredState,
+  discoveryState: OAuthDiscoveryState | undefined,
+  expectedServerUrl?: string,
+): StoredState {
   return {
     serverUrl: parsed.serverUrl ?? (expectedServerUrl ? canonicalServerUrl(expectedServerUrl) : undefined),
-    clientInfo: parsed.clientInfo
-      ? {
-          client_id: parsed.clientInfo.client_id,
-          client_secret: parsed.clientInfo.client_secret,
-          client_id_issued_at: parsed.clientInfo.client_id_issued_at,
-          client_secret_expires_at: parsed.clientInfo.client_secret_expires_at,
-          token_endpoint_auth_method: parsed.clientInfo.token_endpoint_auth_method,
-          redirect_uris: parsed.clientInfo.redirect_uris,
-          issuer: parsed.clientInfo.issuer,
-        }
-      : undefined,
-    tokens: parsed.tokens
-      ? {
-          access_token: parsed.tokens.access_token,
-          token_type: parsed.tokens.token_type,
-          refresh_token: parsed.tokens.refresh_token,
-          expires_in: parsed.tokens.expires_in,
-          scope: parsed.tokens.scope,
-          saved_at: parsed.tokens.saved_at,
-          issuer: parsed.tokens.issuer,
-        }
-      : undefined,
+    clientInfo: parsed.clientInfo ? toStoredClientInfo(parsed.clientInfo) : undefined,
+    tokens: parsed.tokens ? toStoredTokens(parsed.tokens) : undefined,
     discoveryState,
   };
+}
+
+export async function loadState(
+  serverName: string,
+  storageDir?: string,
+  expectedServerUrl?: string,
+): Promise<StoredState> {
+  const path = statePath(serverName, storageDir);
+  const parsed = await readStoredStateFile(path, serverName);
+  if (parsed === null) return emptyStoredState(expectedServerUrl);
+  if (expectedServerUrl === undefined) {
+    return normalizeStoredState(parsed, parsed.discoveryState as OAuthDiscoveryState | undefined);
+  }
+  if (shouldDiscardStoredState(parsed, expectedServerUrl)) {
+    return emptyStoredState(expectedServerUrl);
+  }
+  return normalizeStoredState(parsed, cachedDiscoveryStateFor(parsed, expectedServerUrl), expectedServerUrl);
 }
 
 export async function saveState(
