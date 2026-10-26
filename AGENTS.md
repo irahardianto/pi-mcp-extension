@@ -64,7 +64,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/schema-convert.ts` | Pure MCP JSON Schema → TypeBox conversion (`convertJsonSchemaToTypebox`, `orderUnionMembers`) |
 | `src/schema-refs.ts` | Pure JSON Pointer (`$ref`) resolution for schema conversion (`resolveRefTarget`, `unescapeJsonPointer`, `stepJsonPointer`) |
 | `src/jsonc.ts` | Pure JSONC text utility (`stripJsonComments`): single-pass `//` line and `/* */` block comment removal outside of double-quoted strings, preserving `\n`/`\r` so `JSON.parse` error line numbers stay accurate. Used by `src/config.ts` (runtime `mcp.json`), `scripts/ruleset-audit.ts` (`.github/rulesets/*.json`), and, as the single canonical import path, the test suites (`tests/config.test.ts`, `tests/fuzz.test.ts`, `tests/repo-policy.test.ts` for `.github/rulesets/default-branch.json`) |
-| `src/config.ts` | Zod schemas, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases, and per-server file origins (`loadConfigWithOrigins`, `FileConfigOrigin`) |
+| `src/config.ts` | Zod schemas, global `<agentDir>/mcp.json` + project `.pi/mcp.json` merge (project overrides only what it states; **no `${VAR}` interpolation**), Pi 1.x config aliases (including Pi 1.3.0 `enabled: false`, partial project override entries, and stdio `cwd`), and per-server file origins (`loadConfigWithOrigins`, `FileConfigOrigin`) |
 | `src/server-provenance.ts` | Pure per-server config provenance (`withExtensionServers`, `lookupServerSource`, `ServerConfigSource`): which file or extension supplied each server, plus the skipped-project-config note |
 | `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, refresh rotation, credential invalidation |
 | `src/oauth-status.ts` | Stored OAuth state inspection (`getAuthStatus`), credential reset (`resetAuth`), and best-effort token invalidation (`invalidateStoredTokens`) |
@@ -113,7 +113,7 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 
 **Lifecycle & processes** (`server-manager.test.ts`, `stdio-process.test.ts`, `connection-coordinator.test.ts`, `connection-coordination.test.ts`, `management-tools.test.ts`)
 - `server.attempt` and `connectAttempts` entries are cleared in `finally` / `_shutdown()` on every path: success, failure, abort, reload.
-- stdio: pass the session `cwd` to `StdioClientTransport`, track the child PID as soon as it spawns (`instrumentStdioTransport`), and have `_shutdown()` do SIGTERM → bounded wait → SIGKILL (`ensurePidTerminated`), including before retrying a failed handshake.
+- stdio: pass the session `cwd` — or the per-server `config.cwd` resolved against it by `resolveStdioCwd` (`~` expanded, relative paths resolved, unset keeps the session cwd) — to `StdioClientTransport`, track the child PID as soon as it spawns (`instrumentStdioTransport`), and have `_shutdown()` do SIGTERM → bounded wait → SIGKILL (`ensurePidTerminated`), including before retrying a failed handshake.
 - Health checks never overlap, each ping is time-bounded, and transport `onclose` triggers recovery for all three transports.
 - Decode child `stderr` with `StringDecoder` (`createLineSplitter`) and pass every line and server-controlled log/error message through `sanitizeTerminalText` (`sanitizeStderrLine`) before storing or displaying it.
 - `session_start` / `session_shutdown`, `/mcp*` commands, and management tools are registered even if bootstrap config loading fails or finds no servers, because a later `session_start` in another directory may load a valid `.pi/mcp.json`. On reload, abort in-flight attempts, stop the callback server, call `ToolBridge.updateSettings`, and refresh the roots `cwd`. Root URIs use `pathToFileURL(cwd).href`.
@@ -132,9 +132,12 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - Keep object `properties` when `anyOf` / `oneOf` / `allOf` are present, and emit `{ type: "object", properties: {} }` (not `patternProperties`) for empty objects, because Gemini and OpenAI reject the latter.
 - Track `$ref`s on the active resolution path (`seenRefs`) to stop recursive blow-up. Preserve `integer`, `enum`, `const`, tuple `items`, and numeric/string constraints.
 
-**Config validation** (`config.test.ts`): reject bad config at load time, not at connect time.
+**Config validation** (`config.test.ts`, `pi-1x-compat.test.ts`): reject bad config at load time, not at connect time.
 - `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`.
 - `auth` is rejected on `stdio` servers, and `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated when the config loads.
+- A Pi 1.3.0 partial project entry (no `command`, `url`, `type`, or `transport`) is an override of the global entry with that name: it is merged onto the **raw** global entry before validation (global command/URL/headers/auth kept) and may only set `enabled`, `lifecycle`, and Pi's `exposure` / `toolExposure` (the last two accepted and ignored). A project override must never fail the whole config — that tore down every global server on `session_start` — and an unknown name or any other key is a config error naming file and server.
+- `enabled: false` normalizes to `lifecycle: "lazy"` even when `lifecycle: "eager"` is also set; a non-boolean `enabled` is rejected at load time.
+- `auth.provider` (Pi's `/login` provider token) is rejected with a `config` error rather than silently downgraded to OAuth 2.1 DCR, and `cwd` is accepted only on `stdio` transports.
 
 **Diagnostics** (`debug-log.test.ts`, `server-manager.test.ts`)
 - The extension writes to `stderr` only when no UI context exists, and only `warn`/`error` events (plus `info` events explicitly flagged `stderr: true`, e.g. child-server output and the headless OAuth URL fallback); other `info` telemetry is log-file only, so headless stderr output is unchanged from before the sink. While a UI is active, every diagnostic goes through `reportDiagnostic(...)` in `src/debug-log.ts`: the log file when `PI_MCP_DEBUG=1`, a `ctx.ui.notify(...)` for user-actionable events, and nothing otherwise. Semgrep `pi-mcp.no-stderr` keeps direct `console.error` / `process.stderr.write` calls out of every module except `src/debug-log.ts`.
