@@ -1450,7 +1450,9 @@ describe("ServerManager stdio cwd (Pi 1.3.0)", () => {
       mcpServers: {
         scoped: {
           command: "node",
-          args: ["--import", "tsx/esm", MOCK_SERVER_PATH],
+          // Resolve the loader to a file: URL: the child starts in another cwd, where a bare
+          // `tsx/esm` specifier would not resolve.
+          args: ["--import", import.meta.resolve("tsx/esm"), MOCK_SERVER_PATH],
           transport: "stdio",
           lifecycle: "lazy",
           cwd: "./nested",
