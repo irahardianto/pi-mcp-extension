@@ -256,4 +256,63 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("applies a Pi 1.3.0 project override entry without tearing down the other global servers", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-project-override-"));
+    const globalConfigPath = join(dir, "global-mcp.json");
+    const mockExt = createMockExtension();
+    const tools = mockExt.tools;
+    const events = mockExt.events;
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: false,
+      isProjectTrusted: () => true,
+    });
+
+    try {
+      await writeFile(
+        globalConfigPath,
+        JSON.stringify({
+          settings: { maxRetries: 0 },
+          mcpServers: {
+            shared_global: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+            stay_on: {
+              command: "node",
+              args: ["--import", tsxEsmLoader, mockServerPath],
+              lifecycle: "eager",
+            },
+          },
+        }),
+      );
+      // Pi 1.3.0 `/mcp` writes exactly this to disable one global server for one project.
+      await mkdir(join(dir, ".pi"), { recursive: true });
+      await writeFile(
+        join(dir, ".pi", "mcp.json"),
+        JSON.stringify({ mcpServers: { shared_global: { enabled: false } } }),
+      );
+
+      await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath });
+      await events.get("session_start")({}, ctx);
+
+      const status = JSON.parse(
+        (await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      );
+      const byName = new Map<string, { state?: string; lifecycle?: string }>(
+        status.map((r: { name: string; state?: string; lifecycle?: string }) => [r.name, r]),
+      );
+      assert.equal(byName.get("shared_global")?.state, "stopped", "the project override must hold the server down");
+      assert.equal(byName.get("shared_global")?.lifecycle, "lazy");
+      assert.equal(byName.get("stay_on")?.state, "ready", "a project override must not tear down the other global servers");
+      const active = mockExt.activeTools;
+      assert.ok(!active.includes("mcp_shared_global_echo"));
+      assert.ok(active.includes("mcp_stay_on_echo"));
+    } finally {
+      await events.get("session_shutdown")?.({}, ctx);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

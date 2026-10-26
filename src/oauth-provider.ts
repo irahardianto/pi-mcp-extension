@@ -57,6 +57,8 @@ export interface AuthConfig {
    * Pre-registered client_secret.
    */
   clientSecret?: string | undefined;
+  /** `client_name` sent with Dynamic Client Registration. Default: `pi-mcp/<server name>`. */
+  clientName?: string | undefined;
 }
 
 const DEFAULT_CALLBACK_PORT = 19876;
@@ -252,7 +254,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       redirectUris = [String(this.redirectUrl)];
     }
     return {
-      client_name: `pi-mcp/${this.serverName}`,
+      client_name: this.authConfig.clientName ?? `pi-mcp/${this.serverName}`,
       redirect_uris: redirectUris,
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],

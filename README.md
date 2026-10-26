@@ -151,20 +151,36 @@ In project-level `.pi/mcp.json`, `settings` keys carry no defaults — only the 
 
 ### Per-Server Config
 
-For Pi 1.x compatibility, server entries also accept `type` as an alias for `transport`, `"http"` as an alias for `"streamable-http"`, `oauth` as an alias for `auth`, and `timeout` (in seconds) as an alias for `requestTimeoutMs`.
+For Pi 1.x compatibility, server entries also accept `type` as an alias for `transport`, `"http"` as an alias for `"streamable-http"`, `oauth` as an alias for `auth`, `timeout` (in seconds) as an alias for `requestTimeoutMs`, and `enabled: false` as a request to keep the server out of the eager set (`lifecycle: "lazy"`). Pi's `auth.provider` (`/login` provider token) is **rejected** at load time instead of being silently downgraded to OAuth 2.1 — use `auth` (OAuth) or static `headers`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `transport` (or `type`) | `"stdio" \| "streamable-http" \| "http" \| "sse"` | `"stdio"` (`"streamable-http"` when `url` is set without `command`) | Transport protocol (`"http"` is normalized to `"streamable-http"`) |
 | `command` | `string` | — | Executable to spawn (**required** for `stdio`) |
 | `args` | `string[]` | `[]` | Arguments for the command |
+| `cwd` | `string` | session working directory | Working directory for a `stdio` server (rejected on `streamable-http` / `sse`). A relative path resolves against the session working directory and a leading `~` expands to your home directory |
 | `env` | `Record<string, string>` | — | Extra environment variables for the child process (literal values, no `${VAR}` interpolation) |
 | `url` | `string` | — | Server URL (**required** for `streamable-http` and `sse`) |
 | `headers` | `Record<string, string>` | — | Static headers sent with `streamable-http` and `sse` requests |
 | `auth` (or `oauth`) | `object` | — | OAuth 2.1 configuration described below and in [OAUTH.md](./OAUTH.md) (`streamable-http` / `sse` only) |
 | `lifecycle` | `"eager" \| "lazy"` | `"lazy"` (`"eager"` for `pi.registerMcpServer()` unless `enabled: false`) | `eager` = auto-start on `session_start`, `lazy` = connect on request via `mcp_connect`, `/mcp:start`, or `/mcp:auth` |
+| `enabled` | `boolean` | `true` | Pi 1.3.0 switch: `false` keeps the entry configured but out of the eager set (normalized to `lifecycle: "lazy"`, even when `lifecycle: "eager"` is also set) |
 | `requestTimeoutMs` (or `timeout`) | `number` | global setting | Per-server timeout override in ms (`timeout` is specified in seconds and multiplied by `1000`) |
 | `healthCheckIntervalMs` | `number` | disabled | Opt-in ping interval in ms for proactive connection health monitoring |
+
+### Project Override Entries
+
+A trusted project's `.pi/mcp.json` may carry a Pi 1.3.0 **partial override** for a global server: an entry with no `command`, `url`, `type`, or `transport` changes only per-project settings and keeps the rest of the global entry, including credentials the project cannot set itself.
+
+```jsonc
+// ~/.pi/agent/mcp.json
+{ "mcpServers": { "internal-tools": { "command": "internal-mcp", "lifecycle": "eager" } } }
+
+// <project>/.pi/mcp.json — turn it off for this project only
+{ "mcpServers": { "internal-tools": { "enabled": false } } }
+```
+
+An override may set `enabled`, `lifecycle`, and Pi's `exposure` / `toolExposure` (the two Pi-native exposure keys are accepted for Pi compatibility and ignored, because this extension decides tool activation itself). Any other key, or an override for a name no global entry defines, is reported as a config error naming the file and the server.
 
 ### OAuth Config
 
@@ -176,6 +192,7 @@ Configured under `auth` (or `oauth`). Token and client state are persisted per s
 | `scope` | `string` | discovered | Requested scope when the server does not advertise one in `WWW-Authenticate` |
 | `clientId` | `string` | dynamic registration | Pre-registered OAuth client ID (skips Dynamic Client Registration) |
 | `clientSecret` | `string` | — | Secret for a pre-registered confidential client |
+| `clientName` (or `oauth.clientName`) | `string` | `pi-mcp/<server name>` | `client_name` sent with Dynamic Client Registration, for servers that only accept known clients |
 | `redirectUrl` (or `oauth.callbackUrl` / `oauth.callbackPort`) | `string` | `http://127.0.0.1:19876/callback` | Local HTTP loopback callback (`localhost`, `127.0.0.1`, or `::1` with path `/callback` and an explicit non-zero port; `callbackPort` maps to `http://127.0.0.1:<port>/callback`). Scans forward from `19876` when omitted; binds the exact host and port when configured. |
 
 ## Commands

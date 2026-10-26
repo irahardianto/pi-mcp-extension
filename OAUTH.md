@@ -55,7 +55,9 @@ You can provide pre-registered client credentials:
 }
 ```
 
-For Pi 1.x compatibility, an `oauth` object (`{ clientId, clientSecret, scope, redirectUrl | callbackUrl | callbackPort }`) is also accepted as an alias for `auth` (`callbackPort` maps to `http://127.0.0.1:<port>/callback`).
+For Pi 1.x compatibility, an `oauth` object (`{ clientId, clientSecret, clientName, scope, redirectUrl | callbackUrl | callbackPort }`) is also accepted as an alias for `auth` (`callbackPort` maps to `http://127.0.0.1:<port>/callback`). `clientName` is the `client_name` sent with Dynamic Client Registration (default `pi-mcp/<server name>`), for authorization servers that only accept known clients.
+
+Pi's `auth.provider` (`/login` provider token) is not supported: it is rejected when the config loads with a `config` error instead of being silently downgraded to OAuth 2.1, because this extension cannot forward a Pi provider token. Use `auth` (OAuth) or static `headers`.
 
 ### Authenticate a Server
 

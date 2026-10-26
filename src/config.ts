@@ -7,7 +7,9 @@
  *      $PI_CODING_AGENT_DIR when set (Pi profiles / alternative agent dirs), else ~/.pi/agent
  *
  * Project servers/settings override global servers/settings per-key (shallow merge).
- * No deep merge, no env var interpolation — WYSIWYG config.
+ * A Pi 1.3.0 partial project entry (`{ "enabled": false }` — no `command`/`url`) overrides only the
+ * per-project keys of the global server of that name, keeping the global entry's credentials.
+ * No deep merge of any other keys, no env var interpolation — WYSIWYG config.
  */
 
 import { readFile } from "node:fs/promises";
@@ -58,8 +60,27 @@ const AuthConfigSchema = z.preprocess(
        * Pre-registered client_secret.
        */
       clientSecret: z.string().optional(),
+      /**
+       * `client_name` sent with Dynamic Client Registration (Pi 1.3.0 `oauth.clientName`).
+       * Default: `pi-mcp/<server name>`.
+       */
+      clientName: z.string().trim().min(1).optional(),
+      /**
+       * Pi's `/login` provider auth (`auth.provider`), accepted only so it can be rejected with a
+       * clear error: this extension runs OAuth 2.1 and cannot forward a Pi provider token.
+       */
+      provider: z.unknown().optional(),
     })
     .superRefine((auth, ctx) => {
+      if (auth.provider !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["provider"],
+          message:
+            '"auth.provider" sends a Pi /login provider token, which pi-mcp-extension does not support; ' +
+            'remove it to use OAuth 2.1, or send a static credential with "headers"',
+        });
+      }
       if (auth.redirectUrl !== undefined) {
         try {
           callbackServerConfigFromRedirectUrl(auth.redirectUrl);
@@ -104,6 +125,17 @@ function normalizeAuthAlias(obj: Record<string, unknown>): void {
   }
 }
 
+/**
+ * Map Pi 1.3.0 `enabled: false` onto `lifecycle: "lazy"`. Pi keeps a disabled entry configured but
+ * out of the connect set; the closest behavior here is the lazy lifecycle (manual `/mcp:start`).
+ * An explicit `lifecycle: "eager"` never wins over `enabled: false`, which is what Pi does too.
+ */
+function normalizeEnabledAlias(obj: Record<string, unknown>): void {
+  if (obj.enabled === false) {
+    obj.lifecycle = "lazy";
+  }
+}
+
 /** Map legacy `timeout` (seconds) onto `requestTimeoutMs` (milliseconds). */
 function normalizeTimeoutAlias(obj: Record<string, unknown>): void {
   if (obj.requestTimeoutMs !== undefined) {
@@ -115,13 +147,14 @@ function normalizeTimeoutAlias(obj: Record<string, unknown>): void {
   obj.requestTimeoutMs = obj.timeout * 1000;
 }
 
-/** Rewrite Pi 1.x config aliases (`type`, `oauth`, `timeout`) before schema validation. */
+/** Rewrite Pi 1.x config aliases (`type`, `oauth`, `timeout`, `enabled`) before schema validation. */
 function normalizeServerConfigAliases(raw: unknown): unknown {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const obj = { ...(raw as Record<string, unknown>) };
   normalizeTransportAlias(obj);
   normalizeAuthAlias(obj);
   normalizeTimeoutAlias(obj);
+  normalizeEnabledAlias(obj);
   return obj;
 }
 
@@ -133,6 +166,11 @@ export const ServerConfigSchema = z.preprocess(
       command: z.string().optional(),
       /** Arguments passed to command. */
       args: z.array(z.string()).default([]),
+      /**
+       * Working directory for a stdio server (Pi 1.3.0 `cwd`). A leading `~` expands to the home
+       * directory and a relative path resolves against the session working directory.
+       */
+      cwd: z.string().min(1).optional(),
       /**
        * Extra environment variables passed to the child process as literals.
        * These merge with process.env; project env overrides parent env.
@@ -164,6 +202,11 @@ export const ServerConfigSchema = z.preprocess(
        * "lazy"  — start manually via /mcp:start command.
        */
       lifecycle: z.enum(["eager", "lazy"]).default("lazy"),
+      /**
+       * Pi 1.3.0 switch: `false` keeps the entry configured but out of the eager set (normalized to
+       * `lifecycle: "lazy"`). Default: `true`.
+       */
+      enabled: z.boolean().optional(),
       /** Per-request timeout in ms. Overrides global setting. Default: 30000. */
       requestTimeoutMs: z.number().positive().optional(),
       /**
@@ -188,11 +231,20 @@ export const ServerConfigSchema = z.preprocess(
             message: "OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'",
           });
         }
-      } else if (cfg.url === undefined) {
-        ctx.addIssue({
-          code: "custom",
-          message: `"url" is required for ${cfg.transport} transport`,
-        });
+      } else {
+        if (cfg.url === undefined) {
+          ctx.addIssue({
+            code: "custom",
+            message: `"url" is required for ${cfg.transport} transport`,
+          });
+        }
+        if (cfg.cwd !== undefined) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["cwd"],
+            message: `"cwd" is only supported for 'stdio' transport, not '${cfg.transport}'`,
+          });
+        }
       }
     }),
 );
@@ -241,6 +293,88 @@ const ProjectConfigSchema = z.object({
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
 });
 type ProjectConfig = z.output<typeof ProjectConfigSchema>;
+
+// ─── Pi 1.3.0 project override entries ────────────────────────────────────────
+
+/**
+ * Keys a Pi 1.3.0 project entry may override on the global entry of the same name (`/mcp` writes
+ * such an entry as soon as a global server is disabled or its exposure is changed for one project).
+ * `exposure` / `toolExposure` are Pi-native tool-exposure settings: they are accepted so a shared
+ * `mcp.json` loads, and ignored because this extension decides tool activation itself. `lifecycle`
+ * is this extension's equivalent of `enabled`.
+ */
+const PROJECT_OVERRIDE_KEYS = ["enabled", "exposure", "toolExposure", "lifecycle"] as const;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A project entry without a transport definition only overrides the global server of that name. */
+function isProjectOverrideEntry(value: unknown): value is Record<string, unknown> {
+  if (!isPlainObject(value)) return false;
+  return (
+    value.command === undefined &&
+    value.url === undefined &&
+    value.type === undefined &&
+    value.transport === undefined
+  );
+}
+
+function invalidProjectConfig(projectPath: string, detail: string): McpError {
+  return new McpError(`Invalid mcp.json at ${projectPath}:\n  ${detail}`, "<config>", "config");
+}
+
+/** Merge a partial project override onto the raw global entry, keeping the global credentials. */
+function mergeProjectOverride(
+  name: string,
+  override: Record<string, unknown>,
+  globalServers: Record<string, unknown>,
+  projectPath: string,
+): Record<string, unknown> {
+  const unsupported = Object.keys(override).filter(
+    (key) => !(PROJECT_OVERRIDE_KEYS as readonly string[]).includes(key),
+  );
+  if (unsupported.length > 0) {
+    throw invalidProjectConfig(
+      projectPath,
+      `mcpServers.${name}: a project override can only set ${PROJECT_OVERRIDE_KEYS.join(", ")} (found ${unsupported.join(", ")})`,
+    );
+  }
+  const base = globalServers[name];
+  if (!isPlainObject(base)) {
+    throw invalidProjectConfig(
+      projectPath,
+      `mcpServers.${name}: a project override needs "command" or "url" in this file, or a global server of that name`,
+    );
+  }
+  const merged: Record<string, unknown> = { ...base };
+  for (const key of PROJECT_OVERRIDE_KEYS) {
+    if (override[key] !== undefined) {
+      merged[key] = override[key];
+    }
+  }
+  return merged;
+}
+
+/**
+ * Resolve Pi 1.3.0 partial project entries (`{ "<server>": { "enabled": false } }`) against the raw
+ * global file *before* validation, so `ProjectConfigSchema` sees a complete entry instead of
+ * failing with `"command" is required for stdio transport` (which tore down every global server on
+ * `session_start`).
+ */
+function applyProjectOverrides(projectRaw: unknown, globalRaw: unknown, projectPath: string): unknown {
+  if (!isPlainObject(projectRaw) || !isPlainObject(projectRaw.mcpServers)) return projectRaw;
+  const globalServers = isPlainObject(globalRaw) && isPlainObject(globalRaw.mcpServers)
+    ? globalRaw.mcpServers
+    : {};
+  const servers: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(projectRaw.mcpServers)) {
+    servers[name] = isProjectOverrideEntry(value)
+      ? mergeProjectOverride(name, value, globalServers, projectPath)
+      : value;
+  }
+  return { ...projectRaw, mcpServers: servers };
+}
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
@@ -425,7 +559,11 @@ export async function loadConfigWithOrigins(
 
   const projectCfg = projectRaw === undefined
     ? undefined
-    : parseWith(ProjectConfigSchema, projectRaw, projectConfigPath);
+    : parseWith(
+        ProjectConfigSchema,
+        applyProjectOverrides(projectRaw, globalRaw, projectConfigPath),
+        projectConfigPath,
+      );
 
   return {
     config: projectCfg === undefined ? globalCfg : mergeConfigs(globalCfg, projectCfg),

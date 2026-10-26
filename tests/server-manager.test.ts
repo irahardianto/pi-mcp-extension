@@ -1434,3 +1434,42 @@ describe("classifyConnectFailure", () => {
 
 
 
+
+// ── Pi 1.3.0 stdio cwd ────────────────────────────────────────────────────────
+
+describe("ServerManager stdio cwd (Pi 1.3.0)", () => {
+  it("spawns a stdio server in its configured cwd, resolved against the session cwd", async () => {
+    const { mkdtemp, mkdir, realpath, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-cwd-"));
+    const nested = join(dir, "nested");
+    await mkdir(nested, { recursive: true });
+
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 },
+      mcpServers: {
+        scoped: {
+          command: "node",
+          args: ["--import", "tsx/esm", MOCK_SERVER_PATH],
+          transport: "stdio",
+          lifecycle: "lazy",
+          cwd: "./nested",
+        },
+      },
+    });
+
+    try {
+      await manager.startServer("scoped", dir);
+      const client = manager.getServer("scoped")?.client;
+      assert.ok(client, "server should be connected");
+
+      const result = await client.callTool({ name: "get_cwd", arguments: {} });
+      const reported = (result.content as Array<{ type: string; text?: string }>)[0]?.text;
+      assert.ok(reported, "mock server should report its working directory");
+      assert.equal(await realpath(reported), await realpath(nested));
+    } finally {
+      await manager.shutdownAll();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

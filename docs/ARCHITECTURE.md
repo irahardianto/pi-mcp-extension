@@ -320,16 +320,28 @@ Behavior:
   name entirely. If neither file exists, `loadConfig()` returns an empty valid config
   with default settings. There is no deep merge and **no `${VAR}` interpolation** —
   config is WYSIWYG.
+- **Pi 1.3.0 project overrides.** An entry without `command`, `url`, `type`, or
+  `transport` is a partial override of the global server with the same name, exactly as
+  Pi's `/mcp` writes it (`{ "internal-tools": { "enabled": false } }`). The override is
+  applied to the **raw** global entry before validation, so the global `command`/`url`,
+  headers, and OAuth config are kept and the project only changes `enabled`,
+  `lifecycle`, `exposure`, or `toolExposure` (`exposure` / `toolExposure` are Pi-native
+  and ignored here). An override with any other key, or for a name no global file
+  defines, is a config error naming the file and the server.
 - **Pi 1.x aliases** are normalized before validation: `type` → `transport`, `"http"` →
-  `"streamable-http"`, `oauth` → `auth`, and `timeout` (seconds) → `requestTimeoutMs`.
-  Defaults: `transport` is `stdio` (or `streamable-http` when `url` is set), `lifecycle`
-  is `lazy` (eager for extension-registered servers unless `enabled: false`),
-  `toolPrefix` is `mcp`, `requestTimeoutMs` is `30000`, and `maxRetries` is `5`.
+  `"streamable-http"`, `oauth` → `auth`, `timeout` (seconds) → `requestTimeoutMs`, and
+  `enabled: false` → `lifecycle: "lazy"` (a disabled server never joins the eager set,
+  even when `lifecycle` says `eager`). Defaults: `transport` is `stdio` (or
+  `streamable-http` when `url` is set), `lifecycle` is `lazy` (eager for
+  extension-registered servers unless `enabled: false`), `toolPrefix` is `mcp`,
+  `requestTimeoutMs` is `30000`, and `maxRetries` is `5`.
 - **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `auth` is
-  rejected on `stdio`; `auth.redirectUrl` (including the `callbackUrl` / `callbackPort`
-  aliases) is validated when the config loads; `stdio` requires `command` and URL-based
-  transports require `url`. Failures are `McpError` of kind `config` and include the file
-  path.
+  rejected on `stdio`; `auth.provider` (Pi's `/login` provider token, which this
+  extension cannot forward) is rejected instead of being silently downgraded to OAuth;
+  `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated
+  when the config loads; `stdio` requires `command` and URL-based transports require
+  `url`; `cwd` is stdio-only. Failures are `McpError` of kind `config` and include the
+  file path.
 - **Extension-registered servers** from `pi.registerMcpServer()` are collected on
   bootstrap and on every `mcp_servers_change`; a same-named `mcp.json` entry takes
   precedence.

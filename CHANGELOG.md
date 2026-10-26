@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Pi 1.3.0 `McpStdioServerConfig.cwd` is honored for stdio servers (`pi mcp add --cwd <dir>`), so a server can be spawned in its own working directory: a relative path resolves against the session working directory and a leading `~` expands to your home directory. A `cwd` on a `streamable-http` or `sse` entry is rejected at load time.
+- Pi 1.3.0 `oauth.clientName` (also accepted as `auth.clientName`) sets the `client_name` sent with Dynamic Client Registration (default `pi-mcp/<server name>`), for authorization servers that only accept known clients.
+
+### Fixed
+- A Pi 1.3.0 project override entry in `<cwd>/.pi/mcp.json` (`{ "internal-tools": { "enabled": false } }` — no `command`/`url`) no longer fails validation with `"command" is required for stdio transport` and tears down every global MCP server for the session: the override is merged onto the raw global entry (keeping its command, URL, headers, and OAuth config) and may only set `enabled`, `lifecycle`, Pi's `exposure`, or `toolExposure` (the two exposure keys are accepted for Pi compatibility and ignored). An override for a name no global entry defines, or with any other key, is a config error naming the file and the server (#215).
+- `enabled: false` in `mcp.json`, `.pi/mcp.json`, or a `pi.registerMcpServer()` config now keeps the server out of the eager set (normalized to `lifecycle: "lazy"`) even when `lifecycle: "eager"` is also set, and a non-boolean `enabled` is rejected at load time instead of being silently ignored (#215).
+- Pi's `auth.provider` (`/login` provider token) is rejected with a `config` error at load time instead of being silently stripped and downgraded to OAuth 2.1 Dynamic Client Registration, which could register a client against a server the user never meant to authorize that way (#215).
+
 ## [1.11.0] - 2026-10-26
 
 ### Added

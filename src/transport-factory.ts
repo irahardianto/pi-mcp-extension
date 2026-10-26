@@ -6,6 +6,8 @@
  * SDK workarounds.
  */
 
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -67,15 +69,36 @@ function wireStdioStderr(transport: StdioClientTransport, onStderr: (line: strin
   transport.stderr.on("close", flush);
 }
 
+/** Expand a leading `~` / `~/` / `~\` to the home directory, the way Pi resolves a config `cwd`. */
+function expandHome(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/") || path.startsWith("~\\")) return join(homedir(), path.slice(2));
+  return path;
+}
+
+/**
+ * Resolve the working directory for a stdio server: Pi 1.3.0's per-server `cwd` (relative paths
+ * resolve against the session working directory, `~` expands to the home directory), else the
+ * session working directory unchanged.
+ */
+export function resolveStdioCwd(
+  configuredCwd: string | undefined,
+  sessionCwd: string | undefined,
+): string | undefined {
+  if (configuredCwd === undefined) return sessionCwd;
+  return resolve(sessionCwd ?? process.cwd(), expandHome(configuredCwd));
+}
+
 function createStdioTransport(
   serverName: string,
   config: ServerConfig,
-  cwd: string | undefined,
+  sessionCwd: string | undefined,
   onStderr: ((line: string) => void) | undefined,
 ): Transport {
   if (!config.command) {
     throw new McpError("stdio transport requires 'command'", serverName, "config");
   }
+  const cwd = resolveStdioCwd(config.cwd, sessionCwd);
   const transport = new StdioClientTransport({
     command: config.command,
     args: config.args,

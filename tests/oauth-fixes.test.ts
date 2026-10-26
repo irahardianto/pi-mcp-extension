@@ -107,6 +107,18 @@ describe("OAuth Security Fixes", () => {
       assert.strictEqual(provider.clientMetadata.scope, "read write");
     });
 
+    it("should use a configured clientName for DCR and fall back to pi-mcp/<server>", () => {
+      const named = new McpOAuthProvider({
+        serverName: testServerName,
+        authConfig: { clientName: "custom-client" },
+        storageDir: testStorage,
+      });
+      provider = new McpOAuthProvider({ serverName: testServerName, authConfig: {}, storageDir: testStorage });
+
+      assert.strictEqual(named.clientMetadata.client_name, "custom-client");
+      assert.strictEqual(provider.clientMetadata.client_name, `pi-mcp/${testServerName}`);
+    });
+
     it("should always return expired tokens (to allow SDK silent refresh)", async () => {
       // CRITICAL: tokens() must ALWAYS return stored tokens, even if expired.
       // The SDK's auth() function checks tokens?.refresh_token to attempt silent

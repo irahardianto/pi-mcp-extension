@@ -67,6 +67,9 @@
     "context7": {
       "command": "npx",
       "args": ["-y", "@context7/mcp"],
+      // Optional per-server working directory (stdio only). A relative path resolves
+      // against the session working directory; "~" expands to your home directory.
+      "cwd": "./",
       "env": {
         "CONTEXT7_API_KEY": "YOUR_API_KEY"
       },

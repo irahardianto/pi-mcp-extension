@@ -70,6 +70,16 @@ const TOOLS = [
     annotations: { readOnlyHint: true },
   },
   {
+    name: "get_cwd",
+    description: "Report the working directory the server process was started in",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: "fail_tool",
     description: "A tool that always returns isError: true",
     inputSchema: {
@@ -104,6 +114,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = a + b;
       return {
         content: [{ type: "text", text: String(result) }],
+        isError: false,
+      };
+    }
+
+    case "get_cwd": {
+      return {
+        content: [{ type: "text", text: process.cwd() }],
         isError: false,
       };
     }
