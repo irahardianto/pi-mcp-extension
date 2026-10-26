@@ -111,6 +111,80 @@ function hasArraySchemaKeywords(schema: Record<string, unknown>): boolean {
   return schema["items"] !== undefined || Array.isArray(schema["prefixItems"]);
 }
 
+/** Whether `ref` is already on the active resolution path. */
+function isRefSeenOnPath(
+  ref: string,
+  ctx: ConversionContext,
+  extraRefs: ReadonlySet<string>,
+): boolean {
+  return ctx.seenRefs.has(ref) || extraRefs.has(ref);
+}
+
+/**
+ * Resolve an `allOf` member's `$ref` chain while probing it for object-ness.
+ * Returns `null` for an unresolvable ref or a ref cycle, so probing always terminates.
+ */
+function resolveProbeRef(
+  sub: Record<string, unknown>,
+  ctx: ConversionContext,
+  seenRefs: Set<string>,
+): Record<string, unknown> | null {
+  let current = sub;
+  let ref = current["$ref"];
+  while (typeof ref === "string" && !isRefSeenOnPath(ref, ctx, seenRefs)) {
+    seenRefs.add(ref);
+    const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
+    if (!resolved) {
+      return null;
+    }
+    current = resolved;
+    ref = current["$ref"];
+  }
+  return typeof ref === "string" ? null : current;
+}
+
+/** Whether a sub-schema describes an object directly, through a `$ref`, or through a nested `allOf`. */
+function isObjectLikeSubSchema(
+  sub: Record<string, unknown>,
+  ctx: ConversionContext,
+  seenRefs: Set<string>,
+): boolean {
+  if (sub["type"] === "object" || hasObjectSchemaKeywords(sub)) {
+    return true;
+  }
+  return hasAllOfObjectSubSchema(sub, ctx, seenRefs);
+}
+
+/**
+ * Whether `allOf` composes object sub-schemas / `$ref`s to object definitions.
+ * WHY: JSON Schema generators (Pydantic, FastAPI, OpenAPI 3.0) omit `type: "object"`
+ * on the `allOf` wrapper. Without object inference the schema becomes a bare
+ * `Type.Intersect`, which has no `properties` — Pi's `normalizeOptionalNulls` then
+ * skips it (coercing optional `null`s into `"null"` / `0` / `false`) and Anthropic's
+ * adapter sends an empty `input_schema`.
+ */
+function hasAllOfObjectSubSchema(
+  schema: Record<string, unknown>,
+  ctx: ConversionContext,
+  seenRefs: Set<string> = new Set<string>(),
+): boolean {
+  const allOf = schema["allOf"];
+  if (!Array.isArray(allOf)) {
+    return false;
+  }
+  return allOf.some((sub) => {
+    if (!isPlainObject(sub)) {
+      return false;
+    }
+    const resolved = resolveProbeRef(sub, ctx, seenRefs);
+    return resolved ? isObjectLikeSubSchema(resolved, ctx, seenRefs) : false;
+  });
+}
+
+function hasObjectSchemaShape(schema: Record<string, unknown>, ctx: ConversionContext): boolean {
+  return hasObjectSchemaKeywords(schema) || hasAllOfObjectSubSchema(schema, ctx);
+}
+
 interface ConversionContext {
   rootDefs: Record<string, Record<string, unknown>>;
   effectiveRoot: Record<string, unknown>;
@@ -347,13 +421,35 @@ function convertArraySchema(
   );
 }
 
-/** Resolve an `allOf` sub-schema's `$ref` (unless it is already being resolved). */
-function resolveAllOfSubSchema(sub: Record<string, unknown>, ctx: ConversionContext): Record<string, unknown> {
-  const ref = sub["$ref"];
-  if (typeof ref !== "string" || ctx.seenRefs.has(ref)) {
-    return sub;
+/** Accumulates flattened `allOf` contributions plus the refs already walked. */
+interface AllOfMerge {
+  properties: Record<string, unknown>;
+  required: Set<string>;
+  visitedRefs: Set<string>;
+}
+
+/**
+ * Follow an `allOf` sub-schema's `$ref` chain, stopping at cycles and unresolvable refs.
+ * WHY: generators chain definitions (`A: { $ref: B }`), so merging only the first hop
+ * would drop every property inherited further down the chain.
+ */
+function chaseAllOfRefs(
+  sub: Record<string, unknown>,
+  merge: AllOfMerge,
+  ctx: ConversionContext,
+): Record<string, unknown> {
+  let current = sub;
+  let ref = current["$ref"];
+  while (typeof ref === "string" && !isRefSeenOnPath(ref, ctx, merge.visitedRefs)) {
+    merge.visitedRefs.add(ref);
+    const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
+    if (!resolved) {
+      return current;
+    }
+    current = resolved;
+    ref = current["$ref"];
   }
-  return resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot) ?? sub;
+  return current;
 }
 
 /** Merge a sub-schema's properties without overwriting properties declared by the caller. */
@@ -380,18 +476,20 @@ function mergeSubSchemaRequired(req: unknown, required: Set<string>): void {
   }
 }
 
-function mergeAllOfSubSchema(
-  sub: unknown,
-  rawProperties: Record<string, unknown>,
-  required: Set<string>,
-  ctx: ConversionContext,
-): void {
+/** Merge one `allOf` member (and every nested member beneath it) into the accumulator. */
+function mergeAllOfSubSchema(sub: unknown, merge: AllOfMerge, ctx: ConversionContext): void {
   if (!isPlainObject(sub)) {
     return;
   }
-  const resolvedSub = resolveAllOfSubSchema(sub, ctx);
-  mergeSubSchemaProperties(resolvedSub["properties"], rawProperties);
-  mergeSubSchemaRequired(resolvedSub["required"], required);
+  const resolvedSub = chaseAllOfRefs(sub, merge, ctx);
+  mergeSubSchemaProperties(resolvedSub["properties"], merge.properties);
+  mergeSubSchemaRequired(resolvedSub["required"], merge.required);
+  const nested = resolvedSub["allOf"];
+  if (Array.isArray(nested)) {
+    for (const nestedSub of nested) {
+      mergeAllOfSubSchema(nestedSub, merge, ctx);
+    }
+  }
 }
 
 function convertObjectSchema(
@@ -399,14 +497,15 @@ function convertObjectSchema(
   opts: Record<string, unknown>,
   ctx: ConversionContext,
 ): TSchema {
-  const rawProperties: Record<string, unknown> = isPlainObject(schema["properties"])
-    ? { ...schema["properties"] }
-    : {};
-  const required = new Set<string>(
-    Array.isArray(schema["required"])
-      ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
-      : [],
-  );
+  const merge: AllOfMerge = {
+    properties: isPlainObject(schema["properties"]) ? { ...schema["properties"] } : {},
+    required: new Set<string>(
+      Array.isArray(schema["required"])
+        ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
+        : [],
+    ),
+    visitedRefs: new Set<string>(),
+  };
   const additionalProperties = schema["additionalProperties"];
 
   let allOfSchemas: TSchema[] | undefined;
@@ -420,19 +519,19 @@ function convertObjectSchema(
       ),
     );
     for (const sub of schema["allOf"] as unknown[]) {
-      mergeAllOfSubSchema(sub, rawProperties, required, ctx);
+      mergeAllOfSubSchema(sub, merge, ctx);
     }
   }
 
   const props: Record<string, TSchema> = {};
-  for (const [key, value] of Object.entries(rawProperties)) {
+  for (const [key, value] of Object.entries(merge.properties)) {
     const converted = convertJsonSchemaToTypebox(
       value as Record<string, unknown>,
       ctx.rootDefs,
       ctx.effectiveRoot,
       ctx.seenRefs,
     );
-    props[key] = required.has(key) ? converted : Type.Optional(converted);
+    props[key] = merge.required.has(key) ? converted : Type.Optional(converted);
   }
 
   const objOpts: Record<string, unknown> = { ...opts };
@@ -447,8 +546,8 @@ function convertObjectSchema(
     );
   }
 
-  if (required.size > 0) {
-    objOpts["required"] = Array.from(required);
+  if (merge.required.size > 0) {
+    objOpts["required"] = Array.from(merge.required);
   }
 
   if (Array.isArray(schema["oneOf"])) {
@@ -525,7 +624,7 @@ function resolveNonTypedSchema(
     return convertMultiTypeSchema(schema, rawType, opts, ctx);
   }
   if (
-    !hasObjectSchemaKeywords(schema) &&
+    !hasObjectSchemaShape(schema, ctx) &&
     !hasArraySchemaKeywords(schema) &&
     rawType !== "object" &&
     rawType !== "array"
@@ -544,7 +643,9 @@ function resolveNonTypedSchema(
  *   - Nullable and multi-type arrays ("type": ["string", "null"]) with Type.Null() ordered first
  *   - Cycle-safe $ref (#, #/$defs/, #/definitions/, and arbitrary RFC 6901 JSON Pointers)
  *   - oneOf / anyOf → TypeBox Union
- *   - allOf → TypeBox Intersect
+ *   - allOf → TypeBox Intersect; when it composes object sub-schemas or `$ref`s to
+ *     object definitions, an object schema with merged `properties` / `required`
+ *     (recursing through nested `allOf` and chained `$ref`s) that keeps the members
  * Falls back to Type.Any() for unresolvable $ref, recursive cycles, or missing type.
  */
 export function convertJsonSchemaToTypebox(
@@ -579,7 +680,7 @@ export function convertJsonSchemaToTypebox(
   const type =
     typeof rawType === "string"
       ? rawType
-      : hasObjectSchemaKeywords(schema)
+      : hasObjectSchemaShape(schema, ctx)
         ? "object"
         : hasArraySchemaKeywords(schema)
           ? "array"

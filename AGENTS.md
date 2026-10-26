@@ -130,6 +130,7 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 **Schema conversion** (`tool-bridge.test.ts`): Pi runs `Value.Convert(schema, args)` before validating.
 - In unions, `Type.Null()` must come before `String` / `Number` / `Integer` / `Boolean`, or `null` gets coerced to `""` / `0` / `false`.
 - Keep object `properties` when `anyOf` / `oneOf` / `allOf` are present, and emit `{ type: "object", properties: {} }` (not `patternProperties`) for empty objects, because Gemini and OpenAI reject the latter.
+- An `allOf` that composes object sub-schemas or `$ref`s to object definitions **must** infer `type: "object"` and flatten `properties` / `required` — recursively through nested `allOf` and chained `$ref`s, cycle-safe — while still carrying the `allOf` members for Intersect semantics. Generators (Pydantic, FastAPI, OpenAPI 3.0) omit `type: "object"` on the wrapper, and a bare `Type.Intersect` has no `properties`: Pi's `normalizeOptionalNulls` then skips the object (coercing optional `null`s into `"null"` / `0` / `false`) and Anthropic's adapter sends an empty `input_schema`. An `allOf` whose members are not object-like stays a bare Intersect.
 - Track `$ref`s on the active resolution path (`seenRefs`) to stop recursive blow-up. Preserve `integer`, `enum`, `const`, tuple `items`, and numeric/string constraints.
 
 **Config validation** (`config.test.ts`, `pi-1x-compat.test.ts`): reject bad config at load time, not at connect time.
