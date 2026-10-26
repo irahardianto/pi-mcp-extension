@@ -331,6 +331,13 @@ function mergeProjectOverride(
   globalServers: Record<string, unknown>,
   projectPath: string,
 ): Record<string, unknown> {
+  const base = globalServers[name];
+  if (!isPlainObject(base)) {
+    throw invalidProjectConfig(
+      projectPath,
+      `mcpServers.${name}: a project override needs "command" or "url" in this file, or a global server of that name`,
+    );
+  }
   const unsupported = Object.keys(override).filter(
     (key) => !(PROJECT_OVERRIDE_KEYS as readonly string[]).includes(key),
   );
@@ -340,14 +347,10 @@ function mergeProjectOverride(
       `mcpServers.${name}: a project override can only set ${PROJECT_OVERRIDE_KEYS.join(", ")} (found ${unsupported.join(", ")})`,
     );
   }
-  const base = globalServers[name];
-  if (!isPlainObject(base)) {
-    throw invalidProjectConfig(
-      projectPath,
-      `mcpServers.${name}: a project override needs "command" or "url" in this file, or a global server of that name`,
-    );
-  }
   const merged: Record<string, unknown> = { ...base };
+  if (override.lifecycle !== undefined && override.enabled === undefined) {
+    delete merged.enabled;
+  }
   for (const key of PROJECT_OVERRIDE_KEYS) {
     if (override[key] !== undefined) {
       merged[key] = override[key];

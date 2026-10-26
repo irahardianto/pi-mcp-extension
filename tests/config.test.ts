@@ -1027,12 +1027,32 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
     });
   });
 
-  it("rejects a project override for a server no config defines", async () => {
+  it("rejects a project override for a server no config defines, even when non-override keys are present", async () => {
     await withTempDir(async (dir) => {
       await writeGlobalConfig(dir, { mcpServers: { known: { command: "node" } } });
-      await writeMcpJson(dir, { mcpServers: { unknown_server: { enabled: false } } });
+      await writeMcpJson(dir, {
+        mcpServers: {
+          unknown_server: { enabled: false },
+        },
+      });
 
-      await assert.rejects(() => loadBoth(dir), expectConfigError("unknown_server"));
+      await assert.rejects(
+        () => loadBoth(dir),
+        expectConfigError('mcpServers.unknown_server: a project override needs "command" or "url" in this file, or a global server of that name'),
+      );
+
+      // A standalone project entry that forgot "command"/"url" (e.g. only "args") must report
+      // the missing command/url / missing global server rather than the override-keys message.
+      await writeMcpJson(dir, {
+        mcpServers: {
+          missing_command_local: { args: ["server.js"] },
+        },
+      });
+
+      await assert.rejects(
+        () => loadBoth(dir),
+        expectConfigError('mcpServers.missing_command_local: a project override needs "command" or "url" in this file, or a global server of that name'),
+      );
     });
   });
 
@@ -1042,6 +1062,31 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
       await writeMcpJson(dir, { mcpServers: { known: { args: ["sneaky.js"] } } });
 
       await assert.rejects(() => loadBoth(dir), expectConfigError("enabled, exposure, toolExposure, lifecycle"));
+    });
+  });
+
+  it("allows a project override with lifecycle: eager or enabled: true to promote a globally disabled server", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          via_lifecycle: { command: "node", args: ["a.js"], enabled: false },
+          via_enabled: { command: "node", args: ["b.js"], lifecycle: "eager", enabled: false },
+          still_disabled: { command: "node", args: ["c.js"], enabled: false },
+        },
+      });
+      await writeMcpJson(dir, {
+        mcpServers: {
+          via_lifecycle: { lifecycle: "eager" },
+          via_enabled: { enabled: true },
+          still_disabled: { lifecycle: "eager", enabled: false },
+        },
+      });
+
+      const loaded = await loadBoth(dir);
+
+      assert.equal(loaded.config.mcpServers["via_lifecycle"]?.lifecycle, "eager");
+      assert.equal(loaded.config.mcpServers["via_enabled"]?.lifecycle, "eager");
+      assert.equal(loaded.config.mcpServers["still_disabled"]?.lifecycle, "lazy");
     });
   });
 
@@ -1058,6 +1103,13 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
 
       assert.equal(cfg.mcpServers["disabled"]?.lifecycle, "lazy");
       assert.equal(cfg.mcpServers["active"]?.lifecycle, "eager");
+
+      const regDisabled = parseRegisteredServerConfig("ext", {
+        command: "node",
+        lifecycle: "eager",
+        enabled: false,
+      });
+      assert.equal(regDisabled.lifecycle, "lazy");
     });
   });
 
@@ -1081,10 +1133,16 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
     });
   });
 
-  it("rejects cwd on a non-stdio transport", async () => {
+  it("rejects cwd on a non-stdio transport and rejects empty or non-string cwd", async () => {
     await withTempDir(async (dir) => {
       await writeMcpJson(dir, {
         mcpServers: { remote: { url: "https://mcp.example.com/mcp", cwd: "./sub" } },
+      });
+
+      await assert.rejects(() => loadConfig(dir), expectConfigError("cwd"));
+
+      await writeMcpJson(dir, {
+        mcpServers: { emptyCwd: { command: "node", cwd: "" } },
       });
 
       await assert.rejects(() => loadConfig(dir), expectConfigError("cwd"));
@@ -1107,17 +1165,25 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
     });
   });
 
-  it("carries Pi's oauth.clientName through to the DCR client metadata name", async () => {
+  it("carries Pi's oauth.clientName through to the DCR client metadata name and rejects blank clientName", async () => {
     await withTempDir(async (dir) => {
       await writeMcpJson(dir, {
         mcpServers: {
-          named: { url: "https://mcp.example.com/mcp", oauth: { clientName: "custom-client" } },
+          named: { url: "https://mcp.example.com/mcp", oauth: { clientName: "  custom-client  " } },
         },
       });
 
       const cfg = await loadConfig(dir);
 
       assert.equal(cfg.mcpServers["named"]?.auth?.clientName, "custom-client");
+
+      await writeMcpJson(dir, {
+        mcpServers: {
+          blank: { url: "https://mcp.example.com/mcp", oauth: { clientName: "   " } },
+        },
+      });
+
+      await assert.rejects(() => loadConfig(dir), expectConfigError("clientName"));
     });
   });
 });
