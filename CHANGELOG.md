@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-26
+
 ### Added
 - `/mcp <name>` now explains a server instead of only printing its state: the config source (`global`, `project`, or `extension`), transport and lifecycle, `Tools: <active>/<discovered> active`, the OAuth credential summary for servers with an `auth` config, a single troubleshooting `Hint:` when the server failed (`/mcp:auth <name>` or `--reset` for authorization failures, auth-lock contention, or `PI_MCP_DEBUG=1 pi` plus the issue tracker for connection failures), and a note when the project's `.pi/mcp.json` was skipped because the project is untrusted. A corrupt stored OAuth state file is reported as backed up and never breaks the view (#196).
 - `mcp_status` reports a `source` field (`global`, `project`, `extension`, or `unknown`) on every row, so an agent can tell a global entry from a project override or a `pi.registerMcpServer()` entry (#196).
