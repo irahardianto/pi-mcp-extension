@@ -18,4 +18,12 @@ rules:
           - metavariable-regex:
               metavariable: $PATTERN
               regex: ".*401.*"
-      - pattern-regex: /[^/\n]*401[^/\n]*/[a-z]*\.(test|exec)\(
+      # WHY: match the regex literal itself rather than `/<re>/.test(` / `/<re>/.exec(` so a `401`
+      # pattern is caught wherever it lives: inline, inside an array constant, or bound to a
+      # variable before `.some(...)` / `.test(...)` is called on it. Matching only the literal
+      # keeps ordinary strings (`"docs/http/401/handling.md"`) out of the findings.
+      - patterns:
+          - pattern: $REGEX_LITERAL
+          - metavariable-regex:
+              metavariable: $REGEX_LITERAL
+              regex: '^/(?:[^/\n\\]|\\.)*401(?:[^/\n\\]|\\.)*/[dgimsuvy]*$'

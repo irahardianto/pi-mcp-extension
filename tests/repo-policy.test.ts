@@ -557,6 +557,93 @@ describe("coverage and Qlty maintainability policy", () => {
     });
   });
 
+  it("configures [smells.boolean_logic] with threshold 4 in .qlty/qlty.toml", () => {
+    const qltyToml = readRepoFile(".qlty/qlty.toml");
+    assert.match(
+      qltyToml,
+      /\[smells\.boolean_logic\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*4/,
+      ".qlty/qlty.toml must configure [smells.boolean_logic] with enabled = true and threshold = 4",
+    );
+  });
+
+  it("configures pi-mcp/max-boolean-operators with max 3 on src and scripts in eslint.config.mjs", () => {
+    const eslintConfig = readRepoFile("eslint.config.mjs");
+    assert.match(
+      eslintConfig,
+      /"pi-mcp\/max-boolean-operators":\s*\[\s*"error",\s*\{\s*max:\s*3\s*\}\s*\]/,
+      "eslint.config.mjs must configure pi-mcp/max-boolean-operators with max: 3 as error",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts",\s*"scripts\/\*\*\/\*\.ts"\][\s\S]*?"pi-mcp\/max-boolean-operators"/,
+      "eslint.config.mjs must scope pi-mcp/max-boolean-operators to src/**/*.ts and scripts/**/*.ts",
+    );
+  });
+
+  it("enforces the boolean-operator cap on the whole expression, not per nested group", async () => {
+    const { RuleTester } = await import("eslint");
+    // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
+    const { maxBooleanOperatorsRule } = (await import("../eslint.config.mjs")) as {
+      maxBooleanOperatorsRule: import("eslint").Rule.RuleModule;
+    };
+    const message = (count: number): string =>
+      `Boolean expression has ${String(count)} logical operators (&& / ||), above the maximum of 3. Extract a named predicate or a constant lookup table instead of a long inline chain.`;
+    const ruleTester = new RuleTester();
+    ruleTester.run("pi-mcp/max-boolean-operators", maxBooleanOperatorsRule, {
+      valid: [
+        { code: "const ok = a && b && c && d;", options: [{ max: 3 }] },
+        { code: "const ok = (a && b) || (c && d);", options: [{ max: 3 }] },
+        { code: "const ok = a && (b || c) && d;", options: [{ max: 3 }] },
+        { code: "if (a && b) { x(); } else if (c || d) { y(); }", options: [{ max: 3 }] },
+        // WHY: `??` is a nullish fallback, not a multi-branch predicate; cognitive complexity governs it.
+        { code: "const ok = a ?? b ?? c ?? d ?? e;", options: [{ max: 3 }] },
+        { code: "const ok = messages.some((m) => /401/.test(m)) && ready;", options: [{ max: 3 }] },
+      ],
+      invalid: [
+        {
+          code: "const tooLong = a && b && c && d && e;",
+          options: [{ max: 3 }],
+          errors: [{ message: message(4) }],
+        },
+        {
+          code: "const splitAcrossGroups = (a && b) || (c && d) || (e && f);",
+          options: [{ max: 3 }],
+          errors: [{ message: message(5) }],
+        },
+        {
+          code: "if (a && b || c && d || e) { x(); }",
+          options: [{ max: 3 }],
+          errors: [{ message: message(4) }],
+        },
+        {
+          code: "function guard(a) { return a.one || a.two || a.three || a.four || a.five; }",
+          options: [{ max: 3 }],
+          errors: [{ message: message(4) }],
+        },
+      ],
+    });
+  });
+
+  it("documents the boolean-operator limit in AGENTS.md and CONTRIBUTING.md", () => {
+    const agents = readRepoFile("AGENTS.md");
+    assert.match(
+      agents,
+      /^[- ]+.*pi-mcp\/max-boolean-operators/m,
+      "AGENTS.md must name the pi-mcp/max-boolean-operators rule",
+    );
+    assert.match(
+      agents,
+      /at `<= 3` logical operators/,
+      "AGENTS.md must document the <= 3 logical-operator limit",
+    );
+    const contributing = readRepoFile("CONTRIBUTING.md");
+    assert.match(
+      contributing,
+      /pi-mcp\/max-boolean-operators/,
+      "CONTRIBUTING.md must name the pi-mcp/max-boolean-operators rule",
+    );
+  });
+
   it("documents the function-complexity standard in AGENTS.md and CONTRIBUTING.md", () => {
     const agents = readRepoFile("AGENTS.md");
     assert.match(

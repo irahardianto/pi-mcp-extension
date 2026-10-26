@@ -280,6 +280,69 @@ export const maxReturnStatementsRule = {
   },
 };
 
+function isBooleanOperator(node) {
+  return node?.type === "LogicalExpression" && (node.operator === "&&" || node.operator === "||");
+}
+
+/**
+ * Total `&&` / `||` operators inside a boolean expression tree. Only logical subtrees are
+ * descended into, so an unrelated `&&` chain nested in a call argument keeps its own budget.
+ */
+function countBooleanOperators(node) {
+  if (!isBooleanOperator(node)) return 0;
+  return 1 + countBooleanOperators(node.left) + countBooleanOperators(node.right);
+}
+
+/**
+ * Caps `&&` / `||` operators per boolean expression, mirroring Qlty's `boolean_logic` smell
+ * (`[smells.boolean_logic]`, threshold 4 → expressions with >= 4 operators are flagged). The
+ * chain is counted from its root, so `(a && b) || (c && d) || e` cannot split its budget across
+ * sub-expressions. `??` chains are deliberate nullish fallbacks and stay governed by
+ * `pi-mcp/max-cognitive-complexity`.
+ */
+export const maxBooleanOperatorsRule = {
+  meta: {
+    type: "suggestion",
+    schema: [
+      {
+        type: "object",
+        properties: { max: { type: "integer", minimum: 1 } },
+        additionalProperties: false,
+      },
+    ],
+    messages: {
+      tooComplex:
+        "Boolean expression has {{count}} logical operators (&& / ||), above the maximum of {{max}}. Extract a named predicate or a constant lookup table instead of a long inline chain.",
+    },
+  },
+  create(context) {
+    const max = context.options[0]?.max ?? 3;
+    return {
+      LogicalExpression(node) {
+        if (!isBooleanOperator(node)) return;
+        // Report once per expression, from its root, with the whole tree's operator count.
+        if (isBooleanOperator(node.parent)) return;
+        const count = countBooleanOperators(node);
+        if (count > max) {
+          context.report({
+            node,
+            messageId: "tooComplex",
+            data: { count: String(count), max: String(max) },
+          });
+        }
+      },
+    };
+  },
+};
+
+const piMcpPlugin = {
+  rules: {
+    "max-return-statements": maxReturnStatementsRule,
+    "max-cognitive-complexity": maxCognitiveComplexityRule,
+    "max-boolean-operators": maxBooleanOperatorsRule,
+  },
+};
+
 export default tseslint.config(
   {
     ignores: ["node_modules/**", ".semgrep/**"],
@@ -341,6 +404,9 @@ export default tseslint.config(
   },
   {
     files: ["src/**/*.ts", "scripts/**/*.ts"],
+    plugins: {
+      "pi-mcp": piMcpPlugin,
+    },
     rules: {
       "max-depth": ["error", 4],
       "no-restricted-syntax": [
@@ -351,17 +417,13 @@ export default tseslint.config(
             "Control flow is nested too deeply (level >= 5). Decompose into focused helper functions or flatten branches with early returns.",
         },
       ],
+      "pi-mcp/max-boolean-operators": ["error", { max: 3 }],
     },
   },
   {
     files: ["src/**/*.ts"],
     plugins: {
-      "pi-mcp": {
-        rules: {
-          "max-return-statements": maxReturnStatementsRule,
-          "max-cognitive-complexity": maxCognitiveComplexityRule,
-        },
-      },
+      "pi-mcp": piMcpPlugin,
     },
     rules: {
       "no-console": ["error", { allow: ["error"] }],

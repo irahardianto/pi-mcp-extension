@@ -45,6 +45,14 @@ threshold = 5
 enabled = true
 threshold = 15
 
+# WHY: `threshold = 4` is Qlty's minimum offending `&&` / `||` operator count, so `<= 3` operators
+# pass and `>= 4` are reported as `Complex binary expression` (verified against this Qlty build).
+# It matches ESLint's `pi-mcp/max-boolean-operators` cap of 3 (see AGENTS.md -> Architecture):
+# the ESLint rule is the blocking gate, this smell keeps the Qlty dashboard on the same threshold.
+[smells.boolean_logic]
+enabled = true
+threshold = 4
+
 # Disable third-party linters so CI workflows (.github/workflows/ci.yml, semgrep.yml,
 # secret-scan.yml, workflow-lint.yml) remain the single source of truth.
 [[plugin]]

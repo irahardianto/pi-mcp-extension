@@ -53,6 +53,11 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
   `<= 4` control-flow nesting levels. Qlty's `function_complexity`,
   `return_statements`, and `nested_control_flow` smells use the same thresholds;
   keep `qlty smells --all` clean when you touch `src/`.
+- `npm run lint` also caps boolean expressions at `<= 3` `&&` / `||` operators on
+  `src/**/*.ts` and `scripts/**/*.ts` (`pi-mcp/max-boolean-operators`), matching
+  Qlty's `boolean_logic` smell (threshold 4). Extract a named predicate or a
+  lookup table instead of a long inline chain; keep `qlty smells --all` free of
+  `Complex binary expression` findings.
 - Work on a branch and open a PR. Do not push to `main`; every push to `main`
   can publish to npm.
 - Use a [Conventional Commit](https://www.conventionalcommits.org/) **PR title**.
