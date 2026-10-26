@@ -310,31 +310,115 @@ function createLockHandle(ctx: LockContext): AuthLockHandle {
   });
 }
 
+function errnoCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException).code;
+}
+
+/** Stat the existing lock file; `undefined` when it disappeared (ENOENT) mid-race. */
+async function statExistingLockFile(
+  path: string,
+  deps: AuthLockDeps,
+): Promise<{ mtimeMs: number } | undefined> {
+  try {
+    return await deps.fs.stat(path);
+  } catch (statErr) {
+    if (errnoCode(statErr) === "ENOENT") {
+      return undefined;
+    }
+    throw statErr;
+  }
+}
+
+/**
+ * Read and parse the lock record at `path`.
+ * `undefined` means the file vanished (ENOENT); `null` means it is unreadable or corrupt.
+ */
+async function readExistingLockRecord(
+  path: string,
+  deps: AuthLockDeps,
+): Promise<LockRecord | null | undefined> {
+  try {
+    return parseLockRecord(await deps.fs.readFile(path, "utf8"));
+  } catch (readErr) {
+    if (errnoCode(readErr) === "ENOENT") {
+      return undefined;
+    }
+    return null;
+  }
+}
+
+/** Read the moved stale candidate; a missing or corrupt candidate is treated as unparsable. */
+async function readMovedLockRecord(path: string, deps: AuthLockDeps): Promise<LockRecord | null> {
+  try {
+    return parseLockRecord(await deps.fs.readFile(path, "utf8"));
+  } catch {
+    // WHY: Best-effort inspection of a renamed candidate; an unreadable file simply fails the
+    // identity check below and the contender's lock is restored instead of reclaimed.
+    return null;
+  }
+}
+
+/** Move the stale candidate aside; `undefined` when it vanished (ENOENT) before the rename. */
+async function moveStaleCandidate(path: string, deps: AuthLockDeps): Promise<string | undefined> {
+  const movedPath = `${path}.stale-${randomUUID()}`;
+  try {
+    await deps.fs.rename(path, movedPath);
+    return movedPath;
+  } catch (renameErr) {
+    if (errnoCode(renameErr) === "ENOENT") {
+      return undefined;
+    }
+    throw renameErr;
+  }
+}
+
+/**
+ * Confirm the file moved aside is the same lock we measured as stale: either the same nonce, or,
+ * when the stale lock was unparsable, an unparsable file with the same mtime.
+ */
+async function isSameStaleCandidate(
+  record: LockRecord | null,
+  movedRecord: LockRecord | null,
+  movedPath: string,
+  statResult: { mtimeMs: number },
+  deps: AuthLockDeps,
+): Promise<boolean> {
+  if (record !== null) {
+    return movedRecord !== null && movedRecord.nonce === record.nonce;
+  }
+  try {
+    const movedStat = await deps.fs.stat(movedPath);
+    return movedRecord === null && movedStat.mtimeMs === statResult.mtimeMs;
+  } catch {
+    // WHY: A vanished moved file cannot be the stale lock we measured; fall back to restore.
+    return false;
+  }
+}
+
+/** Restore a contender's fresh lock file, then clean up the temporary candidate path. */
+async function restoreCandidate(movedPath: string, path: string, deps: AuthLockDeps): Promise<void> {
+  await deps.fs.link(movedPath, path).catch(() => {
+    // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
+  });
+  await deps.fs.unlink(movedPath).catch(() => {
+    // WHY: Best-effort cleanup of temporary stale-check file.
+  });
+}
+
 async function inspectAndReclaimStaleLock(
   serverName: string,
   path: string,
   deps: AuthLockDeps,
 ): Promise<void> {
   // Lock file already exists — inspect and check staleness
-  let statResult: { mtimeMs: number };
-  try {
-    statResult = await deps.fs.stat(path);
-  } catch (statErr) {
-    if ((statErr as NodeJS.ErrnoException).code === "ENOENT") {
-      return;
-    }
-    throw statErr;
+  const statResult = await statExistingLockFile(path, deps);
+  if (!statResult) {
+    return;
   }
 
-  let record: LockRecord | null = null;
-  try {
-    const raw = await deps.fs.readFile(path, "utf8");
-    record = parseLockRecord(raw);
-  } catch (readErr) {
-    if ((readErr as NodeJS.ErrnoException).code === "ENOENT") {
-      return;
-    }
-    record = null;
+  const record = await readExistingLockRecord(path, deps);
+  if (record === undefined) {
+    return;
   }
 
   const stale = isLockStale(record, statResult.mtimeMs, deps.clock.now(), {
@@ -346,49 +430,20 @@ async function inspectAndReclaimStaleLock(
   }
 
   // Reclaim protocol: move stale candidate aside, verify identity, then delete or restore
-  const movedPath = `${path}.stale-${randomUUID()}`;
-  try {
-    await deps.fs.rename(path, movedPath);
-  } catch (renameErr) {
-    if ((renameErr as NodeJS.ErrnoException).code === "ENOENT") {
-      return;
-    }
-    throw renameErr;
+  const movedPath = await moveStaleCandidate(path, deps);
+  if (!movedPath) {
+    return;
   }
 
-  let movedRecord: LockRecord | null = null;
-  try {
-    const movedRaw = await deps.fs.readFile(movedPath, "utf8");
-    movedRecord = parseLockRecord(movedRaw);
-  } catch {
-    movedRecord = null;
-  }
-
-  let matchesStale = false;
-  if (record !== null) {
-    matchesStale = movedRecord !== null && movedRecord.nonce === record.nonce;
-  } else {
-    try {
-      const movedStat = await deps.fs.stat(movedPath);
-      matchesStale = movedRecord === null && movedStat.mtimeMs === statResult.mtimeMs;
-    } catch {
-      matchesStale = false;
-    }
-  }
-
-  if (matchesStale) {
+  const movedRecord = await readMovedLockRecord(movedPath, deps);
+  if (await isSameStaleCandidate(record, movedRecord, movedPath, statResult, deps)) {
     await deps.fs.unlink(movedPath).catch(() => {
       // WHY: Best-effort removal of reclaimed stale lock file.
     });
     return;
   }
 
-  await deps.fs.link(movedPath, path).catch(() => {
-    // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
-  });
-  await deps.fs.unlink(movedPath).catch(() => {
-    // WHY: Best-effort cleanup of temporary stale-check file.
-  });
+  await restoreCandidate(movedPath, path, deps);
   throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
 }
 

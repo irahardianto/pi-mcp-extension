@@ -74,26 +74,59 @@ const AuthConfigSchema = z.preprocess(
     }),
 );
 
+/** Map legacy `type`/`url`-only entries onto an explicit `transport`. */
+function normalizeTransportAlias(obj: Record<string, unknown>): void {
+  const rawTransport = obj.transport ?? obj.type;
+  if (rawTransport === "http") {
+    obj.transport = "streamable-http";
+    return;
+  }
+  if (obj.transport !== undefined) {
+    return;
+  }
+  if (rawTransport !== undefined) {
+    obj.transport = rawTransport;
+    return;
+  }
+  if (obj.url !== undefined && obj.command === undefined) {
+    obj.transport = "streamable-http";
+  }
+}
+
+/** Map the legacy `oauth` object onto `auth`. */
+function normalizeAuthAlias(obj: Record<string, unknown>): void {
+  if (obj.auth !== undefined) {
+    return;
+  }
+  const oauth = obj.oauth;
+  if (oauth && typeof oauth === "object" && !Array.isArray(oauth)) {
+    obj.auth = oauth;
+  }
+}
+
+/** Map legacy `timeout` (seconds) onto `requestTimeoutMs` (milliseconds). */
+function normalizeTimeoutAlias(obj: Record<string, unknown>): void {
+  if (obj.requestTimeoutMs !== undefined) {
+    return;
+  }
+  if (typeof obj.timeout !== "number" || obj.timeout <= 0) {
+    return;
+  }
+  obj.requestTimeoutMs = obj.timeout * 1000;
+}
+
+/** Rewrite Pi 1.x config aliases (`type`, `oauth`, `timeout`) before schema validation. */
+function normalizeServerConfigAliases(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const obj = { ...(raw as Record<string, unknown>) };
+  normalizeTransportAlias(obj);
+  normalizeAuthAlias(obj);
+  normalizeTimeoutAlias(obj);
+  return obj;
+}
+
 export const ServerConfigSchema = z.preprocess(
-  (raw) => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
-    const obj = { ...(raw as Record<string, unknown>) };
-    const rawTransport = obj.transport ?? obj.type;
-    if (rawTransport === "http") {
-      obj.transport = "streamable-http";
-    } else if (obj.transport === undefined && rawTransport !== undefined) {
-      obj.transport = rawTransport;
-    } else if (obj.transport === undefined && obj.url !== undefined && obj.command === undefined) {
-      obj.transport = "streamable-http";
-    }
-    if (obj.auth === undefined && obj.oauth && typeof obj.oauth === "object" && !Array.isArray(obj.oauth)) {
-      obj.auth = obj.oauth;
-    }
-    if (obj.requestTimeoutMs === undefined && typeof obj.timeout === "number" && obj.timeout > 0) {
-      obj.requestTimeoutMs = obj.timeout * 1000;
-    }
-    return obj;
-  },
+  normalizeServerConfigAliases,
   z
     .object({
       /** Executable to spawn (e.g. "npx", "node", "uvx"). Required for stdio. */

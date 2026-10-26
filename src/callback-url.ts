@@ -57,6 +57,58 @@ export function isSafeAuthorizationUrl(input: string | URL): boolean {
   return false;
 }
 
+function parseRedirectUrl(input: string): URL {
+  try {
+    return new URL(input.trim());
+  } catch {
+    throw new CallbackUrlValidationError("invalid_url", "Invalid redirect URL");
+  }
+}
+
+function expectedRedirectUrl(redirectUrl: string | URL): URL {
+  return redirectUrl instanceof URL ? redirectUrl : new URL(String(redirectUrl));
+}
+
+/** Reject a callback URL whose origin or path differs from the configured redirect URL. */
+function assertRedirectTargetMatches(url: URL, redirectUrl: string | URL | undefined): void {
+  if (redirectUrl === undefined) {
+    if (url.pathname !== "/callback") {
+      throw new CallbackUrlValidationError("wrong_path", "Redirect URL path must be /callback");
+    }
+    return;
+  }
+
+  const expected = expectedRedirectUrl(redirectUrl);
+  if (url.protocol !== expected.protocol || url.hostname !== expected.hostname || url.port !== expected.port) {
+    throw new CallbackUrlValidationError(
+      "wrong_origin",
+      `Redirect URL origin must match ${expected.origin}`,
+    );
+  }
+  if (url.pathname !== expected.pathname) {
+    throw new CallbackUrlValidationError(
+      "wrong_path",
+      `Redirect URL path must be ${expected.pathname}`,
+    );
+  }
+}
+
+const INVALID_STATE_MESSAGE = "Invalid or expired state parameter - potential CSRF attack";
+
+/** Reject a callback whose `state` does not match the expected literal or predicate. */
+function assertExpectedState(
+  state: string,
+  expectedState: string | ((state: string) => boolean) | undefined,
+): void {
+  if (expectedState === undefined) {
+    return;
+  }
+  const matches = typeof expectedState === "string" ? state === expectedState : expectedState(state);
+  if (!matches) {
+    throw new CallbackUrlValidationError("invalid_state", INVALID_STATE_MESSAGE);
+  }
+}
+
 /**
  * Parse and validate an OAuth callback URL (either from an incoming HTTP callback request
  * or from a user-pasted redirect URL).
@@ -65,38 +117,8 @@ export function parseCallbackUrl(
   input: string,
   options: ParseCallbackUrlOptions = {},
 ): { state: string; code: string } | { state: string; error: string } {
-  const trimmed = input.trim();
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new CallbackUrlValidationError("invalid_url", "Invalid redirect URL");
-  }
-
-  if (options.redirectUrl !== undefined) {
-    const expected =
-      options.redirectUrl instanceof URL
-        ? options.redirectUrl
-        : new URL(String(options.redirectUrl));
-    if (
-      url.protocol !== expected.protocol ||
-      url.hostname !== expected.hostname ||
-      url.port !== expected.port
-    ) {
-      throw new CallbackUrlValidationError(
-        "wrong_origin",
-        `Redirect URL origin must match ${expected.origin}`,
-      );
-    }
-    if (url.pathname !== expected.pathname) {
-      throw new CallbackUrlValidationError(
-        "wrong_path",
-        `Redirect URL path must be ${expected.pathname}`,
-      );
-    }
-  } else if (url.pathname !== "/callback") {
-    throw new CallbackUrlValidationError("wrong_path", "Redirect URL path must be /callback");
-  }
+  const url = parseRedirectUrl(input);
+  assertRedirectTargetMatches(url, options.redirectUrl);
 
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
@@ -110,17 +132,7 @@ export function parseCallbackUrl(
     );
   }
 
-  if (typeof options.expectedState === "string" && state !== options.expectedState) {
-    throw new CallbackUrlValidationError(
-      "invalid_state",
-      "Invalid or expired state parameter - potential CSRF attack",
-    );
-  } else if (typeof options.expectedState === "function" && !options.expectedState(state)) {
-    throw new CallbackUrlValidationError(
-      "invalid_state",
-      "Invalid or expired state parameter - potential CSRF attack",
-    );
-  }
+  assertExpectedState(state, options.expectedState);
 
   if (error) {
     return { state, error: errorDescription || error };

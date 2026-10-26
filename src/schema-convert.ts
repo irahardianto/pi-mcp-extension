@@ -347,6 +347,39 @@ function convertArraySchema(
   );
 }
 
+/** Resolve an `allOf` sub-schema's `$ref` (unless it is already being resolved). */
+function resolveAllOfSubSchema(sub: Record<string, unknown>, ctx: ConversionContext): Record<string, unknown> {
+  const ref = sub["$ref"];
+  if (typeof ref !== "string" || ctx.seenRefs.has(ref)) {
+    return sub;
+  }
+  return resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot) ?? sub;
+}
+
+/** Merge a sub-schema's properties without overwriting properties declared by the caller. */
+function mergeSubSchemaProperties(props: unknown, rawProperties: Record<string, unknown>): void {
+  if (!isPlainObject(props)) {
+    return;
+  }
+  for (const [key, value] of Object.entries(props)) {
+    if (!(key in rawProperties)) {
+      rawProperties[key] = value;
+    }
+  }
+}
+
+/** Merge a sub-schema's `required` names into the caller's required set. */
+function mergeSubSchemaRequired(req: unknown, required: Set<string>): void {
+  if (!Array.isArray(req)) {
+    return;
+  }
+  for (const reqKey of req) {
+    if (typeof reqKey === "string") {
+      required.add(reqKey);
+    }
+  }
+}
+
 function mergeAllOfSubSchema(
   sub: unknown,
   rawProperties: Record<string, unknown>,
@@ -356,28 +389,9 @@ function mergeAllOfSubSchema(
   if (!isPlainObject(sub)) {
     return;
   }
-  const resolvedSub =
-    typeof sub["$ref"] === "string" && !ctx.seenRefs.has(sub["$ref"])
-      ? (resolveRefTarget(sub["$ref"], ctx.rootDefs, ctx.effectiveRoot) ?? sub)
-      : sub;
-
-  const props = resolvedSub["properties"];
-  if (isPlainObject(props)) {
-    for (const [k, v] of Object.entries(props)) {
-      if (!(k in rawProperties)) {
-        rawProperties[k] = v;
-      }
-    }
-  }
-
-  const req = resolvedSub["required"];
-  if (Array.isArray(req)) {
-    for (const reqKey of req) {
-      if (typeof reqKey === "string") {
-        required.add(reqKey);
-      }
-    }
-  }
+  const resolvedSub = resolveAllOfSubSchema(sub, ctx);
+  mergeSubSchemaProperties(resolvedSub["properties"], rawProperties);
+  mergeSubSchemaRequired(resolvedSub["required"], required);
 }
 
 function convertObjectSchema(

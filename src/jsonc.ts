@@ -79,6 +79,29 @@ function consumeBlockComment(text: string, start: number): ConsumedChunk {
 }
 
 /**
+ * Consume the next token of the document: a double-quoted string, a line comment
+ * (dropped, text preserved), a block comment (masked), or a single literal character.
+ * Keeping the dispatch in one named helper keeps the scan loop flat.
+ */
+function consumeNextChunk(text: string, index: number): ConsumedChunk {
+  const ch = text[index]!;
+
+  if (ch === '"') {
+    return consumeDoubleQuotedString(text, index);
+  }
+
+  if (ch === "/" && text[index + 1] === "/") {
+    return { chunk: "", nextIndex: skipLineComment(text, index) };
+  }
+
+  if (ch === "/" && text[index + 1] === "*") {
+    return consumeBlockComment(text, index);
+  }
+
+  return { chunk: ch, nextIndex: index + 1 };
+}
+
+/**
  * Strip `//` line comments and `/* ... *\/` block comments outside of double-quoted
  * JSON strings in a single character-by-character pass.
  *
@@ -97,29 +120,9 @@ export function stripJsonComments(text: string): string {
   let index = 0;
 
   while (index < text.length) {
-    const ch = text[index]!;
-
-    if (ch === '"') {
-      const string = consumeDoubleQuotedString(text, index);
-      out += string.chunk;
-      index = string.nextIndex;
-      continue;
-    }
-
-    if (ch === "/" && text[index + 1] === "/") {
-      index = skipLineComment(text, index);
-      continue;
-    }
-
-    if (ch === "/" && text[index + 1] === "*") {
-      const comment = consumeBlockComment(text, index);
-      out += comment.chunk;
-      index = comment.nextIndex;
-      continue;
-    }
-
-    out += ch;
-    index += 1;
+    const consumed = consumeNextChunk(text, index);
+    out += consumed.chunk;
+    index = consumed.nextIndex;
   }
 
   return out;
