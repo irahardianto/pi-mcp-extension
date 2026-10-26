@@ -36,6 +36,7 @@ import { createTransport } from "./transport-factory.js";
 import {
   classifyConnectFailure,
   isOAuthUnauthorizedError,
+  type ConnectFailureAction,
 } from "./connect-policy.js";
 
 export {
@@ -102,6 +103,98 @@ export type ToolRefreshCallback = (
 
 /** Called when background auto-recovery after a disconnect or health check fails. */
 export type RecoveryFailedCallback = (serverName: string, error: Error) => void;
+
+interface HandshakeParams {
+  server: ManagedServer;
+  client: Client;
+  transport: Transport;
+  timeoutMs: number;
+  signal: AbortSignal;
+  currentCwd: string;
+}
+
+interface ConnectFailureContext {
+  server: ManagedServer;
+  client: Client;
+  transport: Transport;
+  cwd: string;
+  signal: AbortSignal;
+  corruptStateRecovered: boolean;
+  err: unknown;
+}
+
+interface ConnectRaceGuard {
+  outcome: Promise<never>;
+  dispose: () => void;
+}
+
+function createConnectRaceGuard(
+  timeoutMs: number,
+  signal: AbortSignal,
+  serverName: string,
+): ConnectRaceGuard {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+
+  const outcome = new Promise<never>((_resolve, reject) => {
+    if (signal.aborted) {
+      reject(new AuthCancelledError(serverName));
+      return;
+    }
+    onAbort = () => {
+      reject(new AuthCancelledError(serverName));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    timer = setTimeout(() => {
+      reject(
+        new McpError(
+          `Connection timed out after ${timeoutMs}ms`,
+          serverName,
+          "timeout",
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  const dispose = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    if (onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  };
+
+  return { outcome, dispose };
+}
+
+function isSdkTimeoutError(err: unknown): boolean {
+  if (err instanceof McpError) return false;
+  if ((err as { code?: unknown } | null)?.code === -32001) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /Request timed out|timed out/i.test(message);
+}
+
+function rethrowNormalizedConnectError(
+  err: unknown,
+  signal: AbortSignal,
+  serverName: string,
+  timeoutMs: number,
+): never {
+  if (signal.aborted || err instanceof AuthCancelledError) {
+    throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
+  }
+  if (isSdkTimeoutError(err)) {
+    throw new McpError(
+      `Connection timed out after ${timeoutMs}ms`,
+      serverName,
+      "timeout",
+      err,
+    );
+  }
+  throw err;
+}
 
 // ─── ServerManager ────────────────────────────────────────────────────────────
 
@@ -372,56 +465,13 @@ export class ServerManager {
       // WHY: Handled via Promise.race below.
     });
 
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let onAbort: (() => void) | undefined;
-
-    const raceOutcome = new Promise<never>((_resolve, reject) => {
-      if (signal.aborted) {
-        reject(new AuthCancelledError(serverName));
-        return;
-      }
-      onAbort = () => {
-        reject(new AuthCancelledError(serverName));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-
-      timer = setTimeout(() => {
-        reject(
-          new McpError(
-            `Connection timed out after ${timeoutMs}ms`,
-            serverName,
-            "timeout",
-          ),
-        );
-      }, timeoutMs);
-    });
-
+    const guard = createConnectRaceGuard(timeoutMs, signal, serverName);
     try {
-      await Promise.race([connectPromise, raceOutcome]);
+      await Promise.race([connectPromise, guard.outcome]);
     } catch (err) {
-      if (signal.aborted || err instanceof AuthCancelledError) {
-        throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
-      }
-      if (
-        !(err instanceof McpError) &&
-        ((err as { code?: unknown })?.code === -32001 ||
-          /Request timed out|timed out/i.test(err instanceof Error ? err.message : String(err)))
-      ) {
-        throw new McpError(
-          `Connection timed out after ${timeoutMs}ms`,
-          serverName,
-          "timeout",
-          err,
-        );
-      }
-      throw err;
+      rethrowNormalizedConnectError(err, signal, serverName, timeoutMs);
     } finally {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
-      if (onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
+      guard.dispose();
     }
   }
 
@@ -556,14 +606,8 @@ export class ServerManager {
     return client;
   }
 
-  private async _handshakeAndDiscover(
-    server: ManagedServer,
-    client: Client,
-    transport: Transport,
-    timeoutMs: number,
-    signal: AbortSignal,
-    currentCwd: string,
-  ): Promise<void> {
+  private async _handshakeAndDiscover(params: HandshakeParams): Promise<void> {
+    const { server, client, transport, timeoutMs, signal, currentCwd } = params;
     await this._connectWithTimeoutAndSignal(client, transport, timeoutMs, signal, server.name);
     if (signal.aborted) throw new AuthCancelledError(server.name);
     if (transport instanceof StdioClientTransport && !server.childPid) {
@@ -855,84 +899,135 @@ export class ServerManager {
     server.client = client;
 
     try {
-      await this._handshakeAndDiscover(server, client, transport, timeoutMs, signal, currentCwd);
+      await this._handshakeAndDiscover({ server, client, transport, timeoutMs, signal, currentCwd });
       this._startHealthCheck(server, timeoutMs, signal, cwd);
       this._wireDisconnectRecovery(server, client, signal, cwd);
     } catch (err) {
-      await this._cleanupFailedConnect(server, client, transport);
-
-      const action = classifyConnectFailure({
-        error: err,
-        aborted: signal.aborted,
+      await this._handleConnectFailure({
+        server,
+        client,
+        transport,
+        cwd,
+        signal,
         corruptStateRecovered,
-        hasAuth: Boolean(server.config.auth),
-        transport: server.config.transport,
-        retryCount: server.retryCount,
-        maxRetries: this.settings.maxRetries,
-        serverName: server.name,
+        err,
       });
-
-      const error = err instanceof Error ? err : new Error(String(err));
-      const { kind: errorKind, message: errorMessage } = describeError(err);
-
-      reportDiagnostic({
-        level: action.kind === "cancelled" ? "info" : "warn",
-        event: "server.connect_failure",
-        server: server.name,
-        message: `Connection attempt for ${server.name} failed: ${errorMessage}`,
-        fields: { outcome: action.kind, kind: errorKind, attempt: server.retryCount },
-      });
-
-      switch (action.kind) {
-        case "cancelled":
-          throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
-        case "retry-corrupt-state": {
-          reportDiagnostic({
-            level: "warn",
-            event: "oauth.state_corrupt",
-            server: server.name,
-            message: errorMessage,
-            fields: { kind: errorKind },
-          });
-          if (signal.aborted) throw new AuthCancelledError(server.name);
-          return this._connect(server, server.cwd ?? cwd, signal, true);
-        }
-        case "auth-required": {
-          server.lastError = error;
-          if (action.invalidateTokens) {
-            await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
-          }
-          const authError = err instanceof AuthRequiredError ? err : new AuthRequiredError(server.name);
-          server.lastError = authError;
-          this._setState(server, "stopped", "auth-required");
-          throw authError;
-        }
-        case "fail":
-          server.lastError = action.error;
-          this._setState(server, "stopped", "failed");
-          throw action.error;
-        case "give-up":
-          server.lastError = error;
-          this._setState(server, "stopped", "give-up");
-          throw action.error;
-        case "retry": {
-          server.lastError = error;
-          server.retryCount++;
-          reportDiagnostic({
-            level: "warn",
-            event: "server.retry",
-            server: server.name,
-            message: `Retrying ${server.name} in ${action.delayMs}ms (attempt ${server.retryCount})`,
-            fields: { attempt: server.retryCount, delayMs: action.delayMs },
-          });
-          await this._waitRetry(server, signal, action.delayMs);
-          if (signal.aborted) throw new AuthCancelledError(server.name);
-          return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
-        }
-      }
     }
   }
 
+  private async _handleConnectFailure(context: ConnectFailureContext): Promise<void> {
+    const { server, client, transport, signal, corruptStateRecovered, err } = context;
+    await this._cleanupFailedConnect(server, client, transport);
+
+    const action = classifyConnectFailure({
+      error: err,
+      aborted: signal.aborted,
+      corruptStateRecovered,
+      hasAuth: Boolean(server.config.auth),
+      transport: server.config.transport,
+      retryCount: server.retryCount,
+      maxRetries: this.settings.maxRetries,
+      serverName: server.name,
+    });
+
+    this._reportConnectFailure(server, action.kind, err);
+    return this._applyConnectFailureAction(context, action);
+  }
+
+  private _reportConnectFailure(
+    server: ManagedServer,
+    outcome: ConnectFailureAction["kind"],
+    err: unknown,
+  ): void {
+    const { kind: errorKind, message: errorMessage } = describeError(err);
+    reportDiagnostic({
+      level: outcome === "cancelled" ? "info" : "warn",
+      event: "server.connect_failure",
+      server: server.name,
+      message: `Connection attempt for ${server.name} failed: ${errorMessage}`,
+      fields: { outcome, kind: errorKind, attempt: server.retryCount },
+    });
+  }
+
+  private async _applyConnectFailureAction(
+    context: ConnectFailureContext,
+    action: ConnectFailureAction,
+  ): Promise<void> {
+    const { server, cwd, signal, corruptStateRecovered, err } = context;
+    const error = err instanceof Error ? err : new Error(String(err));
+    switch (action.kind) {
+      case "cancelled":
+        throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
+      case "retry-corrupt-state":
+        return this._retryCorruptState(server, cwd, signal, err);
+      case "auth-required":
+        return this._raiseAuthRequired(server, err, action.invalidateTokens);
+      case "fail":
+        server.lastError = action.error;
+        this._setState(server, "stopped", "failed");
+        throw action.error;
+      case "give-up":
+        server.lastError = error;
+        this._setState(server, "stopped", "give-up");
+        throw action.error;
+      case "retry":
+        server.lastError = error;
+        return this._scheduleReconnect(server, cwd, signal, corruptStateRecovered, action.delayMs);
+    }
+  }
+
+  private _retryCorruptState(
+    server: ManagedServer,
+    cwd: string,
+    signal: AbortSignal,
+    err: unknown,
+  ): Promise<void> {
+    const { kind: errorKind, message: errorMessage } = describeError(err);
+    reportDiagnostic({
+      level: "warn",
+      event: "oauth.state_corrupt",
+      server: server.name,
+      message: errorMessage,
+      fields: { kind: errorKind },
+    });
+    if (signal.aborted) throw new AuthCancelledError(server.name);
+    return this._connect(server, server.cwd ?? cwd, signal, true);
+  }
+
+  private async _raiseAuthRequired(
+    server: ManagedServer,
+    err: unknown,
+    invalidateTokens: boolean,
+  ): Promise<never> {
+    server.lastError = err instanceof Error ? err : new Error(String(err));
+    if (invalidateTokens) {
+      await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
+    }
+    const authError = err instanceof AuthRequiredError ? err : new AuthRequiredError(server.name);
+    server.lastError = authError;
+    this._setState(server, "stopped", "auth-required");
+    throw authError;
+  }
+
+  private async _scheduleReconnect(
+    server: ManagedServer,
+    cwd: string,
+    signal: AbortSignal,
+    corruptStateRecovered: boolean,
+    delayMs: number,
+  ): Promise<void> {
+    server.retryCount++;
+    reportDiagnostic({
+      level: "warn",
+      event: "server.retry",
+      server: server.name,
+      message: `Retrying ${server.name} in ${delayMs}ms (attempt ${server.retryCount})`,
+      fields: { attempt: server.retryCount, delayMs },
+    });
+    await this._waitRetry(server, signal, delayMs);
+    if (signal.aborted) throw new AuthCancelledError(server.name);
+    return this._connect(server, server.cwd ?? cwd, signal, corruptStateRecovered);
+  }
 
   /** Tear down a server that died or stopped responding, then reconnect. */
   private async _recover(server: ManagedServer, cwd: string): Promise<void> {

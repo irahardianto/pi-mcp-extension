@@ -21,36 +21,72 @@ function isHttpStatusCodeUnauthorized(numericCode: number, error: unknown): bool
   return false;
 }
 
+function extractNumericStatusCode(rec: {
+  code?: unknown;
+  status?: unknown;
+  statusCode?: unknown;
+}): number | undefined {
+  if (typeof rec.code === "number") return rec.code;
+  if (typeof rec.status === "number") return rec.status;
+  if (typeof rec.statusCode === "number") return rec.statusCode;
+  return undefined;
+}
+
 function isObjectRecordUnauthorized(
   error: object,
   seen: Set<unknown>,
 ): boolean | undefined {
-  if (error instanceof McpError) {
+  if (error instanceof McpError && error.code === "tool") {
     // WHY: Tool-level application errors (`isError: true`) come from tool execution logic
     // (e.g. "found 401 items in database") and must never trigger MCP OAuth re-authentication.
-    if (error.code === "tool") {
-      return false;
-    }
+    return false;
   }
 
   const rec = error as { code?: unknown; status?: unknown; statusCode?: unknown; cause?: unknown };
   if (rec.cause !== undefined && isOAuthUnauthorizedError(rec.cause, seen)) {
     return true;
   }
-  const numericCode =
-    typeof rec.code === "number"
-      ? rec.code
-      : typeof rec.status === "number"
-        ? rec.status
-        : typeof rec.statusCode === "number"
-          ? rec.statusCode
-          : undefined;
+  const numericCode = extractNumericStatusCode(rec);
   // WHY: Only treat 100..599 as HTTP status codes so negative JSON-RPC error codes
   // (e.g. -32000) still inspect the error message for wrapped HTTP 401/403 status text.
   if (numericCode !== undefined && numericCode >= 100 && numericCode <= 599) {
     return isHttpStatusCodeUnauthorized(numericCode, error);
   }
   return undefined;
+}
+
+function hasBare401StatusMarker(msg: string): boolean {
+  return (
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /^\s*401\s*$/.test(msg) ||
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /\bHTTP(?:\/\d(?:\.\d)?)?[:\s]+401\b/i.test(msg) ||
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /\bstatus(?:\s+code)?[:\s(]+401\b/i.test(msg)
+  );
+}
+
+function hasWrapped401StatusText(msg: string): boolean {
+  return (
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /\b(?:POSTing|GETting|connecting)\s+to\s+\S+:\s*401\b/i.test(msg) ||
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /\breturned\s+401\b/i.test(msg) ||
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /\b401\s+Unauthorized\b/i.test(msg)
+  );
+}
+
+function has401MessageMarker(msg: string): boolean {
+  return (
+    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
+    /\(401\)/.test(msg) ||
+    /\binvalid_token\b/i.test(msg)
+  );
+}
+
+function hasUnauthorizedMessageMarker(msg: string): boolean {
+  return hasBare401StatusMarker(msg) || hasWrapped401StatusText(msg) || has401MessageMarker(msg);
 }
 
 function isUnauthorizedErrorMessage(msg: string): boolean {
@@ -65,23 +101,7 @@ function isUnauthorizedErrorMessage(msg: string): boolean {
     }
   }
 
-  if (
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /^\s*401\s*$/.test(msg) ||
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /\bHTTP(?:\/\d(?:\.\d)?)?[:\s]+401\b/i.test(msg) ||
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /\bstatus(?:\s+code)?[:\s(]+401\b/i.test(msg) ||
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /\b(?:POSTing|GETting|connecting)\s+to\s+\S+:\s*401\b/i.test(msg) ||
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /\breturned\s+401\b/i.test(msg) ||
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /\b401\s+Unauthorized\b/i.test(msg) ||
-    // nosemgrep: pi-mcp.no-401-substring -- WHY: intentional message-text fallback after structured checks for SDK paths that only surface text
-    /\(401\)/.test(msg) ||
-    /\binvalid_token\b/i.test(msg)
-  ) {
+  if (hasUnauthorizedMessageMarker(msg)) {
     return true;
   }
 
@@ -91,26 +111,27 @@ function isUnauthorizedErrorMessage(msg: string): boolean {
   );
 }
 
+function extractErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : "";
+}
+
 export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>()): boolean {
   if (!error || seen.has(error)) {
     return false;
   }
   if (typeof error === "object") {
     seen.add(error);
-  }
-
-  if (error instanceof AuthRequiredError || error instanceof UnauthorizedError) {
-    return true;
-  }
-
-  if (typeof error === "object" && error !== null) {
+    if (error instanceof AuthRequiredError || error instanceof UnauthorizedError) {
+      return true;
+    }
     const objectResult = isObjectRecordUnauthorized(error, seen);
     if (objectResult !== undefined) {
       return objectResult;
     }
   }
 
-  const msg = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const msg = extractErrorMessage(error);
   return msg ? isUnauthorizedErrorMessage(msg) : false;
 }
 

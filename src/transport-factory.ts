@@ -30,6 +30,132 @@ function resolveEnv(extra?: Record<string, string>): Record<string, string> {
   return env;
 }
 
+function createRequestInit(config: ServerConfig): RequestInit | undefined {
+  // Build requestInit for static headers (API keys, etc.)
+  return config.headers ? { headers: config.headers } : undefined;
+}
+
+function createOAuthProvider(
+  serverName: string,
+  config: ServerConfig,
+  storageDir?: string,
+): OAuthClientProvider | undefined {
+  if (!config.auth || config.transport === "stdio") return undefined;
+  // Silent transport attempts must not write PKCE or launch a browser.
+  return new McpOAuthProvider({
+    serverName,
+    authConfig: config.auth,
+    storageDir,
+    mode: "silent",
+    serverUrl: config.url,
+  });
+}
+
+function wireStdioStderr(transport: StdioClientTransport, onStderr: (line: string) => void): void {
+  if (!transport.stderr) return;
+  const splitter = createLineSplitter((rawLine) => {
+    const clean = sanitizeTerminalText(rawLine);
+    if (clean) onStderr(clean);
+  });
+  transport.stderr.on("data", (chunk: Buffer) => {
+    splitter.write(chunk);
+  });
+  const flush = (): void => {
+    splitter.end();
+  };
+  transport.stderr.on("end", flush);
+  transport.stderr.on("close", flush);
+}
+
+function createStdioTransport(
+  serverName: string,
+  config: ServerConfig,
+  cwd: string | undefined,
+  onStderr: ((line: string) => void) | undefined,
+): Transport {
+  if (!config.command) {
+    throw new McpError("stdio transport requires 'command'", serverName, "config");
+  }
+  const transport = new StdioClientTransport({
+    command: config.command,
+    args: config.args,
+    env: resolveEnv(config.env),
+    ...(cwd !== undefined ? { cwd } : {}),
+    stderr: "pipe",
+  });
+  if (onStderr) {
+    wireStdioStderr(transport, onStderr);
+  }
+  return transport;
+}
+
+function createStreamableHttpTransport(
+  config: ServerConfig,
+  requestInit: RequestInit | undefined,
+  authProvider: OAuthClientProvider | undefined,
+): Transport {
+  return new StreamableHTTPClientTransport(
+    new URL(config.url!),
+    {
+      ...(requestInit && { requestInit }),
+      ...(authProvider && { authProvider }),
+      // WHY: Disable internal SDK SSE stream retries so unexpected disconnects
+      // immediately surface to ServerManager._recover() for deterministic backoff.
+      reconnectionOptions: {
+        maxRetries: 0,
+        initialReconnectionDelay: 0,
+        maxReconnectionDelay: 0,
+        reconnectionDelayGrowFactor: 1,
+      },
+    },
+  );
+}
+
+function createSseTransport(
+  config: ServerConfig,
+  requestInit: RequestInit | undefined,
+  authProvider: OAuthClientProvider | undefined,
+): Transport {
+  const transport = new SSEClientTransport(
+    new URL(config.url!),
+    {
+      ...(requestInit && { requestInit }),
+      ...(authProvider && { authProvider }),
+    },
+  );
+  // WHY: SSEClientTransport.start() awaits the initial `event: endpoint` SSE frame,
+  // while SSEClientTransport.close() aborts _abortController and closes _eventSource
+  // without firing _eventSource.onerror, leaving start() pending forever (which would
+  // deadlock `await client.close()`). Wrap start() and close() so closing the transport
+  // immediately rejects any pending start() promise.
+  const origStart = transport.start.bind(transport);
+  const origClose = transport.close.bind(transport);
+  let rejectPendingStart: ((err: Error) => void) | null = null;
+  transport.start = () =>
+    new Promise<void>((resolve, reject) => {
+      rejectPendingStart = reject;
+      origStart().then(
+        () => {
+          rejectPendingStart = null;
+          resolve();
+        },
+        (err: unknown) => {
+          rejectPendingStart = null;
+          reject(err);
+        },
+      );
+    });
+  transport.close = async () => {
+    if (rejectPendingStart) {
+      const reject = rejectPendingStart;
+      rejectPendingStart = null;
+      reject(new Error("SSE transport closed before endpoint event"));
+    }
+    await origClose();
+  };
+  return transport;
+}
+
 export function createTransport(
   serverName: string,
   config: ServerConfig,
@@ -39,108 +165,15 @@ export function createTransport(
 ): Transport {
   const cwd = typeof cwdOrOnStderr === "string" ? cwdOrOnStderr : cwdArg;
   const onStderr = typeof cwdOrOnStderr === "function" ? cwdOrOnStderr : undefined;
-
-  // Build requestInit for static headers (API keys, etc.)
-  const requestInit: RequestInit | undefined = config.headers
-    ? { headers: config.headers }
-    : undefined;
-
-  // Build OAuth authProvider if auth config is present
-  let authProvider: OAuthClientProvider | undefined;
-  if (config.auth && config.transport !== "stdio") {
-    // Silent transport attempts must not write PKCE or launch a browser.
-    authProvider = new McpOAuthProvider({
-      serverName,
-      authConfig: config.auth,
-      storageDir,
-      mode: "silent",
-      serverUrl: config.url,
-    });
-  }
+  const requestInit = createRequestInit(config);
+  const authProvider = createOAuthProvider(serverName, config, storageDir);
 
   switch (config.transport) {
-    case "stdio": {
-      if (!config.command) {
-        throw new McpError("stdio transport requires 'command'", serverName, "config");
-      }
-      const transport = new StdioClientTransport({
-        command: config.command,
-        args: config.args,
-        env: resolveEnv(config.env),
-        ...(cwd !== undefined ? { cwd } : {}),
-        stderr: "pipe",
-      });
-      if (onStderr && transport.stderr) {
-        const splitter = createLineSplitter((rawLine) => {
-          const clean = sanitizeTerminalText(rawLine);
-          if (clean) onStderr(clean);
-        });
-        transport.stderr.on("data", (chunk: Buffer) => {
-          splitter.write(chunk);
-        });
-        const flush = (): void => {
-          splitter.end();
-        };
-        transport.stderr.on("end", flush);
-        transport.stderr.on("close", flush);
-      }
-      return transport;
-    }
+    case "stdio":
+      return createStdioTransport(serverName, config, cwd, onStderr);
     case "streamable-http":
-      return new StreamableHTTPClientTransport(
-        new URL(config.url!),
-        {
-          ...(requestInit && { requestInit }),
-          ...(authProvider && { authProvider }),
-          // WHY: Disable internal SDK SSE stream retries so unexpected disconnects
-          // immediately surface to ServerManager._recover() for deterministic backoff.
-          reconnectionOptions: {
-            maxRetries: 0,
-            initialReconnectionDelay: 0,
-            maxReconnectionDelay: 0,
-            reconnectionDelayGrowFactor: 1,
-          },
-        },
-      );
-    case "sse": {
-      const transport = new SSEClientTransport(
-        new URL(config.url!),
-        {
-          ...(requestInit && { requestInit }),
-          ...(authProvider && { authProvider }),
-        },
-      );
-      // WHY: SSEClientTransport.start() awaits the initial `event: endpoint` SSE frame,
-      // while SSEClientTransport.close() aborts _abortController and closes _eventSource
-      // without firing _eventSource.onerror, leaving start() pending forever (which would
-      // deadlock `await client.close()`). Wrap start() and close() so closing the transport
-      // immediately rejects any pending start() promise.
-      const origStart = transport.start.bind(transport);
-      const origClose = transport.close.bind(transport);
-      let rejectPendingStart: ((err: Error) => void) | null = null;
-      transport.start = () =>
-        new Promise<void>((resolve, reject) => {
-          rejectPendingStart = reject;
-          origStart().then(
-            () => {
-              rejectPendingStart = null;
-              resolve();
-            },
-            (err: unknown) => {
-              rejectPendingStart = null;
-              reject(err);
-            },
-          );
-        });
-      transport.close = async () => {
-        if (rejectPendingStart) {
-          const reject = rejectPendingStart;
-          rejectPendingStart = null;
-          reject(new Error("SSE transport closed before endpoint event"));
-        }
-        await origClose();
-      };
-      return transport;
-    }
+      return createStreamableHttpTransport(config, requestInit, authProvider);
+    case "sse":
+      return createSseTransport(config, requestInit, authProvider);
   }
 }

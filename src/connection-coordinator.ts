@@ -8,7 +8,7 @@
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { McpConfig, ServerConfig } from "./config.js";
-import type { ServerManager } from "./server-manager.js";
+import type { ManagedServer, ServerManager } from "./server-manager.js";
 import type { ToolBridge } from "./tool-bridge.js";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { AuthRequiredError } from "./oauth-provider.js";
@@ -42,13 +42,44 @@ type ConnectAttemptEntry = {
   waiters: number;
 };
 
+type ActiveStartupTurn = {
+  serverName: string;
+  handoffPromise?: Promise<void>;
+};
+
+type StartupPromptTurn = {
+  name: string;
+  ctx: ExtensionContext;
+  previous: Promise<void>;
+  promptController: AbortController;
+  release: () => void;
+};
+
+type ConnectAttemptParams = {
+  serverName: string;
+  serverConfig: ServerConfig;
+  ctx: ExtensionContext;
+  controller: AbortController;
+  existing: ConnectAttemptEntry | undefined;
+  reset: boolean;
+  alreadyQueued: boolean;
+  inheritedStartupTurn: ActiveStartupTurn | null;
+};
+
+type InteractiveAuthParams = {
+  serverName: string;
+  ctx: ExtensionContext;
+  controller: AbortController;
+  reset: boolean;
+};
+
 export class ConnectionCoordinator {
   private readonly deps: ConnectionCoordinatorDeps;
   private readonly connectAttempts = new Map<string, ConnectAttemptEntry>();
   private readonly declinedStartupAuth = new Set<string>();
   private readonly startupPromptControllers = new Map<string, AbortController>();
   private authQueue: Promise<void> = Promise.resolve();
-  private activeStartupTurn: { serverName: string; handoffPromise?: Promise<void> } | null = null;
+  private activeStartupTurn: ActiveStartupTurn | null = null;
   private activeCtx: ExtensionContext | undefined;
 
   constructor(deps: ConnectionCoordinatorDeps) {
@@ -185,77 +216,100 @@ export class ConnectionCoordinator {
     });
     this.authQueue = previous.then(() => gate);
 
-    void (async () => {
-      let currentTurn: { serverName: string; handoffPromise?: Promise<void> } | null = null;
-      try {
-        await waitForQueueTurn(previous, promptController.signal, name);
-        if (
-          promptController.signal.aborted ||
-          this.declinedStartupAuth.has(name) ||
-          this.deps.manager.getServer(name)?.state === "ready" ||
-          this.connectAttempts.has(name)
-        ) {
-          return;
-        }
-        currentTurn = { serverName: name };
-        this.activeStartupTurn = currentTurn;
-        let choice: string | undefined;
-        try {
-          choice = await promptStartupAuth(name, ctx, promptController.signal);
-        } finally {
-          if (this.startupPromptControllers.get(name) === promptController) {
-            this.startupPromptControllers.delete(name);
-          }
-        }
-        if (currentTurn.handoffPromise) {
-          // WHY: An explicit connectRequested (/mcp:auth, /mcp:start, or mcp_connect) superseded
-          // this server's startup prompt while it held the active queue turn. Hold the queue slot
-          // until that connection/auth finishes before letting the next server's prompt appear.
-          await currentTurn.handoffPromise.catch(() => {
-            // WHY: Errors from an explicit connectRequested handoff are surfaced to its own caller.
-          });
-          return;
-        }
-        if (
-          promptController.signal.aborted ||
-          this.deps.manager.getServer(name)?.state === "ready" ||
-          this.connectAttempts.has(name)
-        ) {
-          return;
-        }
-        if (choice === startupAuthNowOption) {
-          try {
-            await this.connect(name, ctx, { alreadyQueued: true });
-          } catch (err) {
-            if (!(err instanceof AuthCancelledError)) {
-              const msg = formatErrorMessage(err);
-              ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
-            }
-          }
-        } else {
-          this.declinedStartupAuth.add(name);
-          this.syncStatus(ctx);
-        }
-      } catch (err) {
-        if (!(err instanceof AuthCancelledError)) {
-          const msg = formatErrorMessage(err);
-          ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
-        }
-      } finally {
-        if (this.startupPromptControllers.get(name) === promptController) {
-          this.startupPromptControllers.delete(name);
-        }
-        if (currentTurn && this.activeStartupTurn === currentTurn) {
-          if (currentTurn.handoffPromise) {
-            await currentTurn.handoffPromise.catch(() => {
-              // WHY: Suppress rejection here because connectRequested caller handles it.
-            });
-          }
-          this.activeStartupTurn = null;
-        }
-        release();
+    void this._runStartupPromptTurn({ name, ctx, previous, promptController, release });
+  }
+
+  private async _runStartupPromptTurn(turn: StartupPromptTurn): Promise<void> {
+    let currentTurn: ActiveStartupTurn | null = null;
+    try {
+      await waitForQueueTurn(turn.previous, turn.promptController.signal, turn.name);
+      if (this._shouldSkipStartupPrompt(turn)) return;
+      currentTurn = { serverName: turn.name };
+      this.activeStartupTurn = currentTurn;
+      const choice = await this._promptStartupChoice(turn);
+      if (await this._awaitHandoffIfSuperseded(currentTurn)) return;
+      if (this._isPromptAbandoned(turn)) return;
+      await this._applyStartupAuthChoice(turn, choice);
+    } catch (err) {
+      this._notifyStartupFailure(turn.name, turn.ctx, err);
+    } finally {
+      await this._finishStartupTurn(turn, currentTurn);
+    }
+  }
+
+  private async _promptStartupChoice(turn: StartupPromptTurn): Promise<string | undefined> {
+    try {
+      return await promptStartupAuth(turn.name, turn.ctx, turn.promptController.signal);
+    } finally {
+      this._forgetPromptController(turn);
+    }
+  }
+
+  private _shouldSkipStartupPrompt(turn: StartupPromptTurn): boolean {
+    return this._isPromptAbandoned(turn) || this.declinedStartupAuth.has(turn.name);
+  }
+
+  private _isPromptAbandoned(turn: StartupPromptTurn): boolean {
+    return (
+      turn.promptController.signal.aborted ||
+      this.deps.manager.getServer(turn.name)?.state === "ready" ||
+      this.connectAttempts.has(turn.name)
+    );
+  }
+
+  private async _awaitHandoffIfSuperseded(turn: ActiveStartupTurn): Promise<boolean> {
+    if (!turn.handoffPromise) return false;
+    // WHY: An explicit connectRequested (/mcp:auth, /mcp:start, or mcp_connect) superseded
+    // this server's startup prompt while it held the active queue turn. Hold the queue slot
+    // until that connection/auth finishes before letting the next server's prompt appear.
+    await turn.handoffPromise.catch(() => {
+      // WHY: Errors from an explicit connectRequested handoff are surfaced to its own caller.
+    });
+    return true;
+  }
+
+  private async _applyStartupAuthChoice(
+    turn: StartupPromptTurn,
+    choice: string | undefined,
+  ): Promise<void> {
+    if (choice !== startupAuthNowOption) {
+      this.declinedStartupAuth.add(turn.name);
+      this.syncStatus(turn.ctx);
+      return;
+    }
+    try {
+      await this.connect(turn.name, turn.ctx, { alreadyQueued: true });
+    } catch (err) {
+      this._notifyStartupFailure(turn.name, turn.ctx, err);
+    }
+  }
+
+  private _notifyStartupFailure(name: string, ctx: ExtensionContext, err: unknown): void {
+    if (err instanceof AuthCancelledError) return;
+    const msg = formatErrorMessage(err);
+    ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
+  }
+
+  private _forgetPromptController(turn: StartupPromptTurn): void {
+    if (this.startupPromptControllers.get(turn.name) === turn.promptController) {
+      this.startupPromptControllers.delete(turn.name);
+    }
+  }
+
+  private async _finishStartupTurn(
+    turn: StartupPromptTurn,
+    currentTurn: ActiveStartupTurn | null,
+  ): Promise<void> {
+    this._forgetPromptController(turn);
+    if (currentTurn && this.activeStartupTurn === currentTurn) {
+      if (currentTurn.handoffPromise) {
+        await currentTurn.handoffPromise.catch(() => {
+          // WHY: Suppress rejection here because connectRequested caller handles it.
+        });
       }
-    })();
+      this.activeStartupTurn = null;
+    }
+    turn.release();
   }
 
   async startEagerServers(
@@ -342,6 +396,153 @@ export class ConnectionCoordinator {
     }
   }
 
+  private _requireConnectableServer(
+    serverName: string,
+    signal: AbortSignal | undefined,
+    reset: boolean,
+    ctx: ExtensionContext,
+  ): ManagedServer {
+    const server = this.deps.manager.getServer(serverName);
+    if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
+    if (signal?.aborted) throw new AuthCancelledError(serverName);
+    if (reset && !server.config.auth) {
+      throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
+    }
+    if (reset && !ctx.hasUI) throw new AuthRequiredError(serverName);
+    return server;
+  }
+
+  // All requests join an in-flight reset. A reset supersedes a normal connect.
+  private _canJoinAttempt(existing: ConnectAttemptEntry, reset: boolean): boolean {
+    return !existing.controller.signal.aborted && (!reset || existing.reset);
+  }
+
+  private _supersedeAttempt(
+    serverName: string,
+    existing: ConnectAttemptEntry | undefined,
+  ): AbortController {
+    const controller = new AbortController();
+    if (existing) {
+      existing.controller.abort();
+      void this.deps.manager.stopServer(serverName);
+    }
+    return controller;
+  }
+
+  private _startConnectTask(
+    params: ConnectAttemptParams,
+    entry: ConnectAttemptEntry,
+  ): Promise<void> {
+    const { serverName, controller } = params;
+    const task = this._executeConnectTask(params)
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+        throw err;
+      })
+      .finally(() => {
+        if (this.connectAttempts.get(serverName) === entry) this.connectAttempts.delete(serverName);
+      });
+    void task.catch(() => {
+      // WHY: Prevent unhandled rejection when task settles after an aborted waiter detaches.
+    });
+    return task;
+  }
+
+  private async _executeConnectTask(params: ConnectAttemptParams): Promise<void> {
+    const { serverName, ctx, controller, existing, reset, alreadyQueued } = params;
+    if (existing) {
+      // Wait for a superseded connect to release its callback listener and auth lock.
+      await existing.promise.catch(() => {
+        // WHY: Ignore errors from the superseded connect attempt while waiting for cleanup.
+      });
+    }
+    this._ensureActive(controller.signal, serverName);
+    if (reset) {
+      this.deps.bridge.deactivateServer(serverName);
+      await this.deps.manager.stopServer(serverName);
+      this._ensureActive(controller.signal, serverName);
+    }
+    if (await this._tryStartServer(params)) {
+      this._markServerConnected(serverName, ctx);
+      return;
+    }
+    if (!ctx.hasUI) throw new AuthRequiredError(serverName);
+    const runInteractiveAuth = (): Promise<void> => this._authorizeAndRestart(params);
+    if (alreadyQueued || params.inheritedStartupTurn) {
+      await runInteractiveAuth();
+    } else {
+      await this.runSerializedAuth(serverName, controller.signal, runInteractiveAuth);
+    }
+    this._markServerConnected(serverName, ctx);
+  }
+
+  private async _tryStartServer(params: ConnectAttemptParams): Promise<boolean> {
+    const { serverName, serverConfig, ctx, controller, reset } = params;
+    if (reset) return false;
+    try {
+      await this._startAndGuardAbort(serverName, ctx, controller.signal);
+      return true;
+    } catch (err) {
+      if (!(err instanceof AuthRequiredError) || !serverConfig.auth) throw err;
+      return false;
+    }
+  }
+
+  private async _authorizeAndRestart(params: InteractiveAuthParams): Promise<void> {
+    const { serverName, ctx, controller, reset } = params;
+    this._ensureActive(controller.signal, serverName);
+    await this.deps.authorize(serverName, ctx, controller.signal, reset);
+    this._ensureActive(controller.signal, serverName);
+    await this._startAndGuardAbort(serverName, ctx, controller.signal);
+  }
+
+  private async _startAndGuardAbort(
+    serverName: string,
+    ctx: ExtensionContext,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.deps.manager.startServer(serverName, ctx.cwd);
+    if (!signal.aborted) return;
+    await this.deps.manager.stopServer(serverName);
+    throw new AuthCancelledError(serverName);
+  }
+
+  private _ensureActive(signal: AbortSignal, serverName: string): void {
+    if (signal.aborted) throw new AuthCancelledError(serverName);
+  }
+
+  private _markServerConnected(serverName: string, ctx: ExtensionContext): void {
+    this.declinedStartupAuth.delete(serverName);
+    this.syncStatus(ctx);
+  }
+
+  private _resolveInheritedStartupTurn(
+    serverName: string,
+    alreadyQueued: boolean,
+  ): ActiveStartupTurn | null {
+    if (alreadyQueued || this.activeStartupTurn?.serverName !== serverName) {
+      return null;
+    }
+    return this.activeStartupTurn;
+  }
+
+  private _handoffAndCancelStartupPrompt(
+    serverName: string,
+    alreadyQueued: boolean,
+    inheritedStartupTurn: ActiveStartupTurn | null,
+    promise: Promise<void>,
+  ): void {
+    if (inheritedStartupTurn) {
+      // WHY: Attach handoffPromise before aborting the active startup prompt so the prompt turn
+      // stays held for this server's interactive auth instead of advancing authQueue to the next server.
+      inheritedStartupTurn.handoffPromise = promise;
+    }
+    if (!alreadyQueued) {
+      this.startupPromptControllers.get(serverName)?.abort();
+      this.startupPromptControllers.delete(serverName);
+    }
+  }
+
   async connect(
     serverName: string,
     ctx: ExtensionContext,
@@ -352,84 +553,34 @@ export class ConnectionCoordinator {
     const alreadyQueued = options?.alreadyQueued ?? false;
 
     this.activeCtx = ctx;
-    const server = this.deps.manager.getServer(serverName);
-    if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
-    if (signal?.aborted) throw new AuthCancelledError(serverName);
-    if (reset && !server.config.auth) throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
-    if (reset && !ctx.hasUI) throw new AuthRequiredError(serverName);
-
-    const inheritedStartupTurn =
-      !alreadyQueued && this.activeStartupTurn?.serverName === serverName ? this.activeStartupTurn : null;
-
+    const server = this._requireConnectableServer(serverName, signal, reset, ctx);
+    const inheritedStartupTurn = this._resolveInheritedStartupTurn(serverName, alreadyQueued);
     const existing = this.connectAttempts.get(serverName);
-    // All requests join an in-flight reset. A reset supersedes a normal connect.
-    if (existing && !existing.controller.signal.aborted && (!reset || existing.reset)) {
+    if (existing && this._canJoinAttempt(existing, reset)) {
       return await this._waitForConnectAttempt(serverName, existing, signal);
     }
 
-    const controller = new AbortController();
-    if (existing) {
-      existing.controller.abort();
-      void this.deps.manager.stopServer(serverName);
-    }
-    let entry!: ConnectAttemptEntry;
-    const task = (async () => {
-      // Wait for a superseded connect to release its callback listener and auth lock.
-      if (existing) {
-        await existing.promise.catch(() => {
-          // WHY: Ignore errors from the superseded connect attempt while waiting for cleanup.
-        });
-      }
-      if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-      if (reset) {
-        this.deps.bridge.deactivateServer(serverName);
-        await this.deps.manager.stopServer(serverName);
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-      }
-      try {
-        if (!reset) await this.deps.manager.startServer(serverName, ctx.cwd);
-        else throw new AuthRequiredError(serverName);
-        if (controller.signal.aborted) { await this.deps.manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
-        this.declinedStartupAuth.delete(serverName);
-        this.syncStatus(ctx);
-        return;
-      } catch (err) {
-        if (!(err instanceof AuthRequiredError) || !server.config.auth) throw err;
-      }
-      if (!ctx.hasUI) throw new AuthRequiredError(serverName);
-      const runInteractiveAuth = async (): Promise<void> => {
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-        await this.deps.authorize(serverName, ctx, controller.signal, reset);
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-        await this.deps.manager.startServer(serverName, ctx.cwd);
-        if (controller.signal.aborted) { await this.deps.manager.stopServer(serverName); throw new AuthCancelledError(serverName); }
-      };
-      if (alreadyQueued || inheritedStartupTurn) {
-        await runInteractiveAuth();
-      } else {
-        await this.runSerializedAuth(serverName, controller.signal, runInteractiveAuth);
-      }
-      this.declinedStartupAuth.delete(serverName);
-      this.syncStatus(ctx);
-    })().catch((err: unknown) => {
-      if (controller.signal.aborted) throw new AuthCancelledError(serverName);
-      throw err;
-    }).finally(() => {
-      if (this.connectAttempts.get(serverName) === entry) this.connectAttempts.delete(serverName);
-    });
-    void task.catch(() => {
-      // WHY: Prevent unhandled rejection when task settles after an aborted waiter detaches.
-    });
-    if (inheritedStartupTurn) {
-      // WHY: Attach handoffPromise before aborting the active startup prompt so the prompt turn
-      // stays held for this server's interactive auth instead of advancing authQueue to the next server.
-      inheritedStartupTurn.handoffPromise = task;
-    }
-    if (!alreadyQueued) {
-      this.startupPromptControllers.get(serverName)?.abort();
-      this.startupPromptControllers.delete(serverName);
-    }
-    entry = { promise: task, controller, reset, waiters: 0 };
+    const controller = this._supersedeAttempt(serverName, existing);
+    const entry: ConnectAttemptEntry = {
+      promise: Promise.resolve(),
+      controller,
+      reset,
+      waiters: 0,
+    };
+    entry.promise = this._startConnectTask(
+      {
+        serverName,
+        serverConfig: server.config,
+        ctx,
+        controller,
+        existing,
+        reset,
+        alreadyQueued,
+        inheritedStartupTurn,
+      },
+      entry,
+    );
+    this._handoffAndCancelStartupPrompt(serverName, alreadyQueued, inheritedStartupTurn, entry.promise);
     this.connectAttempts.set(serverName, entry);
     return await this._waitForConnectAttempt(serverName, entry, signal);
   }
