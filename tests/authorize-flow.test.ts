@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   authorize,
   browserOpenCommand,
@@ -184,6 +187,40 @@ describe("authorize-flow", () => {
         /requires an interactive Pi session/,
       );
       assert.equal(getterCalledWith, "custom-srv");
+    });
+
+    it("releases the auth lock when resetServerAuth fails during reset=true", async () => {
+      const authStorageDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-mcp-authorize-lock-"));
+      try {
+        const mockManager = {
+          getServer: () => ({
+            name: "test-srv",
+            config: { url: "https://example.com/mcp", auth: { type: "oauth" } },
+          }),
+          resetServerAuth: async () => {
+            throw new Error("disk error while resetting auth");
+          },
+        } as unknown as ServerManager;
+
+        const deps: AuthorizeDeps = {
+          manager: mockManager,
+          authStorageDir,
+        };
+
+        const mockCtx = { hasUI: true, ui: { notify: () => {} } } as unknown as ExtensionContext;
+        const controller = new AbortController();
+
+        await assert.rejects(
+          () => authorize(deps, "test-srv", mockCtx, controller.signal, true),
+          /disk error while resetting auth/,
+        );
+
+        const entries = await fs.readdir(authStorageDir);
+        const lockFiles = entries.filter((entry) => entry.endsWith(".lock"));
+        assert.deepEqual(lockFiles, []);
+      } finally {
+        await fs.rm(authStorageDir, { recursive: true, force: true });
+      }
     });
   });
 });

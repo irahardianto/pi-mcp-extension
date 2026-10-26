@@ -65,6 +65,13 @@ function escapeHtml(text: string): string {
 }
 
 /**
+ * Whether a `listen` failure is a port already taken by another process.
+ */
+function isAddressInUseError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "EADDRINUSE";
+}
+
+/**
  * Build callback server settings from the configured OAuth redirect URL.
  *
  * Local HTTP redirect URLs must use a fixed listener port because OAuth
@@ -197,6 +204,76 @@ export class CallbackServer {
   }
 
   /**
+   * Backfill `actualServerPort` from the live listener address when it was not
+   * recorded at listen time.
+   */
+  private _syncActualServerPort(): void {
+    if (this.actualServerPort !== null) return;
+
+    const address = this.server?.address();
+    if (address && typeof address === "object" && "port" in address) {
+      this.actualServerPort = address.port;
+    }
+  }
+
+  /**
+   * Reuse the running listener when it already matches the requested port/host,
+   * otherwise close it. Returns the port to short-circuit `ensure` with, or
+   * `null` when the caller must bind a new listener.
+   */
+  private async _reuseOrCloseExistingServer(preferredPort: number, host: string): Promise<number | null> {
+    if (!this.server) return null;
+
+    this._syncActualServerPort();
+    const serverMatchesRequest = this.actualServerPort === preferredPort && this.actualServerHost === host;
+    if (serverMatchesRequest && this.actualServerPort !== null) {
+      return this.actualServerPort;
+    }
+
+    if (this.pendingAuths.size > 0) {
+      throw new Error(
+        `OAuth callback server is already handling an authorization flow on ${this.actualServerHost}:${this.actualServerPort}`
+      );
+    }
+
+    await this.closeCurrentServer();
+    return null;
+  }
+
+  /**
+   * Bind a candidate listener, wiring socket tracking. Closes the candidate again
+   * before rethrowing so a failed attempt leaks neither a socket nor a listener.
+   */
+  private async _tryListenOnPort(candidatePort: number, host: string): Promise<Server> {
+    const candidateServer = createServer((req, res) => this.handleRequest(req, res));
+
+    try {
+      candidateServer.on("connection", (socket: Socket) => {
+        this.serverSockets.add(socket);
+        socket.once("close", () => {
+          this.serverSockets.delete(socket);
+        });
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        candidateServer.once("error", (err: Error) => {
+          reject(err);
+        });
+
+        candidateServer.listen(candidatePort, host, () => {
+          resolve();
+        });
+      });
+      return candidateServer;
+    } catch (error) {
+      await new Promise<void>((resolve) => {
+        candidateServer.close(() => resolve());
+      });
+      throw error;
+    }
+  }
+
+  /**
    * Ensure the callback server is running.
    * Scans forward for an available local port when port fallback is enabled.
    *
@@ -207,62 +284,23 @@ export class CallbackServer {
     const host = options.host ?? DEFAULT_HOST;
     const allowPortFallback = options.allowPortFallback ?? true;
 
-    if (this.server) {
-      const address = this.server.address();
-      if (this.actualServerPort === null && address && typeof address === "object" && "port" in address) {
-        this.actualServerPort = address.port;
-      }
-
-      const serverMatchesRequest = this.actualServerPort === preferredPort && this.actualServerHost === host;
-      if (serverMatchesRequest && this.actualServerPort !== null) {
-        return this.actualServerPort;
-      }
-
-      if (this.pendingAuths.size > 0) {
-        throw new Error(
-          `OAuth callback server is already handling an authorization flow on ${this.actualServerHost}:${this.actualServerPort}`
-        );
-      }
-
-      await this.closeCurrentServer();
-    }
+    const reusablePort = await this._reuseOrCloseExistingServer(preferredPort, host);
+    if (reusablePort !== null) return reusablePort;
 
     const maxAttempts = allowPortFallback ? 25 : 1; // Try up to 25 ports unless a fixed redirect URI is configured
 
     for (let offset = 0; offset < maxAttempts; offset++) {
       const candidatePort = preferredPort + offset;
-      const candidateServer = createServer((req, res) => this.handleRequest(req, res));
 
       try {
-        candidateServer.on("connection", (socket: Socket) => {
-          this.serverSockets.add(socket);
-          socket.once("close", () => {
-            this.serverSockets.delete(socket);
-          });
-        });
-
-        await new Promise<void>((resolve, reject) => {
-          candidateServer.once("error", (err: Error) => {
-            reject(err);
-          });
-
-          candidateServer.listen(candidatePort, host, () => {
-            resolve();
-          });
-        });
-        this.server = candidateServer;
+        this.server = await this._tryListenOnPort(candidatePort, host);
         this.actualServerPort = candidatePort;
         this.actualServerHost = host;
         this.server.unref(); // Don't block process exit
         return candidatePort;
       } catch (error) {
-        const nodeError = error as NodeJS.ErrnoException;
-        await new Promise<void>((resolve) => {
-          candidateServer.close(() => resolve());
-        });
-
         // If not EADDRINUSE, rethrow
-        if (nodeError.code !== "EADDRINUSE") {
+        if (!isAddressInUseError(error)) {
           throw error;
         }
 

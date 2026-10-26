@@ -97,13 +97,16 @@ function promptUserForPaste(
     });
 }
 
+/** Dialog context: a `select`-capable UI with optional input/notify surfaces. */
+type OAuthDialogContext = {
+  hasUI: boolean;
+  ui: Pick<ExtensionUIContext, "select"> & Partial<Pick<ExtensionUIContext, "input" | "notify">>;
+};
+
 async function handlePasteChoice(
   serverName: string,
   callbackResultPromise: Promise<OAuthCallbackResult | OAuthCallbackErrorResult>,
-  context: {
-    hasUI: boolean;
-    ui: Pick<ExtensionUIContext, "select"> & Partial<Pick<ExtensionUIContext, "input" | "notify">>;
-  },
+  context: OAuthDialogContext,
   pasteOptions?: OAuthPasteOptions,
 ): Promise<string | undefined> {
   if (!context.ui.input) return undefined;
@@ -128,14 +131,101 @@ async function handlePasteChoice(
   return parsePastedUrl(inputResult.value, serverName, context, pasteOptions);
 }
 
+/** Outcome of one dialog iteration: a resolved code, a browser retry, or loop again. */
+type DialogStep =
+  | { kind: "code"; code: string }
+  | { kind: "retry" }
+  | { kind: "continue" };
+
+/** Prompt for the retry/paste/cancel choice, abortable by the caller. */
+function promptForDialogChoice(
+  serverName: string,
+  ui: Pick<ExtensionUIContext, "select">,
+  abortController: AbortController,
+): Promise<OAuthWaitResult> {
+  return ui
+    .select(
+      `OAuth pending for ${serverName}`,
+      [authRetryOption, authPasteOption, authCancelOption],
+      { signal: abortController.signal },
+    )
+    .then((choice): OAuthUserChoiceResult => ({ type: "choice", choice }))
+    .catch((error): OAuthDialogAbortedResult => {
+      if (abortController.signal.aborted) {
+        return { type: "dialogAborted" };
+      }
+      throw error;
+    });
+}
+
+/**
+ * Run the paste-back branch of a dialog step: the user chose "Paste redirect
+ * URL", so resolve the code (or loop again when the paste was empty/invalid).
+ */
+async function resolvePasteStep(
+  serverName: string,
+  callbackResultPromise: Promise<OAuthCallbackResult | OAuthCallbackErrorResult>,
+  context: OAuthDialogContext,
+  pasteOptions: OAuthPasteOptions | undefined,
+  dialogAbortController: AbortController,
+): Promise<DialogStep> {
+  const pastedCode = await handlePasteChoice(serverName, callbackResultPromise, context, pasteOptions);
+  if (pastedCode === undefined) return { kind: "continue" };
+  dialogAbortController.abort();
+  return { kind: "code", code: pastedCode };
+}
+
+/**
+ * One iteration of the wait loop: race the loopback callback against the dialog
+ * choice and fold whichever answered first into a {@link DialogStep}.
+ */
+async function runDialogStep(
+  serverName: string,
+  callbackResultPromise: Promise<OAuthCallbackResult | OAuthCallbackErrorResult>,
+  context: OAuthDialogContext,
+  pasteOptions?: OAuthPasteOptions,
+): Promise<DialogStep> {
+  const dialogAbortController = new AbortController();
+  const choicePromise = promptForDialogChoice(serverName, context.ui, dialogAbortController);
+  const result = await Promise.race([callbackResultPromise, choicePromise]);
+
+  if (result.type === "callbackError") {
+    dialogAbortController.abort();
+    throw result.error;
+  }
+
+  if (result.type === "callback") {
+    dialogAbortController.abort();
+    return { kind: "code", code: result.code };
+  }
+
+  if (result.type === "choice" && result.choice === authPasteOption) {
+    return resolvePasteStep(
+      serverName,
+      callbackResultPromise,
+      context,
+      pasteOptions,
+      dialogAbortController,
+    );
+  }
+
+  if (result.type === "choice" && result.choice === authRetryOption) {
+    return { kind: "retry" };
+  }
+
+  if (result.type === "dialogAborted") {
+    return { kind: "continue" };
+  }
+
+  dialogAbortController.abort();
+  throw new AuthCancelledError(serverName);
+}
+
 export async function waitForOAuthCallback(
   serverName: string,
   callbackPromise: Promise<string>,
   reopenBrowser: () => void | Promise<void>,
-  context: {
-    hasUI: boolean;
-    ui: Pick<ExtensionUIContext, "select"> & Partial<Pick<ExtensionUIContext, "input" | "notify">>;
-  },
+  context: OAuthDialogContext,
   pasteOptions?: OAuthPasteOptions,
 ): Promise<string> {
   if (!context.hasUI) {
@@ -147,52 +237,8 @@ export async function waitForOAuthCallback(
     .catch((error): OAuthCallbackErrorResult => ({ type: "callbackError", error }));
 
   while (true) {
-    const dialogAbortController = new AbortController();
-    const choicePromise: Promise<OAuthWaitResult> = context.ui
-      .select(
-        `OAuth pending for ${serverName}`,
-        [authRetryOption, authPasteOption, authCancelOption],
-        { signal: dialogAbortController.signal },
-      )
-      .then((choice): OAuthUserChoiceResult => ({ type: "choice", choice }))
-      .catch((error): OAuthDialogAbortedResult => {
-        if (dialogAbortController.signal.aborted) {
-          return { type: "dialogAborted" };
-        }
-        throw error;
-      });
-
-    const result = await Promise.race([callbackResultPromise, choicePromise]);
-
-    if (result.type === "callback") {
-      dialogAbortController.abort();
-      return result.code;
-    }
-
-    if (result.type === "callbackError") {
-      dialogAbortController.abort();
-      throw result.error;
-    }
-
-    if (result.type === "dialogAborted") {
-      continue;
-    }
-
-    if (result.choice === authRetryOption) {
-      await reopenBrowser();
-      continue;
-    }
-
-    if (result.choice === authPasteOption) {
-      const pastedCode = await handlePasteChoice(serverName, callbackResultPromise, context, pasteOptions);
-      if (pastedCode !== undefined) {
-        dialogAbortController.abort();
-        return pastedCode;
-      }
-      continue;
-    }
-
-    dialogAbortController.abort();
-    throw new AuthCancelledError(serverName);
+    const step = await runDialogStep(serverName, callbackResultPromise, context, pasteOptions);
+    if (step.kind === "code") return step.code;
+    if (step.kind === "retry") await reopenBrowser();
   }
 }
