@@ -570,21 +570,30 @@ describe("fuzz: orderUnionMembers & convertJsonSchemaToTypebox", () => {
   it("convertJsonSchemaToTypebox breaks recursive and circular $ref cycles safely", () => {
     fc.assert(
       fc.property(fc.stringMatching(/^[a-z]{1,10}$/), (defName) => {
-        const schema = {
-          $defs: {
-            [defName]: {
-              type: "object",
-              properties: {
-                cycle: { $ref: `#/$defs/${defName}` },
-                self: { $ref: "#" },
-              },
+        const defs = {
+          [defName]: {
+            type: "object",
+            properties: {
+              cycle: { $ref: `#/$defs/${defName}` },
+              self: { $ref: "#" },
+              allOfCycle: { allOf: [{ $ref: `#/$defs/${defName}` }] },
+              allOfSelf: { allOf: [{ $ref: "#" }] },
             },
           },
-          $ref: `#/$defs/${defName}`,
         };
-        const result = convertJsonSchemaToTypebox(schema);
-        assert.equal(typeof result, "object");
-        assert.ok(result !== null);
+        const directRef = convertJsonSchemaToTypebox({
+          $defs: defs,
+          $ref: `#/$defs/${defName}`,
+        });
+        assert.equal(typeof directRef, "object");
+        assert.ok(directRef !== null);
+
+        const allOfRef = convertJsonSchemaToTypebox({
+          $defs: defs,
+          allOf: [{ $ref: `#/$defs/${defName}` }],
+        });
+        assert.equal(typeof allOfRef, "object");
+        assert.ok(allOfRef !== null);
       }),
       testOptions(),
     );

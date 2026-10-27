@@ -120,27 +120,18 @@ function isRefSeenOnPath(
   return ctx.seenRefs.has(ref) || extraRefs.has(ref);
 }
 
-/**
- * Resolve an `allOf` member's `$ref` chain while probing it for object-ness.
- * Returns `null` for an unresolvable ref or a ref cycle, so probing always terminates.
- */
-function resolveProbeRef(
-  sub: Record<string, unknown>,
+/** Whether a `$ref` on an `allOf` member resolves to an object-like schema. */
+function isRefToObjectSchema(
+  ref: unknown,
   ctx: ConversionContext,
   seenRefs: Set<string>,
-): Record<string, unknown> | null {
-  let current = sub;
-  let ref = current["$ref"];
-  while (typeof ref === "string" && !isRefSeenOnPath(ref, ctx, seenRefs)) {
-    seenRefs.add(ref);
-    const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
-    if (!resolved) {
-      return null;
-    }
-    current = resolved;
-    ref = current["$ref"];
+): boolean {
+  if (typeof ref !== "string" || isRefSeenOnPath(ref, ctx, seenRefs)) {
+    return false;
   }
-  return typeof ref === "string" ? null : current;
+  seenRefs.add(ref);
+  const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
+  return resolved ? isObjectLikeSubSchema(resolved, ctx, seenRefs) : false;
 }
 
 /** Whether a sub-schema describes an object directly, through a `$ref`, or through a nested `allOf`. */
@@ -149,10 +140,12 @@ function isObjectLikeSubSchema(
   ctx: ConversionContext,
   seenRefs: Set<string>,
 ): boolean {
-  if (sub["type"] === "object" || hasObjectSchemaKeywords(sub)) {
-    return true;
-  }
-  return hasAllOfObjectSubSchema(sub, ctx, seenRefs);
+  return (
+    sub["type"] === "object" ||
+    hasObjectSchemaKeywords(sub) ||
+    hasAllOfObjectSubSchema(sub, ctx, seenRefs) ||
+    isRefToObjectSchema(sub["$ref"], ctx, seenRefs)
+  );
 }
 
 /**
@@ -172,13 +165,7 @@ function hasAllOfObjectSubSchema(
   if (!Array.isArray(allOf)) {
     return false;
   }
-  return allOf.some((sub) => {
-    if (!isPlainObject(sub)) {
-      return false;
-    }
-    const resolved = resolveProbeRef(sub, ctx, seenRefs);
-    return resolved ? isObjectLikeSubSchema(resolved, ctx, seenRefs) : false;
-  });
+  return allOf.some((sub) => isPlainObject(sub) && isObjectLikeSubSchema(sub, ctx, seenRefs));
 }
 
 function hasObjectSchemaShape(schema: Record<string, unknown>, ctx: ConversionContext): boolean {
@@ -421,45 +408,34 @@ function convertArraySchema(
   );
 }
 
+/** A property schema paired with the `$ref` path that was dereferenced to reach it. */
+interface MergedProperty {
+  schema: Record<string, unknown>;
+  seenRefs: ReadonlySet<string>;
+}
+
 /** Accumulates flattened `allOf` contributions plus the refs already walked. */
 interface AllOfMerge {
-  properties: Record<string, unknown>;
+  properties: Record<string, MergedProperty>;
   required: Set<string>;
   visitedRefs: Set<string>;
 }
 
-/**
- * Follow an `allOf` sub-schema's `$ref` chain, stopping at cycles and unresolvable refs.
- * WHY: generators chain definitions (`A: { $ref: B }`), so merging only the first hop
- * would drop every property inherited further down the chain.
- */
-function chaseAllOfRefs(
-  sub: Record<string, unknown>,
-  merge: AllOfMerge,
-  ctx: ConversionContext,
-): Record<string, unknown> {
-  let current = sub;
-  let ref = current["$ref"];
-  while (typeof ref === "string" && !isRefSeenOnPath(ref, ctx, merge.visitedRefs)) {
-    merge.visitedRefs.add(ref);
-    const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
-    if (!resolved) {
-      return current;
-    }
-    current = resolved;
-    ref = current["$ref"];
-  }
-  return current;
-}
-
 /** Merge a sub-schema's properties without overwriting properties declared by the caller. */
-function mergeSubSchemaProperties(props: unknown, rawProperties: Record<string, unknown>): void {
+function mergeSubSchemaProperties(
+  props: unknown,
+  mergedProperties: Record<string, MergedProperty>,
+  seenRefs: ReadonlySet<string>,
+): void {
   if (!isPlainObject(props)) {
     return;
   }
   for (const [key, value] of Object.entries(props)) {
-    if (!(key in rawProperties)) {
-      rawProperties[key] = value;
+    if (!(key in mergedProperties)) {
+      mergedProperties[key] = {
+        schema: value as Record<string, unknown>,
+        seenRefs,
+      };
     }
   }
 }
@@ -476,18 +452,49 @@ function mergeSubSchemaRequired(req: unknown, required: Set<string>): void {
   }
 }
 
-/** Merge one `allOf` member (and every nested member beneath it) into the accumulator. */
-function mergeAllOfSubSchema(sub: unknown, merge: AllOfMerge, ctx: ConversionContext): void {
+/**
+ * Follow an `allOf` member's `$ref` if not yet visited, recording `ref` on the active
+ * resolution path for any properties inherited from the referenced definition.
+ * WHY: generators chain definitions (`A: { $ref: B }`) and emit recursive fields wrapped
+ * in `allOf: [{ $ref: "#/$defs/Node" }]`; carrying `nextActiveRefs` onto inherited
+ * properties ensures `convertJsonSchemaToTypebox` breaks `$ref` cycles on inlined fields.
+ */
+function mergeAllOfRef(
+  ref: unknown,
+  merge: AllOfMerge,
+  ctx: ConversionContext,
+  activeRefs: ReadonlySet<string>,
+): void {
+  if (typeof ref !== "string" || isRefSeenOnPath(ref, ctx, merge.visitedRefs)) {
+    return;
+  }
+  merge.visitedRefs.add(ref);
+  const resolved = resolveRefTarget(ref, ctx.rootDefs, ctx.effectiveRoot);
+  if (!resolved) {
+    return;
+  }
+  const nextActiveRefs = new Set(activeRefs);
+  nextActiveRefs.add(ref);
+  mergeAllOfSubSchema(resolved, merge, ctx, nextActiveRefs);
+}
+
+/** Merge one `allOf` member (and every `$ref` or nested `allOf` beneath it) into the accumulator. */
+function mergeAllOfSubSchema(
+  sub: unknown,
+  merge: AllOfMerge,
+  ctx: ConversionContext,
+  activeRefs: ReadonlySet<string> = ctx.seenRefs,
+): void {
   if (!isPlainObject(sub)) {
     return;
   }
-  const resolvedSub = chaseAllOfRefs(sub, merge, ctx);
-  mergeSubSchemaProperties(resolvedSub["properties"], merge.properties);
-  mergeSubSchemaRequired(resolvedSub["required"], merge.required);
-  const nested = resolvedSub["allOf"];
+  mergeSubSchemaProperties(sub["properties"], merge.properties, activeRefs);
+  mergeSubSchemaRequired(sub["required"], merge.required);
+  mergeAllOfRef(sub["$ref"], merge, ctx, activeRefs);
+  const nested = sub["allOf"];
   if (Array.isArray(nested)) {
     for (const nestedSub of nested) {
-      mergeAllOfSubSchema(nestedSub, merge, ctx);
+      mergeAllOfSubSchema(nestedSub, merge, ctx, activeRefs);
     }
   }
 }
@@ -498,7 +505,7 @@ function convertObjectSchema(
   ctx: ConversionContext,
 ): TSchema {
   const merge: AllOfMerge = {
-    properties: isPlainObject(schema["properties"]) ? { ...schema["properties"] } : {},
+    properties: {},
     required: new Set<string>(
       Array.isArray(schema["required"])
         ? (schema["required"] as unknown[]).filter((r): r is string => typeof r === "string")
@@ -506,6 +513,7 @@ function convertObjectSchema(
     ),
     visitedRefs: new Set<string>(),
   };
+  mergeSubSchemaProperties(schema["properties"], merge.properties, ctx.seenRefs);
   const additionalProperties = schema["additionalProperties"];
 
   let allOfSchemas: TSchema[] | undefined;
@@ -524,12 +532,12 @@ function convertObjectSchema(
   }
 
   const props: Record<string, TSchema> = {};
-  for (const [key, value] of Object.entries(merge.properties)) {
+  for (const [key, entry] of Object.entries(merge.properties)) {
     const converted = convertJsonSchemaToTypebox(
-      value as Record<string, unknown>,
+      entry.schema,
       ctx.rootDefs,
       ctx.effectiveRoot,
-      ctx.seenRefs,
+      entry.seenRefs,
     );
     props[key] = merge.required.has(key) ? converted : Type.Optional(converted);
   }
@@ -610,6 +618,23 @@ function convertTypedSchema(
   return Type.Any(opts);
 }
 
+function inferSchemaType(
+  schema: Record<string, unknown>,
+  ctx: ConversionContext,
+): string | undefined {
+  const rawType = schema["type"];
+  if (typeof rawType === "string") {
+    return rawType;
+  }
+  if (hasObjectSchemaShape(schema, ctx)) {
+    return "object";
+  }
+  if (hasArraySchemaKeywords(schema)) {
+    return "array";
+  }
+  return undefined;
+}
+
 function resolveNonTypedSchema(
   schema: Record<string, unknown>,
   opts: Record<string, unknown>,
@@ -622,14 +647,6 @@ function resolveNonTypedSchema(
   const rawType = schema["type"];
   if (Array.isArray(rawType)) {
     return convertMultiTypeSchema(schema, rawType, opts, ctx);
-  }
-  if (
-    !hasObjectSchemaShape(schema, ctx) &&
-    !hasArraySchemaKeywords(schema) &&
-    rawType !== "object" &&
-    rawType !== "array"
-  ) {
-    return convertCombinatorSchema(schema, rawType, opts, ctx) ?? null;
   }
   return null;
 }
@@ -676,15 +693,13 @@ export function convertJsonSchemaToTypebox(
     return nonTyped;
   }
 
-  const rawType = schema["type"];
-  const type =
-    typeof rawType === "string"
-      ? rawType
-      : hasObjectSchemaShape(schema, ctx)
-        ? "object"
-        : hasArraySchemaKeywords(schema)
-          ? "array"
-          : undefined;
+  const type = inferSchemaType(schema, ctx);
+  if (type !== "object" && type !== "array") {
+    const combinator = convertCombinatorSchema(schema, type, opts, ctx);
+    if (combinator) {
+      return combinator;
+    }
+  }
 
   return convertTypedSchema(type, schema, opts, ctx);
 }
