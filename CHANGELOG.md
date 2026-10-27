@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-10-27
+
 ### Fixed
 - A `stdio` server launched through a wrapper command (`npx`, `npm exec`, `uvx`, `sh -c`) no longer leaves the real server process running after a timed-out `initialize` or a `/mcp:stop`: teardown now terminates the whole descendant tree (SIGTERM → bounded wait → SIGKILL per generation) instead of only the wrapper's PID. A surviving grandchild also held the wrapper's inherited `stdout`/`stderr` pipes open, which kept Node's `'close'` event from firing and made `StdioClientTransport.close()` burn its full 4,000ms escalation budget — a 300ms handshake timeout took 4.3s to reject and still leaked the server. Teardown now releases those pipes as well, so the same failure rejects in under a second with no orphaned processes (#205).
 
