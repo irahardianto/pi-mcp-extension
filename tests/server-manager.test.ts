@@ -794,7 +794,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   process.stderr.write(Buffer.from([0x42, 0x6f, 0x6f, 0x74, 0x20, 0xf0, 0x9f]));
   await new Promise((r) => setTimeout(r, 15));
   process.stderr.write(Buffer.from([0x9a, 0x80, 0x20, 0x1b, 0x5b, 0x33, 0x32, 0x6d, 0x6f, 0x6b, 0x1b, 0x5b, 0x30, 0x6d, 0x0d, 0x0a]));
-  process.stderr.write("trailing-without-newline\\x1b]0;title\\x07");
+  await new Promise((r) => process.stderr.write("trailing-without-newline\\x1b]0;title\\x07", r));
   return { tools: [] };
 });
 await server.connect(new StdioServerTransport());

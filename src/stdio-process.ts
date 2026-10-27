@@ -34,6 +34,7 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
 
   return {
     write(chunk: Buffer): void {
+      flushed = false;
       remainder += decoder.write(chunk);
       const lines = remainder.split("\n");
       remainder = lines.pop() ?? "";
@@ -56,8 +57,12 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
 
 // ─── Transport Instrumentation ────────────────────────────────────────────────
 
+/** Grace window for an exited child's pipes to drain naturally before force-destroying them. */
+const PIPE_DRAIN_GRACE_MS = 100;
+
 interface StdioChildRecord {
   process: ChildProcess;
+  closed: boolean;
   /** Flush the buffered partial stderr line before the pipe is destroyed. */
   flushStderr(): void;
 }
@@ -95,10 +100,17 @@ export function instrumentStdioTransport(
 
   const recordProcess = (proc: ChildProcess | undefined): void => {
     if (!proc?.pid) return;
-    childRecords.set(transport, {
-      process: proc,
-      flushStderr: () => flushStderr?.(),
-    });
+    if (!childRecords.has(transport)) {
+      const record: StdioChildRecord = {
+        process: proc,
+        closed: false,
+        flushStderr: () => flushStderr?.(),
+      };
+      proc.once?.("close", () => {
+        record.closed = true;
+      });
+      childRecords.set(transport, record);
+    }
     onPid(proc.pid);
   };
 
@@ -139,6 +151,35 @@ export function instrumentStdioTransport(
     transport.stderr.on("end", flush);
     transport.stderr.on("close", flush);
   }
+}
+
+/**
+ * Wait briefly for an exited child process to drain its stdio pipes and emit `'close'`
+ * naturally before `destroyStdioStreams` force-destroys the parent's pipe read ends.
+ *
+ * WHY: On Windows, `process.stderr` is an overlapped named pipe whose final bytes can
+ * still be in flight in libuv when `TerminateProcess` completes. Letting `'close'` fire
+ * naturally preserves trailing stderr output when no grandchild holds the pipe open, while
+ * bounding the wait to `PIPE_DRAIN_GRACE_MS` when a surviving grandchild keeps it open.
+ */
+export async function waitForChildClose(
+  transport: object | null | undefined,
+  timeoutMs = PIPE_DRAIN_GRACE_MS,
+): Promise<void> {
+  if (!transport) return;
+  const record = childRecords.get(transport);
+  if (!record || record.closed || typeof record.process.once !== "function") return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      record.process.removeListener?.("close", onClose);
+      resolve();
+    }, timeoutMs);
+    const onClose = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    record.process.once("close", onClose);
+  });
 }
 
 /**

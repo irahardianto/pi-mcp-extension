@@ -10,6 +10,7 @@ import {
   instrumentStdioTransport,
   isPidAlive,
   listDescendantPids,
+  waitForChildClose,
   type StdioProcessDeps,
 } from "../src/stdio-process.js";
 
@@ -592,6 +593,40 @@ describe("stdio-process", () => {
       destroyStdioStreams(fakeTransport);
       assert.deepEqual(lines, ["no trailing newline"]);
       assert.deepEqual(destroyed, ["stdout", "stderr"]);
+    });
+
+    it("waitForChildClose resolves immediately on close and times out when a survivor holds pipes open", async () => {
+      await waitForChildClose(null);
+      await waitForChildClose({});
+
+      const childProc = Object.assign(new EventEmitter(), { pid: 5150 });
+      const fakeTransport = {
+        _process: childProc as unknown,
+        pid: 5150,
+        stderr: null,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+
+      instrumentStdioTransport(fakeTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: () => {},
+      });
+      await fakeTransport.start();
+
+      // Bounded timeout when the child has not emitted 'close' yet
+      await waitForChildClose(fakeTransport, 10);
+
+      // Immediate resolution once 'close' fires
+      setImmediate(() => childProc.emit("close", 0, null));
+      await waitForChildClose(fakeTransport, 500);
+
+      // Subsequent calls return immediately because record.closed is true
+      await waitForChildClose(fakeTransport, 500);
     });
   });
 });

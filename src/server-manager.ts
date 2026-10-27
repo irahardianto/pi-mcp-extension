@@ -32,6 +32,7 @@ import {
   destroyStdioStreams,
   ensurePidTerminated,
   instrumentStdioTransport,
+  waitForChildClose,
 } from "./stdio-process.js";
 import { createTransport } from "./transport-factory.js";
 import {
@@ -842,6 +843,7 @@ export class ServerManager {
   ): Promise<void> {
     try {
       await ensurePidTerminated(pid);
+      await waitForChildClose(transport);
     } finally {
       destroyStdioStreams(transport);
     }
@@ -858,8 +860,8 @@ export class ServerManager {
       (transport instanceof StdioClientTransport ? transport.pid : null);
     server.childPid = null;
     await Promise.allSettled([
-      this._terminateStdioTree(pid, transport),
       client.close(),
+      this._terminateStdioTree(pid, transport),
     ]);
     // WHY: Secondary safety check to guarantee PID termination even if transport.close()
     // or child process exit raced during the initial Promise.allSettled.
@@ -1107,8 +1109,8 @@ export class ServerManager {
     server.childPid = null;
 
     await Promise.allSettled([
-      this._terminateStdioTree(pid, transport),
       client?.close(),
+      this._terminateStdioTree(pid, transport),
     ]);
     await ensurePidTerminated(pid);
   }
