@@ -526,7 +526,17 @@ export class ConnectionCoordinator {
     this._ensureActive(controller.signal, serverName);
     await this.deps.authorize(serverName, ctx, controller.signal, reset);
     this._ensureActive(controller.signal, serverName);
-    await this._startAndGuardAbort(serverName, ctx, controller.signal);
+    try {
+      await this._startAndGuardAbort(serverName, ctx, controller.signal);
+    } catch (err) {
+      // WHY: Authorization can succeed and the reconnect still fail for a non-auth reason
+      // (ECONNREFUSED, timeout). lastError now names that failure, so a hint left over from
+      // the earlier decline would tell the user to authorize a server that just authorized.
+      if (!(err instanceof AuthCancelledError)) {
+        this.syncStatus(ctx);
+      }
+      throw err;
+    }
   }
 
   private async _startAndGuardAbort(

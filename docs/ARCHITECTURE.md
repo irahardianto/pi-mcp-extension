@@ -297,9 +297,22 @@ Details:
   deferred `_recover()` can report anything, so `handleUnauthorizedServerError()` returns
   the `AuthRequiredError` it recorded and `src/index.ts` routes it to
   `coordinator.handleRecoveryFailed()` — the same path background recovery uses — which
-  warns the user and repaints the hint. A 401 raised while a connect attempt is still
-  `starting` returns `undefined` instead, because that attempt's own failure path reports
-  it and the user would otherwise be warned twice.
+  warns the user and repaints the hint.
+- `handleUnauthorizedServerError()` acts **only** on a `ready` server. For any other
+  state it is a no-op that leaves the server untouched: a 401/403 during connect
+  (`initialize` succeeds, `tools/list` 401s while `starting`) belongs to that attempt, and
+  shutting the server down there would abort the attempt's own signal — `classifyConnectFailure`
+  checks `aborted` first and would report `AuthCancelledError` instead of `auth-required`,
+  suppressing the startup prompt, the interactive authorization, and the recovery
+  failure. Left alone, `_raiseAuthRequired` invalidates the stale tokens, records and
+  throws the `AuthRequiredError`, and the eager-start / coordinator path reports it once.
+- A `tools/list_changed` refresh that fails is a `notify`-level error, except when the
+  refresh was cancelled (abort or `AuthCancelledError`) or the 401/403 was already
+  reported as a re-authorization warning — then it is logged at `info` without a toast, so
+  it never reads as a second, unrelated problem.
+- A declined server whose `/mcp:auth` succeeds but whose post-authorization reconnect
+  then fails for a non-auth reason (connection refused, timeout) drops the hint: the
+  user authorized, and `lastError` now names the new failure.
 - `cancelServer()` aborts the startup prompt and the in-flight attempt; an aborted
   waiter wakes immediately and rejects with `AuthCancelledError` without breaking the
   queue for later waiters.

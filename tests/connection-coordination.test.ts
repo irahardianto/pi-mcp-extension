@@ -18,6 +18,9 @@ import {
 import { ServerManager } from "../src/server-manager.js";
 import { ToolBridge, type PiExtensionAPI } from "../src/tool-bridge.js";
 import { AuthRequiredError, McpOAuthProvider, acquireAuthLock, getAuthStatus, resetAuth } from "../src/oauth-provider.js";
+import { ConnectionCoordinator } from "../src/connection-coordinator.js";
+import { McpError, AuthCancelledError } from "../src/errors.js";
+import { setDiagnosticUi } from "../src/debug-log.js";
 import type { McpConfig } from "../src/config.js";
 
 const mockServer = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
@@ -752,6 +755,261 @@ it("should report readiness through setServerReadyCallback and only report a mid
     await manager.shutdownAll();
     listener.closeAllConnections();
     await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Fake streamable-http MCP endpoint whose `tools/list` can be switched to 401 on demand.
+ */
+async function startToolListServer(): Promise<{
+  url: string;
+  setToolsListUnauthorized: (value: boolean) => void;
+  close: () => Promise<void>;
+}> {
+  const { createServer } = await import("node:http");
+  let toolsListUnauthorized = false;
+  const listener = createServer((req, res) => {
+    if (req.url !== "/mcp" || req.method !== "POST") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (c) => { body += c.toString(); });
+    req.on("end", () => {
+      const msg = JSON.parse(body);
+      if (msg.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "list-srv", version: "1.0.0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (msg.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (msg.method === "tools/list") {
+        if (toolsListUnauthorized) {
+          res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+          res.end(JSON.stringify({ error: "unauthorized" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { tools: [{ name: "list_ping", inputSchema: { type: "object", properties: {} } }] },
+          }),
+        );
+        return;
+      }
+      res.writeHead(400);
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    url: `http://127.0.0.1:${address.port}/mcp`,
+    setToolsListUnauthorized: (value: boolean) => { toolsListUnauthorized = value; },
+    close: async () => {
+      listener.closeAllConnections();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    },
+  };
+}
+
+it("should classify a 401 on the initial tools/list as AuthRequiredError and still offer startup authorization (Issue 207)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue207-toolslist-"));
+  const authDir = join(dir, "auth");
+  const fake = await startToolListServer();
+  fake.setToolsListUnauthorized(true);
+
+  const manager = new ServerManager(
+    {
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 },
+      mcpServers: {
+        listSrv: {
+          lifecycle: "eager",
+          transport: "streamable-http",
+          url: fake.url,
+          args: [],
+          auth: { type: "oauth", clientId: "cid" },
+        },
+      },
+    },
+    authDir,
+  );
+
+  const bridge = new ToolBridge(
+    { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 },
+    makeBridgeApi(() => {}, () => [], () => {}),
+  );
+  const warnings: string[] = [];
+  manager.setToolRefreshCallback((name, client, options) => bridge.refreshTools(name, client, options));
+  bridge.setAuthErrorCallback(async (name) => {
+    // Same wiring as src/index.ts.
+    const authError = await manager.handleUnauthorizedServerError(name);
+    if (authError) warnings.push(name);
+  });
+
+  try {
+    // Stale credentials on disk must still be invalidated by the auth failure.
+    const seeder = new McpOAuthProvider({
+      serverName: "listSrv",
+      authConfig: { type: "oauth", clientId: "cid" },
+      storageDir: authDir,
+      serverUrl: fake.url,
+    });
+    await seeder.saveTokens({ access_token: "stale", refresh_token: "stale-refresh", token_type: "Bearer" });
+    assert.equal((await getAuthStatus("listSrv", authDir, fake.url))?.hasTokens, true);
+
+    // A 401 during discovery runs while the attempt is still "starting": the attempt must
+    // report AuthRequiredError, not a cancelled connect.
+    await assert.rejects(
+      () => manager.startServer("listSrv", dir),
+      (err: unknown) => {
+        assert.equal(err instanceof AuthCancelledError, false, "a 401 is not a cancellation");
+        assert.ok(err instanceof AuthRequiredError, `expected AuthRequiredError, got ${String(err)}`);
+        return true;
+      },
+    );
+    assert.equal(manager.getServer("listSrv")?.state, "stopped");
+    assert.ok(manager.getServer("listSrv")?.lastError instanceof AuthRequiredError);
+    assert.equal(
+      Boolean((await getAuthStatus("listSrv", authDir, fake.url))?.hasTokens),
+      false,
+      "stale tokens must still be invalidated by the connect failure path",
+    );
+
+    // Mid-attempt the handler is a no-op (the attempt already reported the failure), so the
+    // user is warned once, by the startup prompt path below — not twice.
+    assert.deepEqual(warnings, [], "a connect-time 401 must not be reported through the auth callback");
+
+    // The eager start must still offer interactive authorization instead of silently
+    // swallowing a cancelled connect.
+    const prompts: string[] = [];
+    const statuses: Array<string | undefined> = [];
+    const coordinator = new ConnectionCoordinator({
+      manager,
+      bridge: { deactivateServer: () => {}, removeServer: () => {} } as unknown as ToolBridge,
+      getConfig: () => ({ settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 }, mcpServers: {} }),
+      authorize: async () => {},
+      stopCallbackServer: async () => {},
+    });
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        setStatus: (_key: string, value?: string) => statuses.push(value),
+        select: async (title: string) => {
+          prompts.push(title);
+          return "Not now";
+        },
+      },
+    });
+
+    await coordinator.startEagerServers(
+      [["listSrv", manager.getServer("listSrv")!.config]],
+      ctx,
+    );
+    // The startup prompt turn is queued asynchronously (authQueue).
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(prompts, ["listSrv needs authorization"], "a 401 on tools/list must still prompt");
+    assert.equal(statuses.at(-1), "run /mcp:auth listSrv");
+  } finally {
+    await manager.shutdownAll();
+    await fake.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("should not toast a duplicate tools refresh failure when the refresh was a 401 or a cancellation (Issue 207)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue207-refresh-"));
+  const fake = await startToolListServer();
+
+  const manager = new ServerManager(
+    {
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 },
+      mcpServers: {
+        listSrv: {
+          lifecycle: "lazy",
+          transport: "streamable-http",
+          url: fake.url,
+          args: [],
+          auth: { type: "oauth", clientId: "cid" },
+        },
+      },
+    },
+    join(dir, "auth"),
+  );
+
+  const notifications: Array<{ message: string; level?: string }> = [];
+  setDiagnosticUi({ notify: (message: string, level?: string) => notifications.push({ message, ...(level ? { level } : {}) }) }, true);
+  let refreshMode: "401" | "cancelled" | "protocol" = "protocol";
+
+  try {
+    await manager.startServer("listSrv", dir);
+    manager.setToolRefreshCallback(async (name: string) => {
+      if (refreshMode === "cancelled") throw new AuthCancelledError(name);
+      if (refreshMode === "protocol") throw new McpError("Failed to list tools", name, "protocol");
+      // Mirror ToolBridge on a 401/403: report the auth failure, then surface the protocol error.
+      await manager.handleUnauthorizedServerError(name);
+      throw new McpError("Failed to list tools from listSrv: HTTP 401", name, "protocol");
+    });
+
+    const client = manager.getServer("listSrv")!.client!;
+    const triggerListChanged = () =>
+      (client as unknown as { _onnotification: (msg: unknown) => Promise<void> })._onnotification({
+        jsonrpc: "2.0",
+        method: "notifications/tools/list_changed",
+      });
+
+    // A cancelled refresh (e.g. /mcp:stop) must not toast.
+    refreshMode = "cancelled";
+    await triggerListChanged();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(notifications.length, 0, "a cancelled refresh is not a failure");
+
+    // A genuine refresh failure is still reported.
+    refreshMode = "protocol";
+    await triggerListChanged();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(
+      notifications.some((n) => /Failed to refresh tools/.test(n.message)),
+      `expected a refresh failure toast, got ${JSON.stringify(notifications)}`,
+    );
+
+    // A 401 during list_changed is covered by the re-auth warning; no second toast.
+    notifications.length = 0;
+    refreshMode = "401";
+    await triggerListChanged();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(manager.getServer("listSrv")?.state, "stopped");
+    assert.ok(manager.getServer("listSrv")?.lastError instanceof AuthRequiredError);
+    assert.equal(
+      notifications.some((n) => /Failed to refresh tools/.test(n.message)),
+      false,
+      `unexpected duplicate toast: ${JSON.stringify(notifications)}`,
+    );
+  } finally {
+    setDiagnosticUi(null, false);
+    await manager.shutdownAll();
+    await fake.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

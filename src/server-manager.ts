@@ -354,20 +354,28 @@ export class ServerManager {
     * request (tools/list or tools/call) fails with 401/403 insufficient_scope.
     *
     * Returns the {@link AuthRequiredError} when a server that was already `ready`
-    * lost its credentials mid-session, and `undefined` when nothing needed
-    * reporting (unknown server, non-OAuth server, or a 401 raised while a connect
-    * attempt was still in flight — that attempt's own failure path reports it, so
-    * returning the error here would notify the user twice).
+    * lost its credentials mid-session, and `undefined` otherwise (unknown server,
+    * non-OAuth server, or a server that is not `ready` — see below).
+    *
+    * Only a `ready` server is handled here. For any other state this is a no-op and
+    * must NOT touch the server: a 401/403 during a connect attempt (`initialize` ok,
+    * `tools/list` 401 while `starting`) arrives while that attempt owns the
+    * lifecycle, and shutting the server down here would abort the attempt's own
+    * signal. `classifyConnectFailure` then sees `aborted` first and reports
+    * `AuthCancelledError` instead of `auth-required`, which suppresses the startup
+    * auth prompt, the interactive authorization, and the recovery failure alike.
+    * Left alone, the attempt's `_raiseAuthRequired` invalidates the tokens, records
+    * the `AuthRequiredError`, and reports it exactly once.
     */
   async handleUnauthorizedServerError(name: string): Promise<AuthRequiredError | undefined> {
     const server = this.servers.get(name);
     if (!server || !server.config.auth || server.config.transport === "stdio") {
       return undefined;
     }
-    // WHY: Capture readiness before _shutdown() moves the server to "stopped": only a
-    // server that was serving requests has a live session whose auth state the user
-    // must be told about (and whose footer hint must be repainted).
-    const wasReady = server.state === "ready";
+    if (server.state !== "ready") {
+      // WHY: See the JSDoc above — an in-flight connect attempt reports its own 401.
+      return undefined;
+    }
     const authError = new AuthRequiredError(name);
     // WHY: Shut down immediately before async disk I/O so server.generation increments
     // synchronously and cancels any concurrent _recover() microtask queued by client.onerror.
@@ -375,7 +383,7 @@ export class ServerManager {
     server.lastError = authError;
     await invalidateStoredTokens(name, this.storageDir, server.config.url);
     server.lastError = authError;
-    return wasReady ? authError : undefined;
+    return authError;
   }
 
   /** Get recent stderr output for a server. */
@@ -585,30 +593,9 @@ export class ServerManager {
     );
 
     // tools/list_changed: re-discover tools and update Pi registrations
-    client.setNotificationHandler(
-      ToolListChangedNotificationSchema,
-      async () => {
-        if (!signal.aborted && this.onToolRefresh && server.state === "ready" && server.client === client) {
-          try {
-            const refreshTimeoutMs = this._resolveTimeoutMs(server);
-            await this.onToolRefresh(server.name, server.client, {
-              requestTimeoutMs: refreshTimeoutMs,
-              signal,
-            });
-          } catch (err) {
-            const { kind, message } = describeError(err);
-            reportDiagnostic({
-              level: "error",
-              event: "server.tools_refresh_failed",
-              server: server.name,
-              message: `Failed to refresh tools for ${server.name}: ${message}`,
-              fields: { kind },
-              notify: true,
-            });
-          }
-        }
-      },
-    );
+    client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+      await this._handleToolListChanged(server, client, signal);
+    });
 
     // notifications/message: structured logging from MCP servers
     client.setNotificationHandler(
@@ -634,6 +621,48 @@ export class ServerManager {
     );
 
     return client;
+  }
+
+  /**
+   * Re-discover tools after a `notifications/tools/list_changed` from a ready server.
+   *
+   * Extracted from the notification handler so the handler registration stays a single
+   * guarded call.
+   */
+  private async _handleToolListChanged(
+    server: ManagedServer,
+    client: Client,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const onToolRefresh = this.onToolRefresh;
+    if (signal.aborted || !onToolRefresh || server.state !== "ready" || server.client !== client) {
+      return;
+    }
+    try {
+      const refreshTimeoutMs = this._resolveTimeoutMs(server);
+      await onToolRefresh(server.name, server.client, {
+        requestTimeoutMs: refreshTimeoutMs,
+        signal,
+      });
+    } catch (err) {
+      const { kind, message } = describeError(err);
+      // WHY: Two failures here are already accounted for and must not toast: a cancelled
+      // refresh (/mcp:stop, session teardown) is expected, and a 401/403 was just reported
+      // by handleUnauthorizedServerError as a re-authorization warning plus the footer hint
+      // — a second "Failed to refresh tools" error would read as an unrelated problem.
+      const alreadyReported =
+        err instanceof AuthCancelledError ||
+        signal.aborted ||
+        server.lastError instanceof AuthRequiredError;
+      reportDiagnostic({
+        level: alreadyReported ? "info" : "error",
+        event: "server.tools_refresh_failed",
+        server: server.name,
+        message: `Failed to refresh tools for ${server.name}: ${message}`,
+        fields: { kind },
+        notify: !alreadyReported,
+      });
+    }
   }
 
   private async _handshakeAndDiscover(params: HandshakeParams): Promise<void> {

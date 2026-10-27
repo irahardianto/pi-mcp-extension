@@ -525,4 +525,30 @@ describe("ConnectionCoordinator auth hint synchronization (Issue 207)", () => {
     assert.equal(statuses.at(-1), undefined);
     assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
   });
+
+  it("clears a stale hint when the reconnect after a successful authorization fails for a non-auth reason", async () => {
+    // First attempt: no credentials -> AuthRequiredError -> interactive authorization runs,
+    // and the reconnect that follows it fails with ECONNREFUSED.
+    let startAttempts = 0;
+    const { coordinator, ctx, statuses } = setup({
+      onStartServer: async () => {
+        startAttempts++;
+        throw startAttempts === 1
+          ? new AuthRequiredError("oauthSrv")
+          : new McpError("connect ECONNREFUSED", "oauthSrv", "connection");
+      },
+    });
+
+    coordinator.markAuthRequired("oauthSrv");
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    await assert.rejects(
+      coordinator.connect("oauthSrv", ctx),
+      (err: unknown) => err instanceof McpError && err.code === "connection",
+    );
+    assert.equal(startAttempts, 2, "the reconnect after authorize() must have been attempted");
+
+    assert.equal(statuses.at(-1), undefined, "a successful authorization must not leave the hint behind");
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
+  });
 });
