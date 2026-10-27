@@ -593,30 +593,42 @@ setInterval(() => {}, 1000);
     );
 
     const manager = new ServerManager({
-      settings: { toolPrefix: "mcp", requestTimeoutMs: 300, maxRetries: 0 },
+      // WHY: 500ms timeout provides enough startup margin on slower macOS/Windows CI runners
+      // before initialize times out and triggers process termination.
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 500, maxRetries: 0 },
       mcpServers: {
         wrapper: {
           command: process.execPath,
           args: [wrapperScript],
           transport: "stdio",
           lifecycle: "lazy",
-          requestTimeoutMs: 300,
+          requestTimeoutMs: 500,
         },
       },
     });
 
+    let pids: { wrapper: number; grandchild: number } | undefined;
     try {
       const startedAt = Date.now();
       await assert.rejects(() => manager.startServer("wrapper", dir));
       const elapsed = Date.now() - startedAt;
 
-      const pids = JSON.parse(await readFile(pidFile, "utf8")) as {
-        wrapper: number;
-        grandchild: number;
-      };
+      let pidText = "";
+      for (let i = 0; i < 50; i++) {
+        try {
+          pidText = await readFile(pidFile, "utf8");
+          if (pidText.trim()) break;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw err;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      pids = JSON.parse(pidText) as { wrapper: number; grandchild: number };
       assert.ok(pids.grandchild > 0, `Expected a grandchild PID in ${pidFile}`);
 
-      // 300ms handshake + 500ms SIGTERM window + SIGKILL escalation. A leaked grandchild
+      // 500ms handshake + 500ms SIGTERM window + SIGKILL escalation. A leaked grandchild
       // holding the inherited pipes would add the SDK's full 4,000ms close() budget.
       assert.ok(elapsed < 3000, `Expected bounded teardown, took ${elapsed}ms`);
 
@@ -632,6 +644,123 @@ setInterval(() => {}, 1000);
       }
     } finally {
       await manager.shutdownAll();
+      for (const pid of [pids?.grandchild, pids?.wrapper]) {
+        if (!pid) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // WHY: Best-effort test cleanup for Windows (where grandchild discovery is
+          // unsupported) or if an assertion above failed before the tree was reaped.
+        }
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("should terminate grandchildren and release pipes when stopping a ready wrapper server (Issue #205)", async () => {
+    const { mkdtemp, rm, writeFile, readFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-wrapper-stop-"));
+    const pidFile = join(dir, "pids.json");
+    const grandchildScript = join(dir, "grandchild.mjs");
+    const wrapperScript = join(dir, "wrapper.mjs");
+
+    await writeFile(
+      grandchildScript,
+      `
+import { createInterface } from "node:readline";
+
+process.on("SIGTERM", () => {});
+const rl = createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "grandchild-mcp", version: "1.0.0" },
+      },
+    }) + "\\n");
+  } else if (msg.method === "tools/list") {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: { tools: [] },
+    }) + "\\n");
+  }
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    await writeFile(
+      wrapperScript,
+      `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+const child = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], {
+  stdio: "inherit",
+});
+writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ wrapper: process.pid, grandchild: child.pid }));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 },
+      mcpServers: {
+        wrapper: {
+          command: process.execPath,
+          args: [wrapperScript],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+
+    let pids: { wrapper: number; grandchild: number } | undefined;
+    try {
+      await manager.startServer("wrapper", dir);
+      assert.equal(manager.getServer("wrapper")?.state, "ready");
+
+      pids = JSON.parse(await readFile(pidFile, "utf8")) as {
+        wrapper: number;
+        grandchild: number;
+      };
+      assert.ok(pids.grandchild > 0, `Expected a grandchild PID in ${pidFile}`);
+
+      const stopStartedAt = Date.now();
+      await manager.stopServer("wrapper");
+      const elapsed = Date.now() - stopStartedAt;
+
+      assert.equal(manager.getServer("wrapper")?.state, "stopped");
+      assert.ok(elapsed < 3000, `Expected bounded stopServer teardown, took ${elapsed}ms`);
+
+      for (const [label, pid] of Object.entries(pids)) {
+        // WHY: descendant discovery is POSIX-only (see listDescendantPids); on Windows the
+        // leaked grandchild is expected, and only the wrapper's own death is asserted.
+        if (label === "grandchild" && process.platform === "win32") continue;
+        assert.throws(
+          () => process.kill(pid, 0),
+          (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+          `Expected ${label} PID ${pid} to be terminated before stopServer finished`,
+        );
+      }
+    } finally {
+      await manager.shutdownAll();
+      for (const pid of [pids?.grandchild, pids?.wrapper]) {
+        if (!pid) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // WHY: Best-effort test cleanup for Windows or failed assertions.
+        }
+      }
       await rm(dir, { recursive: true, force: true });
     }
   });

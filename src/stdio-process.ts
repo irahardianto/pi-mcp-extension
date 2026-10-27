@@ -201,18 +201,22 @@ async function readChildrenFile(path: string): Promise<string> {
   }
 }
 
+/** Timeout for a single `ps` process-table snapshot on non-Linux POSIX systems. */
+const PS_TIMEOUT_MS = 1_000;
+
 /**
- * Read the direct child PIDs of `pid` from the `ps` process table.
+ * Read the full `ps` process table and index it as `parentPid → childPids`.
  *
- * WHY: macOS and other POSIX systems have no `/proc`; `ps -A -o pid=,ppid=` is the
- * portable way to rebuild the parent → children index.
+ * WHY: macOS and other non-Linux POSIX systems have no `/proc`; `ps -A -o pid=,ppid=`
+ * dumps the entire process table in one call so a single snapshot can serve the whole
+ * tree walk without spawning `ps` once per node.
  */
-async function readPsChildren(pid: number): Promise<number[]> {
+async function readPsProcessTable(): Promise<Map<number, number[]>> {
   const { stdout } = await execFileAsync("ps", ["-A", "-o", "pid=,ppid="], {
     maxBuffer: 16 * 1024 * 1024,
+    timeout: PS_TIMEOUT_MS,
   });
-  const childrenOf = indexProcessTable(stdout);
-  return childrenOf.get(pid) ?? [];
+  return indexProcessTable(stdout);
 }
 
 /** Index `ps -A -o pid=,ppid=` output as a parent PID → child PIDs map. */
@@ -233,15 +237,20 @@ export function indexProcessTable(stdout: string): Map<number, number[]> {
   return childrenOf;
 }
 
-function readPlatformChildren(pid: number): Promise<number[]> {
-  if (process.platform === "linux") return readProcChildren(pid);
+function createPlatformChildReader(): (pid: number) => Promise<number[]> {
+  if (process.platform === "linux") return readProcChildren;
   if (process.platform === "win32") {
     // WHY: Windows has no `/proc` or `ps`, and the portable tree kill (`taskkill /T`)
     // must be driven by the caller's own signal semantics. Discovery reports nothing so
     // teardown falls back to killing the top-level PID plus destroying the pipes.
-    return Promise.resolve([]);
+    return () => Promise.resolve([]);
   }
-  return readPsChildren(pid);
+  let tablePromise: Promise<Map<number, number[]>> | null = null;
+  return async (pid: number): Promise<number[]> => {
+    tablePromise ??= readPsProcessTable();
+    const childrenOf = await tablePromise;
+    return childrenOf.get(pid) ?? [];
+  };
 }
 
 /**
@@ -252,7 +261,7 @@ function readPlatformChildren(pid: number): Promise<number[]> {
  */
 export async function listDescendantPids(
   pid: number,
-  readChildren: (pid: number) => Promise<number[]> = readPlatformChildren,
+  readChildren: (pid: number) => Promise<number[]> = createPlatformChildReader(),
 ): Promise<number[]> {
   try {
     const descendants = await walkDescendants(pid, readChildren);

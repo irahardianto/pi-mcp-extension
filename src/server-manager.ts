@@ -858,8 +858,8 @@ export class ServerManager {
       (transport instanceof StdioClientTransport ? transport.pid : null);
     server.childPid = null;
     await Promise.allSettled([
-      client.close(),
       this._terminateStdioTree(pid, transport),
+      client.close(),
     ]);
     // WHY: Secondary safety check to guarantee PID termination even if transport.close()
     // or child process exit raced during the initial Promise.allSettled.
@@ -1107,8 +1107,8 @@ export class ServerManager {
     server.childPid = null;
 
     await Promise.allSettled([
-      client?.close(),
       this._terminateStdioTree(pid, transport),
+      client?.close(),
     ]);
     await ensurePidTerminated(pid);
   }
