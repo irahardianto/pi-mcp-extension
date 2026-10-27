@@ -4,9 +4,12 @@ import { EventEmitter } from "node:events";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   createLineSplitter,
+  destroyStdioStreams,
   ensurePidTerminated,
+  indexProcessTable,
   instrumentStdioTransport,
   isPidAlive,
+  listDescendantPids,
   type StdioProcessDeps,
 } from "../src/stdio-process.js";
 
@@ -208,6 +211,7 @@ describe("stdio-process", () => {
           throw new Error("sleep should not be called");
         },
         now: () => 0,
+        listDescendantPids: async () => [],
       };
 
       await ensurePidTerminated(null, deps);
@@ -249,6 +253,7 @@ describe("stdio-process", () => {
           currentNow += ms;
         },
         now: () => currentNow,
+        listDescendantPids: async () => [],
       };
 
       await ensurePidTerminated(5555, deps);
@@ -287,6 +292,7 @@ describe("stdio-process", () => {
           currentNow += ms;
         },
         now: () => currentNow,
+        listDescendantPids: async () => [],
       };
 
       await ensurePidTerminated(9999, deps);
@@ -311,6 +317,7 @@ describe("stdio-process", () => {
           throw new Error("should not sleep when SIGTERM sees ESRCH");
         },
         now: () => currentNow,
+        listDescendantPids: async () => [],
       };
       await ensurePidTerminated(1111, depsTermRace);
 
@@ -327,6 +334,7 @@ describe("stdio-process", () => {
           currentNow += ms;
         },
         now: () => currentNow,
+        listDescendantPids: async () => [],
       };
       await ensurePidTerminated(2222, depsKillRace);
       assert.deepEqual(
@@ -335,4 +343,256 @@ describe("stdio-process", () => {
       );
     });
   });
+
+  describe("descendant process tree (Issue #205)", () => {
+    /** Run `run` with `process.platform` overridden, then restore the real platform. */
+    async function withPlatform(platform: NodeJS.Platform, run: () => Promise<void>): Promise<void> {
+      const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+      // WHY: Descendant discovery dispatches on process.platform; redefining it is the only
+      // way to exercise the macOS/Windows branches from the Linux runner that measures coverage.
+      Object.defineProperty(process, "platform", {
+        configurable: true,
+        enumerable: true,
+        value: platform,
+      });
+      try {
+        await run();
+      } finally {
+        if (descriptor) Object.defineProperty(process, "platform", descriptor);
+      }
+    }
+
+    async function spawnHangingChild(): Promise<{ pid: number; kill(): void }> {
+      const { spawn } = await import("node:child_process");
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+        stdio: "ignore",
+      });
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", resolve);
+        child.once("error", reject);
+      });
+      assert.ok(child.pid, "expected a spawned child PID");
+      return { pid: child.pid, kill: () => void child.kill("SIGKILL") };
+    }
+
+    it("signals descendants deepest-first before the wrapper and escalates SIGKILL to survivors", async () => {
+      let currentNow = 0;
+      const calls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+      const alive = new Set<number>([1000, 1001, 1002]);
+
+      const deps: StdioProcessDeps = {
+        kill: (pid, signal) => {
+          calls.push({ pid, signal });
+          if (signal === 0) {
+            if (!alive.has(pid)) throw createEsrchError();
+            return true;
+          }
+          // The wrapper ignores SIGTERM; its descendants honour it.
+          if (signal === "SIGTERM" && pid !== 1000) alive.delete(pid);
+          if (signal === "SIGKILL") alive.delete(pid);
+          return true;
+        },
+        sleep: async (ms) => {
+          currentNow += ms;
+        },
+        now: () => currentNow,
+        listDescendantPids: async () => [1002, 1001],
+      };
+
+      await ensurePidTerminated(1000, deps);
+
+      assert.deepEqual(
+        calls.filter((c) => c.signal === "SIGTERM").map((c) => c.pid),
+        [1002, 1001, 1000],
+      );
+      // Only the wrapper survives SIGTERM, so escalation must not signal the reaped children.
+      assert.deepEqual(
+        calls.filter((c) => c.signal === "SIGKILL").map((c) => c.pid),
+        [1000],
+      );
+      assert.deepEqual([...alive], []);
+    });
+
+    it("re-snapshots on escalation so children spawned during the SIGTERM window are killed too", async () => {
+      let currentNow = 0;
+      const sigkills: number[] = [];
+      const alive = new Set<number>([2000, 2001, 2002]);
+      let scans = 0;
+
+      const deps: StdioProcessDeps = {
+        kill: (pid, signal) => {
+          if (signal === 0) {
+            if (!alive.has(pid)) throw createEsrchError();
+            return true;
+          }
+          // Everything ignores SIGTERM; only the SIGKILL escalation ends the tree.
+          if (signal === "SIGKILL") {
+            sigkills.push(pid);
+            alive.delete(pid);
+          }
+          return true;
+        },
+        sleep: async (ms) => {
+          currentNow += ms;
+        },
+        now: () => currentNow,
+        listDescendantPids: async () => {
+          scans += 1;
+          return scans === 1 ? [2001] : [2001, 2002];
+        },
+      };
+
+      await ensurePidTerminated(2000, deps);
+
+      assert.equal(scans, 2);
+      assert.deepEqual(sigkills.sort((a, b) => a - b), [2000, 2001, 2002]);
+    });
+
+    it("walks descendants of the calling process deepest-first through /proc or ps", {
+      // WHY: Windows has no /proc or ps, so discovery is intentionally reported as empty there.
+      skip: process.platform === "win32" && "Windows has no portable process-tree enumeration",
+    }, async () => {
+      const child = await spawnHangingChild();
+      try {
+        const descendants = await listDescendantPids(process.pid);
+        assert.ok(
+          descendants.includes(child.pid),
+          `expected ${child.pid} among [${descendants.join(", ")}]`,
+        );
+        // WHY: no ordering assertion here — on macOS discovery shells out to `ps`, which is
+        // itself a short-lived child of this process and lands in the snapshot too. Ordering
+        // is covered deterministically by the injected-tree test above.
+      } finally {
+        child.kill();
+      }
+    });
+
+    it("falls back to the ps process table on non-Linux POSIX platforms", {
+      // WHY: the `ps` fallback is unreachable on Windows, which never shells out to ps.
+      skip: process.platform === "win32" && "ps is a POSIX tool",
+    }, async () => {
+      const child = await spawnHangingChild();
+      try {
+        await withPlatform("darwin", async () => {
+          const descendants = await listDescendantPids(process.pid);
+          assert.ok(
+            descendants.includes(child.pid),
+            `expected ${child.pid} among [${descendants.join(", ")}]`,
+          );
+        });
+      } finally {
+        child.kill();
+      }
+    });
+
+    it("reports no descendants on win32, where only the root PID can be signalled", async () => {
+      await withPlatform("win32", async () => {
+        assert.deepEqual(await listDescendantPids(process.pid), []);
+      });
+    });
+
+    it("stops walking a tree that loops back on itself", async () => {
+      const tree = new Map<number, number[]>([
+        [1, [2]],
+        [2, [1, 2, 3]],
+        [3, []],
+      ]);
+      assert.deepEqual(await listDescendantPids(1, async (pid) => tree.get(pid) ?? []), [3, 2]);
+    });
+
+    it("reports no descendants when discovery is unavailable", async () => {
+      const failure: NodeJS.ErrnoException = new Error("spawn ps ENOENT");
+      failure.code = "ENOENT";
+      assert.deepEqual(
+        await listDescendantPids(1, async () => {
+          throw failure;
+        }),
+        [],
+      );
+    });
+  });
+
+  describe("indexProcessTable", () => {
+    it("indexes ps output by parent PID and ignores malformed rows", () => {
+      const table = indexProcessTable("  1     0\n   42   1\n\n 43 1 \nnot a row\n");
+      assert.deepEqual(table.get(0), [1]);
+      assert.deepEqual(table.get(1), [42, 43]);
+      assert.equal(table.get(999), undefined);
+    });
+  });
+
+  describe("destroyStdioStreams", () => {
+    it("destroys the recorded child pipes exactly once and ignores un-instrumented transports", async () => {
+      const destroyed: string[] = [];
+      const fakeChild = {
+        pid: 31337,
+        stdin: { destroy: () => destroyed.push("stdin") },
+        stdout: { destroy: () => destroyed.push("stdout") },
+        stderr: { destroy: () => destroyed.push("stderr") },
+      };
+      const fakeTransport = {
+        _process: fakeChild as unknown,
+        pid: fakeChild.pid,
+        stderr: null,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+
+      instrumentStdioTransport(fakeTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: () => {},
+      });
+      await fakeTransport.start();
+
+      destroyStdioStreams(fakeTransport);
+      // stdin is our write end; the SDK still ends it as part of its own close sequence.
+      assert.deepEqual(destroyed, ["stdout", "stderr"]);
+
+      destroyStdioStreams(fakeTransport);
+      destroyStdioStreams({});
+      destroyStdioStreams(undefined);
+      assert.deepEqual(destroyed, ["stdout", "stderr"]);
+    });
+
+    it("flushes the buffered partial stderr line before destroying the pipes", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const destroyed: string[] = [];
+      const fakeTransport = {
+        _process: {
+          pid: 4242,
+          stdout: { destroy: () => destroyed.push("stdout") },
+          stderr: { destroy: () => destroyed.push("stderr") },
+        },
+        pid: 4242,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+
+      instrumentStdioTransport(fakeTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      // A line with no trailing newline stays buffered until something ends the stream;
+      // destroying the pipe would otherwise drop the server's last words.
+      stderrStream.emit("data", Buffer.from("no trailing newline", "utf8"));
+      assert.deepEqual(lines, []);
+
+      destroyStdioStreams(fakeTransport);
+      assert.deepEqual(lines, ["no trailing newline"]);
+      assert.deepEqual(destroyed, ["stdout", "stderr"]);
+    });
+  });
 });
+

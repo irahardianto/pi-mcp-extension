@@ -565,6 +565,77 @@ setInterval(() => {}, 1000);
     }
   });
 
+  it("should terminate grandchildren spawned by a stdio wrapper and keep teardown fast (Issue #205)", async () => {
+    const { mkdtemp, rm, writeFile, readFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-wrapper-tree-"));
+    const pidFile = join(dir, "pids.json");
+    const wrapperScript = join(dir, "wrapper.mjs");
+
+    await writeFile(
+      wrapperScript,
+      `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+// A wrapper such as npx / npm exec / uvx / sh -c: the MCP server is a grandchild that
+// inherits the wrapper's stdio pipes, and the wrapper itself never speaks MCP.
+const child = spawn(
+  process.execPath,
+  ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"],
+  { stdio: "inherit" },
+);
+writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ wrapper: process.pid, grandchild: child.pid }));
+process.on("SIGTERM", () => {});
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`,
+    );
+
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 300, maxRetries: 0 },
+      mcpServers: {
+        wrapper: {
+          command: process.execPath,
+          args: [wrapperScript],
+          transport: "stdio",
+          lifecycle: "lazy",
+          requestTimeoutMs: 300,
+        },
+      },
+    });
+
+    try {
+      const startedAt = Date.now();
+      await assert.rejects(() => manager.startServer("wrapper", dir));
+      const elapsed = Date.now() - startedAt;
+
+      const pids = JSON.parse(await readFile(pidFile, "utf8")) as {
+        wrapper: number;
+        grandchild: number;
+      };
+      assert.ok(pids.grandchild > 0, `Expected a grandchild PID in ${pidFile}`);
+
+      // 300ms handshake + 500ms SIGTERM window + SIGKILL escalation. A leaked grandchild
+      // holding the inherited pipes would add the SDK's full 4,000ms close() budget.
+      assert.ok(elapsed < 3000, `Expected bounded teardown, took ${elapsed}ms`);
+
+      for (const [label, pid] of Object.entries(pids)) {
+        // WHY: descendant discovery is POSIX-only (see listDescendantPids); on Windows the
+        // leaked grandchild is expected, and only the wrapper's own death is asserted.
+        if (label === "grandchild" && process.platform === "win32") continue;
+        assert.throws(
+          () => process.kill(pid, 0),
+          (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+          `Expected ${label} PID ${pid} to be terminated before startServer finished`,
+        );
+      }
+    } finally {
+      await manager.shutdownAll();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("should buffer split multi-byte UTF-8 stderr chunks with StringDecoder and strip terminal control sequences (Issue 21.4)", async () => {
     const serverManagerMod = await import("../src/server-manager.js");
     assert.equal(typeof serverManagerMod.sanitizeStderrLine, "function");

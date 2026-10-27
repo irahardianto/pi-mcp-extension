@@ -3,12 +3,19 @@
  *
  * Provides pure StringDecoder-based line splitting across chunk boundaries,
  * StdioClientTransport instrumentation (early PID capture, memoized close,
- * stderr wiring), and deterministic SIGTERM → bounded wait → SIGKILL cleanup
- * with injectable process/timer dependencies.
+ * stderr wiring), descendant process-tree discovery for wrappers such as
+ * `npx`, `uvx`, or `sh -c`, and deterministic SIGTERM → bounded wait → SIGKILL
+ * cleanup with injectable process/timer dependencies.
  */
 
+import { execFile } from "node:child_process";
+import { readFile, readdir } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import { promisify } from "node:util";
+import type { ChildProcess } from "node:child_process";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const execFileAsync = promisify(execFile);
 
 // ─── Line Splitting ───────────────────────────────────────────────────────────
 
@@ -49,6 +56,21 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
 
 // ─── Transport Instrumentation ────────────────────────────────────────────────
 
+interface StdioChildRecord {
+  process: ChildProcess;
+  /** Flush the buffered partial stderr line before the pipe is destroyed. */
+  flushStderr(): void;
+}
+
+/**
+ * Child processes of instrumented transports, keyed by transport.
+ *
+ * WHY: `StdioClientTransport.close()` clears `_process` synchronously, so the child
+ * handle is gone by the time teardown needs its pipes and its stderr flush. A WeakMap
+ * keeps both reachable without pinning a closed transport in memory.
+ */
+const childRecords = new WeakMap<object, StdioChildRecord>();
+
 export interface InstrumentStdioTransportOptions {
   onPid(pid: number): void;
   onStderrLine(line: string): void;
@@ -66,17 +88,28 @@ export function instrumentStdioTransport(
   // WHY: Capture child PID immediately when StdioClientTransport spawns the process
   // (before `initialize` is sent), so a timeout or cancellation during `initialize`
   // can still terminate the child process deterministically before retrying.
+  const spawnedProcess = (): ChildProcess | undefined =>
+    (transport as unknown as { _process?: ChildProcess })._process;
+
+  let flushStderr: (() => void) | null = null;
+
+  const recordProcess = (proc: ChildProcess | undefined): void => {
+    if (!proc?.pid) return;
+    childRecords.set(transport, {
+      process: proc,
+      flushStderr: () => flushStderr?.(),
+    });
+    onPid(proc.pid);
+  };
+
   const origStart = transport.start.bind(transport);
   transport.start = async () => {
     const startPromise = origStart();
-    const earlyProc = (transport as unknown as { _process?: { pid?: number } })._process;
-    if (earlyProc?.pid) {
-      onPid(earlyProc.pid);
-    }
+    recordProcess(spawnedProcess());
     await startPromise;
-    const proc = (transport as unknown as { _process?: { pid?: number } })._process;
+    const proc = spawnedProcess();
     if (proc?.pid) {
-      onPid(proc.pid);
+      recordProcess(proc);
     } else if (transport.pid) {
       onPid(transport.pid);
     }
@@ -99,12 +132,157 @@ export function instrumentStdioTransport(
     transport.stderr.on("data", (chunk: Buffer) => {
       splitter.write(chunk);
     });
-    const flushStderr = (): void => {
+    const flush = (): void => {
       splitter.end();
     };
-    transport.stderr.on("end", flushStderr);
-    transport.stderr.on("close", flushStderr);
+    flushStderr = flush;
+    transport.stderr.on("end", flush);
+    transport.stderr.on("close", flush);
   }
+}
+
+/**
+ * Destroy the child's `stdout`/`stderr` pipes once the process tree is gone.
+ *
+ * WHY: A surviving grandchild (e.g. a server spawned by an `npx` wrapper) inherits the
+ * wrapper's pipe write ends, so Node never emits `'close'` for the wrapper and
+ * `StdioClientTransport.close()` burns its full 4000ms escalation budget waiting for the
+ * `'close'` event. Destroying the parent's read ends lets `close()` resolve immediately
+ * even when a descendant escaped the tree kill. `stdin` is left alone: it is our write
+ * end and the SDK still ends it as part of its own close sequence.
+ */
+export function destroyStdioStreams(transport: object | null | undefined): void {
+  if (!transport) return;
+  const record = childRecords.get(transport);
+  if (!record) return;
+  childRecords.delete(transport);
+  // WHY: Flush the buffered partial stderr line first. Destroying our read end keeps the
+  // SDK's PassThrough from ever emitting 'end', so without this a forced teardown drops the
+  // server's last words (the buffered remainder of a line with no trailing newline).
+  record.flushStderr();
+  record.process.stdout?.destroy();
+  record.process.stderr?.destroy();
+}
+
+// ─── Descendant Discovery ─────────────────────────────────────────────────────
+
+/**
+ * Upper bound on tracked descendants.
+ *
+ * WHY: A wrapper that respawns children while we walk the tree could otherwise make
+ * discovery unbounded; teardown only needs the tree as it stood when we snapshotted it.
+ */
+const MAX_DESCENDANTS = 256;
+
+/** Read the direct child PIDs of `pid` from Linux `/proc`. */
+async function readProcChildren(pid: number): Promise<number[]> {
+  // WHY: /proc/<pid>/task/<tid>/children lists each thread's direct children, so a
+  // multithreaded wrapper is covered without scanning every process in /proc.
+  const taskDir = `/proc/${pid}/task`;
+  const tids = await readdir(taskDir);
+  const children: number[] = [];
+  for (const tid of tids) {
+    const raw = await readChildrenFile(`${taskDir}/${tid}/children`);
+    for (const token of raw.split(/\s+/)) {
+      if (token) children.push(Number(token));
+    }
+  }
+  return children;
+}
+
+async function readChildrenFile(path: string): Promise<string> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (err) {
+    // WHY: A thread can exit between readdir() and readFile(), and a process that dies
+    // mid-walk simply has no children left to report.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw err;
+  }
+}
+
+/**
+ * Read the direct child PIDs of `pid` from the `ps` process table.
+ *
+ * WHY: macOS and other POSIX systems have no `/proc`; `ps -A -o pid=,ppid=` is the
+ * portable way to rebuild the parent → children index.
+ */
+async function readPsChildren(pid: number): Promise<number[]> {
+  const { stdout } = await execFileAsync("ps", ["-A", "-o", "pid=,ppid="], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const childrenOf = indexProcessTable(stdout);
+  return childrenOf.get(pid) ?? [];
+}
+
+/** Index `ps -A -o pid=,ppid=` output as a parent PID → child PIDs map. */
+export function indexProcessTable(stdout: string): Map<number, number[]> {
+  const childrenOf = new Map<number, number[]>();
+  for (const line of stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!match) continue;
+    const childPid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    const siblings = childrenOf.get(parentPid);
+    if (siblings) {
+      siblings.push(childPid);
+    } else {
+      childrenOf.set(parentPid, [childPid]);
+    }
+  }
+  return childrenOf;
+}
+
+function readPlatformChildren(pid: number): Promise<number[]> {
+  if (process.platform === "linux") return readProcChildren(pid);
+  if (process.platform === "win32") {
+    // WHY: Windows has no `/proc` or `ps`, and the portable tree kill (`taskkill /T`)
+    // must be driven by the caller's own signal semantics. Discovery reports nothing so
+    // teardown falls back to killing the top-level PID plus destroying the pipes.
+    return Promise.resolve([]);
+  }
+  return readPsChildren(pid);
+}
+
+/**
+ * Snapshot the descendant PIDs of `pid`, deepest generation first.
+ *
+ * Returns `[]` when discovery is unavailable (Windows, containers without `ps` or
+ * `/proc`), which leaves the caller's single-PID teardown intact.
+ */
+export async function listDescendantPids(
+  pid: number,
+  readChildren: (pid: number) => Promise<number[]> = readPlatformChildren,
+): Promise<number[]> {
+  try {
+    const descendants = await walkDescendants(pid, readChildren);
+    // Breadth-first order reversed: each generation is signalled before its parent, so a
+    // wrapper cannot respawn or reap a child that is still being torn down.
+    return descendants.reverse();
+  } catch {
+    // WHY: Discovery is best-effort by design: the PID can exit between the liveness check
+    // and the `/proc` walk, and minimal containers ship neither `ps` nor `/proc`. A tree we
+    // cannot read must never fail the caller's shutdown path — teardown still kills the
+    // root PID and releases the inherited pipes.
+    return [];
+  }
+}
+
+async function walkDescendants(
+  pid: number,
+  readChildren: (pid: number) => Promise<number[]>,
+): Promise<number[]> {
+  const descendants: number[] = [];
+  const seen = new Set<number>([pid]);
+  const pending = await readChildren(pid);
+  while (pending.length > 0 && descendants.length < MAX_DESCENDANTS) {
+    const next = pending.shift();
+    if (next === undefined || seen.has(next)) continue;
+    seen.add(next);
+    descendants.push(next);
+    pending.push(...(await readChildren(next)));
+  }
+  return descendants;
 }
 
 // ─── Process Supervision ──────────────────────────────────────────────────────
@@ -113,12 +291,15 @@ export interface StdioProcessDeps {
   kill(pid: number, signal?: NodeJS.Signals | number): void | boolean;
   sleep(ms: number): Promise<void>;
   now(): number;
+  /** Snapshot descendant PIDs of `pid`, deepest first. Resolves `[]` when unavailable. */
+  listDescendantPids(pid: number): Promise<number[]>;
 }
 
 const defaultDeps: StdioProcessDeps = {
   kill: (pid, signal) => process.kill(pid, signal),
   sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   now: () => Date.now(),
+  listDescendantPids: (pid) => listDescendantPids(pid),
 };
 
 function resolveDeps(deps?: Partial<StdioProcessDeps>): StdioProcessDeps {
@@ -127,6 +308,7 @@ function resolveDeps(deps?: Partial<StdioProcessDeps>): StdioProcessDeps {
     kill: deps.kill ?? defaultDeps.kill,
     sleep: deps.sleep ?? defaultDeps.sleep,
     now: deps.now ?? defaultDeps.now,
+    listDescendantPids: deps.listDescendantPids ?? defaultDeps.listDescendantPids,
   };
 }
 
@@ -146,29 +328,68 @@ export function isPidAlive(
   }
 }
 
+/** Send `signal` to one PID; `false` when the PID was already gone (ESRCH). */
+function signalPid(pid: number, signal: NodeJS.Signals, d: StdioProcessDeps): boolean {
+  try {
+    d.kill(pid, signal);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+      return false;
+    }
+    // WHY: EPERM and platform refusals mean this PID cannot be signalled (a recycled PID
+    // or a sandboxed process). Teardown still has to signal the rest of the tree within
+    // the bounded wait instead of rejecting the caller's shutdown path.
+    return true;
+  }
+}
+
+function allExited(pids: readonly number[], d: StdioProcessDeps): boolean {
+  return pids.every((pid) => !isPidAlive(pid, d));
+}
+
 async function signalAndWaitForExit(
-  pid: number,
+  pids: readonly number[],
   signal: NodeJS.Signals,
   timeoutMs: number,
   d: StdioProcessDeps,
 ): Promise<boolean> {
-  try {
-    d.kill(pid, signal);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-      return true;
-    }
+  const attempted = pids.map((pid) => signalPid(pid, signal, d));
+  // Every target reported ESRCH: the tree is already gone, so there is nothing to wait for.
+  if (!attempted.some(Boolean)) {
+    return true;
   }
 
   const deadline = d.now() + timeoutMs;
   while (d.now() < deadline) {
-    if (!isPidAlive(pid, d)) {
+    if (allExited(pids, d)) {
       return true;
     }
     await d.sleep(25);
   }
 
-  return !isPidAlive(pid, d);
+  return allExited(pids, d);
+}
+
+/**
+ * Escalate to SIGKILL across the surviving tree.
+ *
+ * WHY: The wrapper can spawn new children while it ignores SIGTERM, so the tree is
+ * re-snapshotted; the original snapshot still covers descendants of a wrapper that
+ * already exited (they were re-parented to init and are no longer discoverable).
+ */
+async function escalateToSigkill(
+  rootPid: number,
+  descendants: readonly number[],
+  d: StdioProcessDeps,
+): Promise<void> {
+  const rescanned = await d.listDescendantPids(rootPid);
+  const survivors = [...new Set([...rescanned, ...descendants])].filter((candidate) =>
+    isPidAlive(candidate, d),
+  );
+  const targets = [...survivors, rootPid].filter((candidate) => isPidAlive(candidate, d));
+  if (targets.length === 0) return;
+  await signalAndWaitForExit(targets, "SIGKILL", 200, d);
 }
 
 export async function ensurePidTerminated(
@@ -180,10 +401,12 @@ export async function ensurePidTerminated(
     return;
   }
 
-  if (await signalAndWaitForExit(pid, "SIGTERM", 500, d)) {
+  // WHY: Snapshot before signalling any PID: a wrapper that exits first re-parents its
+  // children to init, after which they can no longer be found by parent PID.
+  const descendants = await d.listDescendantPids(pid);
+  if (await signalAndWaitForExit([...descendants, pid], "SIGTERM", 500, d)) {
     return;
   }
 
-  await signalAndWaitForExit(pid, "SIGKILL", 200, d);
+  await escalateToSigkill(pid, descendants, d);
 }
-

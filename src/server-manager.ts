@@ -29,6 +29,7 @@ import type { ToolRefreshOptions } from "./tool-bridge.js";
 import { sanitizeTerminalText, type SanitizeTerminalTextOptions } from "./terminal-text.js";
 import { describeError, reportDiagnostic } from "./debug-log.js";
 import {
+  destroyStdioStreams,
   ensurePidTerminated,
   instrumentStdioTransport,
 } from "./stdio-process.js";
@@ -827,6 +828,25 @@ export class ServerManager {
     };
   }
 
+  /**
+   * Terminate the stdio child process tree, then release the child's pipe handles.
+   *
+   * WHY: `client.close()` waits for the child's `'close'` event, which never fires while a
+   * leaked grandchild still holds the inherited stdout/stderr write ends — the SDK then
+   * burns its full 2 × 2,000ms escalation budget. Killing the tree first and destroying the
+   * pipes afterwards keeps teardown bounded even if a descendant escaped the tree kill.
+   */
+  private async _terminateStdioTree(
+    pid: number | null,
+    transport: Transport | undefined,
+  ): Promise<void> {
+    try {
+      await ensurePidTerminated(pid);
+    } finally {
+      destroyStdioStreams(transport);
+    }
+  }
+
   private async _cleanupFailedConnect(
     server: ManagedServer,
     client: Client,
@@ -839,7 +859,7 @@ export class ServerManager {
     server.childPid = null;
     await Promise.allSettled([
       client.close(),
-      ensurePidTerminated(pid),
+      this._terminateStdioTree(pid, transport),
     ]);
     // WHY: Secondary safety check to guarantee PID termination even if transport.close()
     // or child process exit raced during the initial Promise.allSettled.
@@ -1081,13 +1101,14 @@ export class ServerManager {
       server.childPid ??
       (server.transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
       null;
+    const transport = server.transport;
     server.client = null;
     server.transport = undefined;
     server.childPid = null;
 
     await Promise.allSettled([
       client?.close(),
-      ensurePidTerminated(pid),
+      this._terminateStdioTree(pid, transport),
     ]);
     await ensurePidTerminated(pid);
   }

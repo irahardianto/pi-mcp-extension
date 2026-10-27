@@ -20,7 +20,7 @@
 - **Clean cancellation** — `AbortSignal` propagation via `notifications/cancelled`
 - **Smart reconnection** — Fixed delay retry schedule (1s → 3s → 5s → 10s → 30s), configurable max retries, and automatic recovery when a server transport closes unexpectedly
 - **Health checks** — Opt-in periodic pings to detect stale connections
-- **Safe process lifecycle** — Child PID tracking (`StdioClientTransport.pid`) with safety-net `SIGKILL` for orphaned subprocesses
+- **Safe process lifecycle** — Child PID tracking (`StdioClientTransport.pid`) with tree-aware cleanup: descendants of wrapper commands (`npx`, `npm exec`, `uvx`, `sh -c`) are terminated too, and inherited pipes are released so teardown never stalls
 - **Stable tool names** — Sanitized, collision-avoiding names (max 64 chars) that stay constant across reconnects
 - **No tool churn** — Activate/deactivate pattern ensures tools don't flicker during reconnection
 - **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects via `ctx.isProjectTrusted()`), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
