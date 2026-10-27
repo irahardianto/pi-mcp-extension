@@ -55,9 +55,12 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
   keep `qlty smells --all` clean when you touch `src/`.
 - `npm run lint` also caps boolean expressions at `<= 3` `&&` / `||` operators on
   `src/**/*.ts` and `scripts/**/*.ts` (`pi-mcp/max-boolean-operators`), matching
-  Qlty's `boolean_logic` smell (threshold 4). Extract a named predicate or a
-  lookup table instead of a long inline chain; keep `qlty smells --all` free of
-  `Complex binary expression` findings.
+  Qlty's `boolean_logic` smell (threshold 4), and caps function/method parameter
+  lists at `<= 5` parameters (`@typescript-eslint/max-params`), matching Qlty's
+  `function-parameters` smell (threshold 5). Extract a named predicate or a
+  lookup table instead of a long inline chain, and group related arguments into a
+  typed options object; keep `qlty smells --all` free of `Complex binary expression`
+  and `function-parameters` findings.
 - Work on a branch and open a PR. Do not push to `main`; every push to `main`
   can publish to npm.
 - Use a [Conventional Commit](https://www.conventionalcommits.org/) **PR title**.

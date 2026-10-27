@@ -23,11 +23,12 @@
 - **Safe process lifecycle** — Child PID tracking (`StdioClientTransport.pid`) with safety-net `SIGKILL` for orphaned subprocesses
 - **Stable tool names** — Sanitized, collision-avoiding names (max 64 chars) that stay constant across reconnects
 - **No tool churn** — Activate/deactivate pattern ensures tools don't flicker during reconnection
-- **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects via `ctx.isProjectTrusted()`), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
+- **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects via `ctx.isProjectTrusted()`, including Pi 1.3.0 partial overrides), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
 - **Rich tool results & annotations** — MCP `image` content passthrough (`ImageContent`), plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` surfaced in tool descriptions
-- **On-demand agent tools & commands** — `mcp_status` and `mcp_connect` agent tools plus `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash commands with server-name autocomplete
-- **Structured error handling** — Distinct error codes for config, connection, protocol, and tool-level failures
-- **OAuth 2.1** — Browser and headless/SSH authorization with PKCE, protected-resource discovery, Dynamic Client Registration, startup prompts for eager servers, cross-process lock recovery, token refresh, and secure local persistence (see [OAUTH.md](./OAUTH.md))
+- **On-demand agent tools & commands** — `mcp_status` and `mcp_connect` agent tools plus `/mcp`, `/mcp <name>` (with config provenance and failure hints), `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash commands with server-name autocomplete
+- **Structured error handling** — Distinct error codes (`config`, `connection`, `auth`, `timeout`, `protocol`, `tool`) and actionable failure hints
+- **Redacted debug logging** — Opt-in `PI_MCP_DEBUG=1` JSON Lines log (`<agent dir>/logs/pi-mcp.log`, `0600`, ~2 MB rotation) with automatic secret masking and zero TUI `stderr` noise
+- **OAuth 2.1** — Browser and headless/SSH authorization with PKCE, protected-resource discovery, Dynamic Client Registration, startup prompts for eager servers, cross-process lock recovery, token refresh, and origin/issuer-bound local persistence (see [OAUTH.md](./OAUTH.md))
 
 ## Installation
 
@@ -57,7 +58,7 @@ pi -e npm:pi-mcp-extension
    }
    ```
 
-3. Create a config file at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (project-level):
+3. Create a config file at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (project-level). Both files support **JSONC** (`//` line and `/* ... */` block comments):
    ```jsonc
    {
      "mcpServers": {
@@ -70,11 +71,11 @@ pi -e npm:pi-mcp-extension
    }
    ```
 
-4. Start Pi — your MCP tools are ready. Use `/mcp` to check server status.
+4. Start Pi — your MCP tools are ready. Use `/mcp` to check all servers or `/mcp <name>` to inspect one in detail.
 
 ## Configuration
 
-Servers can be configured via JSON files or registered programmatically by other Pi 1.x extensions:
+Servers can be configured via JSON/JSONC files (`//` and `/* */` comments are supported) or registered programmatically by other Pi 1.x extensions:
 
 | Source | Precedence & Scope |
 |---|---|
@@ -103,7 +104,7 @@ Servers can be configured via JSON files or registered programmatically by other
       "lifecycle": "eager"
     },
     "deepsource": {
-      "url": "https://mcp.deepsource.io/mcp", // "transport" defaults to "streamable-http" when "url" is set
+      "url": "https://mcp.deepsource.com/mcp", // "transport" defaults to "streamable-http" when "url" is set
       "lifecycle": "eager"
     },
 
@@ -123,6 +124,7 @@ Servers can be configured via JSON files or registered programmatically by other
     "context7": {
       "command": "npx",
       "args": ["-y", "@context7/mcp"],
+      "cwd": "./",
       "transport": "stdio",
       "lifecycle": "lazy"
     },
@@ -184,14 +186,14 @@ An override may set `enabled`, `lifecycle`, and Pi's `exposure` / `toolExposure`
 
 ### OAuth Config
 
-Configured under `auth` (or `oauth`). Token and client state are persisted per server in `<agent dir>/mcp-auth/<hash>.json` (`0700` directory, `0600` files on POSIX) with atomic writes and automatic backup of corrupt state files. See [OAUTH.md](./OAUTH.md) for architecture and troubleshooting details.
+Configured under `auth` (or `oauth`). Token and client state are persisted per server in `<agent dir>/mcp-auth/<hash>.json` (`0700` directory, `0600` files on POSIX) with atomic writes, origin (`serverUrl`) and authorization-server (`issuer`) binding, and automatic backup of corrupt state files. See [OAUTH.md](./OAUTH.md) for architecture and troubleshooting details.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `type` | `"oauth"` | `"oauth"` | Authentication type |
 | `scope` | `string` | discovered | Requested scope when the server does not advertise one in `WWW-Authenticate` |
 | `clientId` | `string` | dynamic registration | Pre-registered OAuth client ID (skips Dynamic Client Registration) |
-| `clientSecret` | `string` | — | Secret for a pre-registered confidential client |
+| `clientSecret` | `string` | — | Secret for a pre-registered confidential client (used in memory; never written to disk) |
 | `clientName` (or `oauth.clientName`) | `string` | `pi-mcp/<server name>` | `client_name` sent with Dynamic Client Registration, for servers that only accept known clients |
 | `redirectUrl` (or `oauth.callbackUrl` / `oauth.callbackPort`) | `string` | `http://127.0.0.1:19876/callback` | Local HTTP loopback callback (`localhost`, `127.0.0.1`, or `::1` with path `/callback` and an explicit non-zero port; `callbackPort` maps to `http://127.0.0.1:<port>/callback`). Scans forward from `19876` when omitted; binds the exact host and port when configured. |
 
@@ -199,7 +201,7 @@ Configured under `auth` (or `oauth`). Token and client state are persisted per s
 
 Server-name arguments provide autocomplete suggestions from the configured MCP servers. `/mcp:auth` suggests only servers configured for OAuth.
 
-| Command | Description |
+| Slash Command | Description |
 |---|---|
 | `/mcp` | Show status summary of all configured servers |
 | `/mcp <name>` | Show detailed status for one server: config source, transport/lifecycle, tool activation, OAuth credential status, failure hint, and stderr log |
@@ -208,7 +210,12 @@ Server-name arguments provide autocomplete suggestions from the configured MCP s
 | `/mcp:auth <name>` | Connect with stored OAuth credentials and client registration; request browser authorization only if needed |
 | `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization |
 
-Agent tools `mcp_status` and `mcp_connect` let Pi inspect configured servers and connect one named server without routine slash commands. `mcp_status` reports lifecycle, connection state, discovered and active tool counts, credential presence, config source, and safe action hints without returning tokens, headers, or authorization URLs. `mcp_connect` activates discovered tools before returning success. Connection failures return fixed actionable categories instead of raw server response text.
+In addition to user slash commands, two built-in **agent tools** let the LLM inspect and connect configured servers directly:
+
+| Agent Tool | Parameters | Description |
+|---|---|---|
+| `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active`), `auth` credential presence, `source` (`global` / `project` / `extension`), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
+| `mcp_connect` | `{ name: string }` | Connect one named server, run interactive OAuth if needed, and verify that discovered tools are active before returning success (returns fixed actionable categories on failure instead of raw server response text) |
 
 ### Inspecting one server (`/mcp <name>`)
 
@@ -276,39 +283,53 @@ While a Pi UI is active, the extension never writes diagnostics to Pi's stderr (
 
 ## How It Works
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Pi Agent                                               │
-│                                                         │
-│  ┌──────────┐    ┌────────────────┐    ┌─────────────┐  │
-│  │ index.ts │───▶│ server-manager │───▶│ tool-bridge  │  │
-│  │ (entry)  │    │ (lifecycle)    │    │ (MCP → Pi)   │  │
-│  └──────────┘    └───────┬────────┘    └──────┬──────┘  │
-│       │                  │                     │         │
-│       ▼                  ▼                     ▼         │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────┐   │
-│  │ config   │    │ MCP SDK      │    │ TypeBox      │   │
-│  │ (Zod)    │    │ (transport)  │    │ (schema)     │   │
-│  └──────────┘    └──────────────┘    └──────────────┘   │
-└─────────────────────────────────────────────────────────┘
-         │                  │
-         ▼                  ▼
-   Global/Project    ┌──────────────┐
-   mcp.json files    │ MCP Servers  │
-   + Extensions      │ (stdio/http) │
-                     └──────────────┘
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Pi Agent (TUI / RPC, ExtensionAPI)                                     │
+│                                                                         │
+│  ┌────────────────────┐    ┌────────────────────────┐                   │
+│  │ index.ts           │───▶│ register-commands      │ (/mcp, :start,    │
+│  │ (entry & mcp_*     │    │ (/mcp* slash commands) │  :stop, :auth)    │
+│  │  agent tools)      │    └───────────┬────────────┘                   │
+│  └────┬──────────┬────┘                │                                │
+│       │          └──────────────┐      │                                │
+│       │                         ▼      ▼                                │
+│       │                    ┌────────────────────────┐                   │
+│       │                    │ connection-coordinator │                   │
+│       │                    │ (in-flight connects,   │                   │
+│       │                    │  authQueue, teardown)  │                   │
+│       │                    └───────────┬────────────┘                   │
+│       │                                │                                │
+│       │                                ▼                                │
+│       │                    ┌────────────────────────┐    ┌───────────┐  │
+│       │                    │ server-manager         │───▶│tool-bridge│  │
+│       │                    │ (stopped → starting    │    │(MCP → Pi) │  │
+│       │                    │  → ready lifecycle)    │    └─────┬─────┘  │
+│       ▼                    └───────────┬────────────┘          │        │
+│  ┌────────────────────┐                ▼                       ▼        │
+│  │ config             │    ┌────────────────────────┐    ┌───────────┐  │
+│  │ (Zod + JSONC)      │    │ transport-factory &    │    │ TypeBox   │  │
+│  └────────┬───────────┘    │ oauth-provider (SDK)   │    │ (schema)  │  │
+│           │                └───────────┬────────────┘    └───────────┘  │
+└───────────┼────────────────────────────┼────────────────────────────────┘
+            │                            │
+            ▼                            ▼
+   Global/Project mcp.json       ┌──────────────┐
+   + Registered Extensions       │ MCP Servers  │
+                                 │ (stdio/http) │
+                                 └──────────────┘
 ```
 
 1. **Config is loaded** from global `<agent dir>/mcp.json`, trusted project `.pi/mcp.json` (checked via `ctx.isProjectTrusted()` on `session_start`), and extension-registered servers (`pi.getMcpServers()` / `mcp_servers_change`), with `mcp.json` taking precedence over extension-registered servers and project entries overriding global ones
-2. **Eager servers connect** at `session_start` (offering a sequential `Authorize now` / `Not now` prompt when an eager OAuth server needs authorization in an interactive session); lazy servers wait for `mcp_connect`, `/mcp:start`, or `/mcp:auth`
+2. **Eager servers connect** at `session_start` via `ConnectionCoordinator` (offering a sequential `Authorize now` / `Not now` prompt when an eager OAuth server needs authorization in an interactive session); lazy servers wait for `mcp_connect`, `/mcp:start`, or `/mcp:auth`
 3. **Tools are discovered** via paginated `tools/list` calls (cursor-based, up to 100 pages) before a server enters `ready`
-4. **JSON Schema → TypeBox** conversion registers tools with Pi-compatible parameter schemas
+4. **JSON Schema → TypeBox** conversion registers tools with Pi-compatible parameter schemas (preserving nullable union ordering, resolving `$ref`s cycle-safely, and inferring/flattening `allOf` object schemas)
 5. **Pi tools are registered** as `<prefix>_<server>_<tool>` (sanitized, max 64 chars with hash suffix) and pass through text and `image` content blocks (`ImageContent`)
 6. **Tools activate/deactivate** automatically as servers connect/disconnect
 7. **AbortSignal** is wired through to `notifications/cancelled` for clean cancellation
 8. **Reconnection & recovery** uses a fixed delay schedule with configurable max retries on initial failure, health check failure, or unexpected transport close (`client.onclose`)
 9. **`list_changed` notifications** trigger re-discovery, deactivating stale tools automatically
-10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, and cleanly stops all servers (with a `SIGKILL` safety net for `stdio` child processes)
+10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with a `SIGKILL` safety net for `stdio` child processes)
 
 ## MCP Spec Compliance
 
@@ -340,30 +361,38 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, workflow, and the pre-merge 
 ## Development
 
 ```bash
-# Install dependencies
-npm install
+# Install dependencies (clean lockfile install)
+npm ci
 
-# Lint (type-aware ESLint)
+# Lint (type-aware ESLint + structural/complexity checks)
 npm run lint
 
 # Type check (strict mode)
 npm run typecheck
 
-# Run all tests
+# Run all test suites
 npm test
+
+# Run all test suites with coverage floor (95% lines / 85% branches / 83% functions)
+npm run test:coverage
 
 # Run integration tests only (real stdio server)
 npm run test:integration
+
+# Verify npm tarball contents
+npm pack --dry-run
 ```
 
 ### Testing
 
 The test suite includes:
-- **Config & Pi 1.x compatibility** — Zod schema, `$PI_CODING_AGENT_DIR` resolution, global/project merge, project trust boundary (`ctx.isProjectTrusted()`), Pi 1.x schema aliases (`type: "http"`, URL-only HTTP, `oauth`, `timeout`), and dynamic `pi.getMcpServers()` / `mcp_servers_change`
-- **Server lifecycle & coordination** — Connect, retry, unexpected close recovery, shutdown with PID `SIGKILL` safety net, health check, concurrent connect/reset coordination, and cancellation
-- **OAuth 2.1 & auth locks** — Challenge discovery, PKCE, Dynamic Client Registration, startup authorization prompts, headless/SSH redirect URL paste-back, URL scheme validation, cross-process lock heartbeat and stale lock reclamation
-- **Tool bridge & management tools** — JSON Schema → TypeBox conversion, name sanitization, image content passthrough, `isError` filtering, activate/deactivate, `mcp_status` / `mcp_connect`, and slash command completions
-- **End-to-end integration** — Real mock MCP and OAuth servers over stdio and HTTP with tool discovery and execution
+- **Config & Pi 1.x / 1.3.0 compatibility** (`tests/config.test.ts`, `tests/pi-1x-compat.test.ts`) — Zod schema, JSONC comments, `$PI_CODING_AGENT_DIR` resolution, global/project merge, project trust boundary (`ctx.isProjectTrusted()`), Pi 1.3.0 `enabled: false` and partial project overrides, `stdio` `cwd`, `oauth.clientName`, Pi 1.x schema aliases (`type: "http"`, URL-only HTTP, `oauth`, `timeout`), and dynamic `pi.getMcpServers()` / `mcp_servers_change`
+- **Server lifecycle & coordination** (`tests/server-manager.test.ts`, `tests/stdio-process.test.ts`, `tests/transport-factory.test.ts`, `tests/connection-coordinator.test.ts`, `tests/connection-coordination.test.ts`) — Connect, retry, unexpected close recovery, shutdown with PID `SIGKILL` safety net, health check, concurrent connect/reset coordination, and cancellation
+- **OAuth 2.1 & auth locks** (`tests/oauth-fixes.test.ts`, `tests/authorize-flow.test.ts`, `tests/auth-lock.test.ts`, `tests/auth-commands.test.ts`, `tests/auth-arguments.test.ts`, `tests/fake-oauth-server.test.ts`) — Challenge discovery, PKCE, Dynamic Client Registration, origin and issuer binding, startup authorization prompts, headless/SSH redirect URL paste-back, URL scheme validation, cross-process lock heartbeat, and stale lock reclamation
+- **Tool bridge, status diagnostics & debug log** (`tests/tool-bridge.test.ts`, `tests/management-tools.test.ts`, `tests/server-status.test.ts`, `tests/status-commands.test.ts`, `tests/completions.test.ts`, `tests/debug-log.test.ts`) — JSON Schema → TypeBox conversion (`allOf` object inference, `$ref` cycle protection, union `null` ordering), name sanitization, image content passthrough, `isError` filtering, activate/deactivate, `mcp_status` / `mcp_connect`, `/mcp <name>` config provenance and failure hints, slash command completions, and redacted `PI_MCP_DEBUG=1` JSONL logging
+- **Property-based fuzzing** (`tests/fuzz.test.ts`) — `fast-check` properties covering JSONC comment stripping, callback/redirect URL validation, `WWW-Authenticate` challenge parsing, JSON Schema → TypeBox conversion, tool naming, terminal/log secret sanitization, and custom header merging
+- **Release flow & repository policy** (`tests/release.test.ts`, `tests/ruleset-audit.test.ts`, `tests/repo-policy.test.ts`) — Release PR orchestration and npm/git self-healing (`scripts/release.ts`), live GitHub ruleset drift auditing (`scripts/ruleset-audit.ts`), and CI/ESLint/Qlty policy invariants
+- **End-to-end integration** — Real mock MCP and OAuth servers over `stdio` and HTTP with tool discovery and execution
 
 ## Security
 
