@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-10-27
+
 ### Fixed
 - A tool schema that composes an object with `allOf` and does not repeat `type: "object"` on the wrapper — the shape Pydantic, FastAPI, and OpenAPI 3.0 generators emit, e.g. `{ "allOf": [{ "$ref": "#/$defs/Pagination" }, { "properties": { "search": { "type": "string" } } }] }` — now converts to an object schema with merged `properties` and `required` instead of a bare `allOf` with neither. Optional arguments left as `null` were coerced to `"null"`, `0`, or `false` (producing false validation errors such as `must be >= 1`), and Anthropic received an empty `input_schema` with no parameters at all. Nested `allOf` chains and chained `$ref` definitions now flatten transitively, and `$ref` cycles stay bounded (#212).
 
