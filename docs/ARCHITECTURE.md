@@ -285,6 +285,21 @@ Details:
   `authQueue` and prompt sequentially (`Authorize now` / `Not now`) in an interactive
   session. Choosing **Not now** records the decline for the rest of the session and
   leaves a `run /mcp:auth <name>` status hint.
+- The `run /mcp:auth <name>` footer hint is derived state, not a latch: the declined set
+  keeps only servers whose last recorded failure is still an `AuthRequiredError`. The hint
+  clears when the server becomes `ready` again — through an explicit connect, an eager
+  start, or a background `_recover()` (`ServerManager.onServerReady` → `syncStatus()`) —
+  and it clears when a later failure replaces that error with a connection error
+  (`ECONNREFUSED`, timeout), so it never points at authorization for a server whose
+  actual problem is the network. A cancelled eager start (`/mcp:stop` while connecting)
+  is not reported as a start failure.
+- A mid-session 401/403 on `tools/call` or `tools/list` stops the server before the
+  deferred `_recover()` can report anything, so `handleUnauthorizedServerError()` returns
+  the `AuthRequiredError` it recorded and `src/index.ts` routes it to
+  `coordinator.handleRecoveryFailed()` — the same path background recovery uses — which
+  warns the user and repaints the hint. A 401 raised while a connect attempt is still
+  `starting` returns `undefined` instead, because that attempt's own failure path reports
+  it and the user would otherwise be warned twice.
 - `cancelServer()` aborts the startup prompt and the in-flight attempt; an aborted
   waiter wakes immediately and rejects with `AuthCancelledError` without breaking the
   queue for later waiters.

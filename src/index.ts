@@ -162,8 +162,20 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   manager.setRecoveryFailedCallback((serverName, error) => {
     coordinator.handleRecoveryFailed(serverName, error);
   });
+  manager.setServerReadyCallback(() => {
+    // WHY: Eager starts and background _recover() reconnects never pass through
+    // coordinator.connect(), so without this the "run /mcp:auth <name>" footer hint
+    // survives a server that has since connected cleanly.
+    coordinator.syncStatus();
+  });
   bridge.setAuthErrorCallback(async (serverName) => {
-    await manager.handleUnauthorizedServerError(serverName);
+    const authError = await manager.handleUnauthorizedServerError(serverName);
+    if (authError) {
+      // WHY: A mid-session 401/403 stops the server synchronously, which cancels the
+      // deferred _recover() that would have called onRecoveryFailed — so report the
+      // failure here or the re-auth warning and the footer hint never appear.
+      coordinator.handleRecoveryFailed(serverName, authError);
+    }
   });
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────

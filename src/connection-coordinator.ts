@@ -73,6 +73,24 @@ type InteractiveAuthParams = {
   reset: boolean;
 };
 
+/**
+ * Whether a declined server still deserves the `run /mcp:auth <name>` footer hint.
+ *
+ * WHY: A decline records "this server needed authorization at some point", which stays
+ * true until there is positive evidence otherwise. `ready` is that evidence, and so is a
+ * `stopped` server whose `lastError` is now a non-auth failure (`ECONNREFUSED`, timeout) —
+ * that failure overwrote `AuthRequiredError`, so authorization is no longer the problem
+ * and the hint would send the user down the wrong path. An unknown server drops out too.
+ * Anything ambiguous (no `lastError` yet, still `starting`) keeps the hint, because
+ * clearing it on doubt would hide a pending authorization the user was just told about.
+ */
+function retainsAuthHint(server: Pick<ManagedServer, "state" | "lastError"> | undefined): boolean {
+  if (!server || server.state === "ready") return false;
+  const lastError = server.lastError;
+  if (!lastError || lastError instanceof AuthRequiredError) return true;
+  return server.state !== "stopped";
+}
+
 export class ConnectionCoordinator {
   private readonly deps: ConnectionCoordinatorDeps;
   private readonly connectAttempts = new Map<string, ConnectAttemptEntry>();
@@ -124,7 +142,7 @@ export class ConnectionCoordinator {
   syncStatus(ctx: ExtensionContext | undefined = this.activeCtx): void {
     for (const declinedName of Array.from(this.declinedStartupAuth)) {
       const server = this.deps.manager.getServer(declinedName);
-      if (!server || server.state === "ready") {
+      if (!retainsAuthHint(server)) {
         this.declinedStartupAuth.delete(declinedName);
       }
     }
@@ -147,18 +165,23 @@ export class ConnectionCoordinator {
 
   handleRecoveryFailed(serverName: string, error: unknown): void {
     if (error instanceof AuthRequiredError) {
-      this.declinedStartupAuth.add(serverName);
       this.activeCtx?.ui.notify(
         `pi-mcp: ${serverName} requires re-authorization — run /mcp:auth ${serverName}`,
         "warning",
       );
-      this.syncStatus(this.activeCtx);
-    } else {
-      this.activeCtx?.ui.notify(
-        `pi-mcp: Lost connection to ${serverName} — ${formatErrorMessage(error)}`,
-        "error",
-      );
+      // WHY: Route through markAuthRequired so a mid-session 401 (reported by
+      // ServerManager.handleUnauthorizedServerError) lands in the declined set and
+      // repaints the footer hint exactly like a declined startup prompt.
+      this.markAuthRequired(serverName);
+      return;
     }
+    this.activeCtx?.ui.notify(
+      `pi-mcp: Lost connection to ${serverName} — ${formatErrorMessage(error)}`,
+      "error",
+    );
+    // WHY: The failure just overwrote lastError, so a hint left over from an earlier
+    // decline now points at authorization that is not the problem — clear it.
+    this.syncStatus(this.activeCtx);
   }
 
   cancelServer(serverName: string): void {
@@ -325,6 +348,9 @@ export class ConnectionCoordinator {
         try {
           await this.deps.manager.startServer(name, ctx.cwd);
         } catch (err) {
+          // WHY: A cancelled start means the user stopped the server (/mcp:stop) or the
+          // session is tearing down; reporting it as a start failure would be a bogus error.
+          if (err instanceof AuthCancelledError) return;
           if (err instanceof AuthRequiredError && cfg.auth && ctx.hasUI) {
             authRequiredServers.add(name);
             return;
@@ -335,12 +361,14 @@ export class ConnectionCoordinator {
       }),
     );
 
+    // WHY: Reconcile the footer hint once every eager start has settled — a declined
+    // server may have connected cleanly or failed with a non-auth error, and either
+    // outcome makes "run /mcp:auth <name>" stale.
+    this.syncStatus(ctx);
+
     for (const [name] of serversToStart) {
       if (!authRequiredServers.has(name)) continue;
-      if (this.declinedStartupAuth.has(name)) {
-        this.syncStatus(ctx);
-        continue;
-      }
+      if (this.declinedStartupAuth.has(name)) continue;
       this.enqueueStartupAuthPrompt(name, ctx);
     }
 
@@ -483,8 +511,13 @@ export class ConnectionCoordinator {
       await this._startAndGuardAbort(serverName, ctx, controller.signal);
       return true;
     } catch (err) {
-      if (!(err instanceof AuthRequiredError) || !serverConfig.auth) throw err;
-      return false;
+      if (err instanceof AuthRequiredError && serverConfig.auth) return false;
+      // WHY: A non-auth connect failure (e.g. ECONNREFUSED) overwrites lastError, so a
+      // hint left over from an earlier decline no longer describes this server's problem.
+      if (!(err instanceof AuthCancelledError)) {
+        this.syncStatus(ctx);
+      }
+      throw err;
     }
   }
 

@@ -659,6 +659,103 @@ it("should cancel listAllTools and refreshTools with AuthCancelledError instead 
   );
 });
 
+it("should report readiness through setServerReadyCallback and only report a mid-session 401 for a server that was serving requests (Issue 207)", async () => {
+  const { createServer } = await import("node:http");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue207-ready-"));
+
+  const listener = createServer((req, res) => {
+    if (req.url !== "/mcp" || req.method !== "POST") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (c) => { body += c.toString(); });
+    req.on("end", () => {
+      const msg = JSON.parse(body);
+      if (msg.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "ready-srv", version: "1.0.0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (msg.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (msg.method === "tools/list") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { tools: [{ name: "ready_ping", inputSchema: { type: "object", properties: {} } }] },
+          }),
+        );
+        return;
+      }
+      res.writeHead(400);
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/mcp`;
+
+  const manager = new ServerManager(
+    {
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 },
+      mcpServers: {
+        readySrv: {
+          lifecycle: "lazy",
+          transport: "streamable-http",
+          url: baseUrl,
+          args: [],
+          auth: { type: "oauth", clientId: "cid" },
+        },
+      },
+    },
+    join(dir, "auth"),
+  );
+
+  try {
+    const readyCalls: string[] = [];
+    manager.setServerReadyCallback((name: string) => readyCalls.push(name));
+
+    await manager.startServer("readySrv", dir);
+    assert.deepEqual(readyCalls, ["readySrv"], "an explicit connect reports readiness");
+    assert.equal(manager.getServer("readySrv")?.state, "ready");
+
+    // A server that was serving requests lost its credentials mid-session: report it.
+    const midSessionError = await manager.handleUnauthorizedServerError("readySrv");
+    assert.ok(midSessionError instanceof AuthRequiredError);
+    assert.equal(manager.getServer("readySrv")?.state, "stopped");
+    assert.equal(manager.getServer("readySrv")?.lastError, midSessionError);
+
+    // Already reported and already stopped: a second 401 must not report again.
+    assert.equal(await manager.handleUnauthorizedServerError("readySrv"), undefined);
+
+    // Unknown and non-OAuth servers have nothing to report.
+    assert.equal(await manager.handleUnauthorizedServerError("nope"), undefined);
+  } finally {
+    await manager.shutdownAll();
+    listener.closeAllConnections();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it("should recover SSE and StreamableHTTP servers on unexpected transport errors while ignoring benign protocol warnings, and surface recovery failures via callback and UI notifications (Issue 20.2)", async () => {
   const { createServer } = await import("node:http");
   const { mkdir, writeFile } = await import("node:fs/promises");

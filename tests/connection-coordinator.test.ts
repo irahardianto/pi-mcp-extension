@@ -24,7 +24,14 @@ function gate(): { promise: Promise<void>; resolve: () => void; reject: (err: un
 }
 
 interface FakeManagerOptions {
-  servers?: Record<string, { config: Partial<ServerConfig> & Pick<ServerConfig, "transport">; state?: "stopped" | "starting" | "ready" }>;
+  servers?: Record<
+    string,
+    {
+      config: Partial<ServerConfig> & Pick<ServerConfig, "transport">;
+      state?: "stopped" | "starting" | "ready";
+      lastError?: unknown;
+    }
+  >;
   onStartServer?: (name: string, cwd: string) => Promise<void>;
   onStopServer?: (name: string) => Promise<void>;
 }
@@ -55,7 +62,7 @@ function makeFakeManager(options: FakeManagerOptions = {}): {
       client: null,
       transport: null,
       stderrLog: [],
-      lastError: null,
+      lastError: entry.lastError ?? null,
     } as unknown as ManagedServer);
   }
 
@@ -68,10 +75,17 @@ function makeFakeManager(options: FakeManagerOptions = {}): {
     getAllServers: () => Array.from(servers.values()),
     startServer: async (name: string, cwd: string) => {
       startCalls.push({ name, cwd });
-      if (options.onStartServer) {
-        await options.onStartServer(name, cwd);
-      }
       const s = servers.get(name);
+      try {
+        if (options.onStartServer) {
+          await options.onStartServer(name, cwd);
+        }
+      } catch (err) {
+        // WHY: Mirror the real manager, which records the connect failure on lastError
+        // before rejecting — hint-retention decisions read that field.
+        if (s) (s as { lastError: unknown }).lastError = err;
+        throw err;
+      }
       if (s) (s as { state: string }).state = "ready";
     },
     stopServer: async (name: string) => {
@@ -349,5 +363,166 @@ describe("ConnectionCoordinator direct unit tests", () => {
     assert.equal(formatErrorMessage(new Error("AuthRequiredError: please log in")), "please log in");
     assert.equal(startupAuthNowOption, "Authorize now");
     assert.equal(startupAuthLaterOption, "Not now");
+  });
+});
+
+describe("ConnectionCoordinator auth hint synchronization (Issue 207)", () => {
+  const oauthConfig: Partial<ServerConfig> & Pick<ServerConfig, "transport"> = {
+    transport: "sse",
+    url: "https://example.com",
+    auth: { type: "oauth", clientId: "test" },
+  };
+
+  function setup(options: Omit<FakeManagerOptions, "servers"> = {}) {
+    const fake = makeFakeManager({
+      ...options,
+      // WHY: A declined server is always a server whose last connect failed with
+      // AuthRequiredError, so the fixture starts in exactly that recorded state.
+      servers: { oauthSrv: { config: oauthConfig, state: "stopped", lastError: new AuthRequiredError("oauthSrv") } },
+    });
+    const fakeBridge = makeFakeBridge();
+    const notifications: Array<{ msg: string; level: string | undefined }> = [];
+    const statuses: Array<string | undefined> = [];
+    const coordinator = new ConnectionCoordinator({
+      manager: fake.manager,
+      bridge: fakeBridge.bridge,
+      getConfig: () => ({ settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 }, mcpServers: {} }),
+      authorize: async () => {},
+      stopCallbackServer: async () => {},
+    });
+    const ctx = createMockContext({
+      hasUI: true,
+      ui: {
+        notify: (msg: string, level?: string) => notifications.push({ msg, level }),
+        setStatus: (_key: string, text?: string) => statuses.push(text),
+      },
+    });
+    coordinator.setActiveContext(ctx);
+    const server = fake.manager.getServer("oauthSrv")!;
+    return { coordinator, ctx, notifications, statuses, server };
+  }
+
+  it("reports a mid-session 401 by warning and painting the /mcp:auth footer hint", () => {
+    const { coordinator, notifications, statuses } = setup();
+
+    coordinator.handleRecoveryFailed("oauthSrv", new AuthRequiredError("oauthSrv"));
+
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), true);
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+    assert.deepEqual(notifications, [
+      {
+        msg: "pi-mcp: oauthSrv requires re-authorization — run /mcp:auth oauthSrv",
+        level: "warning",
+      },
+    ]);
+  });
+
+  it("keeps the hint while authorization is still required and clears it once the server is ready", () => {
+    const { coordinator, ctx, statuses, server } = setup();
+
+    coordinator.markAuthRequired("oauthSrv");
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    // A reconnect attempt is in flight: the outcome is unknown, so the hint stays.
+    server.state = "starting";
+    coordinator.syncStatus(ctx);
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    // A retry failed for a non-auth reason while the state machine is mid-attempt; the
+    // decisive stopped/ready outcome has not been recorded yet.
+    (server as { lastError: unknown }).lastError = new McpError("connect ECONNREFUSED", "oauthSrv", "connection");
+    coordinator.syncStatus(ctx);
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    // Recovered by an eager start or background _recover(): nothing left to authorize.
+    server.state = "ready";
+    coordinator.syncStatus(ctx);
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
+  });
+
+  it("clears a stale hint once the same server fails with a non-auth error", () => {
+    const { coordinator, notifications, statuses, server } = setup();
+
+    coordinator.markAuthRequired("oauthSrv");
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    server.state = "stopped";
+    (server as { lastError: unknown }).lastError = new McpError(
+      "connect ECONNREFUSED 127.0.0.1:9",
+      "oauthSrv",
+      "connection",
+    );
+    coordinator.handleRecoveryFailed("oauthSrv", (server as { lastError: unknown }).lastError);
+
+    assert.equal(statuses.at(-1), undefined, "authorization is no longer the problem");
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
+    assert.ok(
+      notifications.some(
+        (n) => n.msg === "pi-mcp: Lost connection to oauthSrv — [oauthSrv] connect ECONNREFUSED 127.0.0.1:9" && n.level === "error",
+      ),
+    );
+    assert.equal(
+      notifications.some((n) => n.msg.includes("requires re-authorization")),
+      false,
+    );
+  });
+
+  it("clears a stale hint when an eager start fails with a non-auth error and still reports the failure", async () => {
+    const { coordinator, ctx, notifications, statuses } = setup({
+      onStartServer: async () => {
+        throw new McpError("connect ECONNREFUSED", "oauthSrv", "connection");
+      },
+    });
+
+    coordinator.markAuthRequired("oauthSrv");
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    await coordinator.startEagerServers([["oauthSrv", oauthConfig as ServerConfig]], ctx);
+
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
+    assert.ok(notifications.some((n) => n.msg === "pi-mcp: Failed to start oauthSrv — [oauthSrv] connect ECONNREFUSED"));
+  });
+
+  it("clears the hint when an eager start reconnects a previously declined server", async () => {
+    const { coordinator, ctx, statuses } = setup();
+
+    coordinator.markAuthRequired("oauthSrv");
+    assert.equal(statuses.at(-1), "run /mcp:auth oauthSrv");
+
+    await coordinator.startEagerServers([["oauthSrv", oauthConfig as ServerConfig]], ctx);
+
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
+  });
+
+  it("does not report a start failure when an eager start is cancelled by /mcp:stop", async () => {
+    const { coordinator, ctx, notifications } = setup({
+      onStartServer: async () => {
+        throw new AuthCancelledError("oauthSrv");
+      },
+    });
+
+    await coordinator.startEagerServers([["oauthSrv", oauthConfig as ServerConfig]], ctx);
+
+    assert.deepEqual(notifications, [], "a cancelled start is not a failure");
+  });
+
+  it("clears a stale hint when an explicit reconnect fails with a non-auth error", async () => {
+    const { coordinator, ctx, statuses } = setup({
+      onStartServer: async () => {
+        throw new McpError("connect ECONNREFUSED", "oauthSrv", "connection");
+      },
+    });
+
+    coordinator.markAuthRequired("oauthSrv");
+    await assert.rejects(
+      coordinator.connect("oauthSrv", ctx),
+      (err: unknown) => err instanceof McpError && err.code === "connection",
+    );
+
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
   });
 });

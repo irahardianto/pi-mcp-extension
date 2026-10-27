@@ -106,6 +106,17 @@ export type ToolRefreshCallback = (
 /** Called when background auto-recovery after a disconnect or health check fails. */
 export type RecoveryFailedCallback = (serverName: string, error: Error) => void;
 
+/**
+ * Called every time a server reaches `ready`, whether the transition came from an
+ * explicit connect, an eager startup, or background `_recover()`.
+ *
+ * WHY: Readiness is the only state change that makes a previously declined
+ * `run /mcp:auth <name>` footer hint obsolete, and eager starts plus background
+ * recovery bypass `ConnectionCoordinator.connect()`, which is where the hint is
+ * otherwise repainted.
+ */
+export type ServerReadyCallback = (serverName: string) => void;
+
 interface HandshakeParams {
   server: ManagedServer;
   client: Client;
@@ -206,6 +217,7 @@ export class ServerManager {
   private onToolRefresh: ToolRefreshCallback | null = null;
   private onServerStopped: ((name: string) => void) | null = null;
   private onRecoveryFailed: RecoveryFailedCallback | null = null;
+  private onServerReady: ServerReadyCallback | null = null;
 
   constructor(config: McpConfig, private readonly storageDir?: string) {
     this.settings = config.settings;
@@ -237,6 +249,11 @@ export class ServerManager {
 
   setRecoveryFailedCallback(cb: RecoveryFailedCallback): void {
     this.onRecoveryFailed = cb;
+  }
+
+  /** Register callback invoked whenever a server reaches the `ready` state. */
+  setServerReadyCallback(cb: ServerReadyCallback): void {
+    this.onServerReady = cb;
   }
 
   private _resolveTimeoutMs(server: ManagedServer): number {
@@ -335,12 +352,22 @@ export class ServerManager {
   /**
     * Mark an OAuth server as requiring re-authorization when a mid-session
     * request (tools/list or tools/call) fails with 401/403 insufficient_scope.
+    *
+    * Returns the {@link AuthRequiredError} when a server that was already `ready`
+    * lost its credentials mid-session, and `undefined` when nothing needed
+    * reporting (unknown server, non-OAuth server, or a 401 raised while a connect
+    * attempt was still in flight — that attempt's own failure path reports it, so
+    * returning the error here would notify the user twice).
     */
-  async handleUnauthorizedServerError(name: string): Promise<void> {
+  async handleUnauthorizedServerError(name: string): Promise<AuthRequiredError | undefined> {
     const server = this.servers.get(name);
     if (!server || !server.config.auth || server.config.transport === "stdio") {
-      return;
+      return undefined;
     }
+    // WHY: Capture readiness before _shutdown() moves the server to "stopped": only a
+    // server that was serving requests has a live session whose auth state the user
+    // must be told about (and whose footer hint must be repainted).
+    const wasReady = server.state === "ready";
     const authError = new AuthRequiredError(name);
     // WHY: Shut down immediately before async disk I/O so server.generation increments
     // synchronously and cancels any concurrent _recover() microtask queued by client.onerror.
@@ -348,6 +375,7 @@ export class ServerManager {
     server.lastError = authError;
     await invalidateStoredTokens(name, this.storageDir, server.config.url);
     server.lastError = authError;
+    return wasReady ? authError : undefined;
   }
 
   /** Get recent stderr output for a server. */
@@ -626,6 +654,9 @@ export class ServerManager {
     this._setState(server, "ready");
     server.retryCount = 0;
     server.lastError = null;
+    // WHY: Fire only after the server is observably ready with a cleared lastError, so a
+    // listener that repaints session state never sees a half-transitioned server.
+    this.onServerReady?.(server.name);
     if (server.cwd && server.cwd !== currentCwd) {
       void client.sendRootsListChanged().catch(() => {
         // WHY: Best-effort notification if cwd was updated while handshake was in flight.

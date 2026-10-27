@@ -1568,6 +1568,29 @@ describe("OAuth Security Fixes", () => {
         assert.ok(errorNotification, "Expected error notification when hasUI is false");
         assert.doesNotMatch(errorNotification.message, /AuthRequiredError:/);
         assert.match(errorNotification.message, /^pi-mcp: Failed to start eager-oauth — Authorization required for eager-oauth/);
+
+        // Act (Part 4 — Issue 207: usable credentials land again, e.g. the user re-authorized
+        // in another Pi session, so the next eager start connects without a prompt)
+        fakeServer.failRefresh = false;
+        fakeServer.addValidRefreshToken("refreshed-elsewhere-token");
+        const reseededProvider = new McpOAuthProvider({ serverName: "eager-oauth", authConfig: { type: "oauth" }, storageDir: authDir });
+        await reseededProvider.saveClientInformation({ client_id: "seeded-client" });
+        await reseededProvider.saveTokens({
+          access_token: "expired-access-token",
+          refresh_token: "refreshed-elsewhere-token",
+          token_type: "Bearer",
+        });
+        await events.get("session_start")({}, ctx);
+
+        // Assert (Part 4: a clean reconnect clears the stale "run /mcp:auth" hint)
+        assert.strictEqual(selectPrompts.length, 1, "a declined server that now connects must still not re-prompt");
+        assert.deepStrictEqual(
+          statuses.at(-1),
+          { key: "pi-mcp", value: undefined },
+          "the hint must clear once the declined server reaches ready",
+        );
+        await commands.get("mcp").handler("eager-oauth", ctx);
+        assert.match(notifications.at(-1)?.message ?? "", /State:\s+ready/);
       } finally {
         await events.get("session_shutdown")({}, ctx);
         await fakeServer.close();
@@ -2331,11 +2354,18 @@ describe("OAuth Security Fixes", () => {
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => { activeTools = names; },
       });
+      const notifications: Array<{ message: string; type?: string }> = [];
+      const statuses: Array<string | undefined> = [];
       const ctx = createMockContext({
         cwd: dir,
         hasUI: true,
         ui: {
-          notify: () => {},
+          notify: (message: string, type?: string) => {
+            notifications.push({ message, ...(type ? { type } : {}) });
+          },
+          setStatus: (_key: string, value?: string) => {
+            statuses.push(value);
+          },
           select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }) =>
             new Promise<string | undefined>((resolve) => {
               opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
@@ -2408,6 +2438,21 @@ describe("OAuth Security Fixes", () => {
         assert.strictEqual(statusRows[0].state, "stopped");
         assert.strictEqual(statusRows[0].auth, "authorization may be required");
         assert.match(statusRows[0].error, /Authorization required/);
+
+        // Assert (Part 2 — Issue 207: the mid-session 401 must also warn and paint the hint)
+        assert.ok(
+          notifications.some(
+            (n) =>
+              n.message === "pi-mcp: reauth requires re-authorization — run /mcp:auth reauth" &&
+              n.type === "warning",
+          ),
+          `expected a re-authorization warning, got ${JSON.stringify(notifications)}`,
+        );
+        assert.strictEqual(
+          statuses.at(-1),
+          "run /mcp:auth reauth",
+          "the footer hint must point at the server that just lost its credentials",
+        );
       } finally {
         await events.get("session_shutdown")({}, ctx);
         listener.closeAllConnections();
