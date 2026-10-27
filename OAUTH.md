@@ -84,10 +84,11 @@ When running Pi on a remote server over SSH, in a container, or in a headless en
 
 ### Token Storage
 
-Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json` (or `<agent dir>/mcp-auth/<hash>.json` when `$PI_CODING_AGENT_DIR` is set). On systems with POSIX permissions, the directory uses mode `0700` and state files use mode `0600`.
+Tokens are stored per-server in `~/.pi/agent/mcp-auth/<hash>.json` (or `<agent dir>/mcp-auth/<hash>.json` when `$PI_CODING_AGENT_DIR` is set). On systems with POSIX permissions, the directory uses mode `0700` and state files use mode `0600`. Stored state is bound to both the canonical `serverUrl` and the authorization server `issuer`, and a config-supplied `clientSecret` is kept in memory and never written to disk.
 
 ```json
 {
+  "serverUrl": "https://mcp.supabase.com/mcp",
   "clientInfo": {
     "client_id": "...",
     "client_secret": "...",
@@ -116,7 +117,7 @@ Server names can contain spaces. For example, `/mcp:auth team server --reset` re
 
 ### Callback Server
 
-- **File**: `src/callback-server.ts`
+- **Files**: `src/callback-server.ts`, `src/callback-url.ts`
 - **Address**: `127.0.0.1:19876` by default
 - **Path**: `/callback`
 - **Timeout**: 5 minutes
@@ -131,17 +132,17 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### OAuth Provider
 
-- **File**: `src/oauth-provider.ts`
+- **Files**: `src/oauth-provider.ts`, `src/oauth-state-store.ts`, `src/oauth-status.ts`, `src/auth-lock.ts`
 - **Implements**: `OAuthClientProvider` from MCP SDK
 - **Key Methods**:
   - `redirectUrl` - Returns the callback server URL
   - `clientMetadata` - Includes `redirect_uris` for DCR
   - `redirectToAuthorization` - Opens browser via callback
-  - Token persistence to disk
+  - Origin- and issuer-bound token persistence to disk
 
 ### Auth Flow
 
-- **File**: `src/index.ts` (`mcp_connect`, `/mcp:start`, `/mcp:auth`)
+- **Files**: `src/authorize-flow.ts`, `src/authorize-dialog.ts`, `src/connection-coordinator.ts` (triggered from `src/index.ts` for `mcp_connect` and `src/register-commands.ts` for `/mcp:start` and `/mcp:auth`)
 - **Steps**:
   1. Try the stored credentials and silent refresh during the connection
   2. If browser authorization is needed in an interactive session, acquire the auth lock and start the callback server

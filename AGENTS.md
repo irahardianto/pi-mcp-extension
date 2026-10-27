@@ -54,7 +54,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow (`authorize`) and browser launcher (`openBrowser`, `browserOpenCommand`) |
 | `src/authorize-dialog.ts` | Interactive OAuth callback dialog waiter (`waitForOAuthCallback`, `OAuthPasteOptions`) and dialog option constants (`authRetryOption`, `authPasteOption`, `authCancelOption`) |
-| `src/server-manager.ts` | Per-server lifecycle (`stopped → starting → ready → failed`), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
+| `src/server-manager.ts` | Per-server 3-state lifecycle (`stopped → starting → ready`; failed connects return to `stopped` with `lastError` set), retry/backoff, health checks, `onclose` recovery, `roots/list`, `sanitizeStderrLine` |
 | `src/server-status.ts` | Per-server status snapshot shared by `/mcp <name>` and `mcp_status` (`collectServerStatus`), OAuth credential summary and failure-hint formatting (`formatStatusAuth`, `classifyFailure`, `formatFailureHint`), detail renderer (`formatServerDetail`), and tool row (`toStatusRow`) |
 | `src/connect-policy.ts` | Pure connect-failure classification (`classifyConnectFailure`), OAuth 401/403 detection (`isOAuthUnauthorizedError`), and retry backoff schedule (`RETRY_DELAYS_MS`) |
 | `src/transport-factory.ts` | SDK transport construction (`stdio`, `streamable-http`, `sse`), environment resolution (`resolveEnv`), silent OAuth provider wiring, and transport-level SDK workarounds (`createTransport`) |
@@ -69,14 +69,14 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/oauth-provider.ts` | MCP SDK `OAuthClientProvider`: silent vs. interactive modes, refresh rotation, credential invalidation |
 | `src/oauth-status.ts` | Stored OAuth state inspection (`getAuthStatus`), credential reset (`resetAuth`), and best-effort token invalidation (`invalidateStoredTokens`) |
 | `src/oauth-state-store.ts` | Persisted OAuth state: Zod schemas (`StoredStateSchema`), URL canonicalization and origin-binding checks (`canonicalServerUrl`, `urlsMatch`, `isResourceCompatibleWithServerUrl`), atomic `0o600` load/save (`loadState`, `saveState`, `loadStoredRedirectUrisSync`) |
-| `src/auth-lock.ts` | Cross-process `<hash>.json.lock` with heartbeat and stale-lock reclaim; injectable `AuthLockDeps` |
+| `src/auth-lock.ts` | Cross-process `<hash>.json.lock` with heartbeat and stale-lock reclaim (`acquireAuthLock`, `AuthRequiredError`, `AuthLockError`); injectable `AuthLockDeps` |
 | `src/auth-lock-policy.ts` | Pure lock-record schema and staleness policy (`LockRecordSchema`, `parseLockRecord`, `isLockStale`, `formatHolderDetails`, `HEARTBEAT_MS`, `STALE_MS`) |
 | `src/callback-server.ts`, `src/callback-url.ts` | Instance-scoped `CallbackServer` loopback OAuth callback listener; pure redirect/callback URL validation (`callbackServerConfigFromRedirectUrl`) and headless paste-back parsing |
 | `src/auth-challenge.ts` | `WWW-Authenticate` discovery (RFC 9728 `resource_metadata`, `scope`) |
 | `src/terminal-text.ts` | Pure terminal/notification text sanitization (`sanitizeTerminalText`): strips ANSI/OSC/DCS/C1 escape sequences and C0/C1 control characters, collapses line breaks, and bounds string length on code-point boundaries |
 | `src/debug-log.ts` | Opt-in debug log file writer (`PI_MCP_DEBUG=1` → `<agentDir>/logs/pi-mcp.log`, `0o600`, ~2 MB rotation, `DebugLog`, injectable `DebugLogDeps`) and process-wide diagnostic sink (`reportDiagnostic`, UI routing, headless stderr fallback) |
 | `src/debug-log-format.ts` | Pure diagnostic log field allow-listing (`SAFE_FIELD_NAMES`, `sanitizeLogFields`), secret masking (`redactSecrets`, `sanitizeLogText`), error classification (`describeError`), and JSON Lines entry formatting (`buildLogEntry`, `formatLogLine`) |
-| `src/errors.ts` | `McpError` kinds `config \| connection \| auth \| timeout \| protocol`; `AuthRequiredError`, `AuthLockError`, `AuthCancelledError` |
+| `src/errors.ts` | `McpError` and `McpErrorCode` (`config \| connection \| auth \| timeout \| protocol \| tool`); `AuthCancelledError` |
 
 Tests live in `tests/*.test.ts` (`node:test` + `node:assert/strict`, run through `tsx`). Fixtures: `tests/mock-server.ts`, `tests/helpers/`. Property-based fuzz tests live in `tests/fuzz.test.ts` (using `fast-check`, detected by OpenSSF Scorecard). Keep tests out of `src/`.
 
@@ -92,14 +92,14 @@ Release tooling lives outside `src/` (it is not shipped to npm and must not depe
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/*.json` (branch and tag protection rulesets). `.github/CODEOWNERS` lists the security-sensitive paths.
 
 > [!NOTE]
-> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~970 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
+> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~1,095 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
 
 ## Architecture
 
 - **Pure core, thin I/O.** Keep policy and transforms as pure functions: state transitions, retry/timeout math, lock staleness, schema conversion, tool naming, URL/argument parsing, config merging. Keep SDK transports, `node:fs`, `node:child_process`, `node:http`, browser launching, and timers in thin adapters.
 - **Inject boundaries.** A module that touches the filesystem, clock, PIDs, network, or browser takes an optional deps object with production defaults (pattern: `AuthLockDeps` in `src/auth-lock.ts`), so tests use fakes instead of real sleeps, sockets, or processes.
 - **Validate every external input with Zod**: `mcp.json`, stored OAuth state, lock records, DCR/discovery metadata. Never `JSON.parse(x) as T`. Config errors are `McpError(..., "config")` and include the file path.
-- **Classify errors.** New user-facing failures use an `McpError` kind (`config | connection | auth | timeout | protocol`) or an auth subclass (`AuthRequiredError`, `AuthLockError`, `AuthCancelledError`), not a bare `Error`, so callers and `mcp_status` can tell them apart.
+- **Classify errors.** New user-facing failures use an `McpError` kind (`config | connection | auth | timeout | protocol | tool`) or an auth subclass (`AuthRequiredError`, `AuthLockError`, `AuthCancelledError`), not a bare `Error`, so callers and `mcp_status` can tell them apart.
 - **Timeouts and cancellation.** The effective timeout is `server.config.requestTimeoutMs ?? settings.requestTimeoutMs`. Pass `{ timeout, signal }` to SDK calls (`connect`, `ping`, `listTools`, `callTool`) and to OAuth discovery fetches, and check `signal.aborted` between async steps.
 - **Function-level structural simplicity.** Keep functions and methods focused (`<= 4` `return` statements per top-level function or method, enforced by `npm run lint` and Qlty's `return_statements` check). Keep control-flow nesting within `<= 4` levels (enforced by `max-depth` and AST checks in `npm run lint`, and Qlty's `nested_control_flow` smell); prefer guard clauses, early returns, and small pure helpers over deep nesting or chained ternaries. When a function grows beyond 4 returns or 4 nesting levels—or defines multiple inline callbacks with early returns—decompose it into named pure helpers or handler functions, or deduplicate repeated loops/checks. Never work around limits by replacing idiomatic guard clauses with a mutable `let result` variable or deep `if / else` nesting.
 - **Boolean expression simplicity.** Keep every `&&` / `||` expression in `src/` and `scripts/` at `<= 3` logical operators (`<= 4` operands), matching Qlty's `boolean_logic` smell (threshold 4 → `>= 4` operators reports `Complex binary expression`) and enforced by `pi-mcp/max-boolean-operators` in `npm run lint`. The count covers the whole expression, not one operator kind, so splitting a long chain across nested groups buys no budget. Prefer named module-private predicates, a `readonly RegExp[]` / key list plus `.some(...)`, or a constant lookup table over an inline chain—and keep the `// nosemgrep:` comment attached to any extracted `401` regex literal, because `pi-mcp.no-401-substring` matches the literal itself. `??` chains are deliberate nullish fallbacks and stay governed by the cognitive-complexity limit.
@@ -161,7 +161,7 @@ Self-review before finishing:
 - Does anything write to stdout or swallow errors?
 - Is external input Zod-validated and are URLs scheme-checked?
 - Are credentials origin-bound and written `0o600`?
-- Does every new or modified function in `src/` stay within the `<= 4` return statement and `<= 4` control-flow nesting bounds via clean helper decomposition (verified by `npm run lint`)?
+- Does every new or modified function in `src/` stay within the `<= 4` return statement, `<= 4` control-flow nesting, and `<= 5` parameter bounds via clean helper decomposition and options objects (verified by `npm run lint`)?
 - Does every new or modified function in `src/` stay within the cognitive and cyclomatic complexity `<= 15` limit (verified by `npm run lint` via `complexity` and `pi-mcp/max-cognitive-complexity`), and does `qlty smells --all` report zero `function_complexity` findings?
 - Does every `&&` / `||` expression stay at `<= 3` logical operators (verified by `npm run lint` via `pi-mcp/max-boolean-operators`), and does `qlty smells --all` report zero `boolean_logic` (`Complex binary expression`) findings?
 
