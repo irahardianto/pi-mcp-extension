@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-10-28
+
 ### Fixed
 - The `run /mcp:auth <name>` footer hint and the `pi-mcp: <name> requires re-authorization` warning now stay in sync with the server's actual auth state: a mid-session HTTP 401/403 on a tool call or tool list warns and shows the hint instead of stopping the server silently, a declined server that later connects — after an eager restart or a background reconnect — clears the hint instead of leaving it stuck, a declined server whose later failure is a connection error clears the hint instead of blaming authorization, and `/mcp:stop` during an eager start no longer raises a spurious `Failed to start` toast for the cancelled authorization (#207).
 - A 401/403 on the initial `tools/list` of a connect attempt (`initialize` succeeded, discovery did not) is again classified as an authorization failure: it used to be reported as a cancelled authorization, which suppressed the startup authorization prompt, skipped interactive OAuth, and hid the recovery failure. A `tools/list_changed` refresh that hits a 401/403 or is cancelled no longer adds a second, unrelated `Failed to refresh tools` error on top of the re-authorization warning (#207).
