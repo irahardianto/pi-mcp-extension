@@ -344,16 +344,17 @@ describe("stdio-process", () => {
       });
       await fakeTransport.start();
 
-      const payload = Buffer.from("fatal 🚀\n", "utf8");
+      const payload = Buffer.from("fatal 🚀", "utf8");
       stderrStream.emit("data", payload.subarray(0, 8)); // ends inside the emoji
       await fakeTransport.close();
       // The close-time flush must be provisional: finalising the decoder here would replace the
       // half-decoded character with U+FFFD and corrupt the line.
       assert.deepEqual(lines, ["fatal "]);
 
-      // The completing bytes arrive after close and the stream never ends: they must be flushed
-      // on arrival, and must decode without replacement characters.
+      // The completing bytes arrive after close with no trailing newline and the stream never
+      // ends: the post-close quiet-window flush must release them intact without U+FFFD.
       stderrStream.emit("data", payload.subarray(8));
+      await sleep(POST_CLOSE_FLUSH_DELAY_MS * 2);
       assert.deepEqual(lines, ["fatal ", "🚀"]);
       assert.ok(
         lines.every((line) => !line.includes("\uFFFD")),
@@ -841,8 +842,16 @@ setInterval(() => {}, 1000);
       stderrStream.emit("data", Buffer.from("no trailing newline", "utf8"));
       assert.deepEqual(lines, []);
 
-      destroyStdioStreams(fakeTransport);
+      await fakeTransport.close();
       assert.deepEqual(lines, ["no trailing newline"]);
+
+      // A post-close chunk schedules the quiet-window timer; destroyStdioStreams must flush it
+      // immediately and cancel the pending timer before destroying the pipes.
+      stderrStream.emit("data", Buffer.from("post-close trailing", "utf8"));
+      assert.deepEqual(lines, ["no trailing newline"]);
+
+      destroyStdioStreams(fakeTransport);
+      assert.deepEqual(lines, ["no trailing newline", "post-close trailing"]);
       assert.deepEqual(destroyed, ["stdout", "stderr"]);
     });
 

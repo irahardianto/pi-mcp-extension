@@ -116,8 +116,9 @@ interface StderrCarrier {
  * WHY: `StdioClientTransport.close()` never ends its stderr `PassThrough` — it only waits
  * (bounded) for the child's `'close'` event — and a descendant that inherited the stderr write
  * end keeps that event from firing. A line written without a trailing newline would then stay
- * in the splitter's remainder forever. Flushing when close settles, and again for every chunk
- * that arrives afterwards (nothing will emit `'end'` to do it), keeps the child's last words.
+ * in the splitter's remainder forever. Flushing when close settles, and again after
+ * `POST_CLOSE_FLUSH_DELAY_MS` of silence for any chunks that arrive afterwards (nothing will
+ * emit `'end'` to do it), keeps the child's last words.
  * Both flushes are provisional: they must not finalise the decoder, because the bytes of a
  * character can be split across the close boundary; only the stream's own `'end'`/`'close'`
  * finalises it.
@@ -132,14 +133,15 @@ export function instrumentStderr(
   const splitter = createLineSplitter(onLine);
   let closed = false;
   let idleFlush: NodeJS.Timeout | null = null;
-  const flush = (): void => {
-    splitter.flush();
-  };
   const cancelIdleFlush = (): void => {
     if (idleFlush) {
       clearTimeout(idleFlush);
       idleFlush = null;
     }
+  };
+  const flush = (): void => {
+    cancelIdleFlush();
+    splitter.flush();
   };
   // WHY: after close settles nothing emits 'end', so a remainder nobody else will flush has to be
   // released — but a single chunk boundary is not the end of a line. Waiting for the stream to go
@@ -149,7 +151,7 @@ export function instrumentStderr(
     cancelIdleFlush();
     idleFlush = setTimeout(() => {
       idleFlush = null;
-      flush();
+      splitter.flush();
     }, POST_CLOSE_FLUSH_DELAY_MS);
     idleFlush.unref();
   };
@@ -158,24 +160,19 @@ export function instrumentStderr(
     splitter.write(chunk);
     if (closed) scheduleIdleFlush();
   });
-  stream.on("end", () => {
+  const onStreamEnd = (): void => {
     cancelIdleFlush();
     splitter.end();
-  });
-  stream.on("close", () => {
-    cancelIdleFlush();
-    splitter.end();
-  });
+  };
+  stream.on("end", onStreamEnd);
+  stream.on("close", onStreamEnd);
 
   const origClose = transport.close.bind(transport);
-  transport.close = async (): Promise<void> => {
-    try {
-      await origClose();
-    } finally {
+  transport.close = (): Promise<void> =>
+    origClose().finally(() => {
       closed = true;
       flush();
-    }
-  };
+    });
   return flush;
 }
 
