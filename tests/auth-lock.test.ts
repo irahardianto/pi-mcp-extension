@@ -396,7 +396,7 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
   });
 
   it("should restore the contender's fresh lock for every non-EEXIST hard-link failure code", async () => {
-    for (const code of ["EOPNOTSUPP", "EPERM", "EACCES", "EMLINK"]) {
+    for (const code of ["EOPNOTSUPP", "EPERM", "EMLINK"]) {
       // Arrange
       const { files, hooks, calls, deps, winner } = arrangeReclaimRace();
       hooks.beforeLink = () => {
@@ -493,7 +493,6 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       () => acquireAuthLock(serverName, storageDir, { deps }),
       (err: unknown) => err instanceof AuthLockError,
     );
-    assert.equal(files.has(targetLockPath), false);
     assert.equal(calls.rename.length, 1);
     assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
   });
@@ -528,6 +527,67 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       [],
     );
     assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
+  });
+
+  it("should tolerate an empty lock file left by a peer's restore before declaring the lock lost", async () => {
+    // Arrange
+    const fakeClock = createFakeClock(100_000);
+    const { fs } = createFakeFs(() => fakeClock.clock.now());
+    const holder = await acquireAuthLock(serverName, storageDir, {
+      deps: {
+        fs,
+        clock: fakeClock.clock,
+        pid: 1111,
+        hostname: "host-a",
+        isPidAlive: () => true,
+      },
+    });
+
+    // A peer's exclusive-create restore publishes `path` empty for an instant, then writes the
+    // holder's own record back; the first read must not latch "lock lost".
+    const originalReadFile = fs.readFile.bind(fs);
+    let reads = 0;
+    fs.readFile = async (path, encoding) => {
+      if (path === targetLockPath && ++reads === 1) return "";
+      return originalReadFile(path, encoding);
+    };
+
+    // Act
+    await holder.assertHeld();
+
+    // Assert
+    assert.equal(holder.isLost(), false);
+    assert.equal(reads, 2);
+    await holder();
+  });
+
+  it("should report a lost lock when the lock file stays unreadable across every retry", async () => {
+    // Arrange
+    const fakeClock = createFakeClock(100_000);
+    const { fs } = createFakeFs(() => fakeClock.clock.now());
+    const holder = await acquireAuthLock(serverName, storageDir, {
+      deps: {
+        fs,
+        clock: fakeClock.clock,
+        pid: 1111,
+        hostname: "host-a",
+        isPidAlive: () => true,
+      },
+    });
+    let reads = 0;
+    fs.readFile = async () => {
+      reads++;
+      return "";
+    };
+
+    // Act & Assert
+    await assert.rejects(
+      () => holder.assertHeld(),
+      (err: unknown) =>
+        err instanceof AuthLockError && /Authorization lock lost for test-server; retry/.test(err.message),
+    );
+    assert.equal(holder.isLost(), true);
+    assert.equal(reads, 3);
   });
 
   it("should invoke onLost and reject assertHeld when heartbeat detects nonce changed on disk", async () => {

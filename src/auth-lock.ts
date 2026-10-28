@@ -158,29 +158,37 @@ export function createDefaultAuthLockDeps(): AuthLockDeps {
 
 const MAX_ACQUIRE_ATTEMPTS = 3;
 
+/** Yield across microtasks (and briefly on the real fs) while a peer finishes its restore. */
+async function yieldForPeerRestore(usingRealFs: boolean, attempt: number): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  if (usingRealFs && attempt === 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** Read the lock record, retrying while a peer may have the file briefly out of place. */
 async function readLockRecordWithRetry(
   fs: AuthLockFs,
   path: string,
   usingRealFs = false,
 ): Promise<LockRecord | null> {
   for (let i = 0; i < 3; i++) {
+    let record: LockRecord | null = null;
     try {
-      const raw = await fs.readFile(path, "utf8");
-      return parseLockRecord(raw);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT" && i < 2) {
-        // WHY: During stale-lock inspection, a contender briefly renames `path` to
-        // `movedPath` and restores it via `link(movedPath, path)` on nonce mismatch.
-        // Yield across microtasks (and a brief macrotask on real fs) before treating ENOENT as genuine lock loss.
-        await Promise.resolve();
-        await Promise.resolve();
-        if (usingRealFs && i === 1) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 5));
-        }
-        continue;
-      }
-      return null;
+      record = parseLockRecord(await fs.readFile(path, "utf8"));
+    } catch {
+      // WHY: A missing or unreadable file is indistinguishable from a peer's in-flight restore
+      // on a single read; the retry below decides whether the lock is really gone.
     }
+    if (record !== null) return record;
+    if (i === 2) return null;
+    // WHY: During stale-lock inspection a contender briefly renames `path` to `movedPath` and
+    // restores it via `link()` — or, where hard links are unsupported, re-creates it with an
+    // exclusive write that publishes the file empty for an instant. Both read as "no lock"
+    // here, so retry across microtasks (and a brief macrotask on the real fs) before
+    // concluding the lock is genuinely gone.
+    await yieldForPeerRestore(usingRealFs, i);
   }
   return null;
 }
