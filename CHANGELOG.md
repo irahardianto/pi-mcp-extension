@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A `tools/list` request timeout during connect is again retryable and keeps the `timeout` failure category: a server that accepted `initialize` but answered discovery too slowly was reported as an `McpError` with code `protocol`, which fast-fails the connect classifier, so the attempt failed on the first try without consuming `settings.maxRetries`, `mcp_status` showed `Connection protocol`, and `mcp_connect` blamed tool discovery. A `tools/call` timeout is likewise reported as `timeout` instead of `protocol`, and a connect that times out now says the server did not respond in time instead of pointing at its configuration (#209).
+
 ## [1.11.4] - 2026-10-28
 
 ### Fixed

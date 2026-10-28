@@ -406,9 +406,14 @@ function formatMcpAuthError(err: unknown, hasUI: boolean): string | undefined {
   return undefined;
 }
 
-function formatMcpProtocolOrGenericError(err: unknown): string {
+function formatMcpConnectFailureMessage(err: unknown): string {
   if (err instanceof McpError && err.code === "protocol") {
     return "MCP tool discovery failed. Check the server and retry.";
+  }
+  // WHY: a request timeout means the server was reachable but too slow, so pointing at the
+  // configuration would send the user down the wrong path (#209).
+  if (err instanceof McpError && err.code === "timeout") {
+    return "MCP server did not respond in time. Check that it is running and retry.";
   }
   return "MCP connection failed. Check the server configuration and retry.";
 }
@@ -420,7 +425,7 @@ function formatMcpConnectError(err: unknown, options: McpConnectErrorOptions): s
   if (!options.serverExists) {
     return "Unknown MCP server name. Use mcp_status to list configured servers.";
   }
-  return formatMcpAuthError(err, options.hasUI) ?? formatMcpProtocolOrGenericError(err);
+  return formatMcpAuthError(err, options.hasUI) ?? formatMcpConnectFailureMessage(err);
 }
 
 function registerManagementTools(

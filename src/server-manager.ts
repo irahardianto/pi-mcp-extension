@@ -38,6 +38,7 @@ import { createTransport } from "./transport-factory.js";
 import {
   classifyConnectFailure,
   isOAuthUnauthorizedError,
+  isSdkTimeoutError,
   type ConnectFailureAction,
 } from "./connect-policy.js";
 
@@ -180,13 +181,6 @@ function createConnectRaceGuard(
   };
 
   return { outcome, dispose };
-}
-
-function isSdkTimeoutError(err: unknown): boolean {
-  if (err instanceof McpError) return false;
-  if ((err as { code?: unknown } | null)?.code === -32001) return true;
-  const message = err instanceof Error ? err.message : String(err);
-  return /Request timed out|timed out/i.test(message);
 }
 
 function rethrowNormalizedConnectError(

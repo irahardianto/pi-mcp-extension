@@ -3,6 +3,7 @@
  *
  * Owns:
  *   - Pure OAuth 401/403 connect and tool error detection (`isOAuthUnauthorizedError`)
+ *   - Pure SDK request-timeout detection (`isSdkTimeoutError`)
  *   - Fixed retry backoff schedule (`RETRY_DELAYS_MS`)
  *   - Connect-failure classification into retry, auth-required, fast-fail, give-up, or cancelled (`classifyConnectFailure`)
  */
@@ -137,6 +138,26 @@ export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>
 
 /** Fixed retry delay schedule — predictable, no jitter math needed. */
 export const RETRY_DELAYS_MS = [1000, 3000, 5000, 10000, 30000] as const;
+
+/**
+ * Whether `err` is the MCP SDK's own request-timeout rejection.
+ *
+ * The SDK rejects a timed-out `initialize`, `tools/list`, or `tools/call` with **its**
+ * `McpError` carrying the numeric JSON-RPC code `ErrorCode.RequestTimeout` (-32001) —
+ * a different class from pi-mcp's own {@link McpError}, so an `instanceof McpError`
+ * check here only excludes codes this extension already decided on. Any layer that
+ * re-wraps an SDK error must keep the timeout distinction: `classifyConnectFailure`
+ * fast-fails an error coded `"protocol"`, which would turn a transient discovery
+ * timeout into a first-attempt failure with no retries.
+ */
+export function isSdkTimeoutError(err: unknown): boolean {
+  // WHY: our own McpError already carries a deliberate code; never re-derive it from
+  // the message (e.g. "Connection timed out after 5000ms" is already code "timeout").
+  if (err instanceof McpError) return false;
+  if ((err as { code?: unknown } | null)?.code === -32001) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /Request timed out|timed out/i.test(message);
+}
 
 export type TransportType = ServerConfig["transport"];
 

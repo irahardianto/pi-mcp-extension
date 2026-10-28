@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { ServerManager } from "../src/server-manager.js";
 import {
   classifyConnectFailure,
+  isSdkTimeoutError,
   RETRY_DELAYS_MS,
   type ConnectFailureAction,
 } from "../src/connect-policy.js";
@@ -16,6 +17,7 @@ import type { McpConfig } from "../src/config.js";
 import { McpError, AuthCancelledError } from "../src/errors.js";
 import { AuthRequiredError } from "../src/oauth-provider.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { Socket } from "node:net";
@@ -1672,6 +1674,193 @@ describe("ServerManager stdio cwd (Pi 1.3.0)", () => {
     } finally {
       await manager.shutdownAll();
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Request-timeout classification (#209) ────────────────────────────────────
+
+describe("isSdkTimeoutError", () => {
+  it("recognizes the SDK's own RequestTimeout McpError, bare -32001 shapes, and timeout messages", () => {
+    assert.equal(
+      isSdkTimeoutError(SdkMcpError.fromError(ErrorCode.RequestTimeout, "Request timed out", { timeout: 100 })),
+      true,
+    );
+    // Transport-level shapes that carry the JSON-RPC code without an Error instance.
+    assert.equal(isSdkTimeoutError({ code: -32001, message: "whatever" }), true);
+    assert.equal(isSdkTimeoutError(new Error("The operation timed out")), true);
+  });
+
+  it("does not reclassify our own McpError, unrelated codes, or non-timeout failures", () => {
+    // WHY: `McpError` here is pi-mcp's own class; the SDK timeout travels as the SDK's
+    // McpError. Re-matching ours would rewrite a deliberate "protocol"/"connection" code.
+    assert.equal(isSdkTimeoutError(new McpError("Connection timed out after 5000ms", "srv", "timeout")), false);
+    assert.equal(isSdkTimeoutError(new McpError("boom", "srv", "protocol")), false);
+    assert.equal(isSdkTimeoutError(SdkMcpError.fromError(ErrorCode.InternalError, "Maximum total timeout exceeded")), false);
+    assert.equal(isSdkTimeoutError(new Error("connect ECONNREFUSED 127.0.0.1:1")), false);
+    assert.equal(isSdkTimeoutError(null), false);
+    assert.equal(isSdkTimeoutError("timeout"), false);
+  });
+});
+
+/**
+ * Fake streamable-http MCP server whose `tools/list` never answers for the first
+ * `hangTimes` requests, then answers normally. Counting `tools/list` requests is how a
+ * test tells "the client retried" from "the client gave up on attempt 1".
+ */
+async function startSlowToolsListServer(hangTimes: number): Promise<{
+  url: string;
+  toolsListRequests: () => number;
+  close: () => Promise<void>;
+}> {
+  const { createServer } = await import("node:http");
+  const sockets = new Set<Socket>();
+  let toolsListRequests = 0;
+  const listener = createServer((req, res) => {
+    if (req.url !== "/mcp" || req.method !== "POST") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+    req.on("end", () => {
+      const msg = JSON.parse(body) as { id?: number; method?: string };
+      if (msg.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "slow-tools", version: "1.0.0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (msg.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (msg.method === "tools/list") {
+        toolsListRequests++;
+        if (toolsListRequests <= hangTimes) {
+          // Hang: nothing is written, so the SDK's request timeout is what rejects.
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { tools: [{ name: "ping", inputSchema: { type: "object", properties: {} } }] },
+          }),
+        );
+        return;
+      }
+      res.writeHead(400);
+      res.end();
+    });
+  });
+  listener.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    url: `http://127.0.0.1:${address.port}/mcp`,
+    toolsListRequests: () => toolsListRequests,
+    close: async () => {
+      // WHY: a hung tools/list response leaves its socket open; closing without this hangs.
+      listener.closeAllConnections();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    },
+  };
+}
+
+describe("tools/list request timeout during connect (#209)", () => {
+  it("retries a discovery timeout instead of failing the attempt as a protocol error", async () => {
+    const slowServer = await startSlowToolsListServer(1);
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 2 };
+    const manager = new ServerManager({
+      settings,
+      mcpServers: {
+        slow: {
+          url: slowServer.url,
+          args: [],
+          transport: "streamable-http",
+          lifecycle: "lazy",
+          requestTimeoutMs: 150,
+        },
+      },
+    });
+    const bridge = new ToolBridge(settings, makeMockPi());
+    manager.setToolRefreshCallback(async (name, client, options) => {
+      await bridge.refreshTools(name, client, options);
+    });
+
+    try {
+      await manager.startServer("slow", process.cwd());
+      assert.equal(
+        slowServer.toolsListRequests(),
+        2,
+        "a tools/list timeout must consume a retry, not fail the first attempt outright",
+      );
+      assert.equal(manager.getServer("slow")?.state, "ready");
+      assert.equal(manager.getServer("slow")?.retryCount, 0, "a successful retry resets retryCount");
+    } finally {
+      await manager.shutdownAll();
+      await slowServer.close();
+    }
+  });
+
+  it("keeps the timeout code on the exhausted-retries error and on lastError", async () => {
+    const slowServer = await startSlowToolsListServer(Number.POSITIVE_INFINITY);
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 0 };
+    const manager = new ServerManager({
+      settings,
+      mcpServers: {
+        slow: {
+          url: slowServer.url,
+          args: [],
+          transport: "streamable-http",
+          lifecycle: "lazy",
+          requestTimeoutMs: 100,
+        },
+      },
+    });
+    const bridge = new ToolBridge(settings, makeMockPi());
+    manager.setToolRefreshCallback(async (name, client, options) => {
+      await bridge.refreshTools(name, client, options);
+    });
+
+    try {
+      await assert.rejects(
+        () => manager.startServer("slow", process.cwd()),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "timeout");
+          assert.match(err.message, /Failed to list tools from slow/);
+          assert.match(err.message, /Request timed out/);
+          return true;
+        },
+      );
+      // lastError feeds mcp_status' `Connection <code>` line and the /mcp detail view.
+      const lastError = manager.getServer("slow")?.lastError;
+      assert.ok(lastError instanceof McpError);
+      assert.equal(lastError.code, "timeout");
+      assert.equal(slowServer.toolsListRequests(), 1, "maxRetries: 0 must not retry");
+    } finally {
+      await manager.shutdownAll();
+      await slowServer.close();
     }
   });
 });

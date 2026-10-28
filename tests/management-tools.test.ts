@@ -397,3 +397,68 @@ it("isolates a corrupt OAuth state file in mcp_status and recovers on first conn
   }
 });
 
+
+it("reports a tools/list timeout from mcp_connect as a timeout, not as tool discovery or config error (#209)", async () => {
+  const { createServer } = await import("node:http");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-discovery-timeout-"));
+  const mockExt = createMockExtension();
+  const tools = mockExt.tools;
+  const events = mockExt.events;
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+  const listener = createServer((req, res) => {
+    if (req.url !== "/mcp" || req.method !== "POST") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+    req.on("end", () => {
+      const msg = JSON.parse(body) as { id?: number; method?: string };
+      if (msg.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "slow-tools", version: "1.0.0" },
+          },
+        }));
+        return;
+      }
+      if (msg.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      // tools/list hangs forever — the SDK request timeout is the only rejection.
+    });
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
+      settings: { maxRetries: 0, requestTimeoutMs: 100 },
+      mcpServers: { slow: { transport: "streamable-http", url: `http://127.0.0.1:${address.port}/mcp`, lifecycle: "lazy" } },
+    }));
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await events.get("session_start")({}, ctx);
+    await assert.rejects(
+      tools.get("mcp_connect").execute("", { name: "slow" }, undefined, undefined, ctx),
+      /did not respond in time/,
+    );
+    const status = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.equal(status[0].error, "Connection timeout; use mcp_connect to retry");
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    listener.closeAllConnections();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
