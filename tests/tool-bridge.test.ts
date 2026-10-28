@@ -1407,6 +1407,32 @@ describe("ToolBridge request-timeout classification", () => {
     });
   });
 
+  it("still recognizes an abort-shaped rejection when no signal reaches the bridge", async () => {
+    // WHY: the SDK's abort listener sets signal.aborted before rejecting, so this leg only
+    // fires for a rejection produced by a signal we were never handed — keep it exercised.
+    const client = {
+      request: async (req: { method: string }) => {
+        if (req.method === "tools/list") {
+          return { tools: [{ name: "wait", inputSchema: { type: "object" } }] };
+        }
+        throw SdkMcpError.fromError(ErrorCode.RequestTimeout, "AbortError: This operation was aborted");
+      },
+    };
+    const { bridge, tools } = makeBridge();
+    await bridge.refreshTools("srv", client as unknown as Client);
+    const tool = tools[0];
+    assert.ok(tool);
+    await assert.rejects(
+      () => tool.execute("call-abort-nosignal", {}, undefined, undefined, undefined),
+      (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, "protocol");
+        assert.equal(err.message, "Tool execution cancelled");
+        return true;
+      },
+    );
+  });
+
   it("labels a tools/call SDK timeout as 'timeout' and a protocol failure as 'protocol'", async () => {
     let callError: Error | undefined;
     const client = {

@@ -185,8 +185,11 @@ export function isCancellationError(err: unknown, signal?: AbortSignal | undefin
   // WHY: the caller's own abort is authoritative — it survives the SDK rewrapping the reason.
   if (signal?.aborted || err instanceof AuthCancelledError) return true;
   if (!(err instanceof Error)) return false;
-  // WHY: only a -32001 carrier is inspected for an abort reason; a JSON-RPC error response
-  // whose message merely mentions "aborted" must keep its own class.
+  // WHY: fallback for an abort-shaped rejection that arrives without our signal — the SDK's
+  // abort listener sets `signal.aborted` before rejecting, so this leg only matters when the
+  // rejection came from a signal we were never handed (or a transport-level abort). Still
+  // narrow on purpose: only a -32001 carrier is inspected, so a JSON-RPC error response whose
+  // message merely mentions "aborted" keeps its own class.
   return err.name === "AbortError" || ((err as { code?: unknown }).code === -32001 && /abort/i.test(err.message));
 }
 
