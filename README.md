@@ -1,4 +1,4 @@
-# pi-mcp-extension
+# <img src="https://raw.githubusercontent.com/irahardianto/pi-mcp-extension/main/docs/icon.svg" width="32" height="32" align="top" alt="" /> pi-mcp-extension
 
 [![npm version](https://img.shields.io/npm/v/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
 [![npm downloads](https://img.shields.io/npm/dm/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
