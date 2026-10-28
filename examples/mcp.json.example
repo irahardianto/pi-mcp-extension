@@ -11,31 +11,31 @@
     "maxRetries": 5
   },
   "mcpServers": {
-    // ── HTTP-based servers (streamable-http) ───────────────────────────────
+    // ── HTTP servers with OAuth 2.1 (streamable-http) ──────────────────────
     // Use "transport": "streamable-http" (or omit "transport" when "url" is set;
-    // "transport": "http" and "type": "http" are also accepted) for:
-    // - Supabase (https://mcp.supabase.com)
-    // - DeepSource (https://mcp.deepsource.com)
-    // - Z.ai / other modern MCP HTTP servers
+    // "transport": "http" and "type": "http" are also accepted) with "auth"
+    // (or "oauth") for remote servers that use OAuth 2.1 (PKCE + DCR):
 
     "supabase": {
       "transport": "streamable-http",
       "url": "https://mcp.supabase.com/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_SUPABASE_ANON_KEY",
-        "x-project-id": "YOUR_PROJECT_ID"
+      "auth": {
+        "type": "oauth"
       },
       "lifecycle": "eager"
     },
 
     "deepsource": {
-      "transport": "streamable-http",
       "url": "https://mcp.deepsource.com/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_DEEPSOURCE_API_KEY"
+      "auth": {
+        "type": "oauth"
       },
       "lifecycle": "eager"
     },
+
+    // ── HTTP servers with static API key / Bearer headers ──────────────────
+    // Note: when "auth" is set on a server, OAuth owns the Authorization header
+    // and any static "Authorization" entry in "headers" is ignored.
 
     "zai-web-search": {
       "transport": "streamable-http",
@@ -43,7 +43,7 @@
       "headers": {
         "Authorization": "Bearer YOUR_ZAI_API_KEY"
       },
-      "lifecycle": "eager"
+      "lifecycle": "lazy"
     },
 
     // ── Legacy SSE servers ─────────────────────────────────────────────────
@@ -55,7 +55,7 @@
 
     // ── stdio subprocess servers ───────────────────────────────────────────
     // Use "transport": "stdio" (or omit, since it's the default) along with
-    // "command" and optionally "args" and "env" for subprocess-based servers.
+    // "command" and optionally "args", "cwd", and "env" for subprocess servers.
 
     "pathfinder": {
       "transport": "stdio",
@@ -81,5 +81,14 @@
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
       "lifecycle": "lazy"
     }
+
+    // ── Project-level partial overrides (.pi/mcp.json only) ────────────────
+    // In a trusted project's .pi/mcp.json, an entry with no "command", "url",
+    // "type", or "transport" overrides only per-project settings ("enabled" or
+    // "lifecycle") while keeping the global server's URL, command, and credentials:
+    //
+    // "supabase": {
+    //   "enabled": false
+    // }
   }
 }

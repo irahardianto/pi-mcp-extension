@@ -1,10 +1,11 @@
 # pi-mcp-extension
 
 [![npm version](https://img.shields.io/npm/v/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
+[![npm downloads](https://img.shields.io/npm/dm/pi-mcp-extension.svg)](https://www.npmjs.com/package/pi-mcp-extension)
 [![license](https://img.shields.io/npm/l/pi-mcp-extension.svg)](https://github.com/irahardianto/pi-mcp-extension/blob/main/LICENSE)
-[![CI](https://github.com/irahardianto/pi-mcp-extension/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/irahardianto/pi-mcp-extension/actions/workflows/ci.yml)
+[![CI](https://github.com/irahardianto/pi-mcp-extension/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/irahardianto/pi-mcp-extension/actions/workflows/ci.yml)<br>
 [![Code Coverage](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/coverage.svg)](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension)
-[![Maintainability](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg)](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension)<br>
+[![Maintainability](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension/maintainability.svg)](https://qlty.sh/gh/irahardianto/projects/pi-mcp-extension)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/irahardianto/pi-mcp-extension/badge)](https://scorecard.dev/viewer/?uri=github.com/irahardianto/pi-mcp-extension)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15659/badge)](https://www.bestpractices.dev/projects/15659)
 
@@ -12,44 +13,36 @@
 
 `pi-mcp-extension` is a production-ready [Model Context Protocol](https://modelcontextprotocol.io/) client extension for the [Pi coding agent](https://pi.dev). It manages server connections, discovers tools, and bridges them into Pi so the LLM can call them directly.
 
+[Quick Start](#quick-start) · [Configuration](#configuration) · [OAuth 2.1](#oauth-config) · [Commands & Agent Tools](#commands) · [Debug Log](#debug-log) · [How It Works](#how-it-works) · [MCP Spec Compliance](#mcp-spec-compliance)
+
 ## Features
 
 - **Multi-transport** — `stdio` subprocesses, `streamable-http` (including `"http"` and URL-only shorthand), and legacy `sse` out of the box
 - **Auto-discovery** — Paginated `tools/list` with cursor following (MCP 2025-03-26 spec)
 - **Live tool refresh** — `notifications/tools/list_changed` triggers re-discovery without restart
 - **Clean cancellation** — `AbortSignal` propagation via `notifications/cancelled`
-- **Smart reconnection** — Fixed delay retry schedule (1s → 3s → 5s → 10s → 30s), configurable max retries, and automatic recovery when a server transport closes unexpectedly
+- **Smart reconnection** — Fixed delay retry schedule (1s → 3s → 5s → 10s → 30s), configurable max retries, automatic recovery when a server transport closes or errors unexpectedly, and mid-session HTTP `401` / `403 insufficient_scope` detection that invalidates stale tokens and prompts for re-authorization
 - **Health checks** — Opt-in periodic pings to detect stale connections
-- **Safe process lifecycle** — Child PID tracking (`StdioClientTransport.pid`) with tree-aware cleanup: descendants of wrapper commands (`npx`, `npm exec`, `uvx`, `sh -c`) are terminated too, and inherited pipes are released so teardown never stalls
-- **Stable tool names** — Sanitized, collision-avoiding names (max 64 chars) that stay constant across reconnects
+- **Safe process lifecycle** — Child PID tracking with tree-aware cleanup: descendants of wrapper commands (`npx`, `npm exec`, `uvx`, `sh -c`) are terminated too, and inherited pipes are released so teardown never stalls
+- **Stable tool names** — Sanitized, collision-avoiding names (`<prefix>_<server>_<tool>`, max 64 chars) that stay constant across reconnects
 - **No tool churn** — Activate/deactivate pattern ensures tools don't flicker during reconnection
-- **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects via `ctx.isProjectTrusted()`, including Pi 1.3.0 partial overrides), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
-- **Rich tool results & annotations** — MCP `image` content passthrough (`ImageContent`), plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` surfaced in tool descriptions
+- **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects, including Pi 1.3.0 partial overrides), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
+- **Rich tool results & annotations** — MCP `text`, `image` (`ImageContent`), `structuredContent`, embedded `resource` text/blobs, and `audio` fallback descriptions, plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` surfaced in tool descriptions
 - **On-demand agent tools & commands** — `mcp_status` and `mcp_connect` agent tools plus `/mcp`, `/mcp <name>` (with config provenance and failure hints), `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash commands with server-name autocomplete
 - **Structured error handling** — Distinct error codes (`config`, `connection`, `auth`, `timeout`, `protocol`, `tool`) and actionable failure hints
 - **Redacted debug logging** — Opt-in `PI_MCP_DEBUG=1` JSON Lines log (`<agent dir>/logs/pi-mcp.log`, `0600`, ~2 MB rotation) with automatic secret masking and zero TUI `stderr` noise
 - **OAuth 2.1** — Browser and headless/SSH authorization with PKCE, protected-resource discovery, Dynamic Client Registration, startup prompts for eager servers, cross-process lock recovery, token refresh, and origin/issuer-bound local persistence (see [OAUTH.md](./OAUTH.md))
 
-## Installation
-
-```bash
-pi install npm:pi-mcp-extension
-```
-
-Or try without installing:
-
-```bash
-pi -e npm:pi-mcp-extension
-```
-
 ## Quick Start
 
-1. Install the extension:
+> **Prerequisite:** Node.js 22+ and the [Pi coding agent](https://pi.dev).
+
+1. **Install the extension** (or run once without installing via `pi -e npm:pi-mcp-extension`):
    ```bash
    pi install npm:pi-mcp-extension
    ```
 
-2. *(Pi 1.x)* Disable Pi's built-in `mcp` extension so Pi does not warn that both extensions are enabled at the same time — either run `pi config` and uncheck `mcp` under **Built-in extensions**, or add `"extensions": ["-builtin:mcp"]` to `~/.pi/agent/settings.json`:
+2. *(Pi 1.x)* **Disable Pi's built-in `mcp` extension** so Pi does not warn that both extensions are enabled at the same time — either run `pi config` and uncheck `mcp` under **Built-in extensions**, or add `"extensions": ["-builtin:mcp"]` to `~/.pi/agent/settings.json`:
    ```jsonc
    {
      "extensions": [
@@ -58,20 +51,30 @@ pi -e npm:pi-mcp-extension
    }
    ```
 
-3. Create a config file at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (project-level). Both files support **JSONC** (`//` line and `/* ... */` block comments):
+3. **Create a config file** at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (trusted project). Both files support **JSONC** (`//` line and `/* ... */` block comments):
    ```jsonc
    {
      "mcpServers": {
+       // Remote HTTP server with OAuth 2.1 (prompts "Authorize now" on startup)
        "supabase": {
          "transport": "streamable-http",
          "url": "https://mcp.supabase.com/mcp",
+         "auth": {
+           "type": "oauth"
+         },
          "lifecycle": "eager"
+       },
+       // Local stdio subprocess server (connects on demand via /mcp:start or mcp_connect)
+       "context7": {
+         "command": "npx",
+         "args": ["-y", "@context7/mcp"],
+         "lifecycle": "lazy"
        }
      }
    }
    ```
 
-4. Start Pi — your MCP tools are ready. Use `/mcp` to check all servers or `/mcp <name>` to inspect one in detail.
+4. **Start Pi** — your MCP tools are ready. Use `/mcp` to check all servers or `/mcp <name>` to inspect one in detail.
 
 ## Configuration
 
@@ -85,6 +88,8 @@ Servers can be configured via JSON/JSONC files (`//` and `/* */` comments are su
 
 ### Full Example
 
+See also [`examples/mcp.json.example`](./examples/mcp.json.example) for a copy-ready template.
+
 ```jsonc
 {
   "settings": {
@@ -94,7 +99,7 @@ Servers can be configured via JSON/JSONC files (`//` and `/* */` comments are su
   },
   "mcpServers": {
 
-    // ── HTTP-based servers ───────────────────────────────────────────────────
+    // ── HTTP servers with OAuth 2.1 ──────────────────────────────────────────
     "supabase": {
       "transport": "streamable-http",
       "url": "https://mcp.supabase.com/mcp",
@@ -105,7 +110,20 @@ Servers can be configured via JSON/JSONC files (`//` and `/* */` comments are su
     },
     "deepsource": {
       "url": "https://mcp.deepsource.com/mcp", // "transport" defaults to "streamable-http" when "url" is set
+      "auth": {
+        "type": "oauth"
+      },
       "lifecycle": "eager"
+    },
+
+    // ── HTTP servers with static API key / Bearer headers ────────────────────
+    "zai-web-search": {
+      "transport": "streamable-http",
+      "url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_ZAI_API_KEY"
+      },
+      "lifecycle": "lazy"
     },
 
     // ── Legacy SSE servers ───────────────────────────────────────────────────
@@ -153,7 +171,14 @@ In project-level `.pi/mcp.json`, `settings` keys carry no defaults — only the 
 
 ### Per-Server Config
 
-For Pi 1.x compatibility, server entries also accept `type` as an alias for `transport`, `"http"` as an alias for `"streamable-http"`, `oauth` as an alias for `auth`, `timeout` (in seconds) as an alias for `requestTimeoutMs`, and `enabled: false` as a request to keep the server out of the eager set (`lifecycle: "lazy"`). Pi's `auth.provider` (`/login` provider token) is **rejected** at load time instead of being silently downgraded to OAuth 2.1 — use `auth` (OAuth) or static `headers`.
+For Pi 1.x / 1.3.0 compatibility, server entries also accept:
+- `type` as an alias for `transport`, and `"http"` as an alias for `"streamable-http"`
+- `oauth` as an alias for `auth`
+- `timeout` (in seconds) as an alias for `requestTimeoutMs`
+- `enabled: false` to keep the server configured but out of the eager set (normalized to `lifecycle: "lazy"`, even if `lifecycle: "eager"` is also set)
+
+> [!NOTE]
+> Pi's `auth.provider` (`/login` provider token) is **rejected** at load time with a `config` error instead of being silently downgraded to OAuth 2.1 — use `auth` (OAuth 2.1) or static `headers`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -207,15 +232,30 @@ Server-name arguments provide autocomplete suggestions from the configured MCP s
 | `/mcp <name>` | Show detailed status for one server: config source, transport/lifecycle, tool activation, OAuth credential status, failure hint, and stderr log |
 | `/mcp:start <name>` | Connect a server and wait for tool discovery |
 | `/mcp:stop <name>` | Cancel a pending connection, startup prompt, or authorization, or stop a running server and deactivate its tools |
-| `/mcp:auth <name>` | Connect with stored OAuth credentials and client registration; request browser authorization only if needed |
-| `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization |
+| `/mcp:auth <name>` | Connect (or force a fresh reconnect if already `ready`) using stored OAuth credentials and client registration; request browser authorization only if needed |
+| `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization (`--reset` may appear before or after `<name>`) |
 
 In addition to user slash commands, two built-in **agent tools** let the LLM inspect and connect configured servers directly:
 
 | Agent Tool | Parameters | Description |
 |---|---|---|
-| `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active`), `auth` credential presence, `source` (`global` / `project` / `extension`), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
+| `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active`), `auth` credential summary, `source` (`"global"` / `"project"` / `"extension"` / `"unknown"`), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
 | `mcp_connect` | `{ name: string }` | Connect one named server, run interactive OAuth if needed, and verify that discovered tools are active before returning success (returns fixed actionable categories on failure instead of raw server response text) |
+
+`mcp_status` returns a JSON array of [`ServerStatusRow`](./src/server-status.ts) objects:
+
+```json
+[
+  {
+    "name": "supabase",
+    "lifecycle": "eager",
+    "state": "ready",
+    "tools": { "discovered": 12, "active": 12 },
+    "auth": "credentials stored",
+    "source": "global"
+  }
+]
+```
 
 ### Inspecting one server (`/mcp <name>`)
 
@@ -237,10 +277,10 @@ Recent output:
 (no stderr output from supabase)
 ```
 
-- `Source` is the entry that won: `global` (`<agent dir>/mcp.json`), `project` (`<cwd>/.pi/mcp.json`), or `extension` (`pi.registerMcpServer()`). `mcp_status` reports the same value as `source` on each row.
+- `Source` is the entry that won: `global` (`<agent dir>/mcp.json`), `project` (`<cwd>/.pi/mcp.json`), or `extension` (`pi.registerMcpServer()`). `mcp_status` reports the same value as `source` on each row (or `"unknown"` if unrecorded).
 - When the project is untrusted, `Source` never says `project` and a `Project config: not loaded (<path>)` line explains why `mcp.json` in the workspace is not in effect.
 - `Tools` compares discovered tools with the ones Pi has active; a server can be `ready` with `0/N active` when another extension restricts tools.
-- `OAuth` appears only for servers with an `auth` config: `credentials stored`, `authorization may be required`, or `corrupt state file backed up (re-auth required)` (the corrupt file is backed up and the view still renders).
+- `OAuth` appears only for servers with an `auth` config: `credentials stored`, `authorization may be required`, or `corrupt state file backed up (re-auth required)` (the corrupt file is backed up and the view still renders; `mcp_status` reports `"not configured"` when `auth` is unset).
 - A failed server adds one `Hint:` line: `/mcp:auth <name>` (plus `--reset` when stored credentials expired) for a missing/expired authorization, waiting for another Pi process holding the auth lock, or `PI_MCP_DEBUG=1 pi` plus the issue tracker for a connection failure.
 
 ### OAuth startup, headless/SSH, and concurrency behavior
@@ -274,7 +314,12 @@ The log is written to `<agent dir>/logs/pi-mcp.log` (JSON Lines, one event per l
 - **Off by default.** Without `PI_MCP_DEBUG=1` no log file is created.
 - **Private.** The directory is `0o700` and the file is `0o600`, like the OAuth credential files.
 - **Bounded.** The file is rotated to `pi-mcp.log.1` at ~2 MB; a single backup is kept.
-- **Redacted.** Only allow-listed field names are recorded, and a final pass masks anything that looks like a credential: OAuth tokens, codes, and PKCE verifiers, plus API keys and other key/value or JSON secrets (`api_key`, `x-api-key`, `private_key`, `password`, `secret`, `token`, and prefixed forms such as `db_password`), credential-bearing query parameters on a server URL (`?api_key=…`, `?token=…`), `Authorization` headers in any scheme and quoting (including the JSON `"Authorization": "…"` form), and URL userinfo passwords (`https://user:password@host`). A value is masked up to its own delimiter, so a quoted secret keeps its quotes, an object value is masked whole, and text after a closing bracket (`… [REDACTED]) 401`, `… [REDACTED]] 401`) survives. The mask is idempotent and never touches a sentence that merely mentions a credential word (`Unexpected token <`); a word directly after a credential key is masked, because the redactor cannot tell a value from prose and masks on the safe side. The same mask applies to the per-server stderr buffer, the `Last error:` line that `/mcp <name>` shows and `getServerLogs` returns, and user-facing start/auth/recovery failure notifications.
+- **Redacted.** Only allow-listed field names are recorded, and a delimiter-aware pass masks anything that looks like a credential:
+  - OAuth tokens, authorization codes, and PKCE verifiers
+  - API keys and other JSON or key/value secrets (`api_key`, `x-api-key`, `private_key`, `password`, `secret`, `token`, and prefixed forms such as `db_password` or `aws_secret_access_key`)
+  - Credential-bearing query parameters on a server URL (`?api_key=…`, `?token=…`, `?code=…`)
+  - `Authorization` headers in any scheme or quoting, and URL userinfo passwords (`https://user:password@host`)
+  - The same redactor protects the per-server `Recent output:` (`stderr`) buffer, the `Last error:` line in `/mcp` and `/mcp <name>`, and user-facing start/auth/recovery failure notifications.
 - **Best-effort.** A failed log write never breaks a connection or a tool call.
 
 Attach the file to a bug report. It contains no credentials.
@@ -324,12 +369,12 @@ While a Pi UI is active, the extension never writes diagnostics to Pi's stderr (
 2. **Eager servers connect** at `session_start` via `ConnectionCoordinator` (offering a sequential `Authorize now` / `Not now` prompt when an eager OAuth server needs authorization in an interactive session); lazy servers wait for `mcp_connect`, `/mcp:start`, or `/mcp:auth`
 3. **Tools are discovered** via paginated `tools/list` calls (cursor-based, up to 100 pages) before a server enters `ready`
 4. **JSON Schema → TypeBox** conversion registers tools with Pi-compatible parameter schemas (preserving nullable union ordering, resolving `$ref`s cycle-safely, and inferring/flattening `allOf` object schemas)
-5. **Pi tools are registered** as `<prefix>_<server>_<tool>` (sanitized, max 64 chars with hash suffix) and pass through text and `image` content blocks (`ImageContent`)
+5. **Pi tools are registered** as `<prefix>_<server>_<tool>` (sanitized `[a-zA-Z0-9_]`, max 64 chars with an 8-char SHA-256 suffix on truncation or collision) and convert MCP `text`, `image` (`ImageContent`), `structuredContent`, `resource`, and `audio` results
 6. **Tools activate/deactivate** automatically as servers connect/disconnect
 7. **AbortSignal** is wired through to `notifications/cancelled` for clean cancellation
-8. **Reconnection & recovery** uses a fixed delay schedule with configurable max retries on initial failure, health check failure, or unexpected transport close (`client.onclose`)
+8. **Reconnection & recovery** uses a fixed delay schedule with configurable max retries on initial failure, health check failure, or unexpected transport close/error (`client.onclose` / `client.onerror`), while mid-session HTTP `401` / `403 insufficient_scope` invalidates stale tokens and surfaces a re-authorization hint
 9. **`list_changed` notifications** trigger re-discovery, deactivating stale tools automatically
-10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with a `SIGKILL` safety net for `stdio` child processes)
+10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with process-tree `SIGTERM` → `SIGKILL` and pipe cleanup for `stdio` child processes)
 
 ## MCP Spec Compliance
 
@@ -343,7 +388,7 @@ Implements the **MCP 2025-03-26** specification for tool clients:
 | `sse` transport (legacy backwards compat) | ✅ |
 | OAuth 2.1 authorization (PKCE S256, RFC 9728 Protected Resource Metadata, RFC 7591 DCR) | ✅ |
 | Cursor-based `tools/list` pagination | ✅ |
-| `tools/call` with parameters & `image` content (`ImageContent`) passthrough | ✅ |
+| `tools/call` with parameters, `image` (`ImageContent`), `structuredContent`, and `resource` conversion | ✅ |
 | `roots/list` capability (workspace root) | ✅ |
 | `notifications/tools/list_changed` (live refresh) | ✅ |
 | `notifications/cancelled` (AbortSignal) | ✅ |
@@ -359,6 +404,8 @@ Implements the **MCP 2025-03-26** specification for tool clients:
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, workflow, and the pre-merge smoke-test checklist, and [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a behavioral overview of how the runtime fits together (lifecycle, coordination, config trust, and credential storage).
 
 ## Development
+
+Requires **Node.js 22+**.
 
 ```bash
 # Install dependencies (clean lockfile install)
@@ -376,7 +423,7 @@ npm test
 # Run all test suites with coverage floor (95% lines / 85% branches / 83% functions)
 npm run test:coverage
 
-# Run integration tests only (real stdio server)
+# Run a single test suite (e.g. server lifecycle & stdio integration)
 npm run test:integration
 
 # Verify npm tarball contents
