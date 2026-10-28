@@ -464,9 +464,12 @@ export class ToolBridge {
   ): void {
     const annotations = tool.annotations;
     const description = buildToolDescription(tool, annotations);
-    const notifyAuthError = (err: unknown) => this.onAuthError?.(serverName, err);
     const runTool = (params: unknown, signal: AbortSignal | undefined) =>
       this._executeToolCall(serverName, tool.name, client, params, signal);
+    // WHY: `execute` runs with `this` bound to the registered-tool literal rather than the
+    // bridge, so the rethrow helper is reached through a captured closure.
+    const rethrowToolCallError = (err: unknown): Promise<never> =>
+      this._rethrowToolCallError(serverName, err);
 
     this.pi.registerTool({
       name: piName,
@@ -479,22 +482,32 @@ export class ToolBridge {
         try {
           return await runTool(params, signal);
         } catch (err) {
-          if (err instanceof McpError) throw err;
-          if (isOAuthUnauthorizedError(err)) {
-            await notifyAuthError(err);
-          }
-          // Protocol-level errors (JSON-RPC error response, malformed payload) keep
-          // "protocol"; an SDK request timeout keeps its own code so callers can tell
-          // "the server answered badly" from "the server did not answer in time" (#209).
-          throw new McpError(
-            err instanceof Error ? err.message : String(err),
-            serverName,
-            isSdkTimeoutError(err) ? "timeout" : "protocol",
-            err,
-          );
+          return await rethrowToolCallError(err);
         }
       },
     });
+  }
+
+  /**
+   * Normalize a `tools/call` failure into the `McpError` callers see, after notifying the
+   * OAuth handler when the failure means the server needs authorization.
+   */
+  private async _rethrowToolCallError(serverName: string, err: unknown): Promise<never> {
+    if (err instanceof McpError) throw err;
+    if (isOAuthUnauthorizedError(err)) {
+      // WHY: read the handler through `this` at call time — src/index.ts installs it after the
+      // bridge is constructed, and it is the caller for every server, so it takes the name.
+      await this.onAuthError?.(serverName, err);
+    }
+    // Protocol-level errors (JSON-RPC error response, malformed payload) keep
+    // "protocol"; an SDK request timeout keeps its own code so callers can tell
+    // "the server answered badly" from "the server did not answer in time" (#209).
+    throw new McpError(
+      err instanceof Error ? err.message : String(err),
+      serverName,
+      isSdkTimeoutError(err) ? "timeout" : "protocol",
+      err,
+    );
   }
 
   /**

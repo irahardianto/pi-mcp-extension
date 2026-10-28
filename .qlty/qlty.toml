@@ -24,9 +24,12 @@ name = "default"
 default = true
 
 [smells.file_complexity]
-# WHY: Several existing modules exceed the default complexity threshold (e.g. server-manager.ts at ~970 lines).
-# AGENTS.md explicitly states not to split oversized modules opportunistically; modularization
-# is tracked in planned refactoring issues (#136).
+# WHY: This smell reports a per-file aggregate complexity score (`High total complexity (count = N)`),
+# not a line count — the two differ by roughly an order of magnitude, and the largest module
+# (server-manager.ts) scores 120 against this threshold.
+# The threshold is deliberately left far above every current score because AGENTS.md forbids
+# splitting oversized modules opportunistically; modularization is tracked in #136. Lowering it to
+# a value the code actually approaches would turn an architectural decision into a per-PR gate.
 enabled = true
 threshold = 1000
 

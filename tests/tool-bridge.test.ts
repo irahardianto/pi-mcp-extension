@@ -1454,6 +1454,7 @@ describe("ToolBridge request-timeout classification", () => {
       (err: unknown) => {
         assert.ok(err instanceof McpError);
         assert.equal(err.code, "timeout");
+        assert.equal(err.server, "srv", "the failure must name the server that produced it");
         return true;
       },
     );
@@ -1464,6 +1465,7 @@ describe("ToolBridge request-timeout classification", () => {
       (err: unknown) => {
         assert.ok(err instanceof McpError);
         assert.equal(err.code, "protocol");
+        assert.equal(err.server, "srv", "the failure must name the server that produced it");
         return true;
       },
     );
