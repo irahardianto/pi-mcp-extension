@@ -14,9 +14,14 @@ import {
   instrumentStdioTransport,
   isPidAlive,
   listDescendantPids,
+  POST_CLOSE_FLUSH_DELAY_MS,
   waitForChildClose,
   type StdioProcessDeps,
 } from "../src/stdio-process.js";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function createEsrchError(): NodeJS.ErrnoException {
   const err: NodeJS.ErrnoException = new Error("kill ESRCH");
@@ -279,13 +284,44 @@ describe("stdio-process", () => {
 
       // Bytes that were still in flight when close() settled must not be lost, and must not be
       // re-emitted as part of the already-flushed line. Nothing ends the stream here — the SDK
-      // never does when a descendant holds the pipe — so the post-close chunk must flush itself.
+      // never does when a descendant holds the pipe — so the post-close remainder is released
+      // once the stream goes quiet.
       stderrStream.emit("data", Buffer.from("second line\nthird partial", "utf8"));
-      await new Promise((resolve) => setImmediate(resolve));
+      await sleep(POST_CLOSE_FLUSH_DELAY_MS * 2);
       assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
 
       stderrStream.emit("end");
       assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
+    });
+
+    it("keeps a post-close line whole when its chunks arrive in different ticks (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5054,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+      await fakeTransport.close();
+
+      // A chunk boundary must not become a line boundary: one line, two ticks.
+      stderrStream.emit("data", Buffer.from("hel", "utf8"));
+      await new Promise((resolve) => setImmediate(resolve));
+      stderrStream.emit("data", Buffer.from("lo\n", "utf8"));
+      await sleep(POST_CLOSE_FLUSH_DELAY_MS * 2);
+
+      assert.deepEqual(lines, ["hello"]);
     });
 
     it("does not corrupt a UTF-8 character split across the close boundary (#206)", async () => {

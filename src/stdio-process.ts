@@ -75,6 +75,16 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
 /** Grace window for an exited child's pipes to drain naturally before force-destroying them. */
 const PIPE_DRAIN_GRACE_MS = 100;
 
+/**
+ * How long a closed transport's stderr stream must stay quiet before its unterminated remainder
+ * is emitted.
+ *
+ * WHY: nothing ends the SDK's stderr `PassThrough` after close, so the last line has to be
+ * released by us; waiting for silence instead of flushing each chunk keeps a line whole when its
+ * bytes arrive across several ticks, and still surfaces the last one promptly.
+ */
+export const POST_CLOSE_FLUSH_DELAY_MS = 100;
+
 interface StdioChildRecord {
   process: ChildProcess;
   closed: boolean;
@@ -121,27 +131,41 @@ export function instrumentStderr(
 
   const splitter = createLineSplitter(onLine);
   let closed = false;
-  let pendingFlush: NodeJS.Immediate | null = null;
+  let idleFlush: NodeJS.Timeout | null = null;
   const flush = (): void => {
     splitter.flush();
   };
-  // WHY: coalesce a post-close burst into one flush. Chunks that arrive in the same tick are one
-  // write, so flushing each of them would split a line that is still being written; anything the
-  // burst leaves unterminated is flushed once the tick ends.
-  const schedulePostCloseFlush = (): void => {
-    pendingFlush ??= setImmediate(() => {
-      pendingFlush = null;
+  const cancelIdleFlush = (): void => {
+    if (idleFlush) {
+      clearTimeout(idleFlush);
+      idleFlush = null;
+    }
+  };
+  // WHY: after close settles nothing emits 'end', so a remainder nobody else will flush has to be
+  // released — but a single chunk boundary is not the end of a line. Waiting for the stream to go
+  // quiet keeps a line whose chunks straddle several ticks whole, while still surfacing the last
+  // unterminated one within POST_CLOSE_FLUSH_DELAY_MS.
+  const scheduleIdleFlush = (): void => {
+    cancelIdleFlush();
+    idleFlush = setTimeout(() => {
+      idleFlush = null;
       flush();
-    });
-    pendingFlush.unref();
+    }, POST_CLOSE_FLUSH_DELAY_MS);
+    idleFlush.unref();
   };
 
   stream.on("data", (chunk: Buffer) => {
     splitter.write(chunk);
-    if (closed) schedulePostCloseFlush();
+    if (closed) scheduleIdleFlush();
   });
-  stream.on("end", () => splitter.end());
-  stream.on("close", () => splitter.end());
+  stream.on("end", () => {
+    cancelIdleFlush();
+    splitter.end();
+  });
+  stream.on("close", () => {
+    cancelIdleFlush();
+    splitter.end();
+  });
 
   const origClose = transport.close.bind(transport);
   transport.close = async (): Promise<void> => {
