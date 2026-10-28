@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.6] - 2026-10-28
+
 ### Fixed
 - A server configured with both `auth` (OAuth) and a static `Authorization` header no longer sends the wrong credential. The MCP SDK builds `Authorization` from the OAuth access token and then spreads the configured headers on top of it, so an exact-case `Authorization` key silently replaced the token (the OAuth login never took effect), while a lowercase `authorization` key survived as a second entry that `new Headers()` comma-joined into one malformed header (`Bearer <token>, Bearer <static>`). `Authorization` now belongs to OAuth alone: when `auth` is set it is dropped in any casing — for `streamable-http` and `sse`, and in the authorize flow's challenge probe — and every other static header (tenant keys, gateway routing) still applies. The static value also no longer leaks to the authorization server's metadata, registration, and `/token` requests. Dropping it is recorded as a `config.static_authorization_ignored` diagnostic in the [`PI_MCP_DEBUG`](./README.md#debug-log) log, since a mixed config is a migration leftover (#208).
 
