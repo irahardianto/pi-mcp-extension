@@ -335,6 +335,26 @@ export class ConnectionCoordinator {
     turn.release();
   }
 
+  private async _startEagerServer(
+    name: string,
+    cfg: ServerConfig,
+    ctx: ExtensionContext,
+    authRequiredServers: Set<string>,
+  ): Promise<void> {
+    try {
+      await this.deps.manager.startServer(name, ctx.cwd);
+    } catch (err) {
+      if (err instanceof AuthRequiredError && cfg.auth && ctx.hasUI) {
+        authRequiredServers.add(name);
+        return;
+      }
+      // WHY: A cancelled start means the user stopped the server (/mcp:stop) or the
+      // session is tearing down; _notifyStartupFailure ignores AuthCancelledError so
+      // it is not reported as a bogus start failure.
+      this._notifyStartupFailure(name, ctx, err);
+    }
+  }
+
   async startEagerServers(
     serversToStart: Array<[string, ServerConfig]>,
     ctx: ExtensionContext,
@@ -344,21 +364,7 @@ export class ConnectionCoordinator {
 
     // Start all eager servers concurrently
     await Promise.allSettled(
-      serversToStart.map(async ([name, cfg]) => {
-        try {
-          await this.deps.manager.startServer(name, ctx.cwd);
-        } catch (err) {
-          // WHY: A cancelled start means the user stopped the server (/mcp:stop) or the
-          // session is tearing down; reporting it as a start failure would be a bogus error.
-          if (err instanceof AuthCancelledError) return;
-          if (err instanceof AuthRequiredError && cfg.auth && ctx.hasUI) {
-            authRequiredServers.add(name);
-            return;
-          }
-          const msg = formatErrorMessage(err);
-          ctx.ui.notify(`pi-mcp: Failed to start ${name} — ${msg}`, "error");
-        }
-      }),
+      serversToStart.map(([name, cfg]) => this._startEagerServer(name, cfg, ctx, authRequiredServers)),
     );
 
     // WHY: Reconcile the footer hint once every eager start has settled — a declined

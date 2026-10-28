@@ -100,6 +100,7 @@ function calledName(callee) {
 /**
  * Cognitive complexity in the style Qlty's `function_complexity` smell reports: control-flow
  * structures cost `1 + nestingDepth`, `else`/`else if` branches add 1 without deepening nesting,
+ * `while` / `do-while` loop conditions add an extra 1, `continue` and `break` add 1 each,
  * each contiguous run of identical `&&` / `||` / `??` operators adds 1, and direct recursion adds
  * 1. Nested closures deepen nesting and roll their own complexity up into the enclosing function,
  * so a helper that only exists to dodge the limit does not hide the complexity.
@@ -171,10 +172,20 @@ export const maxCognitiveComplexityRule = {
         return;
       }
       frame.score += 1 + frame.depth;
+      // WHY: Qlty charges an extra point for the loop condition of while/do-while.
+      if (node.type === "WhileStatement" || node.type === "DoWhileStatement") {
+        frame.score += 1;
+      }
       if (node.type === "IfStatement" && hasFinalElseClause(node)) {
         frame.score += 1;
       }
       frame.depth += 1;
+    }
+
+    function enterJump() {
+      const frame = currentFrame();
+      if (!frame) return;
+      frame.score += 1;
     }
 
     function exitControlFlow(node) {
@@ -187,6 +198,8 @@ export const maxCognitiveComplexityRule = {
       "FunctionDeclaration:exit": exitFunction,
       "FunctionExpression:exit": exitFunction,
       "ArrowFunctionExpression:exit": exitFunction,
+      ContinueStatement: enterJump,
+      BreakStatement: enterJump,
       LogicalExpression(node) {
         const frame = currentFrame();
         if (!frame || isSameOperatorSequenceMember(node)) return;

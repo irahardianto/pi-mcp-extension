@@ -567,6 +567,46 @@ describe("coverage and Qlty maintainability policy", () => {
             },
           ],
         },
+        {
+          code: "function withContinue(items) { for (const item of items) { if (!item) continue; } }",
+          options: [{ max: 3 }],
+          errors: [
+            {
+              message:
+                "Function 'withContinue' has cognitive complexity 4, above the maximum of 3. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function withBreak() { for (;;) { break; } }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'withBreak' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function withWhile() { while (true) { break; } }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'withWhile' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function withDoWhile() { do { break; } while (true); }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'withDoWhile' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
       ],
     });
   });
