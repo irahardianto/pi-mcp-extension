@@ -59,7 +59,7 @@ For Pi 1.x compatibility, an `oauth` object (`{ clientId, clientSecret, clientNa
 
 Pi's `auth.provider` (`/login` provider token) is not supported: it is rejected when the config loads with a `config` error instead of being silently downgraded to OAuth 2.1, because this extension cannot forward a Pi provider token. Use `auth` (OAuth) or static `headers`.
 
-Static `headers` and `auth` can coexist for non-credential headers (tenant keys, gateway routing), but `Authorization` belongs to OAuth: for a server with `auth` set, an `Authorization` entry in `headers` is ignored — the OAuth access token is sent instead, and the static value is never attached to the OAuth discovery, registration, or token requests. Leaving a static `Authorization` header on an OAuth server is a migration leftover; remove it to keep the config honest. With [`PI_MCP_DEBUG=1`](./README.md#debug-log) the drop is recorded as a `config.static_authorization_ignored` log entry.
+Static `headers` and `auth` can coexist for non-credential headers (tenant keys, gateway routing), but `Authorization` belongs to OAuth: for a server with `auth` set, an `Authorization` entry in `headers` is ignored — the OAuth access token is sent instead, and the static value is never attached to the OAuth discovery, registration, or token requests. Leaving a static `Authorization` header on an OAuth server is a migration leftover; remove it to keep the config honest. With [`PI_MCP_DEBUG=1`](./README.md#debug-log) the drop is recorded as a `config.static_authorization_ignored` diagnostic when the server's transport is built.
 
 ### Authenticate a Server
 

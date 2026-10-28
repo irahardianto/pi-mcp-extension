@@ -630,10 +630,10 @@ export async function authorize(
     // if empty, which the callback server then rejects as a CSRF error.
     authProvider.setState(oauthState);
 
-    // WHY: `Authorization` belongs to the OAuth flow here. Probe and authenticate as an
-    // unauthenticated client so a stale static header cannot turn the challenge probe into a
-    // token-less 200, and so it is never attached to the authorization server's metadata,
-    // registration, or token requests (a different origin in real deployments).
+    // WHY: `Authorization` belongs to the OAuth flow here. Filter the same set the transport
+    // uses, so this flow's own challenge probe and its SDK `fetchFn` (metadata, registration,
+    // token) never carry a static credential that was configured for the MCP server — the
+    // authorization server is usually a different origin.
     const staticHeaders = stripAuthorizationHeader(config.headers);
 
     const authChallenge = await discoverChallengeWithFallback({
