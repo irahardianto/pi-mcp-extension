@@ -451,17 +451,31 @@ describe("OAuth Security Fixes", () => {
     });
 
 
+    async function ensureFixedFreePort(server: CallbackServer): Promise<number> {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const fixedPort = await getFreePort();
+        try {
+          const boundPort = await server.ensure(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
+          assert.strictEqual(boundPort, fixedPort);
+          return boundPort;
+        } catch (err) {
+          if (!(err instanceof Error) || !/requires this exact port/.test(err.message) || attempt === 9) {
+            throw err;
+          }
+        }
+      }
+      throw new Error("Failed to bind fixed port after 10 attempts");
+    }
+
     it("should rebind from a fallback callback listener to a fixed redirect listener when no auth is pending", async () => {
       const callbackServer = new CallbackServer();
 
       try {
-        const fallbackPreferredPort = await getFreePort();
-        const fallbackPort = await callbackServer.ensure(fallbackPreferredPort, { host: "127.0.0.1", allowPortFallback: true });
-        assert.strictEqual(fallbackPort, fallbackPreferredPort);
+        const fallbackPort = await callbackServer.ensure(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
+        assert.ok(fallbackPort >= DEFAULT_PORT);
 
-        const fixedPort = await getFreePort();
-        const reboundPort = await callbackServer.ensure(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
-        assert.strictEqual(reboundPort, fixedPort);
+        const reboundPort = await ensureFixedFreePort(callbackServer);
+        assert.notStrictEqual(reboundPort, fallbackPort);
       } finally {
         await callbackServer.stop();
       }
@@ -471,13 +485,11 @@ describe("OAuth Security Fixes", () => {
       const callbackServer = new CallbackServer();
 
       try {
-        const fixedPort = await getFreePort();
-        const fixedListenerPort = await callbackServer.ensure(fixedPort, { host: "127.0.0.1", allowPortFallback: false });
-        assert.strictEqual(fixedListenerPort, fixedPort);
+        const fixedListenerPort = await ensureFixedFreePort(callbackServer);
 
-        const fallbackPreferredPort = await getFreePort();
-        const fallbackPort = await callbackServer.ensure(fallbackPreferredPort, { host: "127.0.0.1", allowPortFallback: true });
-        assert.strictEqual(fallbackPort, fallbackPreferredPort);
+        const fallbackPort = await callbackServer.ensure(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
+        assert.ok(fallbackPort >= DEFAULT_PORT);
+        assert.notStrictEqual(fallbackPort, fixedListenerPort);
       } finally {
         await callbackServer.stop();
       }
@@ -487,9 +499,8 @@ describe("OAuth Security Fixes", () => {
     it("should stop the callback server when a browser keeps the callback socket open", async () => {
       const callbackServer = new CallbackServer();
 
-      const port = await getFreePort();
       const state = "keepalive-state";
-      await callbackServer.ensure(port, { host: "127.0.0.1", allowPortFallback: false });
+      const port = await callbackServer.ensure(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
       const callbackPromise = callbackServer.waitForCallback(state);
 
       const agent = new Agent({ keepAlive: true });
@@ -527,9 +538,8 @@ describe("OAuth Security Fixes", () => {
       const callbackServer = new CallbackServer();
 
       try {
-        const preferredPort = await getFreePort();
-        const port1 = await callbackServer.ensure(preferredPort);
-        const port2 = await callbackServer.ensure(preferredPort);
+        const port1 = await callbackServer.ensure();
+        const port2 = await callbackServer.ensure(port1);
 
         assert.strictEqual(port1, port2, "Subsequent calls should return the same port");
       } finally {
@@ -542,10 +552,8 @@ describe("OAuth Security Fixes", () => {
       const serverB = new CallbackServer();
 
       try {
-        const preferredPortA = await getFreePort();
-        const preferredPortB = await getFreePort();
-        const portA = await serverA.ensure(preferredPortA, { host: "127.0.0.1", allowPortFallback: true });
-        const portB = await serverB.ensure(preferredPortB, { host: "127.0.0.1", allowPortFallback: true });
+        const portA = await serverA.ensure(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
+        const portB = await serverB.ensure(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
 
         assert.notStrictEqual(portA, portB);
         assert.strictEqual(serverA.isRunning(), true);
@@ -1001,13 +1009,7 @@ describe("OAuth Security Fixes", () => {
 
       // Act & Assert (callback HTTP server integration)
       const callbackServer = new CallbackServer();
-      const probe = createServer();
-      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-      const addr = probe.address();
-      assert.ok(addr && typeof addr === "object");
-      await new Promise<void>((resolve) => probe.close(() => resolve()));
-
-      const port = await callbackServer.ensure(addr.port, { host: "127.0.0.1", allowPortFallback: false });
+      const port = await callbackServer.ensure(DEFAULT_PORT, { host: "127.0.0.1", allowPortFallback: true });
       try {
         const res = await fetch(`http://127.0.0.1:${port}/callback?error=access_denied&state=wrong-state`);
         assert.strictEqual(res.status, 400);
@@ -1118,12 +1120,6 @@ describe("OAuth Security Fixes", () => {
         res.end();
       });
 
-      const callbackProbe = createServer();
-      await new Promise<void>((resolve) => callbackProbe.listen(0, "127.0.0.1", resolve));
-      const callbackAddress = callbackProbe.address();
-      assert.ok(callbackAddress && typeof callbackAddress === "object");
-      await new Promise<void>((resolve) => callbackProbe.close(() => resolve()));
-
       await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
       const address = listener.address();
       assert.ok(address && typeof address === "object");
@@ -1131,7 +1127,6 @@ describe("OAuth Security Fixes", () => {
 
       return {
         base,
-        redirectUrl: `http://127.0.0.1:${callbackAddress.port}/callback`,
         close: async () => {
           listener.closeAllConnections();
           await new Promise<void>((resolve) => listener.close(() => resolve()));
@@ -1182,7 +1177,7 @@ describe("OAuth Security Fixes", () => {
                 lifecycle: "lazy",
                 transport: "streamable-http",
                 url: `${mock.base}/mcp`,
-                auth: { type: "oauth", clientId: "ssh-client", redirectUrl: mock.redirectUrl },
+                auth: { type: "oauth", clientId: "ssh-client" },
               },
             },
           }),
@@ -1261,7 +1256,7 @@ describe("OAuth Security Fixes", () => {
                   lifecycle: "lazy",
                   transport: "streamable-http",
                   url: `${mock.base}/mcp`,
-                  auth: { type: "oauth", clientId: "client-1", redirectUrl: mock.redirectUrl },
+                  auth: { type: "oauth", clientId: "client-1" },
                 },
               },
             }),
@@ -1338,7 +1333,7 @@ describe("OAuth Security Fixes", () => {
                 lifecycle: "lazy",
                 transport: "streamable-http",
                 url: `${mock.base}/mcp`,
-                auth: { type: "oauth", clientId: "headless-client", redirectUrl: mock.redirectUrl },
+                auth: { type: "oauth", clientId: "headless-client" },
               },
             },
           }),

@@ -298,18 +298,11 @@ it("should fail immediately with AuthRequiredError and transition connectRequest
     res.end();
   });
 
-  const callbackProbe = createServer();
-  await new Promise<void>((resolve) => callbackProbe.listen(0, "127.0.0.1", resolve));
-  const callbackAddress = callbackProbe.address();
-  assert.ok(callbackAddress && typeof callbackAddress === "object");
-  await new Promise<void>((resolve) => callbackProbe.close(() => resolve()));
-
   await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
   const address = listener.address();
   assert.ok(address && typeof address === "object");
   base = `http://127.0.0.1:${address.port}`;
 
-  const redirectUrl = `http://127.0.0.1:${callbackAddress.port}/callback`;
   const manager = new ServerManager(
     {
       settings: { toolPrefix: "mcp", requestTimeoutMs: 2000, maxRetries: 2 },
@@ -319,13 +312,13 @@ it("should fail immediately with AuthRequiredError and transition connectRequest
           transport: "streamable-http",
           url: `${base}/mcp`,
           args: [],
-          auth: { type: "oauth", clientId: "local-client", redirectUrl },
+          auth: { type: "oauth", clientId: "local-client" },
         },
       },
     },
     authDir,
   );
-  const provider = new McpOAuthProvider({ serverName: "local", authConfig: { clientId: "local-client", redirectUrl }, storageDir: authDir });
+  const provider = new McpOAuthProvider({ serverName: "local", authConfig: { clientId: "local-client" }, storageDir: authDir });
   const events = createStrictMap<string, MockEventHandler>();
 
   try {
@@ -384,7 +377,7 @@ it("should fail immediately with AuthRequiredError and transition connectRequest
             lifecycle: "lazy",
             transport: "streamable-http",
             url: `${base}/mcp`,
-            auth: { type: "oauth", clientId: "local-client", redirectUrl },
+            auth: { type: "oauth", clientId: "local-client" },
           },
         },
       }),
