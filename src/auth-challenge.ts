@@ -21,6 +21,31 @@ export interface ManualAuthChallengeOptions {
 }
 
 /**
+ * Drop any `Authorization` header (any casing) from a configured static header set.
+ *
+ * WHY: `Authorization` is the one header an OAuth server owns. The MCP SDK builds it from the
+ * OAuth provider's access token and then spreads `requestInit.headers` on top, so an exact-case
+ * `Authorization` key silently replaces the token, while `authorization` in any other casing
+ * survives as a second entry that `new Headers()` comma-joins into one malformed value. The same
+ * static value would also ride along on the OAuth discovery, registration, and token requests
+ * made through `createHeadersFetch`, leaking a resource-server credential to the authorization
+ * server. Drop it (and only it) whenever OAuth is configured; every other static header
+ * (tenant keys, gateways) still applies.
+ */
+export function stripAuthorizationHeader(
+  headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const kept = Object.entries(headers).filter(([name]) => !isAuthorizationHeader(name));
+  return kept.length > 0 ? Object.fromEntries(kept) : undefined;
+}
+
+/** Case-insensitive test for the single header an OAuth server owns. */
+export function isAuthorizationHeader(name: string): boolean {
+  return name.toLowerCase() === "authorization";
+}
+
+/**
  * Wrap a fetch implementation so configured server headers are attached as
  * defaults on every request (e.g. during SDK OAuth metadata discovery and
  * token exchange) without overriding explicit per-request headers.

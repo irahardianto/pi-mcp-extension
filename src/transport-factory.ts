@@ -16,6 +16,8 @@ import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.
 import { McpError } from "./errors.js";
 import type { ServerConfig } from "./config.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
+import { isAuthorizationHeader, stripAuthorizationHeader } from "./auth-challenge.js";
+import { reportDiagnostic } from "./debug-log.js";
 import { createLineSplitter } from "./stdio-process.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -32,9 +34,9 @@ function resolveEnv(extra?: Record<string, string>): Record<string, string> {
   return env;
 }
 
-function createRequestInit(config: ServerConfig): RequestInit | undefined {
+function createRequestInit(headers: Record<string, string> | undefined): RequestInit | undefined {
   // Build requestInit for static headers (API keys, etc.)
-  return config.headers ? { headers: config.headers } : undefined;
+  return headers ? { headers } : undefined;
 }
 
 function createOAuthProvider(
@@ -188,7 +190,18 @@ export function createTransport(
 ): Transport {
   const cwd = typeof cwdOrOnStderr === "string" ? cwdOrOnStderr : cwdArg;
   const onStderr = typeof cwdOrOnStderr === "function" ? cwdOrOnStderr : undefined;
-  const requestInit = createRequestInit(config);
+  // WHY: with OAuth configured the SDK owns `Authorization` (see stripAuthorizationHeader);
+  // a leftover static header is a migration artifact, so drop it and record that we did.
+  const staticHeaders = config.auth ? stripAuthorizationHeader(config.headers) : config.headers;
+  if (config.auth && config.headers && Object.keys(config.headers).some(isAuthorizationHeader)) {
+    reportDiagnostic({
+      level: "info",
+      event: "config.static_authorization_ignored",
+      server: serverName,
+      message: `Ignoring the static Authorization header for "${serverName}": OAuth is configured, so requests carry the OAuth access token instead.`,
+    });
+  }
+  const requestInit = createRequestInit(staticHeaders);
   const authProvider = createOAuthProvider(serverName, config, storageDir);
 
   switch (config.transport) {

@@ -40,6 +40,7 @@ import {
 import {
   asExtensionAPI,
   createMockContext,
+  createMockExtension,
   createStrictMap,
   type MockCommand,
   type MockTool,
@@ -3560,6 +3561,112 @@ describe("OAuth Security Fixes", () => {
         await rm(dir, { recursive: true, force: true });
       }
     });
+  });
+
+  describe("Static Authorization header on an OAuth server (Issue #208)", () => {
+    // The SDK builds `Authorization` from the OAuth provider and then spreads
+    // `requestInit.headers` on top of it: an exact-case key replaces the access token, and any
+    // other casing survives as a second entry that `new Headers()` comma-joins into one
+    // malformed value. Either way the configured static header must not reach an OAuth server,
+    // and it must not leak to the authorization server's metadata, registration, or token
+    // endpoints — a different origin in real deployments.
+    for (const headerName of ["Authorization", "authorization"]) {
+      it(`sends only the OAuth bearer to the MCP server and keeps a configured "${headerName}" header away from the authorization server`, async () => {
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue208-"));
+        const authDir = join(dir, "auth");
+        const fakeServer = await startFakeOAuthServer({ serverName: "mixed-auth", toolName: "mixed_echo" });
+        const mockExt = createMockExtension();
+        const commands = mockExt.commands;
+        const events = mockExt.events;
+        const notifications: string[] = [];
+        const ctx = createMockContext({
+          cwd: dir,
+          hasUI: true,
+          ui: {
+            notify: (message: string) => notifications.push(message),
+          },
+        });
+
+        try {
+          await mkdir(join(dir, ".pi"));
+          await writeFile(
+            join(dir, ".pi", "mcp.json"),
+            JSON.stringify({
+              settings: { maxRetries: 0 },
+              mcpServers: {
+                "mixed-auth": {
+                  lifecycle: "lazy",
+                  transport: "streamable-http",
+                  url: fakeServer.mcpUrl,
+                  // A static header left over from header-based auth (or a shared default).
+                  headers: { [headerName]: "Bearer stale-static-header", "X-Tenant": "acme" },
+                  auth: { type: "oauth" },
+                },
+              },
+            }),
+          );
+
+          await extension(mockExt.api, {
+            bootstrapCwd: dir,
+            globalConfigPath: join(dir, "missing.json"),
+            authStorageDir: authDir,
+            browserOpen: fakeServer.browserOpen,
+          });
+          await events.get("session_start")({}, ctx);
+
+          // Act: the explicit OAuth command runs discovery, DCR, token exchange, then connects.
+          await commands.get("mcp:auth").handler("mixed-auth", ctx);
+
+          // Assert: the chosen credential wins and the configured static value is dropped.
+          assert.strictEqual(
+            fakeServer.requestLog.some((request) => request.authorization?.includes("stale-static-header")),
+            false,
+            "the configured static Authorization value must never be sent",
+          );
+
+          // An unauthenticated request is a legitimate pre-authorization probe; anything else
+          // must be the OAuth access token — never the static value, never a comma-joined pair.
+          const oauthBearer = `Bearer ${fakeServer.issuedAccessTokens[0]}`;
+          const mcpRequests = fakeServer.requestLog.filter((request) => request.path === "/mcp");
+          assert.ok(
+            mcpRequests.some((request) => request.method === "POST" && request.authorization === oauthBearer),
+            "the authorized server must receive authenticated JSON-RPC traffic",
+          );
+          for (const request of mcpRequests) {
+            assert.ok(
+              request.authorization === null || request.authorization === oauthBearer,
+              `${request.method} /mcp carried "${request.authorization}" instead of the OAuth bearer`,
+            );
+            assert.strictEqual(request.headers["x-tenant"], "acme", "unrelated static headers are still sent");
+          }
+
+          const authorizationServerRequests = fakeServer.requestLog.filter(
+            (request) =>
+              request.path === "/token" ||
+              request.path === "/register" ||
+              request.path.startsWith("/.well-known/"),
+          );
+          assert.ok(
+            authorizationServerRequests.some((request) => request.path === "/token"),
+            "the token endpoint must be exercised by the OAuth flow",
+          );
+          for (const request of authorizationServerRequests) {
+            assert.strictEqual(
+              request.authorization,
+              null,
+              `${request.path} must not receive the MCP server's static Authorization header`,
+            );
+          }
+
+          assert.ok(mockExt.activeTools.some((name) => name.includes("mixed_echo")), "the server must reach ready with its tools");
+        } finally {
+          await events.get("session_shutdown")({}, ctx);
+          await fakeServer.close();
+          await rm(dir, { recursive: true, force: true });
+        }
+      });
+    }
   });
 });
 

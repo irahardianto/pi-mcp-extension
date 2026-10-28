@@ -187,7 +187,9 @@ export const ServerConfigSchema = z.preprocess(
       /**
        * Static HTTP headers to include with every request (streamable-http / sse only).
        * Useful for API-key-based auth (e.g. { "Authorization": "Bearer <key>" }).
-       * For OAuth2, use the "auth" field instead.
+       * For OAuth2, use the "auth" field instead: when "auth" is set, OAuth owns the
+       * Authorization header and any Authorization entry here is ignored (other headers
+       * still apply).
        */
       headers: z.record(z.string(), z.string()).optional(),
       /**

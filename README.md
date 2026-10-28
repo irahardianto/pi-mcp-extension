@@ -163,7 +163,7 @@ For Pi 1.x compatibility, server entries also accept `type` as an alias for `tra
 | `cwd` | `string` | session working directory | Working directory for a `stdio` server (rejected on `streamable-http` / `sse`). A relative path resolves against the session working directory and a leading `~` expands to your home directory |
 | `env` | `Record<string, string>` | — | Extra environment variables for the child process (literal values, no `${VAR}` interpolation) |
 | `url` | `string` | — | Server URL (**required** for `streamable-http` and `sse`) |
-| `headers` | `Record<string, string>` | — | Static headers sent with `streamable-http` and `sse` requests |
+| `headers` | `Record<string, string>` | — | Static headers sent with `streamable-http` and `sse` requests. When `auth` is set, OAuth owns `Authorization`, so an `Authorization` entry here is ignored (other headers still apply) |
 | `auth` (or `oauth`) | `object` | — | OAuth 2.1 configuration described below and in [OAUTH.md](./OAUTH.md) (`streamable-http` / `sse` only) |
 | `lifecycle` | `"eager" \| "lazy"` | `"lazy"` (`"eager"` for `pi.registerMcpServer()` unless `enabled: false`) | `eager` = auto-start on `session_start`, `lazy` = connect on request via `mcp_connect`, `/mcp:start`, or `/mcp:auth` |
 | `enabled` | `boolean` | `true` | Pi 1.3.0 switch: `false` keeps the entry configured but out of the eager set (normalized to `lifecycle: "lazy"`, even when `lifecycle: "eager"` is also set) |

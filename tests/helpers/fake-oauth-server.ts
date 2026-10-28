@@ -11,7 +11,16 @@
  */
 
 import { createHash } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
+
+/** One request the fixture saw, recorded so tests can assert on what the client actually sent. */
+export interface ObservedRequest {
+  readonly path: string;
+  readonly method: string;
+  /** `Authorization` header value exactly as received (Node joins duplicates with `, `), or null. */
+  readonly authorization: string | null;
+  readonly headers: IncomingHttpHeaders;
+}
 
 export interface FakeOAuthServerOptions {
   serverName?: string;
@@ -41,6 +50,8 @@ export interface FakeOAuthServer {
   failRefresh: boolean;
   readonly issuedAccessTokens: string[];
   readonly issuedRefreshTokens: string[];
+  /** Every request received so far, in arrival order, with the exact `Authorization` value. */
+  readonly requestLog: ObservedRequest[];
   /** Expire all currently valid access tokens so the next MCP request receives HTTP 401. */
   expireAccessTokens: () => void;
   /** Seed a refresh token as valid (or invalid if omitted) for testing refresh flows. */
@@ -98,6 +109,7 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
   let refreshTokenCounter = 0;
 
   const pendingAuthCodes = new Map<string, PendingAuthCode>();
+  const requestLog: ObservedRequest[] = [];
   const validAccessTokens = new Set<string>();
   const validRefreshTokens = new Set<string>();
   const issuedAccessTokens: string[] = [];
@@ -127,6 +139,12 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
     try {
       const requestUrl = new URL(req.url ?? "/", baseUrl || "http://127.0.0.1");
       const { pathname, searchParams } = requestUrl;
+      requestLog.push({
+        path: pathname,
+        method: req.method ?? "GET",
+        authorization: req.headers.authorization ?? null,
+        headers: req.headers,
+      });
 
       // 1. RFC 9728 Protected Resource Metadata
       if (
@@ -462,6 +480,9 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
     },
     set failRefresh(value: boolean) {
       failRefresh = value;
+    },
+    get requestLog() {
+      return requestLog;
     },
     issuedAccessTokens,
     issuedRefreshTokens,

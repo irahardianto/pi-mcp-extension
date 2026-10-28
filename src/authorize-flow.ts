@@ -9,6 +9,7 @@ import { isSafeAuthorizationUrl } from "./callback-url.js";
 import {
   discoverManualAuthChallenge,
   createHeadersFetch,
+  stripAuthorizationHeader,
   type ManualAuthChallenge,
 } from "./auth-challenge.js";
 import {
@@ -629,16 +630,22 @@ export async function authorize(
     // if empty, which the callback server then rejects as a CSRF error.
     authProvider.setState(oauthState);
 
+    // WHY: `Authorization` belongs to the OAuth flow here. Probe and authenticate as an
+    // unauthenticated client so a stale static header cannot turn the challenge probe into a
+    // token-less 200, and so it is never attached to the authorization server's metadata,
+    // registration, or token requests (a different origin in real deployments).
+    const staticHeaders = stripAuthorizationHeader(config.headers);
+
     const authChallenge = await discoverChallengeWithFallback({
       serverName,
       serverUrl,
-      headers: config.headers,
+      headers: staticHeaders,
       signal,
     });
     assertActive();
 
     const callbackPromise = registerCallbackPromise(callbackServer, oauthState);
-    const customFetch = config.headers ? createHeadersFetch(config.headers) : undefined;
+    const customFetch = staticHeaders ? createHeadersFetch(staticHeaders) : undefined;
 
     const authResult = await runInitialSdkAuth(
       authProvider,
