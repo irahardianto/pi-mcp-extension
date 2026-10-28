@@ -177,11 +177,6 @@ it("opens an interactive browser only once, reopens on Retry, and cancels withou
       res.end(JSON.stringify({ issuer: base, authorization_endpoint: `${base}/authorize`, token_endpoint: `${base}/token`, response_types_supported: ["code"], code_challenge_methods_supported: ["S256"] }));
     } else { res.writeHead(401, { "WWW-Authenticate": "Bearer" }); res.end(); }
   });
-  const callbackPort = createServer();
-  await new Promise<void>((resolve) => callbackPort.listen(0, "127.0.0.1", resolve));
-  const callbackAddress = callbackPort.address();
-  assert.ok(callbackAddress && typeof callbackAddress === "object");
-  await new Promise<void>((resolve) => callbackPort.close(() => resolve()));
   await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
   const address = listener.address();
   assert.ok(address && typeof address === "object");
@@ -201,7 +196,7 @@ it("opens an interactive browser only once, reopens on Retry, and cancels withou
     await mkdir(join(dir, ".pi"));
     await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
       settings: { maxRetries: 2 }, mcpServers: {
-        "local team": { lifecycle: "lazy", transport: "streamable-http", url: `${base}/mcp`, auth: { type: "oauth", clientId: "local-client", redirectUrl: `http://127.0.0.1:${callbackAddress.port}/callback` } },
+        "local team": { lifecycle: "lazy", transport: "streamable-http", url: `${base}/mcp`, auth: { type: "oauth", clientId: "local-client" } },
       },
     }));
     await extension(mockExt.api, {

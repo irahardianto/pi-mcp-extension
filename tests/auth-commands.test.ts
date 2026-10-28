@@ -19,11 +19,6 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
       res.end(JSON.stringify({ issuer: base, authorization_endpoint: `${base}/authorize`, token_endpoint: `${base}/token`, response_types_supported: ["code"], code_challenge_methods_supported: ["S256"] }));
     } else { res.writeHead(401, { "WWW-Authenticate": "Bearer" }); res.end(); }
   });
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  const callbackAddress = probe.address();
-  assert.ok(callbackAddress && typeof callbackAddress === "object");
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
   await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
   const address = listener.address();
   assert.ok(address && typeof address === "object");
@@ -55,7 +50,7 @@ it("coordinates OAuth commands for a server name with spaces, including repeated
     await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
       settings: { maxRetries: 0 },
       mcpServers: {
-        "team server": { lifecycle: "lazy", transport: "streamable-http", url: `${base}/mcp`, auth: { type: "oauth", clientId: "test-client", redirectUrl: `http://127.0.0.1:${callbackAddress.port}/callback` } },
+        "team server": { lifecycle: "lazy", transport: "streamable-http", url: `${base}/mcp`, auth: { type: "oauth", clientId: "test-client" } },
       },
     }));
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "missing.json"), authStorageDir: join(dir, "auth"), browserOpen: () => { opens++; } });
