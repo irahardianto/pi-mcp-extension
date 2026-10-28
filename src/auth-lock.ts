@@ -23,6 +23,7 @@ import { hostname as osHostname } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { agentDir } from "./config.js";
+import { describeError, reportDiagnostic } from "./debug-log.js";
 import {
   formatHolderDetails,
   HEARTBEAT_MS,
@@ -395,14 +396,75 @@ async function isSameStaleCandidate(
   }
 }
 
-/** Restore a contender's fresh lock file, then clean up the temporary candidate path. */
-async function restoreCandidate(movedPath: string, path: string, deps: AuthLockDeps): Promise<void> {
-  await deps.fs.link(movedPath, path).catch(() => {
-    // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
-  });
+/** Remove the temporary stale-check file; an already-removed candidate is not a failure. */
+async function unlinkCandidate(movedPath: string, deps: AuthLockDeps): Promise<void> {
   await deps.fs.unlink(movedPath).catch(() => {
     // WHY: Best-effort cleanup of temporary stale-check file.
   });
+}
+
+/**
+ * Move the candidate back with `rename` when `link` is unavailable.
+ *
+ * `rename` is atomic and carries the whole record, so `path` is either restored intact or left
+ * absent — never a partially written lock another process could read as corrupt.
+ */
+async function restoreCandidateByRename(
+  serverName: string,
+  movedPath: string,
+  path: string,
+  deps: AuthLockDeps,
+): Promise<void> {
+  try {
+    await deps.fs.rename(movedPath, path);
+  } catch (renameErr) {
+    // WHY: Keep the candidate on disk when the fallback restore fails too. It is the
+    // contender's only copy of its active lock, and unlinking it would guarantee the lost-lock
+    // abort this whole path exists to prevent; the caller still throws AuthLockError below.
+    const { kind, message } = describeError(renameErr);
+    reportDiagnostic({
+      level: "warn",
+      event: "auth.lock_restore_failed",
+      server: serverName,
+      message: `Failed to restore the authorization lock file for "${serverName}": ${message}`,
+      fields: { kind },
+    });
+  }
+}
+
+/**
+ * Restore a contender's fresh lock file, then clean up the temporary candidate path.
+ *
+ * `link` restores without ever clobbering a `path` a third process recreated (EEXIST), but
+ * filesystems and sandboxes that refuse hard links (ENOTSUP/EOPNOTSUPP on FAT/exFAT/SMB/SSHFS/
+ * FUSE, EXDEV across mounts, EPERM/EACCES under seccomp) make it fail for reasons that say
+ * nothing about `path`. Falling back to `rename` there is what keeps the contender's lock
+ * alive; unlinking the candidate unconditionally would delete its only copy.
+ */
+async function restoreCandidate(
+  serverName: string,
+  movedPath: string,
+  path: string,
+  deps: AuthLockDeps,
+): Promise<void> {
+  try {
+    await deps.fs.link(movedPath, path);
+  } catch (linkErr) {
+    const code = errnoCode(linkErr);
+    if (code === "EEXIST") {
+      // WHY: `path` already holds a lock (ours is a duplicate copy), so dropping the candidate
+      // cannot lose anyone's lock.
+      await unlinkCandidate(movedPath, deps);
+      return;
+    }
+    if (code === "ENOENT") {
+      // WHY: The candidate itself is gone, so there is nothing left to restore.
+      return;
+    }
+    await restoreCandidateByRename(serverName, movedPath, path, deps);
+    return;
+  }
+  await unlinkCandidate(movedPath, deps);
 }
 
 async function inspectAndReclaimStaleLock(
@@ -443,7 +505,7 @@ async function inspectAndReclaimStaleLock(
     return;
   }
 
-  await restoreCandidate(movedPath, path, deps);
+  await restoreCandidate(serverName, movedPath, path, deps);
   throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
 }
 

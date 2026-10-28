@@ -81,6 +81,7 @@ function createFakeFs(getNow: () => number) {
   const files = new Map<string, FakeFileEntry>();
   const hooks: {
     beforeRename?: ((oldPath: string, newPath: string) => void | Promise<void>) | undefined;
+    beforeLink?: ((existingPath: string, newPath: string) => void | Promise<void>) | undefined;
   } = {};
   const calls = {
     link: [] as Array<{ existingPath: string; newPath: string }>,
@@ -135,6 +136,7 @@ function createFakeFs(getNow: () => number) {
     },
     async link(existingPath, newPath) {
       calls.link.push({ existingPath, newPath });
+      await hooks.beforeLink?.(existingPath, newPath);
       const entry = files.get(existingPath);
       if (!entry) throw createErrno("ENOENT", `ENOENT: no such file or directory, link '${existingPath}'`);
       if (files.has(newPath)) throw createErrno("EEXIST", `EEXIST: file already exists, link '${newPath}'`);
@@ -330,6 +332,162 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
     assert.equal(calls.link[0]?.newPath, targetLockPath);
     const restored = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
     assert.equal(restored.nonce, "fresh-winner-nonce");
+  });
+
+  /**
+   * Arrange the reclaim race: a dead-PID stale lock sits at the target path, and a contender
+   * replaces it with a fresh lock right before our stale-candidate rename executes. The moved
+   * candidate is therefore the contender's only copy of its active lock.
+   */
+  function arrangeReclaimRace() {
+    const fakeClock = createFakeClock(200_000);
+    const fake = createFakeFs(() => fakeClock.clock.now());
+    const stale: LockRecord = {
+      v: 1,
+      pid: 9999,
+      hostname: "host-a",
+      nonce: "stale-nonce",
+      createdAt: 190_000,
+    };
+    const winner: LockRecord = {
+      v: 1,
+      pid: 8888,
+      hostname: "host-a",
+      nonce: "winner-nonce",
+      createdAt: 200_000,
+    };
+    fake.files.set(targetLockPath, { content: JSON.stringify(stale), mtimeMs: 190_000, mode: 0o600 });
+    fake.hooks.beforeRename = (oldPath) => {
+      if (oldPath !== targetLockPath) return;
+      fake.files.set(targetLockPath, { content: JSON.stringify(winner), mtimeMs: 200_000, mode: 0o600 });
+    };
+    const deps: Partial<AuthLockDeps> = {
+      fs: fake.fs,
+      clock: fakeClock.clock,
+      pid: 7777,
+      hostname: "host-a",
+      isPidAlive: (pid) => pid !== 9999,
+    };
+    return { ...fake, fakeClock, deps, winner };
+  }
+
+  it("should restore the contender's fresh lock via rename when the filesystem refuses hard links", async () => {
+    // Arrange
+    const { files, hooks, calls, deps, winner } = arrangeReclaimRace();
+    hooks.beforeLink = () => {
+      throw createErrno("ENOTSUP", "ENOTSUP: operation not supported, link");
+    };
+
+    // Act & Assert
+    await assert.rejects(
+      () => acquireAuthLock(serverName, storageDir, { deps }),
+      (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
+    );
+
+    // The candidate was moved back, not deleted: the contender still holds its lock.
+    const restored = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
+    assert.equal(restored.nonce, winner.nonce);
+    assert.equal(calls.rename.length, 2);
+    assert.equal(calls.rename[1]?.newPath, targetLockPath);
+    assert.deepEqual(
+      [...files.keys()].filter((path) => path.includes(".lock.stale-")),
+      [],
+    );
+  });
+
+  it("should restore the contender's fresh lock for every non-EEXIST hard-link failure code", async () => {
+    for (const code of ["EOPNOTSUPP", "EXDEV", "EPERM", "EACCES", "EMLINK"]) {
+      // Arrange
+      const { files, hooks, deps, winner } = arrangeReclaimRace();
+      hooks.beforeLink = () => {
+        throw createErrno(code, `${code}: hard link refused`);
+      };
+
+      // Act & Assert
+      await assert.rejects(
+        () => acquireAuthLock(serverName, storageDir, { deps }),
+        (err: unknown) => err instanceof AuthLockError,
+      );
+      const restored = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
+      assert.equal(restored.nonce, winner.nonce, `${code} must restore the contender's lock`);
+    }
+  });
+
+  it("should keep the existing lock and drop the candidate when link reports EEXIST", async () => {
+    // Arrange
+    const { files, hooks, calls, deps } = arrangeReclaimRace();
+    const thirdRecord: LockRecord = {
+      v: 1,
+      pid: 5555,
+      hostname: "host-a",
+      nonce: "third-process-nonce",
+      createdAt: 200_000,
+    };
+    hooks.beforeLink = () => {
+      files.set(targetLockPath, {
+        content: JSON.stringify(thirdRecord),
+        mtimeMs: 200_000,
+        mode: 0o600,
+      });
+      throw createErrno("EEXIST", `EEXIST: file already exists, link '${targetLockPath}'`);
+    };
+
+    // Act & Assert
+    await assert.rejects(
+      () => acquireAuthLock(serverName, storageDir, { deps }),
+      (err: unknown) => err instanceof AuthLockError,
+    );
+
+    const kept = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
+    assert.equal(kept.nonce, thirdRecord.nonce);
+    assert.equal(calls.unlink.length, 1);
+    assert.match(calls.unlink[0] ?? "", /\.lock\.stale-/);
+  });
+
+  it("should not attempt a restore when the candidate file already vanished", async () => {
+    // Arrange
+    const { files, hooks, calls, deps } = arrangeReclaimRace();
+    hooks.beforeLink = (existingPath) => {
+      files.delete(existingPath);
+      throw createErrno("ENOENT", `ENOENT: no such file or directory, link '${existingPath}'`);
+    };
+
+    // Act & Assert
+    await assert.rejects(
+      () => acquireAuthLock(serverName, storageDir, { deps }),
+      (err: unknown) => err instanceof AuthLockError,
+    );
+    assert.equal(calls.rename.length, 1);
+    assert.equal(calls.unlink.length, 0);
+  });
+
+  it("should preserve the candidate and still throw AuthLockError when the restore rename fails too", async () => {
+    // Arrange
+    const { files, hooks, calls, deps, winner } = arrangeReclaimRace();
+    const injectWinner = hooks.beforeRename!;
+    hooks.beforeLink = () => {
+      throw createErrno("ENOTSUP", "ENOTSUP: operation not supported, link");
+    };
+    hooks.beforeRename = async (oldPath, newPath) => {
+      await injectWinner(oldPath, newPath);
+      if (newPath === targetLockPath) {
+        throw createErrno("EACCES", "EACCES: permission denied, rename");
+      }
+    };
+
+    // Act & Assert
+    await assert.rejects(
+      () => acquireAuthLock(serverName, storageDir, { deps }),
+      (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
+    );
+
+    // Deleting the only copy would guarantee the contender's lost-lock abort, so it stays on disk.
+    assert.equal(files.has(targetLockPath), false);
+    const candidates = [...files.keys()].filter((path) => path.includes(".lock.stale-"));
+    assert.equal(candidates.length, 1);
+    const preserved = JSON.parse(files.get(candidates[0]!)!.content) as LockRecord;
+    assert.equal(preserved.nonce, winner.nonce);
+    assert.equal(calls.unlink.length, 0);
   });
 
   it("should invoke onLost and reject assertHeld when heartbeat detects nonce changed on disk", async () => {
