@@ -175,11 +175,14 @@ one line per check, and exits non-zero on a failure. Save it as
 
 ```js
 // Headless pi-mcp smoke client: drives Pi over RPC (JSONL on stdin/stdout), no TTY.
-// Run from the repository root:  node /tmp/pi-mcp-smoke/smoke.mjs [--approve]
+// Run from the repository root:  node /tmp/pi-mcp-smoke/smoke.mjs [--no-approve | --approve]
 import { spawn } from "node:child_process";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-const pi = spawn("./node_modules/.bin/pi", ["--mode", "rpc", "--no-session", "-e", "./src/index.ts", ...process.argv.slice(2)], {
+const entry = process.env.SMOKE_ENTRY ?? resolve("src/index.ts");
+const pi = spawn(resolve("node_modules/.bin/pi"), ["--mode", "rpc", "--no-session", "-e", entry, ...process.argv.slice(2)], {
+  cwd: process.env.SMOKE_CWD ?? process.cwd(),
   stdio: ["pipe", "pipe", "inherit"],
 });
 const records = [];
@@ -220,6 +223,7 @@ function waitFor(label, match, from = 0, timeoutMs = 60_000) {
 const notify = (fragment) => (record) => record.method === "notify" && String(record.message).includes(fragment);
 const response = (id) => (record) => record.type === "response" && record.id === id;
 const ready = (from) => waitFor("/mcp ready line", notify("servers ready"), from);
+const allReady = /^MCP: ([1-9]\d*)\/\1 servers ready/;
 
 const results = [];
 async function check(name, body) {
@@ -233,7 +237,7 @@ async function check(name, body) {
 
 await check("/mcp reports every server ready", async () => {
   const line = await ready(send({ id: "1", type: "prompt", message: "/mcp" }));
-  if (!/1\/1 servers ready/.test(line.message)) throw new Error(line.message);
+  if (!allReady.test(line.message)) throw new Error(line.message);
 });
 
 await check("/mcp <name> reports a ready server, live tools, and its source", async () => {
@@ -248,13 +252,13 @@ await check("/mcp:stop then /mcp:start restores the server", async () => {
   await waitFor("stop notify", notify("Stopped mock"), send({ id: "3", type: "prompt", message: "/mcp:stop mock" }));
   await waitFor("start notify", notify("Started mock"), send({ id: "4", type: "prompt", message: "/mcp:start mock" }));
   const line = await ready(send({ id: "5", type: "prompt", message: "/mcp" }));
-  if (!/1\/1 servers ready/.test(line.message)) throw new Error(line.message);
+  if (!allReady.test(line.message)) throw new Error(line.message);
 });
 
 await check("new_session reloads the servers", async () => {
   await waitFor("new_session response", response("6"), send({ id: "6", type: "new_session" }));
   const line = await ready(send({ id: "7", type: "prompt", message: "/mcp" }));
-  if (!/1\/1 servers ready/.test(line.message)) throw new Error(line.message);
+  if (!allReady.test(line.message)) throw new Error(line.message);
 });
 
 pi.stdin.end(); // closing stdin runs Pi's teardown (session_shutdown) and exits 0
@@ -267,9 +271,9 @@ process.exit(failed === 0 ? 0 : 1);
 
 ### Project config trust
 
-Run both halves from a throwaway project directory, and never `--approve` this
-repository itself: its local `.pi/mcp.json` points at real remote servers and
-OAuth providers.
+Run both halves against a throwaway project directory, and never `--approve`
+this repository itself: its local `.pi/mcp.json` points at real remote servers
+and OAuth providers. From the repository root:
 
 ```bash
 mkdir -p /tmp/pi-mcp-smoke/proj/.pi
@@ -280,14 +284,17 @@ cat > /tmp/pi-mcp-smoke/proj/.pi/mcp.json <<JSON
       "type": "stdio",
       "command": "node",
       "args": ["--import", "tsx/esm", "tests/mock-server.ts"],
-      "cwd": "<absolute path to this repository>",
+      "cwd": "$PWD",
       "lifecycle": "eager"
     }
   }
 }
 JSON
-cd /tmp/pi-mcp-smoke/proj
 ```
+
+Run Pi with `/tmp/pi-mcp-smoke/proj` as its working directory while resolving
+the binary and extension from the repository root (`SMOKE_CWD=/tmp/pi-mcp-smoke/proj node /tmp/pi-mcp-smoke/smoke.mjs …`,
+or `(cd /tmp/pi-mcp-smoke/proj && "$OLDPWD/node_modules/.bin/pi" --mode rpc --no-session -e "$OLDPWD/src/index.ts" …)`):
 
 - **Untrusted** (`--no-approve`, and the default with a fresh
   `PI_CODING_AGENT_DIR`): `/mcp mock` carries
@@ -312,20 +319,25 @@ reason to skip the run.
 ### Packaged artifact
 
 To test the actual npm artifact (catches packaging and missing-dependency bugs),
-drive the extracted tarball instead of `./src/index.ts`:
+unpack the tarball, install its runtime dependencies (`--omit=dev --omit=peer`
+omits Pi itself, so keep running the repository's `./node_modules/.bin/pi`),
+and point `-e` (or `SMOKE_ENTRY`) at `/tmp/pi-mcp-smoke/package`:
 
 ```bash
 npm pack
-rm -rf /tmp/pi-mcp-smoke/package && mkdir -p /tmp/pi-mcp-smoke/package
-tar -xzf pi-mcp-extension-*.tgz -C /tmp/pi-mcp-smoke/package
-cd /tmp/pi-mcp-smoke/package
-npm install --omit=dev --omit=peer --ignore-scripts
-./node_modules/.bin/pi -e /tmp/pi-mcp-smoke/package
+rm -rf /tmp/pi-mcp-smoke/package && mkdir -p /tmp/pi-mcp-smoke
+tar -xzf pi-mcp-extension-*.tgz -C /tmp/pi-mcp-smoke
+rm -f pi-mcp-extension-*.tgz
+npm --prefix /tmp/pi-mcp-smoke/package install --omit=dev --omit=peer --ignore-scripts
+SMOKE_ENTRY=/tmp/pi-mcp-smoke/package node /tmp/pi-mcp-smoke/smoke.mjs
+# or directly: ./node_modules/.bin/pi --mode rpc --no-session -e /tmp/pi-mcp-smoke/package
 ```
 
 Installing the `.tgz` directly does **not** work on current Pi: it treats the
-archive as an extension file. Extract it first. A local package is not
-dependency-installed by Pi, which is why the `npm install` step is needed.
+archive as an extension file. Extract it first (`npm pack` archives already
+carry a top-level `package/` prefix, so `-C /tmp/pi-mcp-smoke` unpacks into
+`/tmp/pi-mcp-smoke/package`). A local package is not dependency-installed by
+Pi, which is why the `npm --prefix … install` step is needed.
 
 ### Checklist
 

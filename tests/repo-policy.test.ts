@@ -759,6 +759,35 @@ describe("pre-merge smoke test policy", () => {
     );
     assert.match(section, /--mode rpc/, "the smoke test must document the headless RPC recipe");
     assert.match(section, /PI_CODING_AGENT_DIR/, "the smoke test must isolate the agent directory");
+    assert.match(
+      section,
+      /SMOKE_CWD/,
+      "smoke.mjs must support SMOKE_CWD so project-trust checks run in a throwaway directory while resolving the repo's Pi binary",
+    );
+    assert.match(
+      section,
+      /SMOKE_ENTRY/,
+      "smoke.mjs must support SMOKE_ENTRY so the packaged tarball can be driven by the same harness",
+    );
+  });
+
+  it("extracts the npm pack tarball into /tmp/pi-mcp-smoke without double-nesting or losing ./node_modules/.bin/pi", () => {
+    const section = smokeSection();
+    assert.match(
+      section,
+      /tar -xzf pi-mcp-extension-\*\.tgz -C \/tmp\/pi-mcp-smoke(?:\s|$)/m,
+      "npm pack archives already carry a top-level package/ prefix, so tar must extract to -C /tmp/pi-mcp-smoke",
+    );
+    assert.doesNotMatch(
+      section,
+      /tar -xzf pi-mcp-extension-\*\.tgz -C \/tmp\/pi-mcp-smoke\/package\b/,
+      "extracting to -C /tmp/pi-mcp-smoke/package double-nests package/package/package.json",
+    );
+    assert.match(
+      section,
+      /npm --prefix \/tmp\/pi-mcp-smoke\/package install --omit=dev --omit=peer --ignore-scripts/,
+      "the packaged artifact recipe must install runtime deps with npm --prefix from the repo root so ./node_modules/.bin/pi stays available",
+    );
   });
 
   it("never routes the smoke test through a bare pi launcher", () => {
