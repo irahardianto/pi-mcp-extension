@@ -80,6 +80,25 @@ describe("stdio-process", () => {
       assert.deepEqual(lines, ["launch 🚀 pad", "café"]);
     });
 
+    it("flush() emits the decoded remainder without finalising a split UTF-8 character", () => {
+      const lines: string[] = [];
+      const splitter = createLineSplitter((line) => lines.push(line));
+      const payload = Buffer.from("fatal 🚀", "utf8");
+
+      // Cut inside the 4-byte emoji: the decoder holds the incomplete sequence.
+      splitter.write(payload.subarray(0, 8));
+      splitter.flush();
+      assert.deepEqual(lines, ["fatal "]);
+
+      splitter.write(payload.subarray(8));
+      splitter.end();
+      assert.deepEqual(lines, ["fatal ", "🚀"]);
+      assert.ok(
+        lines.every((line) => !line.includes("\uFFFD")),
+        `expected no replacement characters, got ${JSON.stringify(lines)}`,
+      );
+    });
+
     it("does not emit on end() when there is no trailing remainder", () => {
       const lines: string[] = [];
       const splitter = createLineSplitter((line) => lines.push(line));
@@ -263,6 +282,42 @@ describe("stdio-process", () => {
       stderrStream.emit("data", Buffer.from("second line\nthird partial", "utf8"));
       stderrStream.emit("end");
       assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
+    });
+
+    it("does not corrupt a UTF-8 character split across the close boundary (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5053,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      const payload = Buffer.from("fatal 🚀\n", "utf8");
+      stderrStream.emit("data", payload.subarray(0, 8)); // ends inside the emoji
+      await fakeTransport.close();
+      // The close-time flush must be provisional: finalising the decoder here would replace the
+      // half-decoded character with U+FFFD and corrupt the line.
+      assert.deepEqual(lines, ["fatal "]);
+
+      stderrStream.emit("data", payload.subarray(8));
+      stderrStream.emit("end");
+      assert.deepEqual(lines, ["fatal ", "🚀"]);
+      assert.ok(
+        lines.every((line) => !line.includes("\uFFFD")),
+        `expected no replacement characters, got ${JSON.stringify(lines)}`,
+      );
     });
 
     it("flushes the partial stderr line on close when a grandchild keeps the pipe open (#206)", async () => {

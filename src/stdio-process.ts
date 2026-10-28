@@ -21,16 +21,32 @@ const execFileAsync = promisify(execFile);
 
 export interface LineSplitter {
   write(chunk: Buffer): void;
+  /** Emit the decoded remainder without finalising the decoder (teardown paths). */
+  flush(): void;
+  /** Finalise the decoder (real EOF) and emit whatever is left. Idempotent. */
   end(): void;
 }
 
 /**
- * Create a pure UTF-8 `StringDecoder`-based line splitter with idempotent `end()`.
+ * Create a pure UTF-8 `StringDecoder`-based line splitter with an idempotent `end()`.
+ *
+ * `flush()` and `end()` differ on purpose: `flush()` emits what has already been decoded and
+ * leaves an incomplete UTF-8 sequence buffered inside the decoder, while `end()` is terminal
+ * and replaces such a sequence with U+FFFD. Teardown uses `flush()` because bytes can still
+ * arrive after a forced close, and finalising the decoder first would turn a character split
+ * across that boundary into replacement characters.
  */
 export function createLineSplitter(onLine: (line: string) => void): LineSplitter {
   const decoder = new StringDecoder("utf8");
   let remainder = "";
   let flushed = false;
+
+  const emitRemainder = (): void => {
+    if (!remainder) return;
+    const trailing = remainder;
+    remainder = "";
+    onLine(trailing);
+  };
 
   return {
     write(chunk: Buffer): void {
@@ -42,15 +58,14 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
         onLine(rawLine);
       }
     },
+    flush(): void {
+      emitRemainder();
+    },
     end(): void {
       if (flushed) return;
       flushed = true;
       remainder += decoder.end();
-      if (remainder) {
-        const trailing = remainder;
-        remainder = "";
-        onLine(trailing);
-      }
+      emitRemainder();
     },
   };
 }
@@ -152,12 +167,15 @@ export function instrumentStdioTransport(
     transport.stderr.on("data", (chunk: Buffer) => {
       splitter.write(chunk);
     });
+    // WHY: teardown flushes provisionally. Bytes written just before the child died can still be
+    // in the pipe, so finalising the UTF-8 decoder here would corrupt a character split across
+    // the boundary; the stream's own 'end'/'close' is what really finalises it.
     const flush = (): void => {
-      splitter.end();
+      splitter.flush();
     };
     flushStderr = flush;
-    transport.stderr.on("end", flush);
-    transport.stderr.on("close", flush);
+    transport.stderr.on("end", () => splitter.end());
+    transport.stderr.on("close", () => splitter.end());
   }
 }
 
