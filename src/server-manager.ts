@@ -27,7 +27,7 @@ import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } from "./oauth-provider.js";
 import type { ToolRefreshOptions } from "./tool-bridge.js";
 import { sanitizeTerminalText, type SanitizeTerminalTextOptions } from "./terminal-text.js";
-import { describeError, reportDiagnostic } from "./debug-log.js";
+import { describeError, redactSecrets, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
 import {
   destroyStdioStreams,
   ensurePidTerminated,
@@ -320,7 +320,7 @@ export class ServerManager {
     if (all.length === 0) return "pi-mcp: No servers configured (create ~/.pi/agent/mcp.json)";
     const lines = all.map((s) => {
       const icon = s.state === "ready" ? "✓" : s.state === "starting" ? "⟳" : "✗";
-      const err = s.lastError ? ` — ${sanitizeTerminalText(s.lastError.message)}` : "";
+      const err = s.lastError ? ` — ${sanitizeLogText(s.lastError.message, 500)}` : "";
       return `  ${icon} ${s.name} (${s.state})${err}`;
     });
     const ready = all.filter((s) => s.state === "ready").length;
@@ -508,7 +508,11 @@ export class ServerManager {
   }
 
   private _appendStderr(server: ManagedServer, line: string): void {
-    server.stderrLog.push(line);
+    // WHY: this buffer is what `/mcp <name>` prints as "Recent output" and what
+    // `getServerLogs` returns — text users paste into bug reports. A child server that echoes
+    // its own key on stderr must not surface it there, so mask credentials exactly as the
+    // debug log does. Redacting twice is a no-op.
+    server.stderrLog.push(redactSecrets(line));
     if (server.stderrLog.length > STDERR_BUFFER_SIZE) {
       server.stderrLog.shift();
     }

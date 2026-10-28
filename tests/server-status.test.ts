@@ -160,6 +160,23 @@ describe("status formatting", () => {
 });
 
 describe("formatServerDetail", () => {
+  it("masks a credential quoted by a connect failure, so the view is safe to paste into an issue", () => {
+    const detail = formatServerDetail(
+      snapshot({
+        state: "stopped",
+        lastError: new Error(
+          "connect failed after GET https://mcp.example.com/sse?api_key=s3cr3t-VALUE",
+        ),
+        recentOutput: "(no stderr output from srv)",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+    const lastErrorLine = detail.split("\n").find((line) => line.startsWith("Last error: "));
+    assert.ok(lastErrorLine, detail);
+    assert.ok(!lastErrorLine.includes("s3cr3t-VALUE"), lastErrorLine);
+    assert.ok(lastErrorLine.includes("?api_key=[REDACTED]"), lastErrorLine);
+  });
+
   it("shows transport, lifecycle, provenance, tool counts, and recent output", () => {
     const detail = formatServerDetail(
       snapshot({

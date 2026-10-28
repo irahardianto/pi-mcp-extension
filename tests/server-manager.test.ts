@@ -232,6 +232,17 @@ describe("ServerManager integration (stdio)", () => {
     assert.ok(summary.includes("test"));
     assert.ok(summary.includes("stopped"));
   });
+
+  it("status summary masks a credential a failure message quotes", () => {
+    const server = manager.getServer("test");
+    assert.ok(server);
+    server.lastError = new Error(
+      "connect failed after GET https://mcp.example.com/sse?api_key=s3cr3t-VALUE",
+    );
+    const summary = manager.getStatusSummary();
+    assert.ok(!summary.includes("s3cr3t-VALUE"), summary);
+    assert.ok(summary.includes("?api_key=[REDACTED]"), summary);
+  });
 });
 
 describe("ServerManager — unknown server", () => {
@@ -797,6 +808,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   process.stderr.write(Buffer.from([0x42, 0x6f, 0x6f, 0x74, 0x20, 0xf0, 0x9f]));
   await new Promise((r) => setTimeout(r, 15));
   process.stderr.write(Buffer.from([0x9a, 0x80, 0x20, 0x1b, 0x5b, 0x33, 0x32, 0x6d, 0x6f, 0x6b, 0x1b, 0x5b, 0x30, 0x6d, 0x0d, 0x0a]));
+  await new Promise((r) => process.stderr.write("x-api-key: s3cr3t-VALUE\\n", r));
   await new Promise((r) => process.stderr.write("trailing-without-newline\\x1b]0;title\\x07", r));
   return { tools: [] };
 });
@@ -831,6 +843,17 @@ await server.connect(new StdioServerTransport());
       await manager.stopServer("stderrSrv");
       const logsAfterStop = manager.getServerLogs("stderrSrv");
       assert.ok(logsAfterStop.includes("trailing-without-newline"), `Expected flushed trailing stderr line, got: ${logsAfterStop}`);
+      // A child server that echoes a credential on stderr must not surface it in the buffer
+      // that `/mcp <name>` prints and `getServerLogs` returns. Asserted after the stop so the
+      // whole buffer is settled — the stderr lines arrive asynchronously from the child.
+      assert.ok(
+        logsAfterStop.includes("x-api-key: [REDACTED]"),
+        `Expected the stderr buffer to mask credentials, got: ${logsAfterStop}`,
+      );
+      assert.ok(
+        !logsAfterStop.includes("s3cr3t-VALUE"),
+        `Credential leaked into the stderr buffer: ${logsAfterStop}`,
+      );
     } finally {
       await manager.shutdownAll();
       await rm(dir, { recursive: true, force: true });

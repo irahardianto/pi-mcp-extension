@@ -8,6 +8,7 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { redactSecrets } from "./debug-log.js";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -16,7 +17,7 @@ export const startupAuthLaterOption = "Not now";
 
 export function formatErrorMessage(err: unknown): string {
   const msg = err instanceof McpError ? err.userMessage : err instanceof Error ? err.message : String(err);
-  return sanitizeTerminalText(msg.replace(/^AuthRequiredError:\s*/, ""));
+  return redactSecrets(sanitizeTerminalText(msg.replace(/^AuthRequiredError:\s*/, "")));
 }
 
 // WHY: Allow an aborted waiter on authQueue to wake up and reject immediately without breaking

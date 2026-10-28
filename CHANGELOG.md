@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The `PI_MCP_DEBUG` diagnostic redactor now masks the credential shapes that child servers, MCP log notifications, and transport errors actually echo. It covers API keys and other key/value or JSON secrets (`api_key`, `apiKey`, `x-api-key`, `x_api_key`, `private_key`, `secret_key`, `secret_access_key`, `password`, `passwd`, `secret`, `token`) in double or single quotes, prefixed spellings such as `db_password` and `aws_secret_access_key`, query-string credentials on a server URL (`?api_key=`, `?token=`, `?key=`, `?secret=`, `?password=`, `?auth=`, `?code=`), `Authorization` headers in any scheme (`Token`, `ApiKey`, `DPoP`, `OAuth`, `Bearer`, `Basic`, `Digest`) with or without quotes — including the JSON `"Authorization": "…"` form — and URL userinfo passwords (`https://user:password@host`). A value is masked up to its own delimiter: a quoted value runs to its closing quote, so an apostrophe inside a secret no longer leaves its tail in the log, and an object or array value is masked as one unit instead of stopping at the first brace. Previously only the OAuth-specific field names in double quotes, six query-parameter spellings, and `Bearer`/`Basic`/`Digest` headers were masked, so an `x-api-key` header, a `?api_key=` URL, or a single-quoted `client_secret` reached `<agent dir>/logs/pi-mcp.log` in cleartext. The redactor stays idempotent and leaves prose such as `Unexpected token <` untouched.
+- The same redaction now applies to the `/mcp` and `/mcp <name>` surfaces and error notifications users paste into bug reports: the per-server `stderr` ring buffer ("Recent output", also returned by `getServerLogs`), the `Last error:` line in `/mcp` and `/mcp <name>`, and start/auth/recovery failure notifications (`formatErrorMessage`, `/mcp:auth`). A child server that echoes its own key no longer surfaces it there, and neither does a connect failure whose message contains `?api_key=…` (#201).
+
 ## [1.11.7] - 2026-10-28
 
 ### Fixed
