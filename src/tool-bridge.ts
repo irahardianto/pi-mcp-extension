@@ -18,8 +18,7 @@ import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { McpError, AuthCancelledError } from "./errors.js";
 import type { Settings } from "./config.js";
-import { isSdkTimeoutError } from "./connect-policy.js";
-import { isOAuthUnauthorizedError } from "./server-manager.js";
+import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
 
@@ -367,11 +366,7 @@ export class ToolBridge {
     try {
       return await listAllTools(client, effectiveTimeoutMs, effectiveSignal, serverName);
     } catch (err) {
-      if (
-        err instanceof AuthCancelledError ||
-        effectiveSignal?.aborted ||
-        (err instanceof Error && err.name === "AbortError")
-      ) {
+      if (isCancellationError(err, effectiveSignal)) {
         throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
       }
       if (isOAuthUnauthorizedError(err)) {
@@ -517,13 +512,24 @@ export class ToolBridge {
       throw new McpError("Tool execution cancelled", serverName, "protocol");
     }
 
-    const result = await callToolWithClient(
-      client,
-      toolName,
-      params,
-      this.serverTimeouts.get(serverName) ?? this.settings.requestTimeoutMs,
-      signal,
-    );
+    let result: ToolCallResponse;
+    try {
+      result = await callToolWithClient(
+        client,
+        toolName,
+        params,
+        this.serverTimeouts.get(serverName) ?? this.settings.requestTimeoutMs,
+        signal,
+      );
+    } catch (err) {
+      // WHY: an abort mid-call is rejected by the SDK with its RequestTimeout error, so the
+      // cancellation has to be recognised here — otherwise a caller cancellation is reported
+      // as a server timeout, and blamed on the server (#209).
+      if (isCancellationError(err, signal)) {
+        throw new McpError("Tool execution cancelled", serverName, "protocol");
+      }
+      throw err;
+    }
     const content = buildToolCallContent(result);
 
     // Tool execution errors (isError: true) — distinct from protocol errors

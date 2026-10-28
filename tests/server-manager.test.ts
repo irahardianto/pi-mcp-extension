@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { ServerManager } from "../src/server-manager.js";
 import {
   classifyConnectFailure,
+  isCancellationError,
   isSdkTimeoutError,
   RETRY_DELAYS_MS,
   type ConnectFailureAction,
@@ -1701,6 +1702,45 @@ describe("isSdkTimeoutError", () => {
     assert.equal(isSdkTimeoutError(null), false);
     assert.equal(isSdkTimeoutError("timeout"), false);
   });
+
+  it("decides on the code, not the message, for any other negative JSON-RPC error", () => {
+    // A server error response keeps its own code; its message may legitimately say "timed out".
+    assert.equal(isSdkTimeoutError(SdkMcpError.fromError(ErrorCode.InternalError, "Upstream query timed out")), false);
+    assert.equal(isSdkTimeoutError({ code: -32000, message: "Server timed out" }), false);
+    assert.equal(isSdkTimeoutError({ code: -32602, message: "Request timed out during validation" }), false);
+    // ...and the SDK's RequestTimeout is a timeout even when its message says nothing of the sort.
+    assert.equal(isSdkTimeoutError(SdkMcpError.fromError(ErrorCode.RequestTimeout, "Maximum total timeout exceeded")), true);
+  });
+});
+
+describe("isCancellationError", () => {
+  it("recognizes the caller's abort even when the SDK rewraps it as a RequestTimeout error", () => {
+    // The SDK rejects an in-flight abort as McpError(RequestTimeout, String(signal.reason)).
+    const sdkAbort = SdkMcpError.fromError(ErrorCode.RequestTimeout, "AbortError: This operation was aborted");
+    const aborted = new AbortController();
+    // The abort reason survives in the wrapped message, so the shape alone is enough…
+    assert.equal(isCancellationError(sdkAbort, aborted.signal), true);
+    aborted.abort(new Error("AbortError: This operation was aborted"));
+    assert.equal(isCancellationError(sdkAbort, aborted.signal), true);
+    // …while a plain timeout with a live (unaborted) signal stays a timeout.
+    const timedOut = SdkMcpError.fromError(ErrorCode.RequestTimeout, "Request timed out");
+    assert.equal(isCancellationError(timedOut, new AbortController().signal), false);
+    // A signal-less caller still gets the abort recognized by shape.
+    assert.equal(isCancellationError(sdkAbort), true);
+    assert.equal(isCancellationError(new Error("This operation was aborted")), false, "no -32001 code, no abort reason");
+    const domAbort = Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+    assert.equal(isCancellationError(domAbort), true);
+    assert.equal(isCancellationError(new AuthCancelledError("srv")), true);
+  });
+
+  it("does not mistake a server timeout or a server 'aborted' error for our cancellation", () => {
+    const timedOut = SdkMcpError.fromError(ErrorCode.RequestTimeout, "Request timed out");
+    assert.equal(isCancellationError(timedOut), false);
+    const serverAborted = SdkMcpError.fromError(ErrorCode.InternalError, "upstream query aborted");
+    assert.equal(isCancellationError(serverAborted), false);
+    assert.equal(isCancellationError(new Error("boom")), false);
+    assert.equal(isCancellationError(null), false);
+  });
 });
 
 /**
@@ -1861,6 +1901,119 @@ describe("tools/list request timeout during connect (#209)", () => {
     } finally {
       await manager.shutdownAll();
       await slowServer.close();
+    }
+  });
+});
+
+/**
+ * Fake streamable-http server that discovers one tool and then never answers
+ * `tools/call`, so an in-flight call can be aborted by the caller.
+ */
+async function startHangingToolCallServer(): Promise<{
+  url: string;
+  close: () => Promise<void>;
+}> {
+  const { createServer } = await import("node:http");
+  const sockets = new Set<Socket>();
+  const listener = createServer((req, res) => {
+    if (req.url !== "/mcp" || req.method !== "POST") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+    req.on("end", () => {
+      const msg = JSON.parse(body) as { id?: number; method?: string };
+      if (msg.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "hanging-call", version: "1.0.0" },
+          },
+        }));
+        return;
+      }
+      if (msg.method === "notifications/initialized" || msg.method === "notifications/cancelled") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (msg.method === "tools/list") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { tools: [{ name: "wait", inputSchema: { type: "object", properties: {} } }] },
+        }));
+        return;
+      }
+      // tools/call hangs: only the caller's abort can end it.
+    });
+  });
+  listener.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    url: `http://127.0.0.1:${address.port}/mcp`,
+    close: async () => {
+      listener.closeAllConnections();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    },
+  };
+}
+
+describe("abort during an in-flight tools/call (#209)", () => {
+  it("reports a cancelled tool call as a cancellation, not as a request timeout", async () => {
+    const hangingServer = await startHangingToolCallServer();
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 0 };
+    const manager = new ServerManager({
+      settings,
+      mcpServers: {
+        hang: {
+          url: hangingServer.url,
+          args: [],
+          transport: "streamable-http",
+          lifecycle: "lazy",
+          requestTimeoutMs: 30000,
+        },
+      },
+    });
+    const mockPi = makeMockPi();
+    const bridge = new ToolBridge(settings, mockPi);
+    manager.setToolRefreshCallback(async (name, client, options) => {
+      await bridge.refreshTools(name, client, options);
+    });
+
+    try {
+      await manager.startServer("hang", process.cwd());
+      const tool = mockPi.tools.find((t) => t.name.includes("wait"));
+      assert.ok(tool, "the server's tool must be registered");
+
+      const controller = new AbortController();
+      const pending = tool.execute("call-abort", {}, controller.signal, () => {}, {});
+      // The SDK rejects the request with McpError(RequestTimeout, String(signal.reason)) on
+      // abort, so the abort must be observed before the timeout classification.
+      setTimeout(() => controller.abort(new Error("AbortError: This operation was aborted")), 50);
+      await assert.rejects(pending, (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, "protocol");
+        assert.equal(err.message, "Tool execution cancelled");
+        return true;
+      });
+    } finally {
+      await manager.shutdownAll();
+      await hangingServer.close();
     }
   });
 });

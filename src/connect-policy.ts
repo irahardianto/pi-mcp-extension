@@ -3,7 +3,8 @@
  *
  * Owns:
  *   - Pure OAuth 401/403 connect and tool error detection (`isOAuthUnauthorizedError`)
- *   - Pure SDK request-timeout detection (`isSdkTimeoutError`)
+ *   - Pure SDK request-timeout detection (`isSdkTimeoutError`) and cancellation detection
+ *     (`isCancellationError`)
  *   - Fixed retry backoff schedule (`RETRY_DELAYS_MS`)
  *   - Connect-failure classification into retry, auth-required, fast-fail, give-up, or cancelled (`classifyConnectFailure`)
  */
@@ -154,9 +155,32 @@ export function isSdkTimeoutError(err: unknown): boolean {
   // WHY: our own McpError already carries a deliberate code; never re-derive it from
   // the message (e.g. "Connection timed out after 5000ms" is already code "timeout").
   if (err instanceof McpError) return false;
-  if ((err as { code?: unknown } | null)?.code === -32001) return true;
+  const code = (err as { code?: unknown } | null)?.code;
+  // WHY: a negative numeric code is a JSON-RPC error code, and a server error response
+  // arrives with its own (e.g. ErrorCode.InternalError = -32603) plus a message that may
+  // well say "timed out". Only the SDK's own RequestTimeout means the client gave up on
+  // the server, so no other negative code may fall through to the message heuristic.
+  if (typeof code === "number" && code < 0) return code === -32001;
   const message = err instanceof Error ? err.message : String(err);
   return /Request timed out|timed out/i.test(message);
+}
+
+/**
+ * Whether `err`/`signal` are our own cancellation rather than a failure of the server.
+ *
+ * The SDK's `Protocol.request` rejects an in-flight request on abort as
+ * `McpError(ErrorCode.RequestTimeout, String(signal.reason))` — carrying the *timeout* code
+ * for a caller cancellation (`cancel()` in the SDK is shared by the timeout handler and the
+ * abort listener). Anything that classifies an SDK error must therefore test cancellation
+ * first, or a cancelled tool call is reported as a server timeout.
+ */
+export function isCancellationError(err: unknown, signal?: AbortSignal | undefined): boolean {
+  // WHY: the caller's own abort is authoritative — it survives the SDK rewrapping the reason.
+  if (signal?.aborted || err instanceof AuthCancelledError) return true;
+  if (!(err instanceof Error)) return false;
+  // WHY: only a -32001 carrier is inspected for an abort reason; a JSON-RPC error response
+  // whose message merely mentions "aborted" must keep its own class.
+  return err.name === "AbortError" || ((err as { code?: unknown }).code === -32001 && /abort/i.test(err.message));
 }
 
 export type TransportType = ServerConfig["transport"];

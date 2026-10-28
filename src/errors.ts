@@ -9,7 +9,7 @@ export type McpErrorCode =
   | "connection"  // Transport/connection failed
   | "auth"        // Authentication/authorization failed
   | "timeout"     // Request or connection timed out
-  | "protocol"    // JSON-RPC protocol violation (server error response, timeout, etc.)
+  | "protocol"    // JSON-RPC protocol violation (a server error response, a malformed payload, or a call the caller cancelled)
   | "tool";       // Tool execution error (isError: true from server)
 
 export class McpError extends Error {
