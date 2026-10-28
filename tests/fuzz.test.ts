@@ -43,6 +43,7 @@ import {
   discoverManualAuthChallenge,
 } from "../src/auth-challenge.js";
 import { McpError } from "../src/errors.js";
+import { redactSecrets } from "../src/debug-log-format.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -1002,6 +1003,125 @@ describe("fuzz: createHeadersFetch & discoverManualAuthChallenge", () => {
         assert.ok(result.resourceMetadataUrl instanceof URL);
         assert.equal(result.resourceMetadataUrl.href, expectedUrl);
         assert.equal(result.scope, scope);
+      }),
+      testOptions(),
+    );
+  });
+});
+
+// ─── Suite 9: redactSecrets ────────────────────────────────────────────────────
+
+/**
+ * Secret alphabets chosen for the characters the mask has to get right: an apostrophe (it must
+ * not end an unquoted value), a query separator, and brackets/commas (they must not truncate a
+ * structured value). A quoted value may hold anything but its own delimiter; an unquoted one
+ * stops at a separator and may not start with a quote or a bracket.
+ */
+const quotedSecret = fc.stringMatching(/^[A-Za-z0-9'&,;._+=\/@{}[\]]{8,24}$/);
+const bareSecret = fc
+  .stringMatching(/^[A-Za-z0-9'._+=\/@]{8,24}$/)
+  .filter((secret) => !secret.startsWith("'"));
+
+const credentialKey = fc.constantFrom(
+  "api_key",
+  "apiKey",
+  "x-api-key",
+  "private_key",
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "client_secret",
+  "access_token",
+  "refresh_token",
+);
+
+/** `db_password`, `my_api_key`, … — the leading boundary must allow a prefixed name. */
+const prefixedKey = fc
+  .tuple(fc.constantFrom("db_", "my_", "app_", "user_"), credentialKey)
+  .map(([prefix, key]) => `${prefix}${key}`);
+
+const authScheme = fc.constantFrom(
+  "Bearer",
+  "Basic",
+  "Digest",
+  "Token",
+  "ApiKey",
+  "DPoP",
+  "OAuth",
+);
+
+const queryName = fc.constantFrom(
+  "api_key",
+  "apiKey",
+  "token",
+  "key",
+  "secret",
+  "password",
+  "code",
+  "auth",
+);
+
+const credentialCarriers: Array<fc.Arbitrary<{ text: string; secret: string }>> = [
+  fc.tuple(credentialKey, bareSecret).map(([key, secret]) => ({ text: `${key}=${secret}`, secret })),
+  fc.tuple(credentialKey, bareSecret).map(([key, secret]) => ({ text: `${key}: ${secret}`, secret })),
+  fc
+    .tuple(prefixedKey, quotedSecret)
+    .map(([key, secret]) => ({ text: `{"${key}":"${secret}"}`, secret })),
+  // WHY the filter: inside a single-quoted value an apostrophe is indistinguishable from the
+  // closing delimiter, so that carrier only carries secrets without one. The JSON and
+  // double-quoted carriers below do exercise apostrophes.
+  fc
+    .tuple(prefixedKey, quotedSecret.filter((secret) => !secret.includes("'")))
+    .map(([key, secret]) => ({ text: `'${key}': '${secret}'`, secret })),
+  fc
+    .tuple(queryName, bareSecret)
+    .map(([key, secret]) => ({ text: `https://mcp.example.com/sse?${key}=${secret}&mode=fast`, secret })),
+  fc
+    .tuple(authScheme, bareSecret)
+    .map(([scheme, secret]) => ({ text: `Authorization: ${scheme} ${secret}`, secret })),
+  fc
+    .tuple(authScheme, quotedSecret)
+    .map(([scheme, secret]) => ({ text: `{"Authorization": "${scheme} ${secret}"}`, secret })),
+  quotedSecret.map((secret) => ({ text: `{"token":{"value":"${secret}"}}`, secret })),
+  quotedSecret.map((secret) => ({ text: `{"api_key":["${secret}"]}`, secret })),
+  // A URL userinfo password is percent-encoded in practice, so `@` and `/` are filtered out:
+  // they would change the URL's own structure rather than the credential.
+  bareSecret
+    .filter((secret) => !secret.includes("@") && !secret.includes("/"))
+    .map((secret) => ({ text: `https://user:${secret}@mcp.example.com/mcp`, secret })),
+];
+
+describe("fuzz: redactSecrets", () => {
+  it("is idempotent on all inputs", () => {
+    fc.assert(
+      fc.property(arbitraryString, (text) => {
+        const once = redactSecrets(text);
+        assert.equal(redactSecrets(once), once, "Redacting twice must yield the exact same string");
+      }),
+      testOptions(),
+    );
+  });
+
+  it("is idempotent on the credential carriers too", () => {
+    fc.assert(
+      fc.property(fc.oneof(...credentialCarriers), ({ text }) => {
+        const once = redactSecrets(text);
+        assert.equal(redactSecrets(once), once, `Redacting twice changed ${JSON.stringify(text)}`);
+      }),
+      testOptions(),
+    );
+  });
+
+  it("always masks a generated credential in a generated carrier", () => {
+    fc.assert(
+      fc.property(fc.oneof(...credentialCarriers), ({ text, secret }) => {
+        const redacted = redactSecrets(text);
+        assert.ok(
+          !redacted.includes(secret),
+          `Secret leaked for ${JSON.stringify(text)}: ${JSON.stringify(redacted)}`,
+        );
+        assert.ok(redacted.includes("[REDACTED]"), `Expected a mask in ${JSON.stringify(redacted)}`);
       }),
       testOptions(),
     );

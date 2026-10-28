@@ -152,6 +152,167 @@ describe("debug log", () => {
       const text = "Server github closed unexpectedly, reconnecting in 1000ms";
       assert.equal(redactSecrets(text), text);
     });
+
+    // A child server's stderr, an MCP `notifications/message` log line, or a
+    // transport error can echo any of these credential shapes.
+    const apiKey = "s3cr3t-VALUE";
+
+    function assertRedacted(cases: Array<[string, string]>): void {
+      for (const [input, secret] of cases) {
+        const redacted = redactSecrets(input);
+        assert.ok(
+          !redacted.includes(secret),
+          `Secret leaked for ${JSON.stringify(input)}: ${JSON.stringify(redacted)}`,
+        );
+        assert.ok(redacted.includes("[REDACTED]"), `Expected a mask in ${JSON.stringify(redacted)}`);
+      }
+    }
+
+    it("masks api keys, passwords, secrets, and tokens in key-value, JSON, and header text", () => {
+      assertRedacted([
+        [`{"api_key":"${apiKey}"}`, apiKey],
+        [`apiKey=${apiKey}`, apiKey],
+        [`{"x-api-key":"${apiKey}"}`, apiKey],
+        [`x-api-key: ${apiKey}`, apiKey],
+        [`x_api_key: ${apiKey}`, apiKey],
+        [`{"private_key":"${apiKey}"}`, apiKey],
+        [`secret_access_key=${apiKey}`, apiKey],
+        [`{"password":"${apiKey}"}`, apiKey],
+        [`passwd: ${apiKey}`, apiKey],
+        [`{"secret":"${apiKey}"}`, apiKey],
+        [`{"token":"${apiKey}"}`, apiKey],
+        [`token=${apiKey}`, apiKey],
+        [`'client_secret': '${apiKey}'`, apiKey],
+        [`{\\"api_key\\":\\"${apiKey}\\"}`, apiKey],
+      ]);
+    });
+
+    it("masks query-string secrets on MCP server URLs", () => {
+      assertRedacted(
+        [
+          "api_key",
+          "apiKey",
+          "token",
+          "key",
+          "secret",
+          "password",
+          "clientSecret",
+          "accessToken",
+          "refreshToken",
+          "id_token",
+        ].map((name): [string, string] => [
+          `https://mcp.example.com/sse?${name}=${apiKey}&mode=fast`,
+          apiKey,
+        ]),
+      );
+    });
+
+    it("leaves an empty credential value alone, like the key/value path does", () => {
+      assert.equal(redactSecrets("?token="), "?token=");
+      assert.equal(redactSecrets("token="), "token=");
+    });
+
+    it("masks Authorization headers with any scheme, quoting, or none", () => {
+      assertRedacted(
+        ["Token", "ApiKey", "DPoP", "OAuth", "Bearer"].map((scheme): [string, string] => [
+          `Authorization: ${scheme} ${apiKey}`,
+          apiKey,
+        ]),
+      );
+      assertRedacted([
+        [`Authorization: ${apiKey}`, apiKey],
+        [`{"Authorization": "Token ${apiKey}"}`, apiKey],
+        [`"authorization":"Basic ${apiKey}"`, apiKey],
+        [`authorization = ${apiKey}`, apiKey],
+      ]);
+    });
+
+    it("masks the whole value when it is quoted with an apostrophe or is a structure", () => {
+      assertRedacted([
+        // An apostrophe inside the secret must not end the mask early.
+        [`client_secret=ab'cd${apiKey}`, `ab'cd${apiKey}`],
+        [`{"password":"it's ${apiKey}"}`, `it's ${apiKey}`],
+        // A nested credential object/array is masked as one unit, not one character.
+        [`{"token":{"value":"${apiKey}"}}`, apiKey],
+        [`{"api_key":["${apiKey}"]}`, apiKey],
+        [
+          `{"headers":{"authorization":{"scheme":"Bearer","value":"${apiKey}"}}}`,
+          apiKey,
+        ],
+      ]);
+      assert.equal(redactSecrets(`{"token":{"value":"${apiKey}"}}`), '{"token":[REDACTED]}');
+      assert.equal(redactSecrets(`{"password":"it's ${apiKey}"}`), '{"password":"[REDACTED]"}');
+    });
+
+    it("masks compound credential names such as db_password and aws_secret_access_key", () => {
+      assertRedacted([
+        [`{"db_password":"${apiKey}"}`, apiKey],
+        [`{"user_password":"${apiKey}"}`, apiKey],
+        [`{"app_secret":"${apiKey}"}`, apiKey],
+        [`{"my_access_token":"${apiKey}"}`, apiKey],
+        [`{"aws_secret_access_key":"${apiKey}"}`, apiKey],
+        [`https://mcp.example.com/sse?my_api_key=${apiKey}&mode=fast`, apiKey],
+      ]);
+    });
+
+    it("masks an Authorization value that contains an ampersand or an unknown scheme", () => {
+      assertRedacted([
+        [`Authorization: Bearer abc&def${apiKey}`, `abc&def${apiKey}`],
+        [`{"Authorization": "Token abc&def${apiKey}"}`, `abc&def${apiKey}`],
+        [`Authorization: MyScheme ${apiKey}`, apiKey],
+      ]);
+      // A known scheme stays readable; only the credential after it is masked.
+      assert.equal(
+        redactSecrets(`Authorization: Bearer ${apiKey}`),
+        "Authorization: Bearer [REDACTED]",
+      );
+    });
+
+    it("masks URL userinfo passwords", () => {
+      const redacted = redactSecrets(`https://user:${apiKey}@mcp.example.com/mcp`);
+      assert.equal(redacted, "https://user:[REDACTED]@mcp.example.com/mcp");
+    });
+
+    it("keeps prose that merely mentions a credential word intact", () => {
+      const texts = [
+        "Unexpected token < in JSON at position 0",
+        "Error: Unexpected token 'o', \"ok\" is not valid JSON",
+        "GET https://mcp.example.com/sse?mode=fast",
+        "tokens: 42 input, 7 output",
+        "keyboard interrupt",
+        "server github closed unexpectedly, reconnecting in 1000ms",
+      ];
+      for (const text of texts) assert.equal(redactSecrets(text), text);
+    });
+
+    it("masks a word after a credential key even in a prose line, and keeps surrounding syntax", () => {
+      // Deliberate over-redaction: `secret: check` is indistinguishable from a real
+      // assignment, so the word after the key is masked — the sentence still reads.
+      assert.equal(
+        redactSecrets("Invalid secret: check your keys"),
+        "Invalid secret: [REDACTED] your keys",
+      );
+      // An Authorization value runs to the end of the line, so an unquoted prose tail is
+      // masked with it rather than left behind.
+      assert.equal(
+        redactSecrets("missing authorization: ask an admin"),
+        "missing authorization: [REDACTED]",
+      );
+      // A closing bracket terminates the value, so the status code after it survives.
+      assert.equal(
+        redactSecrets("failed (Authorization: ApiKey abc123) 401"),
+        "failed (Authorization: ApiKey [REDACTED]) 401",
+      );
+      // Brackets are paired: the mask never leaves an orphaned closing delimiter.
+      assert.equal(redactSecrets("token=abc(x)"), "token=[REDACTED](x)");
+    });
+
+    it("is idempotent, so re-sanitizing an already redacted line changes nothing", () => {
+      const once = redactSecrets(
+        `x-api-key: ${apiKey} https://user:${apiKey}@host/mcp?token=${apiKey} Authorization: Token ${apiKey}`,
+      );
+      assert.equal(redactSecrets(once), once);
+    });
   });
 
   describe("sanitizeLogText", () => {

@@ -8,7 +8,7 @@
  */
 
 import type { ServerConfig } from "./config.js";
-import { describeError, reportDiagnostic } from "./debug-log.js";
+import { describeError, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
 import { McpError } from "./errors.js";
 import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import type { ManagedServer } from "./server-manager.js";
@@ -123,7 +123,9 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
     `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active`,
     snapshot.auth === undefined ? undefined : `OAuth: ${snapshot.auth}`,
     formatProjectConfigNote(provenance),
-    snapshot.lastError === null ? undefined : `Last error: ${sanitizeTerminalText(snapshot.lastError.message)}`,
+    // WHY: a connect/stream failure usually quotes the request URL, and that URL can carry a
+    // credential. This view is what users paste into an issue, so mask it like the log does.
+    snapshot.lastError === null ? undefined : `Last error: ${sanitizeLogText(snapshot.lastError.message, 500)}`,
     formatFailureHint(classifyFailure(snapshot.lastError), snapshot.name),
   ];
   return `${lines.filter(isDefined).join("\n")}\n\nRecent output:\n${snapshot.recentOutput}`;
