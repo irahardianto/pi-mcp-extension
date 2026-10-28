@@ -91,6 +91,70 @@ interface StdioChildRecord {
  */
 const childRecords = new WeakMap<object, StdioChildRecord>();
 
+/** A transport whose child stderr can be wired and whose `close()` can be wrapped. */
+interface StderrCarrier {
+  stderr?: unknown;
+  close(): Promise<void>;
+}
+
+/**
+ * Split a stdio transport's stderr into lines and make them survive `close()`.
+ *
+ * Returns the provisional flush that teardown paths call before destroying the pipes, or
+ * `null` when the transport has no stderr stream to read.
+ *
+ * WHY: `StdioClientTransport.close()` never ends its stderr `PassThrough` — it only waits
+ * (bounded) for the child's `'close'` event — and a descendant that inherited the stderr write
+ * end keeps that event from firing. A line written without a trailing newline would then stay
+ * in the splitter's remainder forever. Flushing when close settles, and again for every chunk
+ * that arrives afterwards (nothing will emit `'end'` to do it), keeps the child's last words.
+ * Both flushes are provisional: they must not finalise the decoder, because the bytes of a
+ * character can be split across the close boundary; only the stream's own `'end'`/`'close'`
+ * finalises it.
+ */
+export function instrumentStderr(
+  transport: StderrCarrier,
+  onLine: (line: string) => void,
+): (() => void) | null {
+  const stream = transport.stderr as NodeJS.EventEmitter | null | undefined;
+  if (!stream || typeof stream.on !== "function") return null;
+
+  const splitter = createLineSplitter(onLine);
+  let closed = false;
+  let pendingFlush: NodeJS.Immediate | null = null;
+  const flush = (): void => {
+    splitter.flush();
+  };
+  // WHY: coalesce a post-close burst into one flush. Chunks that arrive in the same tick are one
+  // write, so flushing each of them would split a line that is still being written; anything the
+  // burst leaves unterminated is flushed once the tick ends.
+  const schedulePostCloseFlush = (): void => {
+    pendingFlush ??= setImmediate(() => {
+      pendingFlush = null;
+      flush();
+    });
+    pendingFlush.unref();
+  };
+
+  stream.on("data", (chunk: Buffer) => {
+    splitter.write(chunk);
+    if (closed) schedulePostCloseFlush();
+  });
+  stream.on("end", () => splitter.end());
+  stream.on("close", () => splitter.end());
+
+  const origClose = transport.close.bind(transport);
+  transport.close = async (): Promise<void> => {
+    try {
+      await origClose();
+    } finally {
+      closed = true;
+      flush();
+    }
+  };
+  return flush;
+}
+
 export interface InstrumentStdioTransportOptions {
   onPid(pid: number): void;
   onStderrLine(line: string): void;
@@ -98,8 +162,7 @@ export interface InstrumentStdioTransportOptions {
 
 /**
  * Wrap a `StdioClientTransport` to capture its child PID as soon as it spawns,
- * memoize `close()` across duplicate calls, and wire `stderr` through
- * `createLineSplitter`.
+ * memoize `close()` across duplicate calls, and wire `stderr` through `instrumentStderr`.
  */
 export function instrumentStdioTransport(
   transport: StdioClientTransport,
@@ -111,7 +174,9 @@ export function instrumentStdioTransport(
   const spawnedProcess = (): ChildProcess | undefined =>
     (transport as unknown as { _process?: ChildProcess })._process;
 
-  let flushStderr: (() => void) | null = null;
+  // Wire stderr first: `instrumentStderr` wraps `close()` with the flush, and the memoization
+  // below has to sit on top of that wrapper.
+  const flushStderr = instrumentStderr(transport, onStderrLine);
 
   const recordProcess = (proc: ChildProcess | undefined): void => {
     if (!proc?.pid) return;
@@ -149,34 +214,10 @@ export function instrumentStdioTransport(
   const origClose = transport.close.bind(transport);
   transport.close = () => {
     if (!closePromise) {
-      // WHY: `StdioClientTransport.close()` never ends its `PassThrough` stderr stream — it only
-      // waits (bounded) for the child's 'close' event. A descendant that inherited the stderr
-      // write end keeps that event from ever firing, so a line written without a trailing
-      // newline stays trapped in the splitter's remainder and never reaches the server log.
-      // Flushing when close settles makes the transport boundary itself guarantee the child's
-      // last words, instead of relying on every caller remembering `destroyStdioStreams()`.
-      // Safe to flush here even if bytes are still in flight: `end()` is idempotent, and the
-      // next `write()` re-opens the latch so the stream's own 'end'/'close' flushes the rest.
-      closePromise = origClose().finally(() => flushStderr?.());
+      closePromise = origClose();
     }
     return closePromise;
   };
-
-  if (transport.stderr) {
-    const splitter = createLineSplitter(onStderrLine);
-    transport.stderr.on("data", (chunk: Buffer) => {
-      splitter.write(chunk);
-    });
-    // WHY: teardown flushes provisionally. Bytes written just before the child died can still be
-    // in the pipe, so finalising the UTF-8 decoder here would corrupt a character split across
-    // the boundary; the stream's own 'end'/'close' is what really finalises it.
-    const flush = (): void => {
-      splitter.flush();
-    };
-    flushStderr = flush;
-    transport.stderr.on("end", () => splitter.end());
-    transport.stderr.on("close", () => splitter.end());
-  }
 }
 
 /**

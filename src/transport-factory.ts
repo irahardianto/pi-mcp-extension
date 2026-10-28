@@ -18,7 +18,7 @@ import type { ServerConfig } from "./config.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import { isAuthorizationHeader, stripAuthorizationHeader } from "./auth-challenge.js";
 import { reportDiagnostic } from "./debug-log.js";
-import { createLineSplitter } from "./stdio-process.js";
+import { instrumentStderr } from "./stdio-process.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
 function resolveEnv(extra?: Record<string, string>): Record<string, string> {
@@ -55,20 +55,18 @@ function createOAuthProvider(
   });
 }
 
+/**
+ * Route a `createTransport(..., onStderr)` caller's stderr through the shared instrumentation.
+ *
+ * WHY: this used to keep its own line splitter that only flushed on the stream's 'end'/'close',
+ * so on this path a partial line written before a close was dropped — the same defect
+ * `instrumentStderr` fixes for `ServerManager` (#206).
+ */
 function wireStdioStderr(transport: StdioClientTransport, onStderr: (line: string) => void): void {
-  if (!transport.stderr) return;
-  const splitter = createLineSplitter((rawLine) => {
+  instrumentStderr(transport, (rawLine) => {
     const clean = sanitizeTerminalText(rawLine);
     if (clean) onStderr(clean);
   });
-  transport.stderr.on("data", (chunk: Buffer) => {
-    splitter.write(chunk);
-  });
-  const flush = (): void => {
-    splitter.end();
-  };
-  transport.stderr.on("end", flush);
-  transport.stderr.on("close", flush);
 }
 
 /** Expand a leading `~` / `~/` / `~\` to the home directory, the way Pi resolves a config `cwd`. */

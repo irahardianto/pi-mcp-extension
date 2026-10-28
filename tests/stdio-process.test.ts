@@ -278,8 +278,12 @@ describe("stdio-process", () => {
       assert.deepEqual(lines, ["first partial"]);
 
       // Bytes that were still in flight when close() settled must not be lost, and must not be
-      // re-emitted as part of the already-flushed line.
+      // re-emitted as part of the already-flushed line. Nothing ends the stream here — the SDK
+      // never does when a descendant holds the pipe — so the post-close chunk must flush itself.
       stderrStream.emit("data", Buffer.from("second line\nthird partial", "utf8"));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
+
       stderrStream.emit("end");
       assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
     });
@@ -311,8 +315,9 @@ describe("stdio-process", () => {
       // half-decoded character with U+FFFD and corrupt the line.
       assert.deepEqual(lines, ["fatal "]);
 
+      // The completing bytes arrive after close and the stream never ends: they must be flushed
+      // on arrival, and must decode without replacement characters.
       stderrStream.emit("data", payload.subarray(8));
-      stderrStream.emit("end");
       assert.deepEqual(lines, ["fatal ", "🚀"]);
       assert.ok(
         lines.every((line) => !line.includes("\uFFFD")),

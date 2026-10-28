@@ -92,6 +92,26 @@ async function sentHeaders(
   }
 }
 
+describe("createTransport stdio stderr wiring", () => {
+  it("flushes a partial stderr line when the transport closes (#206)", async () => {
+    const lines: string[] = [];
+    const transport = createTransport(
+      "srv",
+      { transport: "stdio", command: process.execPath, args: [], lifecycle: "lazy" },
+      (line) => lines.push(line),
+    ) as unknown as { stderr: NodeJS.WritableStream | null; close(): Promise<void> };
+
+    // A diagnostic with no trailing newline stays in the splitter until something flushes it;
+    // the SDK never ends this PassThrough, so only the close-time flush can release it.
+    transport.stderr?.write(Buffer.from("FATAL: Missing API_KEY", "utf8"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(lines, []);
+
+    await transport.close();
+    assert.deepEqual(lines, ["FATAL: Missing API_KEY"]);
+  });
+});
+
 describe("createTransport with OAuth configured", () => {
   for (const transport of ["streamable-http", "sse"] as const) {
     it(`${transport}: a static Authorization header never replaces the OAuth bearer`, async () => {
