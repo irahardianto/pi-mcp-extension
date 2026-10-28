@@ -839,20 +839,21 @@ await server.connect(new StdioServerTransport());
       assert.ok(logsWhileRunning.includes("Boot 🚀 ok"), `Expected 'Boot 🚀 ok', got: ${logsWhileRunning}`);
       assert.ok(!logsWhileRunning.includes("\ufffd"), "Must not contain replacement character");
       assert.ok(!logsWhileRunning.includes("\x1b"), "Must not contain ESC control characters");
-      // A child server that echoes a credential on stderr must not surface it in the buffer
-      // that `/mcp <name>` prints and `getServerLogs` returns.
-      assert.ok(
-        logsWhileRunning.includes("x-api-key: [REDACTED]"),
-        `Expected the stderr buffer to mask credentials, got: ${logsWhileRunning}`,
-      );
-      assert.ok(
-        !logsWhileRunning.includes("s3cr3t-VALUE"),
-        `Credential leaked into the stderr buffer: ${logsWhileRunning}`,
-      );
 
       await manager.stopServer("stderrSrv");
       const logsAfterStop = manager.getServerLogs("stderrSrv");
       assert.ok(logsAfterStop.includes("trailing-without-newline"), `Expected flushed trailing stderr line, got: ${logsAfterStop}`);
+      // A child server that echoes a credential on stderr must not surface it in the buffer
+      // that `/mcp <name>` prints and `getServerLogs` returns. Asserted after the stop so the
+      // whole buffer is settled — the stderr lines arrive asynchronously from the child.
+      assert.ok(
+        logsAfterStop.includes("x-api-key: [REDACTED]"),
+        `Expected the stderr buffer to mask credentials, got: ${logsAfterStop}`,
+      );
+      assert.ok(
+        !logsAfterStop.includes("s3cr3t-VALUE"),
+        `Credential leaked into the stderr buffer: ${logsAfterStop}`,
+      );
     } finally {
       await manager.shutdownAll();
       await rm(dir, { recursive: true, force: true });
