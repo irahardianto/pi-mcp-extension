@@ -21,16 +21,32 @@ const execFileAsync = promisify(execFile);
 
 export interface LineSplitter {
   write(chunk: Buffer): void;
+  /** Emit the decoded remainder without finalising the decoder (teardown paths). */
+  flush(): void;
+  /** Finalise the decoder (real EOF) and emit whatever is left. Idempotent. */
   end(): void;
 }
 
 /**
- * Create a pure UTF-8 `StringDecoder`-based line splitter with idempotent `end()`.
+ * Create a pure UTF-8 `StringDecoder`-based line splitter with an idempotent `end()`.
+ *
+ * `flush()` and `end()` differ on purpose: `flush()` emits what has already been decoded and
+ * leaves an incomplete UTF-8 sequence buffered inside the decoder, while `end()` is terminal
+ * and replaces such a sequence with U+FFFD. Teardown uses `flush()` because bytes can still
+ * arrive after a forced close, and finalising the decoder first would turn a character split
+ * across that boundary into replacement characters.
  */
 export function createLineSplitter(onLine: (line: string) => void): LineSplitter {
   const decoder = new StringDecoder("utf8");
   let remainder = "";
   let flushed = false;
+
+  const emitRemainder = (): void => {
+    if (!remainder) return;
+    const trailing = remainder;
+    remainder = "";
+    onLine(trailing);
+  };
 
   return {
     write(chunk: Buffer): void {
@@ -42,15 +58,14 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
         onLine(rawLine);
       }
     },
+    flush(): void {
+      emitRemainder();
+    },
     end(): void {
       if (flushed) return;
       flushed = true;
       remainder += decoder.end();
-      if (remainder) {
-        const trailing = remainder;
-        remainder = "";
-        onLine(trailing);
-      }
+      emitRemainder();
     },
   };
 }
@@ -59,6 +74,16 @@ export function createLineSplitter(onLine: (line: string) => void): LineSplitter
 
 /** Grace window for an exited child's pipes to drain naturally before force-destroying them. */
 const PIPE_DRAIN_GRACE_MS = 100;
+
+/**
+ * How long a closed transport's stderr stream must stay quiet before its unterminated remainder
+ * is emitted.
+ *
+ * WHY: nothing ends the SDK's stderr `PassThrough` after close, so the last line has to be
+ * released by us; waiting for silence instead of flushing each chunk keeps a line whole when its
+ * bytes arrive across several ticks, and still surfaces the last one promptly.
+ */
+export const POST_CLOSE_FLUSH_DELAY_MS = 100;
 
 interface StdioChildRecord {
   process: ChildProcess;
@@ -76,6 +101,81 @@ interface StdioChildRecord {
  */
 const childRecords = new WeakMap<object, StdioChildRecord>();
 
+/** A transport whose child stderr can be wired and whose `close()` can be wrapped. */
+interface StderrCarrier {
+  stderr?: unknown;
+  close(): Promise<void>;
+}
+
+/**
+ * Split a stdio transport's stderr into lines and make them survive `close()`.
+ *
+ * Returns the provisional flush that teardown paths call before destroying the pipes, or
+ * `null` when the transport has no stderr stream to read.
+ *
+ * WHY: `StdioClientTransport.close()` never ends its stderr `PassThrough` — it only waits
+ * (bounded) for the child's `'close'` event — and a descendant that inherited the stderr write
+ * end keeps that event from firing. A line written without a trailing newline would then stay
+ * in the splitter's remainder forever. Flushing when close settles, and again after
+ * `POST_CLOSE_FLUSH_DELAY_MS` of silence for any chunks that arrive afterwards (nothing will
+ * emit `'end'` to do it), keeps the child's last words.
+ * Both flushes are provisional: they must not finalise the decoder, because the bytes of a
+ * character can be split across the close boundary; only the stream's own `'end'`/`'close'`
+ * finalises it.
+ */
+export function instrumentStderr(
+  transport: StderrCarrier,
+  onLine: (line: string) => void,
+): (() => void) | null {
+  const stream = transport.stderr as NodeJS.EventEmitter | null | undefined;
+  if (!stream || typeof stream.on !== "function") return null;
+
+  const splitter = createLineSplitter(onLine);
+  let closed = false;
+  let idleFlush: NodeJS.Timeout | null = null;
+  const cancelIdleFlush = (): void => {
+    if (idleFlush) {
+      clearTimeout(idleFlush);
+      idleFlush = null;
+    }
+  };
+  const flush = (): void => {
+    cancelIdleFlush();
+    splitter.flush();
+  };
+  // WHY: after close settles nothing emits 'end', so a remainder nobody else will flush has to be
+  // released — but a single chunk boundary is not the end of a line. Waiting for the stream to go
+  // quiet keeps a line whose chunks straddle several ticks whole, while still surfacing the last
+  // unterminated one within POST_CLOSE_FLUSH_DELAY_MS.
+  const scheduleIdleFlush = (): void => {
+    cancelIdleFlush();
+    idleFlush = setTimeout(() => {
+      idleFlush = null;
+      splitter.flush();
+    }, POST_CLOSE_FLUSH_DELAY_MS);
+    idleFlush.unref();
+  };
+
+  stream.on("data", (chunk: Buffer) => {
+    splitter.write(chunk);
+    if (closed) scheduleIdleFlush();
+  });
+  const onStreamEnd = (): void => {
+    cancelIdleFlush();
+    splitter.end();
+  };
+  stream.on("end", onStreamEnd);
+  stream.on("close", onStreamEnd);
+
+  const origClose = transport.close.bind(transport);
+  transport.close = (): Promise<void> =>
+    origClose().finally(() => {
+      closed = true;
+      flush();
+    });
+  return flush;
+}
+
 export interface InstrumentStdioTransportOptions {
   onPid(pid: number): void;
   onStderrLine(line: string): void;
@@ -83,8 +183,7 @@ export interface InstrumentStdioTransportOptions {
 
 /**
  * Wrap a `StdioClientTransport` to capture its child PID as soon as it spawns,
- * memoize `close()` across duplicate calls, and wire `stderr` through
- * `createLineSplitter`.
+ * memoize `close()` across duplicate calls, and wire `stderr` through `instrumentStderr`.
  */
 export function instrumentStdioTransport(
   transport: StdioClientTransport,
@@ -96,7 +195,9 @@ export function instrumentStdioTransport(
   const spawnedProcess = (): ChildProcess | undefined =>
     (transport as unknown as { _process?: ChildProcess })._process;
 
-  let flushStderr: (() => void) | null = null;
+  // Wire stderr first: `instrumentStderr` wraps `close()` with the flush, and the memoization
+  // below has to sit on top of that wrapper.
+  const flushStderr = instrumentStderr(transport, onStderrLine);
 
   const recordProcess = (proc: ChildProcess | undefined): void => {
     if (!proc?.pid) return;
@@ -138,19 +239,6 @@ export function instrumentStdioTransport(
     }
     return closePromise;
   };
-
-  if (transport.stderr) {
-    const splitter = createLineSplitter(onStderrLine);
-    transport.stderr.on("data", (chunk: Buffer) => {
-      splitter.write(chunk);
-    });
-    const flush = (): void => {
-      splitter.end();
-    };
-    flushStderr = flush;
-    transport.stderr.on("end", flush);
-    transport.stderr.on("close", flush);
-  }
 }
 
 /**

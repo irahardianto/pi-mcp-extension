@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   createLineSplitter,
   destroyStdioStreams,
@@ -10,9 +14,14 @@ import {
   instrumentStdioTransport,
   isPidAlive,
   listDescendantPids,
+  POST_CLOSE_FLUSH_DELAY_MS,
   waitForChildClose,
   type StdioProcessDeps,
 } from "../src/stdio-process.js";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function createEsrchError(): NodeJS.ErrnoException {
   const err: NodeJS.ErrnoException = new Error("kill ESRCH");
@@ -74,6 +83,25 @@ describe("stdio-process", () => {
       splitter.end();
 
       assert.deepEqual(lines, ["launch 🚀 pad", "café"]);
+    });
+
+    it("flush() emits the decoded remainder without finalising a split UTF-8 character", () => {
+      const lines: string[] = [];
+      const splitter = createLineSplitter((line) => lines.push(line));
+      const payload = Buffer.from("fatal 🚀", "utf8");
+
+      // Cut inside the 4-byte emoji: the decoder holds the incomplete sequence.
+      splitter.write(payload.subarray(0, 8));
+      splitter.flush();
+      assert.deepEqual(lines, ["fatal "]);
+
+      splitter.write(payload.subarray(8));
+      splitter.end();
+      assert.deepEqual(lines, ["fatal ", "🚀"]);
+      assert.ok(
+        lines.every((line) => !line.includes("\uFFFD")),
+        `expected no replacement characters, got ${JSON.stringify(lines)}`,
+      );
     });
 
     it("does not emit on end() when there is no trailing remainder", () => {
@@ -172,6 +200,230 @@ describe("stdio-process", () => {
 
       await fakeTransport.start();
       assert.deepEqual(capturedPids, [7777]);
+    });
+
+    it("flushes a buffered partial stderr line when close() settles without the stream ending (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5050,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      // A line with no trailing newline stays buffered; nothing ends the stream here because
+      // the SDK's PassThrough is only ended by the child's own stderr reaching EOF.
+      stderrStream.emit("data", Buffer.from("FATAL: Missing API_KEY", "utf8"));
+      assert.deepEqual(lines, []);
+
+      await fakeTransport.close();
+      assert.deepEqual(lines, ["FATAL: Missing API_KEY"]);
+      assert.equal(stderrStream.listenerCount("end"), 1, "close() must not re-wire the stream");
+    });
+
+    it("still flushes the partial stderr line when close() rejects (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const closeFailure = new Error("close failed");
+      const fakeTransport = {
+        pid: 5051,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.reject(closeFailure);
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+      stderrStream.emit("data", Buffer.from("FATAL: crash during close", "utf8"));
+
+      await assert.rejects(() => fakeTransport.close(), closeFailure);
+      assert.deepEqual(lines, ["FATAL: crash during close"]);
+    });
+
+    it("keeps splitting chunks that arrive after the close-triggered flush (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5052,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      stderrStream.emit("data", Buffer.from("first partial", "utf8"));
+      await fakeTransport.close();
+      assert.deepEqual(lines, ["first partial"]);
+
+      // Bytes that were still in flight when close() settled must not be lost, and must not be
+      // re-emitted as part of the already-flushed line. Nothing ends the stream here — the SDK
+      // never does when a descendant holds the pipe — so the post-close remainder is released
+      // once the stream goes quiet.
+      stderrStream.emit("data", Buffer.from("second line\nthird partial", "utf8"));
+      await sleep(POST_CLOSE_FLUSH_DELAY_MS * 2);
+      assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
+
+      stderrStream.emit("end");
+      assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
+    });
+
+    it("keeps a post-close line whole when its chunks arrive in different ticks (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5054,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+      await fakeTransport.close();
+
+      // A chunk boundary must not become a line boundary: one line, two ticks.
+      stderrStream.emit("data", Buffer.from("hel", "utf8"));
+      await new Promise((resolve) => setImmediate(resolve));
+      stderrStream.emit("data", Buffer.from("lo\n", "utf8"));
+      await sleep(POST_CLOSE_FLUSH_DELAY_MS * 2);
+
+      assert.deepEqual(lines, ["hello"]);
+    });
+
+    it("does not corrupt a UTF-8 character split across the close boundary (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5053,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      const payload = Buffer.from("fatal 🚀", "utf8");
+      stderrStream.emit("data", payload.subarray(0, 8)); // ends inside the emoji
+      await fakeTransport.close();
+      // The close-time flush must be provisional: finalising the decoder here would replace the
+      // half-decoded character with U+FFFD and corrupt the line.
+      assert.deepEqual(lines, ["fatal "]);
+
+      // The completing bytes arrive after close with no trailing newline and the stream never
+      // ends: the post-close quiet-window flush must release them intact without U+FFFD.
+      stderrStream.emit("data", payload.subarray(8));
+      await sleep(POST_CLOSE_FLUSH_DELAY_MS * 2);
+      assert.deepEqual(lines, ["fatal ", "🚀"]);
+      assert.ok(
+        lines.every((line) => !line.includes("\uFFFD")),
+        `expected no replacement characters, got ${JSON.stringify(lines)}`,
+      );
+    });
+
+    it("flushes the partial stderr line on close when a grandchild keeps the pipe open (#206)", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-stderr-flush-"));
+      const pidFile = join(dir, "grandchild.pid");
+      const wrapperScript = join(dir, "wrapper.mjs");
+
+      await writeFile(
+        wrapperScript,
+        `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+process.stderr.write("FATAL: Missing API_KEY (no newline)");
+// A wrapper such as npx / uvx: the MCP server is a grandchild that inherits the wrapper's
+// stderr write end, so the wrapper's own 'close' event never fires while the grandchild lives
+// and the SDK never ends its stderr PassThrough.
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: ["ignore", "ignore", "inherit"],
+  detached: true,
+});
+child.unref();
+writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+process.on("SIGTERM", () => {});
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`,
+      );
+
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [wrapperScript],
+        stderr: "pipe",
+      });
+      const lines: string[] = [];
+      instrumentStdioTransport(transport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+
+      let grandchildPid: number | undefined;
+      try {
+        await transport.start();
+        for (let i = 0; i < 100 && !existsSync(pidFile); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.ok(existsSync(pidFile), `Expected the grandchild PID file at ${pidFile}`);
+        grandchildPid = Number(await readFile(pidFile, "utf8"));
+        assert.ok(grandchildPid > 0, "Expected a grandchild PID");
+
+        // No 'end'/'close' will ever fire: the grandchild holds the pipe. Only close() can
+        // release the buffered line.
+        await transport.close();
+        assert.deepEqual(lines, ["FATAL: Missing API_KEY (no newline)"]);
+      } finally {
+        if (grandchildPid) {
+          try {
+            process.kill(grandchildPid, "SIGKILL");
+          } catch {
+            // WHY: The grandchild may already be gone (killed with the wrapper on some platforms).
+          }
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
     });
   });
 
@@ -590,8 +842,16 @@ describe("stdio-process", () => {
       stderrStream.emit("data", Buffer.from("no trailing newline", "utf8"));
       assert.deepEqual(lines, []);
 
-      destroyStdioStreams(fakeTransport);
+      await fakeTransport.close();
       assert.deepEqual(lines, ["no trailing newline"]);
+
+      // A post-close chunk schedules the quiet-window timer; destroyStdioStreams must flush it
+      // immediately and cancel the pending timer before destroying the pipes.
+      stderrStream.emit("data", Buffer.from("post-close trailing", "utf8"));
+      assert.deepEqual(lines, ["no trailing newline"]);
+
+      destroyStdioStreams(fakeTransport);
+      assert.deepEqual(lines, ["no trailing newline", "post-close trailing"]);
       assert.deepEqual(destroyed, ["stdout", "stderr"]);
     });
 
