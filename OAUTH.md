@@ -134,7 +134,7 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### OAuth Provider
 
-- **Files**: `src/oauth-provider.ts`, `src/oauth-state-store.ts`, `src/oauth-status.ts`, `src/auth-lock.ts`
+- **Files**: `src/oauth-provider.ts`, `src/oauth-state-store.ts`, `src/oauth-status.ts`, `src/auth-lock.ts`, `src/auth-lock-policy.ts`
 - **Implements**: `OAuthClientProvider` from MCP SDK
 - **Key Methods**:
   - `redirectUrl` - Returns the callback server URL
@@ -144,7 +144,7 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### Auth Flow
 
-- **Files**: `src/authorize-flow.ts`, `src/authorize-dialog.ts`, `src/connection-coordinator.ts` (triggered from `src/index.ts` for `mcp_connect` and `src/register-commands.ts` for `/mcp:start` and `/mcp:auth`)
+- **Files**: `src/authorize-flow.ts`, `src/authorize-dialog.ts`, `src/auth-challenge.ts`, `src/startup-auth.ts`, `src/connection-coordinator.ts` (triggered from `src/index.ts` for `mcp_connect` and `src/register-commands.ts` for `/mcp:start` and `/mcp:auth`)
 - **Steps**:
   1. Try the stored credentials and silent refresh during the connection
   2. If browser authorization is needed in an interactive session, acquire the auth lock and start the callback server
@@ -163,7 +163,7 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 3. **Authorization URL Scheme Validation** - Only `https:` (or loopback `http:`) authorization URLs are passed to the system browser opener
 4. **Loopback Only** - The callback server listens only on a local loopback address
 5. **File Permissions** - The auth directory uses `0700` and state files use `0600` where POSIX permissions apply
-6. **Secret Handling** - Authorization codes and tokens are not written to logs
+6. **Secret Handling** - Authorization codes, tokens, PKCE verifiers, and credentials are never written to logs (and are masked by the [`PI_MCP_DEBUG=1` redactor](./README.md#debug-log))
 
 ## Troubleshooting
 
