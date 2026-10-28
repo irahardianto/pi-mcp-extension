@@ -134,7 +134,15 @@ export function instrumentStdioTransport(
   const origClose = transport.close.bind(transport);
   transport.close = () => {
     if (!closePromise) {
-      closePromise = origClose();
+      // WHY: `StdioClientTransport.close()` never ends its `PassThrough` stderr stream — it only
+      // waits (bounded) for the child's 'close' event. A descendant that inherited the stderr
+      // write end keeps that event from ever firing, so a line written without a trailing
+      // newline stays trapped in the splitter's remainder and never reaches the server log.
+      // Flushing when close settles makes the transport boundary itself guarantee the child's
+      // last words, instead of relying on every caller remembering `destroyStdioStreams()`.
+      // Safe to flush here even if bytes are still in flight: `end()` is idempotent, and the
+      // next `write()` re-opens the latch so the stream's own 'end'/'close' flushes the rest.
+      closePromise = origClose().finally(() => flushStderr?.());
     }
     return closePromise;
   };

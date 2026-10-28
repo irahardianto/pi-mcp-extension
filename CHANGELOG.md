@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A `stdio` server's final stderr line is no longer lost when it is written without a trailing newline and the process closes before its stderr reaches EOF: closing the transport now flushes the buffered partial line, so the fatal message that explains a timeout (e.g. `FATAL: Missing API_KEY`) still appears in `/mcp <name>` recent output and `getServerLogs`. `StdioClientTransport.close()` never ends its stderr `PassThrough` — it only waits, bounded, for the child's `'close'` event — and a descendant that inherited the stderr write end keeps that event from firing, so nothing flushed the splitter's remainder once teardown was bypassed. The flush now lives at the transport boundary instead of only in `destroyStdioStreams()`, and a chunk that arrives after the close-time flush is still split and flushed when the stream finally ends (#206).
+
 ## [1.11.6] - 2026-10-28
 
 ### Fixed

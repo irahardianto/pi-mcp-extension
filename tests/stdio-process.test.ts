@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   createLineSplitter,
   destroyStdioStreams,
@@ -172,6 +176,157 @@ describe("stdio-process", () => {
 
       await fakeTransport.start();
       assert.deepEqual(capturedPids, [7777]);
+    });
+
+    it("flushes a buffered partial stderr line when close() settles without the stream ending (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5050,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      // A line with no trailing newline stays buffered; nothing ends the stream here because
+      // the SDK's PassThrough is only ended by the child's own stderr reaching EOF.
+      stderrStream.emit("data", Buffer.from("FATAL: Missing API_KEY", "utf8"));
+      assert.deepEqual(lines, []);
+
+      await fakeTransport.close();
+      assert.deepEqual(lines, ["FATAL: Missing API_KEY"]);
+      assert.equal(stderrStream.listenerCount("end"), 1, "close() must not re-wire the stream");
+    });
+
+    it("still flushes the partial stderr line when close() rejects (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const closeFailure = new Error("close failed");
+      const fakeTransport = {
+        pid: 5051,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.reject(closeFailure);
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+      stderrStream.emit("data", Buffer.from("FATAL: crash during close", "utf8"));
+
+      await assert.rejects(() => fakeTransport.close(), closeFailure);
+      assert.deepEqual(lines, ["FATAL: crash during close"]);
+    });
+
+    it("keeps splitting chunks that arrive after the close-triggered flush (#206)", async () => {
+      const stderrStream = new EventEmitter();
+      const lines: string[] = [];
+      const fakeTransport = {
+        pid: 5052,
+        stderr: stderrStream,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      } as unknown as StdioClientTransport;
+
+      instrumentStdioTransport(fakeTransport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+      await fakeTransport.start();
+
+      stderrStream.emit("data", Buffer.from("first partial", "utf8"));
+      await fakeTransport.close();
+      assert.deepEqual(lines, ["first partial"]);
+
+      // Bytes that were still in flight when close() settled must not be lost, and must not be
+      // re-emitted as part of the already-flushed line.
+      stderrStream.emit("data", Buffer.from("second line\nthird partial", "utf8"));
+      stderrStream.emit("end");
+      assert.deepEqual(lines, ["first partial", "second line", "third partial"]);
+    });
+
+    it("flushes the partial stderr line on close when a grandchild keeps the pipe open (#206)", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-stderr-flush-"));
+      const pidFile = join(dir, "grandchild.pid");
+      const wrapperScript = join(dir, "wrapper.mjs");
+
+      await writeFile(
+        wrapperScript,
+        `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+process.stderr.write("FATAL: Missing API_KEY (no newline)");
+// A wrapper such as npx / uvx: the MCP server is a grandchild that inherits the wrapper's
+// stderr write end, so the wrapper's own 'close' event never fires while the grandchild lives
+// and the SDK never ends its stderr PassThrough.
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: ["ignore", "ignore", "inherit"],
+  detached: true,
+});
+child.unref();
+writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+process.on("SIGTERM", () => {});
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`,
+      );
+
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [wrapperScript],
+        stderr: "pipe",
+      });
+      const lines: string[] = [];
+      instrumentStdioTransport(transport, {
+        onPid: () => {},
+        onStderrLine: (line) => lines.push(line),
+      });
+
+      let grandchildPid: number | undefined;
+      try {
+        await transport.start();
+        for (let i = 0; i < 100 && !existsSync(pidFile); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.ok(existsSync(pidFile), `Expected the grandchild PID file at ${pidFile}`);
+        grandchildPid = Number(await readFile(pidFile, "utf8"));
+        assert.ok(grandchildPid > 0, "Expected a grandchild PID");
+
+        // No 'end'/'close' will ever fire: the grandchild holds the pipe. Only close() can
+        // release the buffered line.
+        await transport.close();
+        assert.deepEqual(lines, ["FATAL: Missing API_KEY (no newline)"]);
+      } finally {
+        if (grandchildPid) {
+          try {
+            process.kill(grandchildPid, "SIGKILL");
+          } catch {
+            // WHY: The grandchild may already be gone (killed with the wrapper on some platforms).
+          }
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
     });
   });
 
