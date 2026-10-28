@@ -87,12 +87,13 @@ const SECRET_KEY_PATTERN = new RegExp(
 );
 
 /**
- * `?code=…`, `&api_key=…`, `?token=…` — query parameters on a server URL. The value needs at
- * least one character, so an empty parameter stays as it is and both this pattern and
- * `readCredentialValue` treat "nothing to mask" the same way.
+ * `?code=…`, `&api_key=…`, `?token=…` — query parameters on a server URL. Matched as a
+ * key/separator prefix so `maskCredentialValues` applies the same delimiter-aware value reader
+ * as `SECRET_KEY_PATTERN` (preserving apostrophes inside a secret and stopping before closing
+ * quotes, brackets, or the next `&name=` parameter).
  */
 const QUERY_SECRET_PATTERN = new RegExp(
-  String.raw`([?&](?:${QUERY_SECRET_NAME})=)[^&\s"']+`,
+  String.raw`([?&](?:[A-Za-z0-9_.\-]*[_-])?(?:${QUERY_SECRET_NAME})=)`,
   "gi",
 );
 
@@ -110,19 +111,53 @@ const AUTHORIZATION_PATTERN = new RegExp(
 const BEARER_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9\-._~+/=]{8,}/gi;
 
 /** `https://user:password@mcp.example.com/mcp` — userinfo credentials in a URL. */
-const URL_CREDENTIALS_PATTERN = /(https?:\/\/[^/\s:@]+:)[^/\s@]+(@)/gi;
+const URL_CREDENTIALS_PATTERN = /(https?:\/\/[^/\s?#@:"']+:)[^/\s?#@]+(@)/gi;
 
-/** Characters that end an unquoted credential value. Brackets are paired so a mask never
- * leaves an orphaned closing delimiter behind. */
-const UNQUOTED_VALUE_TERMINATORS = new Set([" ", "\t", "\n", "\r", "\f", "\v", ";", ",", "{", "}", "(", ")"]);
+/**
+ * Characters that end an unquoted credential value. Brackets (`()`, `{}`, `[]`), double quotes,
+ * and backslash escapes (`\"`) terminate so a mask never swallows an enclosing JSON string or
+ * bracketed clause.
+ */
+const UNQUOTED_VALUE_TERMINATORS = new Set([
+  " ",
+  "\t",
+  "\n",
+  "\r",
+  "\f",
+  "\v",
+  ";",
+  ",",
+  "{",
+  "}",
+  "(",
+  ")",
+  "[",
+  "]",
+  '"',
+  "\\",
+]);
 
 /**
  * Characters that end an unquoted Authorization value. Whitespace is not a terminator: an
  * unknown scheme's value can contain spaces, and stopping at the first one would mask the
- * scheme token and leave the credential behind it in the log. Brackets still terminate, so
- * `(Authorization: ApiKey …) 401` keeps the status code that follows the credential.
+ * scheme token and leave the credential behind it in the log. Brackets and quotes still
+ * terminate, so `(Authorization: ApiKey …) 401` and `[Authorization: Bearer …] 401` keep the
+ * status code that follows the credential.
  */
-const AUTHORIZATION_VALUE_TERMINATORS = new Set(["\n", "\r", ";", ",", "(", ")", "{", "}"]);
+const AUTHORIZATION_VALUE_TERMINATORS = new Set([
+  "\n",
+  "\r",
+  ";",
+  ",",
+  "(",
+  ")",
+  "{",
+  "}",
+  "[",
+  "]",
+  '"',
+  "\\",
+]);
 
 /** `&name=` — a query separator rather than part of an unquoted value. */
 const QUERY_SEPARATOR_PATTERN = /&[A-Za-z0-9_.\-]+=/y;
@@ -134,21 +169,20 @@ interface CredentialValue {
 }
 
 /**
- * Skip the quoted string that opens at `start`. Returns the index just past its closing quote,
- * or the end of the text when it is unterminated. Backslash escapes are skipped so a `\"` inside
- * the string cannot close it.
+ * Return the quote delimiter (`"`, `'`, `\"`, or `\'`) that opens at `index`, or `undefined`
+ * when `index` does not start a quoted string.
  */
-function skipQuoted(text: string, start: number): number {
-  const quote = text.charAt(start);
-  let index = start + 1;
-  while (index < text.length) {
-    if (text.startsWith(quote, index)) return index + 1;
-    index += text.charAt(index) === "\\" ? 2 : 1;
-  }
-  return text.length;
+function openingQuoteAt(text: string, index: number): string | undefined {
+  const char = text.charAt(index);
+  if (char === '"' || char === "'") return char;
+  const next = char === "\\" ? text.charAt(index + 1) : "";
+  return next === '"' || next === "'" ? text.slice(index, index + 2) : undefined;
 }
 
-/** A quoted value runs from its opening delimiter to the matching one. */
+/**
+ * A quoted value runs from its opening delimiter (`"`, `'`, `\"`, or `\'`) to the matching one,
+ * or to the end of the text when unterminated. Backslash escapes inside the string are skipped.
+ */
 function readQuotedValue(text: string, start: number, opening: string): CredentialValue {
   let index = start + opening.length;
   while (index < text.length) {
@@ -160,19 +194,21 @@ function readQuotedValue(text: string, start: number, opening: string): Credenti
 
 /**
  * A `{`/`[` value runs to its matching bracket, so a nested credential object or array is masked
- * as one unit. Quoted strings inside it are skipped, or a bracket inside a string value would
- * close the structure early and leave the rest of the secret in the log.
+ * as one unit. Quoted strings (including JSON-escaped `\"...\"`) inside it are skipped, or a
+ * bracket inside a string value would close the structure early and leave the rest of the secret
+ * in the log.
  */
 function readStructuredValue(text: string, start: number, opening: string): CredentialValue {
   const closing = opening === "{" ? "}" : "]";
   let depth = 0;
   let index = start;
   while (index < text.length) {
-    const char = text.charAt(index);
-    if (char === '"' || char === "'") {
-      index = skipQuoted(text, index);
+    const quote = openingQuoteAt(text, index);
+    if (quote) {
+      index = readQuotedValue(text, index, quote).end;
       continue;
     }
+    const char = text.charAt(index);
     if (char === opening) {
       depth += 1;
     } else if (char === closing) {
@@ -215,11 +251,9 @@ function readCredentialValue(
 ): CredentialValue | undefined {
   // An out-of-range start yields an empty opening and falls through to `readBareValue`, which
   // returns `undefined` for an empty value.
+  const quote = openingQuoteAt(text, start);
+  if (quote) return readQuotedValue(text, start, quote);
   const opening = text.charAt(start);
-  if (opening === "\\" && (text.charAt(start + 1) === '"' || text.charAt(start + 1) === "'")) {
-    return readQuotedValue(text, start, text.slice(start, start + 2));
-  }
-  if (opening === '"' || opening === "'") return readQuotedValue(text, start, opening);
   if (opening === "{" || opening === "[") return readStructuredValue(text, start, opening);
   return readBareValue(text, start, terminators);
 }
@@ -264,9 +298,13 @@ function maskCredentialValues(
 export function redactSecrets(text: string): string {
   let out = text;
   out = out.replace(URL_CREDENTIALS_PATTERN, "$1[REDACTED]$2");
-  out = maskCredentialValues(out, SECRET_KEY_PATTERN);
+  // WHY: `AUTHORIZATION_PATTERN` must run before `SECRET_KEY_PATTERN` because scheme names
+  // like `ApiKey` and `Token` are also in `SECRET_KEY_NAME`; if a credential after
+  // `Authorization: ApiKey ` starts with `=` or `:`, running `SECRET_KEY_PATTERN` first
+  // would treat `ApiKey =…` as a key/value pair and leave a double `[REDACTED][REDACTED]`.
   out = maskCredentialValues(out, AUTHORIZATION_PATTERN, AUTHORIZATION_VALUE_TERMINATORS);
-  out = out.replace(QUERY_SECRET_PATTERN, "$1[REDACTED]");
+  out = maskCredentialValues(out, SECRET_KEY_PATTERN);
+  out = maskCredentialValues(out, QUERY_SECRET_PATTERN);
   out = out.replace(BEARER_PATTERN, "$1 [REDACTED]");
   return out;
 }

@@ -14,6 +14,7 @@ import {
   type ConnectionCoordinator,
   formatErrorMessage,
 } from "./connection-coordinator.js";
+import { sanitizeLogText } from "./debug-log.js";
 import { AuthCancelledError } from "./errors.js";
 import type { ManagedServer, ServerManager } from "./server-manager.js";
 import { lookupServerSource, type ConfigProvenance } from "./server-provenance.js";
@@ -136,7 +137,7 @@ async function handleMcpAuth(
     ctx.ui.notify(`pi-mcp: ${name} ready`, "info");
   } catch (err) {
     ctx.ui.notify(
-      `pi-mcp: ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`,
+      `pi-mcp: ${sanitizeLogText(err instanceof Error ? err.message : String(err), 500)}`,
       err instanceof AuthCancelledError ? "info" : "error",
     );
   }

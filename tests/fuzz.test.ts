@@ -1062,34 +1062,86 @@ const queryName = fc.constantFrom(
   "auth",
 );
 
-const credentialCarriers: Array<fc.Arbitrary<{ text: string; secret: string }>> = [
-  fc.tuple(credentialKey, bareSecret).map(([key, secret]) => ({ text: `${key}=${secret}`, secret })),
-  fc.tuple(credentialKey, bareSecret).map(([key, secret]) => ({ text: `${key}: ${secret}`, secret })),
+const credentialCarriers: Array<fc.Arbitrary<{ text: string; secret: string; expected: string }>> = [
+  fc.tuple(credentialKey, bareSecret).map(([key, secret]) => ({
+    text: `${key}=${secret}`,
+    secret,
+    expected: `${key}=[REDACTED]`,
+  })),
+  fc.tuple(credentialKey, bareSecret).map(([key, secret]) => ({
+    text: `[${key}: ${secret}]`,
+    secret,
+    expected: `[${key}: [REDACTED]]`,
+  })),
   fc
     .tuple(prefixedKey, quotedSecret)
-    .map(([key, secret]) => ({ text: `{"${key}":"${secret}"}`, secret })),
+    .map(([key, secret]) => ({
+      text: `{"${key}":"${secret}"}`,
+      secret,
+      expected: `{"${key}":"[REDACTED]"}`,
+    })),
   // WHY the filter: inside a single-quoted value an apostrophe is indistinguishable from the
   // closing delimiter, so that carrier only carries secrets without one. The JSON and
   // double-quoted carriers below do exercise apostrophes.
   fc
     .tuple(prefixedKey, quotedSecret.filter((secret) => !secret.includes("'")))
-    .map(([key, secret]) => ({ text: `'${key}': '${secret}'`, secret })),
+    .map(([key, secret]) => ({
+      text: `'${key}': '${secret}'`,
+      secret,
+      expected: `'${key}': '[REDACTED]'`,
+    })),
   fc
     .tuple(queryName, bareSecret)
-    .map(([key, secret]) => ({ text: `https://mcp.example.com/sse?${key}=${secret}&mode=fast`, secret })),
+    .map(([key, secret]) => ({
+      text: `https://mcp.example.com/sse?${key}=${secret}&mode=fast`,
+      secret,
+      expected: `https://mcp.example.com/sse?${key}=[REDACTED]&mode=fast`,
+    })),
+  fc
+    .tuple(queryName, bareSecret)
+    .map(([key, secret]) => ({
+      text: `{"url":"https://mcp.example.com/sse?${key}=${secret}","status":401}`,
+      secret,
+      expected: `{"url":"https://mcp.example.com/sse?${key}=[REDACTED]","status":401}`,
+    })),
   fc
     .tuple(authScheme, bareSecret)
-    .map(([scheme, secret]) => ({ text: `Authorization: ${scheme} ${secret}`, secret })),
+    .map(([scheme, secret]) => ({
+      text: `[Authorization: ${scheme} ${secret}] 401`,
+      secret,
+      expected: `[Authorization: ${scheme} [REDACTED]] 401`,
+    })),
   fc
     .tuple(authScheme, quotedSecret)
-    .map(([scheme, secret]) => ({ text: `{"Authorization": "${scheme} ${secret}"}`, secret })),
-  quotedSecret.map((secret) => ({ text: `{"token":{"value":"${secret}"}}`, secret })),
-  quotedSecret.map((secret) => ({ text: `{"api_key":["${secret}"]}`, secret })),
+    .map(([scheme, secret]) => ({
+      text: `{"Authorization": "${scheme} ${secret}"}`,
+      secret,
+      expected: `{"Authorization": "[REDACTED]"}`,
+    })),
+  quotedSecret.map((secret) => ({
+    text: `{"token":{"value":"${secret}"}}`,
+    secret,
+    expected: `{"token":[REDACTED]}`,
+  })),
+  quotedSecret.map((secret) => ({
+    text: `{\\"token\\":{\\"value\\":\\"${secret}\\"},\\"ok\\":true}`,
+    secret,
+    expected: `{\\"token\\":[REDACTED],\\"ok\\":true}`,
+  })),
+  quotedSecret.map((secret) => ({
+    text: `{"api_key":["${secret}"]}`,
+    secret,
+    expected: `{"api_key":[REDACTED]}`,
+  })),
   // A URL userinfo password is percent-encoded in practice, so `@` and `/` are filtered out:
   // they would change the URL's own structure rather than the credential.
   bareSecret
     .filter((secret) => !secret.includes("@") && !secret.includes("/"))
-    .map((secret) => ({ text: `https://user:${secret}@mcp.example.com/mcp`, secret })),
+    .map((secret) => ({
+      text: `https://user:${secret}@mcp.example.com/mcp`,
+      secret,
+      expected: `https://user:[REDACTED]@mcp.example.com/mcp`,
+    })),
 ];
 
 describe("fuzz: redactSecrets", () => {
@@ -1113,15 +1165,15 @@ describe("fuzz: redactSecrets", () => {
     );
   });
 
-  it("always masks a generated credential in a generated carrier", () => {
+  it("always masks the full generated credential in a generated carrier without eating surrounding syntax", () => {
     fc.assert(
-      fc.property(fc.oneof(...credentialCarriers), ({ text, secret }) => {
+      fc.property(fc.oneof(...credentialCarriers), ({ text, secret, expected }) => {
         const redacted = redactSecrets(text);
         assert.ok(
           !redacted.includes(secret),
           `Secret leaked for ${JSON.stringify(text)}: ${JSON.stringify(redacted)}`,
         );
-        assert.ok(redacted.includes("[REDACTED]"), `Expected a mask in ${JSON.stringify(redacted)}`);
+        assert.equal(redacted, expected, `Unexpected redaction for ${JSON.stringify(text)}`);
       }),
       testOptions(),
     );

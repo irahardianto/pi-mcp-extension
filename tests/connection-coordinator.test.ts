@@ -357,10 +357,16 @@ describe("ConnectionCoordinator direct unit tests", () => {
     assert.ok(fakeBridge.removed.includes("oauthSrv"));
   });
 
-  it("formats error messages and strips AuthRequiredError prefix in formatErrorMessage", () => {
+  it("formats error messages, strips AuthRequiredError prefix, and masks credentials in formatErrorMessage", () => {
     assert.equal(formatErrorMessage(new Error("simple error")), "simple error");
     assert.equal(formatErrorMessage(new McpError("custom message", "srv", "connection")), "[srv] custom message");
     assert.equal(formatErrorMessage(new Error("AuthRequiredError: please log in")), "please log in");
+    assert.equal(
+      formatErrorMessage(
+        new McpError("connect failed after GET https://mcp.example.com/sse?api_key=s3cr3t-VALUE", "srv", "connection"),
+      ),
+      "[srv] connect failed after GET https://mcp.example.com/sse?api_key=[REDACTED]",
+    );
     assert.equal(startupAuthNowOption, "Authorize now");
     assert.equal(startupAuthLaterOption, "Not now");
   });

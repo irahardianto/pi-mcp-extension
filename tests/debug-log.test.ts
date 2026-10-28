@@ -187,7 +187,7 @@ describe("debug log", () => {
       ]);
     });
 
-    it("masks query-string secrets on MCP server URLs", () => {
+    it("masks query-string secrets on MCP server URLs, including apostrophes and surrounding JSON or brackets", () => {
       assertRedacted(
         [
           "api_key",
@@ -200,10 +200,36 @@ describe("debug log", () => {
           "accessToken",
           "refreshToken",
           "id_token",
+          "code",
+          "auth",
         ].map((name): [string, string] => [
-          `https://mcp.example.com/sse?${name}=${apiKey}&mode=fast`,
-          apiKey,
+          `https://mcp.example.com/sse?${name}=ab'cd${apiKey}&mode=fast`,
+          `ab'cd${apiKey}`,
         ]),
+      );
+      assert.equal(
+        redactSecrets(`https://mcp.example.com/sse?key=ab'cd${apiKey}&mode=fast`),
+        "https://mcp.example.com/sse?key=[REDACTED]&mode=fast",
+      );
+      assert.equal(
+        redactSecrets(`{"url":"https://mcp.example.com/sse?api_key=${apiKey}"}`),
+        '{"url":"https://mcp.example.com/sse?api_key=[REDACTED]"}',
+      );
+      assert.equal(
+        redactSecrets(`{"url":"https://mcp.example.com/sse?token=${apiKey}","status":401}`),
+        '{"url":"https://mcp.example.com/sse?token=[REDACTED]","status":401}',
+      );
+      assert.equal(
+        redactSecrets(`connect failed (https://mcp.example.com/sse?api_key=${apiKey})`),
+        "connect failed (https://mcp.example.com/sse?api_key=[REDACTED])",
+      );
+      assert.equal(
+        redactSecrets(`connect failed (https://mcp.example.com/sse?key=${apiKey})`),
+        "connect failed (https://mcp.example.com/sse?key=[REDACTED])",
+      );
+      assert.equal(
+        redactSecrets(`connect failed: https://mcp.example.com/sse?api_key=${apiKey}, retrying`),
+        "connect failed: https://mcp.example.com/sse?api_key=[REDACTED], retrying",
       );
     });
 
@@ -242,6 +268,10 @@ describe("debug log", () => {
       ]);
       assert.equal(redactSecrets(`{"token":{"value":"${apiKey}"}}`), '{"token":[REDACTED]}');
       assert.equal(redactSecrets(`{"password":"it's ${apiKey}"}`), '{"password":"[REDACTED]"}');
+      assert.equal(
+        redactSecrets(`{\\"token\\":{\\"value\\":\\"${apiKey}\\"},\\"ok\\":true}`),
+        '{\\"token\\":[REDACTED],\\"ok\\":true}',
+      );
     });
 
     it("masks compound credential names such as db_password and aws_secret_access_key", () => {
@@ -302,6 +332,18 @@ describe("debug log", () => {
       assert.equal(
         redactSecrets("failed (Authorization: ApiKey abc123) 401"),
         "failed (Authorization: ApiKey [REDACTED]) 401",
+      );
+      assert.equal(
+        redactSecrets("failed [Authorization: Bearer abc123] 401"),
+        "failed [Authorization: Bearer [REDACTED]] 401",
+      );
+      assert.equal(
+        redactSecrets("[Authorization: ApiKey =.0_==0.+] 401"),
+        "[Authorization: ApiKey [REDACTED]] 401",
+      );
+      assert.equal(
+        redactSecrets("[x-api-key: abc123]"),
+        "[x-api-key: [REDACTED]]",
       );
       // Brackets are paired: the mask never leaves an orphaned closing delimiter.
       assert.equal(redactSecrets("token=abc(x)"), "token=[REDACTED](x)");

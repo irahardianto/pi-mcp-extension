@@ -283,3 +283,62 @@ it("should report usage on bare /mcp:auth --reset, support leading /mcp:auth --r
   }
 });
 
+it("masks credentials in /mcp:auth failure notifications when the error quotes a URL secret", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-auth-redact-"));
+  const mockExt = createMockExtension();
+  const commands = mockExt.commands;
+  const events = mockExt.events;
+  const notifications: Array<{ msg: string; level?: string | undefined }> = [];
+  const ctx = createMockContext({
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (msg: string, level?: string) => notifications.push({ msg, level }),
+    },
+  });
+
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          "secret-oauth": {
+            lifecycle: "lazy",
+            transport: "streamable-http",
+            url: "http://127.0.0.1:1/mcp",
+            auth: { type: "oauth" },
+          },
+        },
+      }),
+    );
+
+    const failingCallbackServer = {
+      ensure: async () => {
+        throw new Error("callback failed for http://127.0.0.1:0/callback?token=s3cr3t-VALUE");
+      },
+      stop: async () => {},
+      cancel: () => {},
+    };
+
+    await extension(mockExt.api, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "missing.json"),
+      authStorageDir: join(dir, "auth"),
+      callbackServer: failingCallbackServer as never,
+    });
+    await events.get("session_start")({}, ctx);
+
+    notifications.length = 0;
+    await commands.get("mcp:auth").handler("secret-oauth --reset", ctx);
+    const authErrorMsg = notifications.at(-1)?.msg ?? "";
+    assert.ok(!authErrorMsg.includes("s3cr3t-VALUE"), `Secret leaked in /mcp:auth notification: ${authErrorMsg}`);
+    assert.ok(authErrorMsg.includes("?token=[REDACTED]"), `Expected redacted token in: ${authErrorMsg}`);
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+
