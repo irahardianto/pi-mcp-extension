@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#1E1B4B" />
+    </linearGradient>
+    <linearGradient id="strokeGrad" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.75" />
+      <stop offset="100%" stop-color="#818CF8" stop-opacity="0.75" />
+    </linearGradient>
+    <linearGradient id="piGrad" x1="12" y1="16" x2="40" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC" />
+      <stop offset="100%" stop-color="#CBD5E1" />
+    </linearGradient>
+    <linearGradient id="bridgeGrad" x1="33" y1="21" x2="52" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#34D399" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle background -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)" stroke="url(#strokeGrad)" stroke-width="2" />
+
+  <!-- Pi right leg transitioning into MCP protocol bridge -->
+  <path d="M33 32H45" stroke="#38BDF8" stroke-width="4" stroke-linecap="round" />
+  <path d="M33 21V38C33 42.4183 36.5817 46 41 46H45" stroke="url(#bridgeGrad)" stroke-width="4.5" stroke-linecap="round" />
+
+  <!-- Pi left leg and top bar (drawn over top join for a crisp cap) -->
+  <path d="M21 21V41C21 43.5 19.5 45.5 17 46.5" stroke="url(#piGrad)" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M13 21H41" stroke="url(#piGrad)" stroke-width="4.5" stroke-linecap="round" />
+
+  <!-- MCP protocol nodes -->
+  <circle cx="49" cy="32" r="4" fill="#0F172A" stroke="#38BDF8" stroke-width="3" />
+  <circle cx="49" cy="46" r="4" fill="#0F172A" stroke="#34D399" stroke-width="3" />
+</svg>
