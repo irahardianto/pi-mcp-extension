@@ -1703,6 +1703,16 @@ describe("isSdkTimeoutError", () => {
     assert.equal(isSdkTimeoutError("timeout"), false);
   });
 
+  it("reads the message off object-shaped errors, not just Error instances", () => {
+    // A transport may reject with a plain {code, message, data} object; String(err) would be
+    // "[object Object]" and the timeout would be lost.
+    assert.equal(isSdkTimeoutError({ code: 408, message: "Request timed out" }), true);
+    assert.equal(isSdkTimeoutError({ message: "The operation timed out" }), true);
+    assert.equal(isSdkTimeoutError({ code: 408, message: "Bad gateway" }), false);
+    // The code still wins wherever a JSON-RPC code exists.
+    assert.equal(isSdkTimeoutError({ code: -32603, message: "Request timed out" }), false);
+  });
+
   it("decides on the code, not the message, for any other negative JSON-RPC error", () => {
     // A server error response keeps its own code; its message may legitimately say "timed out".
     assert.equal(isSdkTimeoutError(SdkMcpError.fromError(ErrorCode.InternalError, "Upstream query timed out")), false);
@@ -1972,6 +1982,68 @@ async function startHangingToolCallServer(): Promise<{
     },
   };
 }
+
+describe("connect failure classification of server JSON-RPC errors (#209)", () => {
+  it("keeps an initialize error whose message says 'timed out' retryable and coded 'connection'", async () => {
+    const { createServer } = await import("node:http");
+    let initializeRequests = 0;
+    const listener = createServer((req, res) => {
+      if (req.url !== "/mcp" || req.method !== "POST") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      req.on("end", () => {
+        const msg = JSON.parse(body) as { id?: number; method?: string };
+        if (msg.method !== "initialize") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        initializeRequests++;
+        // A JSON-RPC error response (not an SDK timeout) that merely mentions "timed out".
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Upstream query timed out" } }));
+      });
+    });
+    await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+    const address = listener.address();
+    assert.ok(address && typeof address === "object");
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 1 },
+      mcpServers: {
+        bad: {
+          url: `http://127.0.0.1:${address.port}/mcp`,
+          args: [],
+          transport: "streamable-http",
+          lifecycle: "lazy",
+          requestTimeoutMs: 500,
+        },
+      },
+    });
+    try {
+      await assert.rejects(
+        () => manager.startServer("bad", process.cwd()),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          // Retryable, but not a timeout: the server answered, the message must not decide.
+          assert.equal(err.code, "connection");
+          assert.match(err.message, /Connection failed after 1 retries/);
+          return true;
+        },
+      );
+      assert.equal(initializeRequests, 2, "the attempt must be retried, not fast-failed");
+    } finally {
+      await manager.shutdownAll();
+      listener.closeAllConnections();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+});
 
 describe("abort during an in-flight tools/call (#209)", () => {
   it("reports a cancelled tool call as a cancellation, not as a request timeout", async () => {

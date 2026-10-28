@@ -140,6 +140,14 @@ export function isOAuthUnauthorizedError(error: unknown, seen = new Set<unknown>
 /** Fixed retry delay schedule — predictable, no jitter math needed. */
 export const RETRY_DELAYS_MS = [1000, 3000, 5000, 10000, 30000] as const;
 
+/** Message text of an error-ish value, preferring a real `message` field over `String()`. */
+function errorMessageOf(err: unknown): string {
+  // WHY: transports reject with plain `{ code, message, data }` objects too, where
+  // `String(err)` is "[object Object]" and the message would be lost.
+  const message = (err as { message?: unknown } | null)?.message;
+  return typeof message === "string" ? message : String(err);
+}
+
 /**
  * Whether `err` is the MCP SDK's own request-timeout rejection.
  *
@@ -161,8 +169,7 @@ export function isSdkTimeoutError(err: unknown): boolean {
   // well say "timed out". Only the SDK's own RequestTimeout means the client gave up on
   // the server, so no other negative code may fall through to the message heuristic.
   if (typeof code === "number" && code < 0) return code === -32001;
-  const message = err instanceof Error ? err.message : String(err);
-  return /Request timed out|timed out/i.test(message);
+  return /Request timed out|timed out/i.test(errorMessageOf(err));
 }
 
 /**
