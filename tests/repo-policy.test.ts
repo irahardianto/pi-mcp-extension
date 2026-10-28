@@ -739,3 +739,55 @@ describe("coverage and Qlty maintainability policy", () => {
   });
 });
 
+describe("pre-merge smoke test policy", () => {
+  /** The `## Pre-merge smoke test` section of CONTRIBUTING.md, up to the next top-level heading. */
+  function smokeSection(): string {
+    const contributing = readRepoFile("CONTRIBUTING.md");
+    const start = contributing.indexOf("## Pre-merge smoke test");
+    assert.notEqual(start, -1, "CONTRIBUTING.md must keep the '## Pre-merge smoke test' section");
+    const rest = contributing.slice(start);
+    const next = rest.indexOf("\n## ", 1);
+    return next === -1 ? rest : rest.slice(0, next);
+  }
+
+  it("documents the headless RPC smoke recipe in CONTRIBUTING.md", () => {
+    const section = smokeSection();
+    assert.match(
+      section,
+      /node_modules\/\.bin\/pi/,
+      "the smoke test must run the repository's vendored Pi (./node_modules/.bin/pi)",
+    );
+    assert.match(section, /--mode rpc/, "the smoke test must document the headless RPC recipe");
+    assert.match(section, /PI_CODING_AGENT_DIR/, "the smoke test must isolate the agent directory");
+  });
+
+  it("never routes the smoke test through a bare pi launcher", () => {
+    const section = smokeSection();
+    assert.doesNotMatch(
+      section,
+      /(?:^|[\s`|])pi\s(?:-e|install|--approve|--no-approve|--mode|--print)/m,
+      "the smoke test must not tell contributors to run a bare `pi`: it may be a different version, and without a TTY its launcher can die before any UI starts",
+    );
+  });
+
+  it("makes the smoke test part of the definition of done in AGENTS.md", () => {
+    const agents = readRepoFile("AGENTS.md");
+    assert.match(
+      agents,
+      /pre-merge smoke test/i,
+      "AGENTS.md must name the pre-merge smoke test in its definition of done",
+    );
+    assert.match(
+      agents,
+      /node_modules\/\.bin\/pi/,
+      "AGENTS.md must run the smoke test through ./node_modules/.bin/pi",
+    );
+    assert.match(agents, /--mode rpc/, "AGENTS.md must name the headless RPC recipe");
+    assert.match(
+      agents,
+      /not an exemption/i,
+      "AGENTS.md must state that a missing interactive TUI is not an exemption",
+    );
+  });
+});
+
