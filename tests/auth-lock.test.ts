@@ -371,7 +371,7 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
     return { ...fake, fakeClock, deps, winner };
   }
 
-  it("should restore the contender's fresh lock via rename when the filesystem refuses hard links", async () => {
+  it("should restore the contender's fresh lock with an exclusive write when hard links are refused", async () => {
     // Arrange
     const { files, hooks, calls, deps, winner } = arrangeReclaimRace();
     hooks.beforeLink = () => {
@@ -384,11 +384,11 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
     );
 
-    // The candidate was moved back, not deleted: the contender still holds its lock.
-    const restored = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
-    assert.equal(restored.nonce, winner.nonce);
-    assert.equal(calls.rename.length, 2);
-    assert.equal(calls.rename[1]?.newPath, targetLockPath);
+    // The record is back at the lock path (not moved by rename), so the contender keeps its lock.
+    const restoredEntry = files.get(targetLockPath)!;
+    assert.equal((JSON.parse(restoredEntry.content) as LockRecord).nonce, winner.nonce);
+    assert.equal(restoredEntry.mode, 0o600);
+    assert.equal(calls.rename.length, 1);
     assert.deepEqual(
       [...files.keys()].filter((path) => path.includes(".lock.stale-")),
       [],
@@ -396,9 +396,9 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
   });
 
   it("should restore the contender's fresh lock for every non-EEXIST hard-link failure code", async () => {
-    for (const code of ["EOPNOTSUPP", "EXDEV", "EPERM", "EACCES", "EMLINK"]) {
+    for (const code of ["EOPNOTSUPP", "EPERM", "EACCES", "EMLINK"]) {
       // Arrange
-      const { files, hooks, deps, winner } = arrangeReclaimRace();
+      const { files, hooks, calls, deps, winner } = arrangeReclaimRace();
       hooks.beforeLink = () => {
         throw createErrno(code, `${code}: hard link refused`);
       };
@@ -410,10 +410,11 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       );
       const restored = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
       assert.equal(restored.nonce, winner.nonce, `${code} must restore the contender's lock`);
+      assert.equal(calls.rename.length, 1, `${code} must not restore by rename`);
     }
   });
 
-  it("should keep the existing lock and drop the candidate when link reports EEXIST", async () => {
+  it("should keep the lock another process acquired and drop the candidate when link reports EEXIST", async () => {
     // Arrange
     const { files, hooks, calls, deps } = arrangeReclaimRace();
     const thirdRecord: LockRecord = {
@@ -438,13 +439,48 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       (err: unknown) => err instanceof AuthLockError,
     );
 
+    // Exactly one holder survives: the process that acquired the free path keeps its record.
     const kept = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
     assert.equal(kept.nonce, thirdRecord.nonce);
-    assert.equal(calls.unlink.length, 1);
-    assert.match(calls.unlink[0] ?? "", /\.lock\.stale-/);
+    assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
   });
 
-  it("should not attempt a restore when the candidate file already vanished", async () => {
+  it("should not overwrite a lock another process acquired after the hard link failed", async () => {
+    // Arrange
+    const { files, hooks, deps } = arrangeReclaimRace();
+    const thirdRecord: LockRecord = {
+      v: 1,
+      pid: 5555,
+      hostname: "host-a",
+      nonce: "third-process-nonce",
+      createdAt: 200_000,
+    };
+    hooks.beforeLink = () => {
+      // The reclaim made `path` free, so another process legitimately acquired it here.
+      files.set(targetLockPath, {
+        content: JSON.stringify(thirdRecord),
+        mtimeMs: 200_000,
+        mode: 0o600,
+      });
+      throw createErrno("ENOTSUP", "ENOTSUP: operation not supported, link");
+    };
+
+    // Act & Assert
+    await assert.rejects(
+      () => acquireAuthLock(serverName, storageDir, { deps }),
+      (err: unknown) => err instanceof AuthLockError,
+    );
+
+    // Restoring the moved record here would delete a live lock — the failure this path prevents.
+    const kept = JSON.parse(files.get(targetLockPath)!.content) as LockRecord;
+    assert.equal(kept.nonce, thirdRecord.nonce);
+    assert.deepEqual(
+      [...files.keys()].filter((path) => path.includes(".lock.stale-")),
+      [],
+    );
+  });
+
+  it("should drop the candidate and report when it vanished before the restore", async () => {
     // Arrange
     const { files, hooks, calls, deps } = arrangeReclaimRace();
     hooks.beforeLink = (existingPath) => {
@@ -457,22 +493,26 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       () => acquireAuthLock(serverName, storageDir, { deps }),
       (err: unknown) => err instanceof AuthLockError,
     );
+    assert.equal(files.has(targetLockPath), false);
     assert.equal(calls.rename.length, 1);
-    assert.equal(calls.unlink.length, 0);
+    assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
   });
 
-  it("should preserve the candidate and still throw AuthLockError when the restore rename fails too", async () => {
+  it("should drop the candidate and still throw AuthLockError when the restore write fails", async () => {
     // Arrange
-    const { files, hooks, calls, deps, winner } = arrangeReclaimRace();
-    const injectWinner = hooks.beforeRename!;
+    const { fs, files, hooks, calls, deps } = arrangeReclaimRace();
     hooks.beforeLink = () => {
       throw createErrno("ENOTSUP", "ENOTSUP: operation not supported, link");
     };
-    hooks.beforeRename = async (oldPath, newPath) => {
-      await injectWinner(oldPath, newPath);
-      if (newPath === targetLockPath) {
-        throw createErrno("EACCES", "EACCES: permission denied, rename");
+    const originalOpen = fs.open.bind(fs);
+    let exclusiveOpens = 0;
+    fs.open = async (path, flags, mode) => {
+      // The first exclusive create is the acquisition attempt (EEXIST from the stale lock);
+      // only the restore's re-create is denied here.
+      if (flags === "wx" && path === targetLockPath && ++exclusiveOpens > 1) {
+        throw createErrno("EACCES", "EACCES: permission denied, open");
       }
+      return originalOpen(path, flags, mode);
     };
 
     // Act & Assert
@@ -481,13 +521,13 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
     );
 
-    // Deleting the only copy would guarantee the contender's lost-lock abort, so it stays on disk.
+    // Nothing reads a `.stale-*` record again, so an un-restorable candidate must not leak.
     assert.equal(files.has(targetLockPath), false);
-    const candidates = [...files.keys()].filter((path) => path.includes(".lock.stale-"));
-    assert.equal(candidates.length, 1);
-    const preserved = JSON.parse(files.get(candidates[0]!)!.content) as LockRecord;
-    assert.equal(preserved.nonce, winner.nonce);
-    assert.equal(calls.unlink.length, 0);
+    assert.deepEqual(
+      [...files.keys()].filter((path) => path.includes(".lock.stale-")),
+      [],
+    );
+    assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
   });
 
   it("should invoke onLost and reject assertHeld when heartbeat detects nonce changed on disk", async () => {
