@@ -328,41 +328,33 @@ While a Pi UI is active, the extension never writes diagnostics to Pi's stderr (
 
 ## How It Works
 
-```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Pi Agent (TUI / RPC, ExtensionAPI)                                     │
-│                                                                         │
-│  ┌────────────────────┐    ┌────────────────────────┐                   │
-│  │ index.ts           │───▶│ register-commands      │ (/mcp, :start,    │
-│  │ (entry & mcp_*     │    │ (/mcp* slash commands) │  :stop, :auth)    │
-│  │  agent tools)      │    └───────────┬────────────┘                   │
-│  └────┬──────────┬────┘                │                                │
-│       │          └──────────────┐      │                                │
-│       │                         ▼      ▼                                │
-│       │                    ┌────────────────────────┐                   │
-│       │                    │ connection-coordinator │                   │
-│       │                    │ (in-flight connects,   │                   │
-│       │                    │  authQueue, teardown)  │                   │
-│       │                    └───────────┬────────────┘                   │
-│       │                                │                                │
-│       │                                ▼                                │
-│       │                    ┌────────────────────────┐    ┌───────────┐  │
-│       │                    │ server-manager         │───▶│tool-bridge│  │
-│       │                    │ (stopped → starting    │    │(MCP → Pi) │  │
-│       │                    │  → ready lifecycle)    │    └─────┬─────┘  │
-│       ▼                    └───────────┬────────────┘          │        │
-│  ┌────────────────────┐                ▼                       ▼        │
-│  │ config             │    ┌────────────────────────┐    ┌───────────┐  │
-│  │ (Zod + JSONC)      │    │ transport-factory &    │    │ TypeBox   │  │
-│  └────────┬───────────┘    │ oauth-provider (SDK)   │    │ (schema)  │  │
-│           │                └───────────┬────────────┘    └───────────┘  │
-└───────────┼────────────────────────────┼────────────────────────────────┘
-            │                            │
-            ▼                            ▼
-   Global/Project mcp.json       ┌──────────────┐
-   + Registered Extensions       │ MCP Servers  │
-                                 │ (stdio/http) │
-                                 └──────────────┘
+```mermaid
+flowchart TD
+    subgraph Pi["Pi Coding Agent (TUI / RPC, ExtensionAPI)"]
+        Entry["index.ts (entry & mcp_* agent tools)"]
+        Cmds["register-commands (/mcp, :start, :stop, :auth)"]
+        Config["config (Zod + JSONC)"]
+        Coord["connection-coordinator (in-flight connects, authQueue, teardown)"]
+        Mgr["server-manager (stopped -> starting -> ready lifecycle)"]
+        Bridge["tool-bridge (MCP -> Pi tools)"]
+        Schema["schema-convert (JSON Schema -> TypeBox)"]
+        Transport["transport-factory & oauth-provider (MCP SDK)"]
+
+        Entry --> Cmds
+        Entry --> Config
+        Entry --> Coord
+        Cmds --> Coord
+        Coord --> Mgr
+        Mgr --> Bridge
+        Bridge --> Schema
+        Mgr --> Transport
+    end
+
+    Sources[("Global & Project mcp.json + Registered Extensions")]
+    Servers["MCP Servers (stdio / streamable-http / sse)"]
+
+    Config --> Sources
+    Transport <--> Servers
 ```
 
 1. **Config is loaded** from global `<agent dir>/mcp.json`, trusted project `.pi/mcp.json` (checked via `ctx.isProjectTrusted()` on `session_start`), and extension-registered servers (`pi.getMcpServers()` / `mcp_servers_change`), with `mcp.json` taking precedence over extension-registered servers and project entries overriding global ones
