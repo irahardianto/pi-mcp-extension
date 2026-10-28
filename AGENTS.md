@@ -26,7 +26,7 @@ GITHUB_REPOSITORY=<owner>/<repo> GITHUB_TOKEN=$(gh auth token) RULESET_AUDIT_TOK
   node --import tsx/esm scripts/ruleset-audit.ts      # the ruleset drift audit (.github/workflows/ruleset-audit.yml)
 ```
 
-Node 22+ (CI runs 22 and 24 on Linux, and 22 on macOS and Windows). A change is done only when lint, typecheck, test, and pack all pass.
+Node 22+ (CI runs 22 and 24 on Linux, and 22 on macOS and Windows). A change is done only when lint, typecheck, test, and pack all pass — **and**, for anything that touches runtime behavior, when the pre-merge smoke test in [`CONTRIBUTING.md`](CONTRIBUTING.md#pre-merge-smoke-test) has run and its output is pasted into the PR. "Runtime behavior" means `src/index.ts`, `src/register-commands.ts`, `src/connection-coordinator.ts`, `src/server-manager.ts`, `src/stdio-process.ts`, `src/transport-factory.ts`, the OAuth/callback/lock modules (`oauth-*.ts`, `authorize-*.ts`, `auth-lock.ts`, `callback-*.ts`), `package.json`, or any refactor that moves lifecycle code. Drive it headlessly with `./node_modules/.bin/pi --mode rpc --no-session -e ./src/index.ts`, and against the extracted `npm pack` tarball when packaging or entry wiring changes. A missing interactive TUI is not an exemption — RPC mode needs no TTY, so never tick or skip the smoke-test checkbox on that basis, and never substitute a bare `pi` (a different version, and its launcher can die without a TTY). Pure-function, docs-only, and CI-only changes are exempt; say why in the PR.
 
 Tests must pass on macOS and Windows too. Skip a test only when the behavior is POSIX-only by design (e.g. file modes), and only on that platform: `{ skip: process.platform === "win32" && "WHY: <reason>" }`.
 
@@ -156,11 +156,14 @@ For bug fixes, follow this deterministic regression-test workflow:
 3. **Fix at the root**, keeping pure policy separate from I/O.
 4. **Verify:** run the new test, the full suite, lint, typecheck, and pack.
 
+**Pre-merge smoke test.** Deterministic tests cannot see what only Pi provides: slash-command registration, the footer/status surface, real child-process supervision, and the OAuth dialogs. When a change touches runtime behavior (the list under [Commands](#commands)), also run the pre-merge smoke test in [`CONTRIBUTING.md`](CONTRIBUTING.md#pre-merge-smoke-test) and paste the checklist with its output into the PR. Drive it with `./node_modules/.bin/pi --mode rpc --no-session -e ./src/index.ts`: `/mcp*` are extension commands, so they execute over plain JSONL (`disposition: "handled"`) and every `ctx.ui.notify(...)` or dialog reaches the client as an `extension_ui_request` record — no TTY and no ANSI scraping. "There is no interactive Pi TUI in this environment" is therefore not a reason to skip it.
+
 Self-review before finishing:
 - Are promises, timers, child processes, and abort listeners cleaned up on error, abort, and reload?
 - Does anything write to stdout or swallow errors?
 - Is external input Zod-validated and are URLs scheme-checked?
 - Are credentials origin-bound and written `0o600`?
+- Did the pre-merge smoke test run for this change — or is the change genuinely exempt — and is its output in the PR description?
 - Does every new or modified function in `src/` stay within the `<= 4` return statement, `<= 4` control-flow nesting, and `<= 5` parameter bounds via clean helper decomposition and options objects (verified by `npm run lint`)?
 - Does every new or modified function in `src/` stay within the cognitive and cyclomatic complexity `<= 15` limit (verified by `npm run lint` via `complexity` and `pi-mcp/max-cognitive-complexity`), and does `qlty smells --all` report zero `function_complexity` findings?
 - Does every `&&` / `||` expression stay at `<= 3` logical operators (verified by `npm run lint` via `pi-mcp/max-boolean-operators`), and does `qlty smells --all` report zero `boolean_logic` (`Complex binary expression`) findings?
