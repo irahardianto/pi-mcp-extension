@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.5] - 2026-10-28
+
 ### Fixed
 - `isSdkTimeoutError` also reads the `message` of a plain `{ code, message }` rejection (a transport need not throw an `Error`), so a non-JSON-RPC timeout shape is still recognised while any negative JSON-RPC code keeps deciding on its own (#209).
 - A `tools/call` the caller cancelled is reported as a cancellation (`McpError("Tool execution cancelled")`, code `protocol`) instead of a request timeout: the SDK rejects an aborted in-flight request with its own `RequestTimeout` error, so the abort must be recognised before the timeout code. A server-returned JSON-RPC error is likewise never mistaken for a timeout any more — a negative code other than the SDK's `-32001` (e.g. `InternalError`, or `-32000` "upstream query timed out") keeps code `protocol` instead of falling through to a message heuristic (#209).
