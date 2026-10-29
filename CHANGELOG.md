@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.10] - 2026-10-29
+
 ### Changed
 - `package.json` now declares `pi.image` (`docs/icon-preview.png`) and an expanded package `description` for the [Pi package gallery](https://pi.dev/packages/pi-mcp-extension) card and detail header, while keeping `docs/` excluded from the published npm tarball.
 
