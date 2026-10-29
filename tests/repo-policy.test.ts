@@ -10,7 +10,7 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -735,6 +735,46 @@ describe("coverage and Qlty maintainability policy", () => {
       dependabot,
       /ignore:\s*\n(?:\s*#.*\n)*\s*-\s*dependency-name:\s*"typescript"\s*\n\s*versions:\s*\n\s*-\s*">= 7\.0\.0"/m,
       ".github/dependabot.yml must ignore typescript >= 7.0.0 until typescript-eslint supports TypeScript >=7.1",
+    );
+  });
+
+  it("declares a valid Pi package gallery manifest with an existing preview image outside the npm tarball", () => {
+    const pkg = JSON.parse(readRepoFile("package.json")) as {
+      description?: string;
+      keywords?: string[];
+      files?: string[];
+      pi?: {
+        image?: string;
+        extensions?: string[];
+      };
+    };
+    assert.ok(
+      typeof pkg.description === "string" && pkg.description.length > 0,
+      "package.json must declare a non-empty description for the Pi package gallery",
+    );
+    assert.ok(
+      Array.isArray(pkg.keywords) && pkg.keywords.includes("pi-package"),
+      "package.json keywords must include 'pi-package' for pi.dev/packages discovery",
+    );
+    assert.deepEqual(
+      pkg.files,
+      ["src/", "README.md", "LICENSE"],
+      "package.json files must only ship src/, README.md, and LICENSE",
+    );
+    assert.deepEqual(
+      pkg.pi?.extensions,
+      ["./src/index.ts"],
+      "package.json pi.extensions must point to ./src/index.ts",
+    );
+    const rawPrefix = "https://raw.githubusercontent.com/irahardianto/pi-mcp-extension/main/";
+    assert.ok(
+      typeof pkg.pi?.image === "string" && pkg.pi.image.startsWith(rawPrefix),
+      "package.json pi.image must point to a raw.githubusercontent.com asset on main",
+    );
+    const relativeAssetPath = pkg.pi.image.slice(rawPrefix.length);
+    assert.ok(
+      existsSync(path.join(repoRoot, relativeAssetPath)),
+      `pi.image target ${relativeAssetPath} must exist in the repository`,
     );
   });
 });
