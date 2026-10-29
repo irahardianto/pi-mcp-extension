@@ -16,6 +16,7 @@ import {
   type AuthLockTimer,
 } from "../src/auth-lock.js";
 import { HEARTBEAT_MS, isLockStale, STALE_MS, type LockRecord } from "../src/auth-lock-policy.js";
+import { DebugLog, setDebugLog, setDiagnosticUi, type DebugLogEntry } from "../src/debug-log.js";
 import { getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { McpError } from "../src/errors.js";
 
@@ -480,6 +481,37 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
     );
   });
 
+  /** Capture diagnostics emitted via `reportDiagnostic` without writing to headless stderr. */
+  async function captureDiagnostics(run: () => Promise<void>): Promise<DebugLogEntry[]> {
+    const lines: string[] = [];
+    const logger = new DebugLog("/virtual/logs", {
+      fs: {
+        mkdir: async () => undefined,
+        appendFile: async (_path, data) => {
+          lines.push(data);
+        },
+        stat: async () => ({ size: 0 }),
+        rename: async () => undefined,
+        chmod: async () => undefined,
+        unlink: async () => undefined,
+      },
+    });
+    setDebugLog(logger);
+    setDiagnosticUi({ notify() {} }, true);
+    try {
+      await run();
+      await logger.flush();
+    } finally {
+      setDebugLog(null);
+      setDiagnosticUi(null, false);
+    }
+    return lines
+      .join("")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as DebugLogEntry);
+  }
+
   it("should drop the candidate and report when it vanished before the restore", async () => {
     // Arrange
     const { files, hooks, calls, deps } = arrangeReclaimRace();
@@ -489,12 +521,64 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
     };
 
     // Act & Assert
-    await assert.rejects(
-      () => acquireAuthLock(serverName, storageDir, { deps }),
-      (err: unknown) => err instanceof AuthLockError,
-    );
+    const diagnostics = await captureDiagnostics(async () => {
+      await assert.rejects(
+        () => acquireAuthLock(serverName, storageDir, { deps }),
+        (err: unknown) => err instanceof AuthLockError,
+      );
+    });
     assert.equal(calls.rename.length, 1);
     assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0]?.level, "warn");
+    assert.equal(diagnostics[0]?.event, "auth.lock_restore_failed");
+    assert.equal(diagnostics[0]?.server, serverName);
+    assert.equal(diagnostics[0]?.kind, "Error");
+    assert.match(
+      diagnostics[0]?.message ?? "",
+      /Could not restore the authorization lock file for "test-server": ENOENT/,
+    );
+  });
+
+  it("should drop the candidate and report when reading the moved candidate fails during fallback restore", async () => {
+    // Arrange
+    const { fs, files, hooks, calls, deps } = arrangeReclaimRace();
+    hooks.beforeLink = () => {
+      throw createErrno("ENOTSUP", "ENOTSUP: operation not supported, link");
+    };
+    const originalReadFile = fs.readFile.bind(fs);
+    let candidateReads = 0;
+    fs.readFile = async (path, encoding) => {
+      // The first read of `.lock.stale-*` is `readMovedLockRecord` (which sees the contender's
+      // nonce); the second is `restoreCandidateByWrite` reading the candidate back to re-create it.
+      if (path.includes(".lock.stale-") && ++candidateReads > 1) {
+        throw createErrno("EACCES", "EACCES: permission denied, read");
+      }
+      return originalReadFile(path, encoding);
+    };
+
+    // Act & Assert
+    const diagnostics = await captureDiagnostics(async () => {
+      await assert.rejects(
+        () => acquireAuthLock(serverName, storageDir, { deps }),
+        (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
+      );
+    });
+    assert.equal(files.has(targetLockPath), false);
+    assert.deepEqual(
+      [...files.keys()].filter((path) => path.includes(".lock.stale-")),
+      [],
+    );
+    assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0]?.level, "warn");
+    assert.equal(diagnostics[0]?.event, "auth.lock_restore_failed");
+    assert.equal(diagnostics[0]?.server, serverName);
+    assert.equal(diagnostics[0]?.kind, "Error");
+    assert.match(
+      diagnostics[0]?.message ?? "",
+      /Could not restore the authorization lock file for "test-server": EACCES/,
+    );
   });
 
   it("should drop the candidate and still throw AuthLockError when the restore write fails", async () => {
@@ -515,10 +599,12 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
     };
 
     // Act & Assert
-    await assert.rejects(
-      () => acquireAuthLock(serverName, storageDir, { deps }),
-      (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
-    );
+    const diagnostics = await captureDiagnostics(async () => {
+      await assert.rejects(
+        () => acquireAuthLock(serverName, storageDir, { deps }),
+        (err: unknown) => err instanceof AuthLockError && /Another Pi process/.test(err.message),
+      );
+    });
 
     // Nothing reads a `.stale-*` record again, so an un-restorable candidate must not leak.
     assert.equal(files.has(targetLockPath), false);
@@ -527,6 +613,15 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
       [],
     );
     assert.equal(calls.unlink.filter((path) => path.includes(".lock.stale-")).length, 1);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0]?.level, "warn");
+    assert.equal(diagnostics[0]?.event, "auth.lock_restore_failed");
+    assert.equal(diagnostics[0]?.server, serverName);
+    assert.equal(diagnostics[0]?.kind, "Error");
+    assert.match(
+      diagnostics[0]?.message ?? "",
+      /Could not restore the authorization lock file for "test-server": EACCES/,
+    );
   });
 
   it("should tolerate an empty lock file left by a peer's restore before declaring the lock lost", async () => {
