@@ -23,6 +23,7 @@ import { hostname as osHostname } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { agentDir } from "./config.js";
+import { describeError, reportDiagnostic } from "./debug-log.js";
 import {
   formatHolderDetails,
   HEARTBEAT_MS,
@@ -157,29 +158,37 @@ export function createDefaultAuthLockDeps(): AuthLockDeps {
 
 const MAX_ACQUIRE_ATTEMPTS = 3;
 
+/** Yield across microtasks (and briefly on the real fs) while a peer finishes its restore. */
+async function yieldForPeerRestore(usingRealFs: boolean, attempt: number): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  if (usingRealFs && attempt === 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** Read the lock record, retrying while a peer may have the file briefly out of place. */
 async function readLockRecordWithRetry(
   fs: AuthLockFs,
   path: string,
   usingRealFs = false,
 ): Promise<LockRecord | null> {
   for (let i = 0; i < 3; i++) {
+    let record: LockRecord | null = null;
     try {
-      const raw = await fs.readFile(path, "utf8");
-      return parseLockRecord(raw);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT" && i < 2) {
-        // WHY: During stale-lock inspection, a contender briefly renames `path` to
-        // `movedPath` and restores it via `link(movedPath, path)` on nonce mismatch.
-        // Yield across microtasks (and a brief macrotask on real fs) before treating ENOENT as genuine lock loss.
-        await Promise.resolve();
-        await Promise.resolve();
-        if (usingRealFs && i === 1) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 5));
-        }
-        continue;
-      }
-      return null;
+      record = parseLockRecord(await fs.readFile(path, "utf8"));
+    } catch {
+      // WHY: A missing or unreadable file is indistinguishable from a peer's in-flight restore
+      // on a single read; the retry below decides whether the lock is really gone.
     }
+    if (record !== null) return record;
+    if (i === 2) return null;
+    // WHY: During stale-lock inspection a contender briefly renames `path` to `movedPath` and
+    // restores it via `link()` — or, where hard links are unsupported, re-creates it with an
+    // exclusive write that publishes the file empty for an instant. Both read as "no lock"
+    // here, so retry across microtasks (and a brief macrotask on the real fs) before
+    // concluding the lock is genuinely gone.
+    await yieldForPeerRestore(usingRealFs, i);
   }
   return null;
 }
@@ -395,14 +404,110 @@ async function isSameStaleCandidate(
   }
 }
 
-/** Restore a contender's fresh lock file, then clean up the temporary candidate path. */
-async function restoreCandidate(movedPath: string, path: string, deps: AuthLockDeps): Promise<void> {
-  await deps.fs.link(movedPath, path).catch(() => {
-    // WHY: Best-effort restore of contender's fresh lock file if path was not already recreated.
-  });
+/** Remove the temporary stale-check file; an already-removed candidate is not a failure. */
+async function unlinkCandidate(movedPath: string, deps: AuthLockDeps): Promise<void> {
   await deps.fs.unlink(movedPath).catch(() => {
     // WHY: Best-effort cleanup of temporary stale-check file.
   });
+}
+
+/**
+ * Give up on a candidate that cannot be put back, and say so.
+ *
+ * The displaced holder finds out on its next heartbeat and aborts with `Authorization lock
+ * lost`; nothing in this module ever reads a `<path>.stale-*` file again, so leaving the
+ * candidate behind would only accumulate orphans in the auth directory.
+ */
+async function abandonCandidate(
+  serverName: string,
+  movedPath: string,
+  err: unknown,
+  deps: AuthLockDeps,
+): Promise<void> {
+  const { kind, message } = describeError(err);
+  reportDiagnostic({
+    level: "warn",
+    event: "auth.lock_restore_failed",
+    server: serverName,
+    message: `Could not restore the authorization lock file for "${serverName}": ${message}`,
+    fields: { kind },
+  });
+  await unlinkCandidate(movedPath, deps);
+}
+
+/**
+ * Re-create `path` from the candidate when hard links are unavailable.
+ *
+ * Uses the same exclusive-create write as lock acquisition, so a lock another process acquired
+ * while `path` was free is never overwritten; `EEXIST` means that process now holds the lock.
+ */
+async function restoreCandidateByWrite(
+  serverName: string,
+  movedPath: string,
+  path: string,
+  deps: AuthLockDeps,
+): Promise<void> {
+  let data: string;
+  try {
+    data = await deps.fs.readFile(movedPath, "utf8");
+  } catch (readErr) {
+    await abandonCandidate(serverName, movedPath, readErr, deps);
+    return;
+  }
+  try {
+    await writeExclusiveLockFile(deps.fs, path, data);
+  } catch (writeErr) {
+    if (errnoCode(writeErr) === "EEXIST") {
+      // WHY: Another process acquired the lock while `path` was free; its record wins and the
+      // displaced holder detects the loss itself.
+      await unlinkCandidate(movedPath, deps);
+      return;
+    }
+    await abandonCandidate(serverName, movedPath, writeErr, deps);
+    return;
+  }
+  await unlinkCandidate(movedPath, deps);
+}
+
+/**
+ * Restore the contender's fresh lock file, then clean up the temporary candidate path.
+ *
+ * Reached only when `isSameStaleCandidate` found the moved file carries a *different* nonce:
+ * the reclaim race was lost and this record is that process's only copy of its lock. Both
+ * restore primitives refuse to replace an existing lock — `link` fails `EEXIST`, and the
+ * fallback write is exclusive-create — because a filesystem that refuses hard links
+ * (`ENOTSUP`/`EOPNOTSUPP` on FAT/exFAT/SMB/SSHFS/FUSE, `EPERM` under `fs.protected_hardlinks`
+ * or seccomp) says nothing about whether `path` is free. Overwriting there would destroy the
+ * live lock of whichever process acquired it in the meantime, which is the very failure this
+ * path exists to prevent.
+ *
+ * At most one holder survives: if `path` is taken, the displaced holder's record is dropped
+ * and it aborts on its next heartbeat, exactly as if the reclaim had never restored it.
+ */
+async function restoreCandidate(
+  serverName: string,
+  movedPath: string,
+  path: string,
+  deps: AuthLockDeps,
+): Promise<void> {
+  try {
+    await deps.fs.link(movedPath, path);
+  } catch (linkErr) {
+    const code = errnoCode(linkErr);
+    if (code === "EEXIST") {
+      // WHY: `path` holds a lock another process acquired while it was free, so restoring this
+      // record would delete a live lock. Keep that lock; the displaced holder detects the loss.
+      await unlinkCandidate(movedPath, deps);
+      return;
+    }
+    if (code === "ENOENT") {
+      await abandonCandidate(serverName, movedPath, linkErr, deps);
+      return;
+    }
+    await restoreCandidateByWrite(serverName, movedPath, path, deps);
+    return;
+  }
+  await unlinkCandidate(movedPath, deps);
 }
 
 async function inspectAndReclaimStaleLock(
@@ -443,7 +548,7 @@ async function inspectAndReclaimStaleLock(
     return;
   }
 
-  await restoreCandidate(movedPath, path, deps);
+  await restoreCandidate(serverName, movedPath, path, deps);
   throw new AuthLockError(serverName, formatHolderDetails(movedRecord));
 }
 
@@ -473,11 +578,11 @@ async function prepareAuthDirectory(
 async function writeExclusiveLockFile(
   fs: AuthLockFs,
   path: string,
-  record: LockRecord,
+  data: string,
 ): Promise<void> {
   const file = await fs.open(path, "wx", 0o600);
   try {
-    await file.writeFile(JSON.stringify(record));
+    await file.writeFile(data);
     await file.sync();
   } catch (writeErr) {
     await file.close().catch(() => {
@@ -506,7 +611,7 @@ type LockAcquisitionContext = Omit<LockContext, "myRecord">;
 async function tryCreateLock(ctx: LockAcquisitionContext): Promise<AuthLockHandle | null> {
   const myRecord = createLockRecord(ctx.deps);
   try {
-    await writeExclusiveLockFile(ctx.deps.fs, ctx.path, myRecord);
+    await writeExclusiveLockFile(ctx.deps.fs, ctx.path, JSON.stringify(myRecord));
     return createLockHandle({ ...ctx, myRecord });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;

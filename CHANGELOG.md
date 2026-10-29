@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A stale-lock reclaim race no longer deletes the winning process's live authorization lock. `restoreCandidate` put a contender's fresh `<hash>.json.lock` back after the stale-check rename with `link()`, swallowed every error from it, and then unlinked the moved copy unconditionally — so on mounts and sandboxes where `link(2)` fails for a reason that says nothing about the destination (`ENOTSUP`/`EOPNOTSUPP` on FAT/exFAT/SMB/SSHFS/FUSE, `EPERM` under `fs.protected_hardlinks` or seccomp), the contender's only lock file disappeared and its in-flight interactive OAuth flow aborted with `Authorization lock lost`. A link failure that is neither `EEXIST` nor `ENOENT` now re-creates the record with the same exclusive-create write used to acquire a lock: the contender keeps it when the lock path is free, and a lock another process acquired in the meantime is never overwritten, because both restore paths refuse to replace an existing file. A restore that cannot complete is reported as `auth.lock_restore_failed` in the `PI_MCP_DEBUG` log instead of leaving an orphan `.stale-*` file behind (#204).
+
 ## [1.11.8] - 2026-10-28
 
 ### Fixed
