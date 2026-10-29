@@ -1,7 +1,7 @@
 {
   "name": "pi-mcp-extension",
   "version": "1.11.9",
-  "description": "MCP (Model Context Protocol) client extension for the Pi coding agent — connect Pi to any MCP server",
+  "description": "Full-featured, lightweight MCP extension for the Pi coding agent: stdio, SSE & Streamable HTTP transports, OAuth 2.1 (PKCE + DCR), lazy/eager lifecycles — minimal dependencies, zero bloat.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -28,6 +28,7 @@
     "LICENSE"
   ],
   "pi": {
+    "image": "https://raw.githubusercontent.com/irahardianto/pi-mcp-extension/main/docs/icon-preview.png",
     "extensions": [
       "./src/index.ts"
     ]
