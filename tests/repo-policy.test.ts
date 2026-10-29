@@ -776,6 +776,10 @@ describe("coverage and Qlty maintainability policy", () => {
       existsSync(path.join(repoRoot, relativeAssetPath)),
       `pi.image target ${relativeAssetPath} must exist in the repository`,
     );
+    assert.ok(
+      !pkg.files.some((entry) => relativeAssetPath === entry || relativeAssetPath.startsWith(entry)),
+      `pi.image target ${relativeAssetPath} must stay outside package.json files (${pkg.files.join(", ")})`,
+    );
   });
 });
 
