@@ -88,6 +88,32 @@ function isMethodNotFoundError(err: unknown): boolean {
 }
 
 /**
+ * Race an in-flight resource request against an abort signal.
+ * Abort wins as {@link AuthCancelledError}; the in-flight request is left to
+ * settle on its own (its rejection is suppressed).
+ */
+async function raceWithAbort<T>(
+  callPromise: Promise<T>,
+  signal: AbortSignal | undefined,
+  serverName: string,
+): Promise<T> {
+  if (!signal) return callPromise;
+  callPromise.catch(() => {
+    // WHY: Suppress unhandled rejection if in-flight request rejects after abort wins the race.
+  });
+  let onAbort!: () => void;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new AuthCancelledError(serverName));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([callPromise, abortPromise]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
  * Follow a cursor across pages until the server stops sending one, degrading a JSON-RPC
  * `-32601 Method not found` response to an empty list.
  * Aborts surface as {@link AuthCancelledError}; every other failure reaches the caller.
@@ -101,6 +127,9 @@ export async function collectPages<T>(
   try {
     return await collectCursorPages(serverName, method, signal, fetchPage);
   } catch (err) {
+    if (isCancellationError(err, signal)) {
+      throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
+    }
     if (isMethodNotFoundError(err)) return [];
     throw err;
   }
@@ -116,7 +145,7 @@ async function collectCursorPages<T>(
   let cursor: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
     if (signal?.aborted) throw new AuthCancelledError(serverName);
-    const result = await fetchPage(cursor);
+    const result = await raceWithAbort(fetchPage(cursor), signal, serverName);
     items.push(...result.items);
     // WHY: The spec ends pagination by omitting `nextCursor`; an empty string means the same
     // thing and some servers send it, so neither may win another round trip.
@@ -248,9 +277,14 @@ function convertResourceContent(item: unknown): PiResourceContent {
   return { type: "text", text: `[Resource: ${String(entry["uri"] ?? "unknown")}]` };
 }
 
+function resolveBlobMimeType(raw: unknown): string {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed.length > 0 ? trimmed : "application/octet-stream";
+}
+
 function convertBlobResource(entry: Record<string, unknown>): PiResourceContent {
   const uri = String(entry["uri"] ?? "unknown");
-  const mimeType = typeof entry["mimeType"] === "string" ? entry["mimeType"] : "application/octet-stream";
+  const mimeType = resolveBlobMimeType(entry["mimeType"]);
   const blob = String(entry["blob"]);
   if (mimeType.startsWith("image/")) {
     return { type: "image", data: blob, mimeType };
@@ -313,6 +347,7 @@ export class ResourceBridge {
     client: Client,
     options: ResourceRequestOptions,
   ): Promise<ResourceCatalog> {
+    if (options.signal?.aborted) throw new AuthCancelledError(serverName);
     const generation = this._generation(serverName);
     const cached = this.catalogs.get(serverName);
     if (cached?.generation === generation) {
@@ -335,8 +370,13 @@ export class ResourceBridge {
     uri: string,
     options: ResourceRequestOptions,
   ): Promise<PiResourceContent[]> {
+    if (options.signal?.aborted) throw new AuthCancelledError(serverName);
     try {
-      const result = await readResourceOnce(client, uri, options);
+      const result = await raceWithAbort(
+        readResourceOnce(client, uri, options),
+        options.signal,
+        serverName,
+      );
       return convertResourceContents(result.contents);
     } catch (err) {
       return await this._rethrowFailure(serverName, err, options.signal);
@@ -378,7 +418,6 @@ export class ResourceBridge {
     if (isCancellationError(err, signal)) {
       throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
     }
-    if (err instanceof McpError) throw err;
     if (isOAuthUnauthorizedError(err)) {
       await this.onAuthError?.(serverName, err);
     }

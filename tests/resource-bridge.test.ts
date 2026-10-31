@@ -16,7 +16,13 @@ import { fileURLToPath } from "node:url";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import extension from "../src/index.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
-import { ResourceBridge, convertResourceContents } from "../src/resource-bridge.js";
+import {
+  ResourceBridge,
+  collectPages,
+  convertResourceContents,
+  listAllResources,
+  listAllResourceTemplates,
+} from "../src/resource-bridge.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
@@ -66,12 +72,14 @@ function pagedClient(resourcePages: ResourcePage[], templatePages: TemplatePage[
   return { client, calls: () => ({ listCalls, templateCalls }) };
 }
 
-function createGate(): { promise: Promise<void>; open: () => void } {
+function createGate(): { promise: Promise<void>; open: () => void; fail: (err: unknown) => void } {
   let open = (): void => {};
-  const promise = new Promise<void>((resolve) => {
+  let fail = (_err: unknown): void => {};
+  const promise = new Promise<void>((resolve, reject) => {
     open = resolve;
+    fail = reject;
   });
-  return { promise, open };
+  return { promise, open, fail };
 }
 
 // ─── Unit: discovery, caching, failure mapping ───────────────────────────────
@@ -281,6 +289,7 @@ it("converts text, empty text, image and binary resource contents", async () => 
         { uri: "mock://image", mimeType: "image/png", blob: TINY_PNG },
         { uri: "mock://bin", mimeType: "application/octet-stream", blob: "AAECAwQ=" },
         { uri: "mock://untyped-bin", blob: "AAEC" },
+        { uri: "mock://empty-mime-bin", mimeType: "   ", blob: "AAEC" },
       ],
     }),
   });
@@ -293,6 +302,7 @@ it("converts text, empty text, image and binary resource contents", async () => 
     { type: "image", data: TINY_PNG, mimeType: "image/png" },
     { type: "text", text: "[Binary resource: mock://bin (application/octet-stream, 5 bytes)]" },
     { type: "text", text: "[Binary resource: mock://untyped-bin (application/octet-stream, 3 bytes)]" },
+    { type: "text", text: "[Binary resource: mock://empty-mime-bin (application/octet-stream, 3 bytes)]" },
   ]);
 });
 
@@ -304,13 +314,81 @@ it("falls back to a URI placeholder or string coercion for unrecognised content 
   ]);
 });
 
-it("rejects an already-aborted catalog request as a cancellation", async () => {
+it("rejects an already-aborted catalog request on both cold and warm caches", async () => {
   const { client } = pagedClient([{ resources: [{ uri: "mock://a", name: "a" }] }]);
+  const bridge = new ResourceBridge();
   const controller = new AbortController();
   controller.abort();
 
   await assert.rejects(
-    new ResourceBridge().getCatalog("srv", client, { requestTimeoutMs: 1000, signal: controller.signal }),
+    bridge.getCatalog("srv", client, { requestTimeoutMs: 1000, signal: controller.signal }),
+    (err: unknown) => err instanceof AuthCancelledError,
+  );
+
+  // Warm the cache, then verify an already-aborted signal still rejects rather than serving cache.
+  await bridge.getCatalog("srv", client, OPTIONS);
+  await assert.rejects(
+    bridge.getCatalog("srv", client, { requestTimeoutMs: 1000, signal: controller.signal }),
+    (err: unknown) => err instanceof AuthCancelledError,
+  );
+});
+
+it("rejects an already-aborted or mid-flight aborted readResource request as a cancellation", async () => {
+  let readCalls = 0;
+  const gate = createGate();
+  const client = fakeClient({
+    readResource: async () => {
+      readCalls += 1;
+      await gate.promise;
+      return { contents: [{ uri: "mock://a", text: "ok" }] };
+    },
+  });
+  const bridge = new ResourceBridge();
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await assert.rejects(
+    bridge.readResource("srv", client, "mock://a", { requestTimeoutMs: 1000, signal: preAborted.signal }),
+    (err: unknown) => err instanceof AuthCancelledError,
+  );
+  assert.equal(readCalls, 0, "pre-aborted readResource must not invoke client.readResource");
+
+  const midFlight = new AbortController();
+  const pending = bridge.readResource("srv", client, "mock://a", {
+    requestTimeoutMs: 1000,
+    signal: midFlight.signal,
+  });
+  midFlight.abort();
+  await assert.rejects(pending, (err: unknown) => err instanceof AuthCancelledError);
+  gate.open();
+});
+
+it("surfaces mid-flight aborts and SDK abort errors as AuthCancelledError in collectPages and listAll*", async () => {
+  const gate = createGate();
+  const midFlight = new AbortController();
+  const pendingPage = collectPages("srv", "resources/list", midFlight.signal, async () => {
+    await gate.promise;
+    return { items: ["stale"], nextCursor: undefined };
+  });
+  midFlight.abort();
+  await assert.rejects(pendingPage, (err: unknown) => err instanceof AuthCancelledError);
+  gate.fail(new Error("late rejection after abort"));
+  await Promise.resolve();
+
+  const sdkAbortClient = fakeClient({
+    listResources: async () => {
+      throw Object.assign(new Error("AbortError: This operation was aborted"), { code: -32001 });
+    },
+    listResourceTemplates: async () => {
+      throw Object.assign(new Error("AbortError: This operation was aborted"), { code: -32001 });
+    },
+  });
+  await assert.rejects(
+    listAllResources(sdkAbortClient, "srv", { requestTimeoutMs: 1000 }),
+    (err: unknown) => err instanceof AuthCancelledError,
+  );
+  await assert.rejects(
+    listAllResourceTemplates(sdkAbortClient, "srv", { requestTimeoutMs: 1000 }),
     (err: unknown) => err instanceof AuthCancelledError,
   );
 });
@@ -347,7 +425,7 @@ it("redacts secrets and strips terminal escape sequences in resource failure mes
   );
 });
 
-it("sanitizes ANSI escape sequences in /mcp:resources catalog rendering", () => {
+it("sanitizes ANSI escape sequences and renders empty catalogs in /mcp:resources catalog rendering", () => {
   const text = formatResourceCatalog("srv\x1b[31m", {
     resources: [
       {
@@ -357,11 +435,15 @@ it("sanitizes ANSI escape sequences in /mcp:resources catalog rendering", () => 
         mimeType: "text/\x1b[1mplain",
       },
     ],
-    templates: [],
+    templates: [{ uriTemplate: "mock://tpl/{id}", name: "tpl-only" }],
   });
 
   assert.ok(!/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(text), "catalog output must not contain control characters");
   assert.match(text, /mock:\/\/doc — desc — text\/plain/);
+  assert.match(text, /mock:\/\/tpl\/\{id\} — tpl-only$/m);
+
+  const emptyText = formatResourceCatalog("srv", { resources: [], templates: [] });
+  assert.equal(emptyText, "pi-mcp: srv — 0 resource(s), 0 template(s)\n  (none)");
 });
 
 it("bounds the /mcp:resources catalog rendering for a huge catalog", () => {
@@ -507,6 +589,10 @@ it("lists and reads mock-server resources through the agent tools", async () => 
       mockExt.tools.get("mcp_list_resources").execute("", {}, abortedController.signal, undefined, ctx),
       (err: unknown) => err instanceof AuthCancelledError,
     );
+    await assert.rejects(
+      mockExt.tools.get("mcp_read_resource").execute("", { server: "other", uri: "mock://x" }, abortedController.signal, undefined, ctx),
+      (err: unknown) => err instanceof AuthCancelledError,
+    );
 
     const read = async (uri: string) =>
       (await mockExt.tools.get("mcp_read_resource").execute("", { server: "mock", uri }, undefined, undefined, ctx)).content;
@@ -559,6 +645,21 @@ it("keeps healthy catalogs when one server fails and notes a capability-less ser
       mockExt.tools.get("mcp_read_resource").execute("", { server: "plain", uri: "mock://docs/readme" }, undefined, undefined, ctx),
       /does not expose MCP resources/,
     );
+
+    const command = mockExt.commands.get("mcp:resources");
+    assert.ok(command, "mcp:resources must be registered");
+    await command.handler("", ctx);
+    assert.match(lastNotification(session).message, /mock — 4 resource\(s\), 1 template\(s\)/);
+    assert.match(lastNotification(session).message, /broken — failed: \[broken\] MCP resource request failed for broken/);
+    assert.match(lastNotification(session).message, /plain — no MCP resources/);
+
+    await command.handler("plain", ctx);
+    assert.match(lastNotification(session).message, /plain does not expose MCP resources/);
+    assert.equal(lastNotification(session).type, "info");
+
+    await command.handler("broken", ctx);
+    assert.match(lastNotification(session).message, /Failed to list resources for broken/);
+    assert.equal(lastNotification(session).type, "error");
   } finally {
     await stopMockSession(session);
   }
@@ -588,12 +689,16 @@ it("re-lists resources after notifications/resources/list_changed", async () => 
   }
 });
 
-it("serves /mcp:resources summaries, listings, reads, and errors", async () => {
+it("serves /mcp:resources summaries, listings, reads, errors, and tab completions", async () => {
   const session = await startMockSession();
   const { extension: mockExt, ctx } = session;
   try {
     const command = mockExt.commands.get("mcp:resources");
     assert.ok(command, "mcp:resources must be registered");
+    assert.deepEqual(
+      (await command.getArgumentCompletions?.("mo"))?.map((entry) => entry.value),
+      ["mock"],
+    );
 
     await command.handler("", ctx);
     assert.match(lastNotification(session).message, /No connected MCP servers/);

@@ -595,6 +595,7 @@ async function readResourceForTool(
   uri: string,
   signal: AbortSignal | undefined,
 ): Promise<PiResourceContent[]> {
+  if (signal?.aborted) throw new AuthCancelledError(serverName);
   const target = deps.manager.getServer(serverName);
   if (!target) throw new Error("Unknown MCP server name. Use mcp_status to list configured servers.");
   const client = target.client;
