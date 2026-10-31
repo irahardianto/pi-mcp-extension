@@ -47,8 +47,8 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 
 | File | Owns |
 |---|---|
-| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; file-level config provenance tracking; `mcp_status` / `mcp_connect` tools |
-| `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash-command registration (`registerCommands`), including the enriched `/mcp <name>` detail view |
+| `src/index.ts` | Extension entry (default export); `session_start` / `session_shutdown`; file-level config provenance tracking; `mcp_status`, `mcp_connect`, `mcp_list_resources`, and `mcp_read_resource` tools |
+| `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`, and `/mcp:resources` slash-command registration (`registerCommands`), including the enriched `/mcp <name>` detail view |
 | `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, eager server starts, session teardown) |
 | `src/startup-auth.ts` | Abort-aware auth-queue turn waiter (`waitForQueueTurn`), startup authorization prompt (`promptStartupAuth`, `startupAuthNowOption`, `startupAuthLaterOption`), and error message formatting (`formatErrorMessage`) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |
@@ -61,6 +61,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/stdio-process.ts` | Stdio child-process supervision (`isPidAlive`, `ensurePidTerminated`, `instrumentStdioTransport`, `instrumentStderr`, `listDescendantPids`, `waitForChildClose`, `destroyStdioStreams`, injectable `StdioProcessDeps`), descendant process-tree discovery for wrapper commands (`indexProcessTable`), and `StringDecoder` stderr line splitting (`createLineSplitter`) |
 | `src/tool-bridge.ts` | Tool naming/hashing/collisions (`buildToolName`), MCP content conversion (`convertMcpContent`), Pi tool registration and `callTool` (`ToolBridge`) |
 | `src/tool-discovery.ts` | Paginated `tools/list` discovery (`listAllTools`, `McpToolDefinition`) |
+| `src/resource-bridge.ts` | Paginated `resources/list` and `resources/templates/list` discovery with `-32601` degradation (`collectPages`, `listAllResources`, `listAllResourceTemplates`), per-server catalog cache invalidated by `notifications/resources/list_changed` (`ResourceBridge`), and `resources/read` conversion to Pi text/image blocks (`convertResourceContents`, `PiResourceContent`) |
 | `src/schema-convert.ts` | Pure MCP JSON Schema → TypeBox conversion (`convertJsonSchemaToTypebox`, `orderUnionMembers`) |
 | `src/schema-refs.ts` | Pure JSON Pointer (`$ref`) resolution for schema conversion (`resolveRefTarget`, `unescapeJsonPointer`, `stepJsonPointer`) |
 | `src/jsonc.ts` | Pure JSONC text utility (`stripJsonComments`): single-pass `//` line and `/* */` block comment removal outside of double-quoted strings, preserving `\n`/`\r` so `JSON.parse` error line numbers stay accurate. Used by `src/config.ts` (runtime `mcp.json`), `scripts/ruleset-audit.ts` (`.github/rulesets/*.json`), and, as the single canonical import path, the test suites (`tests/config.test.ts`, `tests/fuzz.test.ts`, `tests/repo-policy.test.ts` for `.github/rulesets/default-branch.json`) |
@@ -92,7 +93,7 @@ Release tooling lives outside `src/` (it is not shipped to npm and must not depe
 User-facing docs and repository policies to keep in sync with behavior changes: `README.md` (config, commands, tools), `OAUTH.md` (auth flows), `examples/mcp.json.example` (config schema), `CHANGELOG.md`, `SECURITY.md` (security scope and reporting), and `.github/rulesets/*.json` (branch and tag protection rulesets). `.github/CODEOWNERS` lists the security-sensitive paths.
 
 > [!NOTE]
-> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~1,172 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
+> Several modules currently exceed the ~400-line guideline (`server-manager.ts` is the largest at ~1,200 lines). Do **not** split an oversized module opportunistically inside a fix or feature change; extraction is a planned, separate `refactor:` change that moves code without changing it. Put substantial new pure logic in a focused module instead of growing an oversized one.
 
 ## Architecture
 
@@ -116,6 +117,7 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - stdio: pass the session `cwd` — or the per-server `config.cwd` resolved against it by `resolveStdioCwd` (`~` expanded, relative paths resolved, unset keeps the session cwd) — to `StdioClientTransport`, track the child PID as soon as it spawns (`instrumentStdioTransport`), and have `_shutdown()` do SIGTERM → bounded wait → SIGKILL (`ensurePidTerminated`), including before retrying a failed handshake.
 - Health checks never overlap, each ping is time-bounded, and transport `onclose` triggers recovery for all three transports.
 - Decode child `stderr` with `StringDecoder` (`createLineSplitter`) and pass every line and server-controlled log/error message through `sanitizeTerminalText` (`sanitizeStderrLine`) before storing or displaying it.
+- The resource catalog is per-server and cached only until `notifications/resources/list_changed` (or stop/removal) invalidates it; a page set that was in flight when the generation advanced is returned to its caller but never cached, a server that did not advertise the `resources` capability is never asked, and `-32601` from either list method degrades to an empty list rather than a failure. Resource names, URIs, descriptions, and content are sanitized before reaching a notification.
 - `session_start` / `session_shutdown`, `/mcp*` commands, and management tools are registered even if bootstrap config loading fails or finds no servers, because a later `session_start` in another directory may load a valid `.pi/mcp.json`. On reload, abort in-flight attempts, stop the callback server, call `ToolBridge.updateSettings`, and refresh the roots `cwd`. Root URIs use `pathToFileURL(cwd).href`.
 
 **Security & OAuth** (`oauth-fixes.test.ts`, `auth-lock.test.ts`, `auth-commands.test.ts`, `pi-1x-compat.test.ts`)

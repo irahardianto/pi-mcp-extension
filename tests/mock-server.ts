@@ -14,6 +14,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
 const server = new Server(
@@ -21,6 +24,7 @@ const server = new Server(
   {
     capabilities: {
       tools: { listChanged: true },
+      resources: { listChanged: true },
     },
   },
 );
@@ -88,13 +92,72 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: "add_resource",
+    description: "Add a generated resource and send notifications/resources/list_changed",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 ];
+
+// ── Resource definitions ──────────────────────────────────────────────────────
+
+/** 1×1 transparent PNG, base64-encoded. */
+const TINY_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+const RESOURCES: Array<{ uri: string; name: string; description: string; mimeType: string }> = [
+  { uri: "mock://docs/readme", name: "readme", description: "Mock readme document", mimeType: "text/markdown" },
+  { uri: "mock://empty", name: "empty", description: "Empty text resource", mimeType: "text/plain" },
+  { uri: "mock://image", name: "pixel", description: "Tiny PNG image", mimeType: "image/png" },
+  { uri: "mock://binary", name: "archive", description: "Binary blob", mimeType: "application/octet-stream" },
+];
+
+const RESOURCE_TEMPLATES = [
+  { uriTemplate: "mock://item/{id}", name: "item", description: "Item by id", mimeType: "application/json" },
+];
+
+let generatedResources = 0;
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: RESOURCES,
+}));
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: RESOURCE_TEMPLATES,
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const { uri } = request.params;
+  if (uri === "mock://docs/readme") {
+    return { contents: [{ uri, mimeType: "text/markdown", text: "# Mock readme\n\nHello from the mock resource." }] };
+  }
+  if (uri === "mock://empty") {
+    return { contents: [{ uri, mimeType: "text/plain", text: "" }] };
+  }
+  if (uri === "mock://image") {
+    return { contents: [{ uri, mimeType: "image/png", blob: TINY_PNG }] };
+  }
+  if (uri === "mock://binary") {
+    return { contents: [{ uri, mimeType: "application/octet-stream", blob: "AAECAwQ=" }] };
+  }
+  const templateMatch = /^mock:\/\/item\/(.+)$/.exec(uri);
+  if (templateMatch) {
+    return {
+      contents: [{ uri, mimeType: "application/json", text: JSON.stringify({ id: templateMatch[1] }) }],
+    };
+  }
+  throw new Error(`Unknown resource: ${uri}`);
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -145,6 +208,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{ type: "text", text: "Intentional failure for testing" }],
         isError: true,
       };
+
+    case "add_resource": {
+      generatedResources += 1;
+      RESOURCES.push({
+        uri: `mock://generated/${generatedResources}`,
+        name: `generated-${generatedResources}`,
+        description: "Added at runtime",
+        mimeType: "text/plain",
+      });
+      await server.sendResourceListChanged();
+      return {
+        content: [{ type: "text", text: `Added mock://generated/${generatedResources}` }],
+        isError: false,
+      };
+    }
 
     default:
       throw new Error(`Unknown tool: ${name}`);

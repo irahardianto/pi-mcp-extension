@@ -35,7 +35,7 @@ Security issues in `pi-mcp-extension`'s core logic, configuration handling, auth
 - **Project trust boundary bypass:** Loading or executing untrusted project-level configuration (`<cwd>/.pi/mcp.json`) when `ctx.isProjectTrusted()` is `false`.
 - **OAuth callback attacks:** CSRF vulnerabilities, bypass of callback `state` parameter validation on success or error redirects, or listening on non-loopback interfaces.
 - **Command / shell injection:** Unsanitized parameters or authorization URLs passed to OS openers or shell processes.
-- **Terminal escape sequence injection:** Failure to sanitize raw ANSI/VT control sequences from MCP server `stderr` or output before display.
+- **Terminal escape sequence injection:** Failure to sanitize raw ANSI/VT control sequences from MCP server `stderr` or output before display, including resource names, URIs, descriptions, and `resources/read` content surfaced by `/mcp:resources`.
 - **Insecure file permissions:** Writing sensitive credential caches or lockfiles (`<hash>.json`, `<hash>.json.lock`) with permissions looser than `0o600` inside `0o700` directories.
 - **Supply-chain security:** Vulnerabilities in this package's release workflows, dependency chain, or published npm packages.
 

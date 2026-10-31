@@ -20,6 +20,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   ListRootsRequestSchema,
   ToolListChangedNotificationSchema,
+  ResourceListChangedNotificationSchema,
   LoggingMessageNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpError, AuthCancelledError } from "./errors.js";
@@ -209,6 +210,7 @@ export class ServerManager {
   private readonly servers = new Map<string, ManagedServer>();
   private settings: Settings;
   private onToolRefresh: ToolRefreshCallback | null = null;
+  private onResourceListChanged: ((name: string) => void) | null = null;
   private onServerStopped: ((name: string) => void) | null = null;
   private onRecoveryFailed: RecoveryFailedCallback | null = null;
   private onServerReady: ServerReadyCallback | null = null;
@@ -237,6 +239,11 @@ export class ServerManager {
     this.onToolRefresh = cb;
   }
 
+  /** Register callback invoked when a server reports `notifications/resources/list_changed`. */
+  setResourceListChangedCallback(cb: (name: string) => void): void {
+    this.onResourceListChanged = cb;
+  }
+
   setServerStoppedCallback(cb: (name: string) => void): void {
     this.onServerStopped = cb;
   }
@@ -250,7 +257,8 @@ export class ServerManager {
     this.onServerReady = cb;
   }
 
-  private _resolveTimeoutMs(server: ManagedServer): number {
+  /** Effective request timeout for a server: its own override, else the session default. */
+  resolveRequestTimeoutMs(server: ManagedServer): number {
     return server.config.requestTimeoutMs ?? this.settings.requestTimeoutMs;
   }
 
@@ -595,6 +603,12 @@ export class ServerManager {
       await this._handleToolListChanged(server, client, signal);
     });
 
+    // resources/list_changed: drop the cached resource catalog so the next
+    // `mcp_list_resources` / `/mcp:resources` call re-reads it.
+    client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+      this._handleResourceListChanged(server, client);
+    });
+
     // notifications/message: structured logging from MCP servers
     client.setNotificationHandler(
       LoggingMessageNotificationSchema,
@@ -637,7 +651,7 @@ export class ServerManager {
       return;
     }
     try {
-      const refreshTimeoutMs = this._resolveTimeoutMs(server);
+      const refreshTimeoutMs = this.resolveRequestTimeoutMs(server);
       await onToolRefresh(server.name, server.client, {
         requestTimeoutMs: refreshTimeoutMs,
         signal,
@@ -661,6 +675,19 @@ export class ServerManager {
         notify: !alreadyReported,
       });
     }
+  }
+
+  /**
+   * Invalidate a server's cached resource catalog after a
+   * `notifications/resources/list_changed`.
+   *
+   * Only the current client of a ready server may invalidate: a notification from a
+   * superseded client (reconnect race) or from a server that is being torn down must not
+   * touch the cache the live connection owns.
+   */
+  private _handleResourceListChanged(server: ManagedServer, client: Client): void {
+    if (server.state !== "ready" || server.client !== client) return;
+    this.onResourceListChanged?.(server.name);
   }
 
   private async _handshakeAndDiscover(params: HandshakeParams): Promise<void> {
@@ -966,7 +993,7 @@ export class ServerManager {
     server.lastError = null;
     const currentCwd = server.cwd ?? cwd;
     server.cwd = currentCwd;
-    const timeoutMs = this._resolveTimeoutMs(server);
+    const timeoutMs = this.resolveRequestTimeoutMs(server);
     // Note: retryCount is NOT reset here — it's only reset after successful connect.
     // This ensures the retry limit is respected across reconnection attempts.
     // It IS reset when startServer() is called explicitly (e.g. /mcp:start)

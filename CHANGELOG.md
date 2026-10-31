@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- MCP **Resources** are now bridged into Pi (issue #198): `mcp_list_resources` / `mcp_read_resource` agent tools plus a `/mcp:resources [server] [uri]` slash command expose server resources and URI templates that were previously only reachable when a server embedded them inside a `tools/call` result. Listing follows `resources/list` and `resources/templates/list` cursors with the same 100-page guard as `tools/list`, asks only servers that advertise the `resources` capability, and treats a JSON-RPC `-32601` from either list method as "no resources/templates" instead of a failure. Each server's catalog is cached after the first listing and invalidated by `notifications/resources/list_changed` — a page set that was in flight when the notification arrived is handed to its caller but never cached — and is dropped on stop/removal. `resources/read` returns text as text (including an empty `text: ""`), `image/*` blobs as Pi image blocks, and other binary blobs as a bounded `[Binary resource: … (mimeType, N bytes)]` summary so a large archive cannot flood the context window. Requests carry the per-server timeout and caller `AbortSignal`; cancellation stays a cancellation, an SDK request timeout keeps `"timeout"`, and a 401/403 routes through the existing re-authorization path. Resource names, URIs, descriptions, and previews are sanitized before they reach a notification.
+
+### Changed
+- `ServerManager.resolveRequestTimeoutMs` is now public so the resource bridge and `/mcp:resources` resolve the same effective timeout as tool discovery and execution.
+
 ## [1.11.10] - 2026-10-29
 
 ### Changed

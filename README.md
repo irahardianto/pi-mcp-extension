@@ -28,7 +28,7 @@
 - **No tool churn** — Activate/deactivate pattern ensures tools don't flicker during reconnection
 - **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects, including Pi 1.3.0 partial overrides), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
 - **Rich tool results & annotations** — MCP `text`, `image` (`ImageContent`), `structuredContent`, embedded `resource` text/blobs, and `audio` fallback descriptions, plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` surfaced in tool descriptions
-- **On-demand agent tools & commands** — `mcp_status` and `mcp_connect` agent tools plus `/mcp`, `/mcp <name>` (with config provenance and failure hints), `/mcp:start`, `/mcp:stop`, and `/mcp:auth` slash commands with server-name autocomplete
+- **On-demand agent tools & commands** — `mcp_status`, `mcp_connect`, `mcp_list_resources`, and `mcp_read_resource` agent tools plus `/mcp`, `/mcp <name>` (with config provenance and failure hints), `/mcp:start`, `/mcp:stop`, `/mcp:auth`, and `/mcp:resources` slash commands with server-name autocomplete
 - **Structured error handling** — Distinct error codes (`config`, `connection`, `auth`, `timeout`, `protocol`, `tool`) and actionable failure hints
 - **Redacted debug logging** — Opt-in `PI_MCP_DEBUG=1` JSON Lines log (`<agent dir>/logs/pi-mcp.log`, `0600`, ~2 MB rotation) with automatic secret masking and zero TUI `stderr` noise
 - **OAuth 2.1** — Browser and headless/SSH authorization with PKCE, protected-resource discovery, Dynamic Client Registration, startup prompts for eager servers, cross-process lock recovery, token refresh, and origin/issuer-bound local persistence (see [OAUTH.md](./OAUTH.md))
@@ -234,13 +234,18 @@ Server-name arguments provide autocomplete suggestions from the configured MCP s
 | `/mcp:stop <name>` | Cancel a pending connection, startup prompt, or authorization, or stop a running server and deactivate its tools |
 | `/mcp:auth <name>` | Connect (or force a fresh reconnect if already `ready`) using stored OAuth credentials and client registration; request browser authorization only if needed |
 | `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization (`--reset` may appear before or after `<name>`) |
+| `/mcp:resources` | Show resource and template counts for every connected server |
+| `/mcp:resources <name>` | List one server's resources (`uri`, description, MIME type) and URI templates |
+| `/mcp:resources <name> <uri>` | Read one resource (template URIs filled in) and preview its text or image summary in a notification |
 
-In addition to user slash commands, two built-in **agent tools** let the LLM inspect and connect configured servers directly:
+In addition to user slash commands, built-in **agent tools** let the LLM inspect servers, connect them, and read their resources directly:
 
 | Agent Tool | Parameters | Description |
 |---|---|---|
 | `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active`), `auth` credential summary, `source` (`"global"` / `"project"` / `"extension"` / `"unknown"`), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
 | `mcp_connect` | `{ name: string }` | Connect one named server, run interactive OAuth if needed, and verify that discovered tools are active before returning success (returns fixed actionable categories on failure instead of raw server response text) |
+| `mcp_list_resources` | `{ server?: string }` | List `resources/list` entries (`uri`, `name`, `description`, `mimeType`) and `resources/templates/list` URI templates for connected servers, naming configured servers that are stopped and servers that do not advertise the `resources` capability (read-only) |
+| `mcp_read_resource` | `{ server: string, uri: string }` | Read one resource with `resources/read`: text resources return their text (including empty text), `image/*` blobs return an image block, and other binary blobs return a `[Binary resource: uri (mimeType, N bytes)]` summary instead of filling the context window (read-only) |
 
 `mcp_status` returns a JSON array of [`ServerStatusRow`](./src/server-status.ts) objects:
 
@@ -365,12 +370,12 @@ flowchart TD
 6. **Tools activate/deactivate** automatically as servers connect/disconnect
 7. **AbortSignal** is wired through to `notifications/cancelled` for clean cancellation
 8. **Reconnection & recovery** uses a fixed delay schedule with configurable max retries on initial failure, health check failure, or unexpected transport close/error (`client.onclose` / `client.onerror`), while mid-session HTTP `401` / `403 insufficient_scope` invalidates stale tokens and surfaces a re-authorization hint
-9. **`list_changed` notifications** trigger re-discovery, deactivating stale tools automatically
+9. **`list_changed` notifications** trigger re-discovery, deactivating stale tools automatically and invalidating the cached resource catalog
 10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with process-tree `SIGTERM` → `SIGKILL` and pipe cleanup for `stdio` child processes)
 
 ## MCP Spec Compliance
 
-Implements the **MCP 2025-03-26** specification for tool clients:
+Implements the **MCP 2025-03-26** specification for tool and resource clients:
 
 | Feature | Status |
 |---|---|
@@ -380,6 +385,9 @@ Implements the **MCP 2025-03-26** specification for tool clients:
 | `sse` transport (legacy backwards compat) | ✅ |
 | OAuth 2.1 authorization (PKCE S256, RFC 9728 Protected Resource Metadata, RFC 7591 DCR) | ✅ |
 | Cursor-based `tools/list` pagination | ✅ |
+| Cursor-based `resources/list` and `resources/templates/list` pagination | ✅ |
+| `resources/read` with text, image blobs, and binary size summaries | ✅ |
+| `notifications/resources/list_changed` (catalog invalidation) | ✅ |
 | `tools/call` with parameters, `image` (`ImageContent`), `structuredContent`, and `resource` conversion | ✅ |
 | `roots/list` capability (workspace root) | ✅ |
 | `notifications/tools/list_changed` (live refresh) | ✅ |
@@ -387,7 +395,6 @@ Implements the **MCP 2025-03-26** specification for tool clients:
 | `notifications/message` (structured logging) | ✅ |
 | `isError: true` distinction (protocol vs tool errors, non-text filtered on error) | ✅ |
 | Tool annotations (`readOnlyHint`, `destructiveHint`, etc.) | ✅ |
-| Resources bridge | ⏳ v2 |
 | Prompts bridge | ⏳ v2 |
 | Sampling | ⏳ v2 |
 
@@ -429,6 +436,7 @@ The test suite includes:
 - **Server lifecycle & coordination** (`tests/server-manager.test.ts`, `tests/stdio-process.test.ts`, `tests/transport-factory.test.ts`, `tests/connection-coordinator.test.ts`, `tests/connection-coordination.test.ts`) — Connect, retry, unexpected close recovery, shutdown with PID `SIGKILL` safety net, health check, concurrent connect/reset coordination, and cancellation
 - **OAuth 2.1 & auth locks** (`tests/oauth-fixes.test.ts`, `tests/authorize-flow.test.ts`, `tests/auth-lock.test.ts`, `tests/auth-commands.test.ts`, `tests/auth-arguments.test.ts`, `tests/fake-oauth-server.test.ts`) — Challenge discovery, PKCE, Dynamic Client Registration, origin and issuer binding, startup authorization prompts, headless/SSH redirect URL paste-back, URL scheme validation, cross-process lock heartbeat, and stale lock reclamation
 - **Tool bridge, status diagnostics & debug log** (`tests/tool-bridge.test.ts`, `tests/management-tools.test.ts`, `tests/server-status.test.ts`, `tests/status-commands.test.ts`, `tests/completions.test.ts`, `tests/debug-log.test.ts`) — JSON Schema → TypeBox conversion (`allOf` object inference, `$ref` cycle protection, union `null` ordering), name sanitization, image content passthrough, `isError` filtering, activate/deactivate, `mcp_status` / `mcp_connect`, `/mcp <name>` config provenance and failure hints, slash command completions, and redacted `PI_MCP_DEBUG=1` JSONL logging
+- **Resource bridge** (`tests/resource-bridge.test.ts`) — paginated `resources/list` / `resources/templates/list`, `-32601` degradation, catalog caching with `notifications/resources/list_changed` invalidation, stale in-flight discard, text/image/binary `resources/read` conversion, abort/timeout/401 mapping, `mcp_list_resources` / `mcp_read_resource`, and `/mcp:resources`
 - **Property-based fuzzing** (`tests/fuzz.test.ts`) — `fast-check` properties covering JSONC comment stripping, callback/redirect URL validation, `WWW-Authenticate` challenge parsing, JSON Schema → TypeBox conversion, tool naming, terminal/log secret sanitization, and custom header merging
 - **Release flow & repository policy** (`tests/release.test.ts`, `tests/ruleset-audit.test.ts`, `tests/repo-policy.test.ts`) — Release PR orchestration and npm/git self-healing (`scripts/release.ts`), live GitHub ruleset drift auditing (`scripts/ruleset-audit.ts`), and CI/ESLint/Qlty policy invariants
 - **End-to-end integration** — Real mock MCP and OAuth servers over `stdio` and HTTP with tool discovery and execution

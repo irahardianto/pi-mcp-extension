@@ -27,6 +27,25 @@ export function parseAuthArguments(args = "", serverNames: string[] = []): { nam
   return stripResetFlag(name);
 }
 
+/** Parsed `/mcp:resources [server] [uri]` arguments. */
+export interface ResourceArguments {
+  server: string;
+  uri: string;
+}
+
+/**
+ * Split `/mcp:resources` arguments into an optional server name and an optional URI.
+ * The URI keeps everything after the first whitespace run, so a URI containing spaces
+ * (`file:///path/with space`) is not truncated at the second token.
+ */
+export function parseResourceArguments(args = ""): ResourceArguments {
+  const trimmed = args.trim();
+  if (!trimmed) return { server: "", uri: "" };
+  const separator = trimmed.search(/\s/);
+  if (separator === -1) return { server: trimmed, uri: "" };
+  return { server: trimmed.slice(0, separator), uri: trimmed.slice(separator).trim() };
+}
+
 export interface ServerCompletionEntry {
   name: string;
   state: string;
