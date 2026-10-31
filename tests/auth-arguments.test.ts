@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseAuthArguments } from "../src/commands.js";
+import { parseAuthArguments, parseResourceArguments } from "../src/commands.js";
 
 describe("parseAuthArguments", () => {
   const names = ["local", "team server", "team  server", "release --reset"];
@@ -33,6 +33,39 @@ describe("parseAuthArguments", () => {
     assert.deepEqual(parseAuthArguments("--reset local", names), { name: "local", reset: true });
     assert.deepEqual(parseAuthArguments("--reset team server", names), { name: "team server", reset: true });
     assert.deepEqual(parseAuthArguments("  --reset\tteam  server  ", names), { name: "team  server", reset: true });
+  });
+});
+
+describe("parseResourceArguments", () => {
+  const names = ["local", "team", "team server", "team  server"];
+
+  it("returns empty server and uri for blank input", () => {
+    assert.deepEqual(parseResourceArguments("", names), { server: "", uri: "" });
+    assert.deepEqual(parseResourceArguments("   ", names), { server: "", uri: "" });
+  });
+
+  it("preserves configured server names containing spaces with or without a URI", () => {
+    assert.deepEqual(parseResourceArguments("  team server  ", names), { server: "team server", uri: "" });
+    assert.deepEqual(parseResourceArguments("team  server", names), { server: "team  server", uri: "" });
+    assert.deepEqual(parseResourceArguments("team server mock://docs/readme", names), {
+      server: "team server",
+      uri: "mock://docs/readme",
+    });
+    assert.deepEqual(parseResourceArguments("team server file:///path/with space", names), {
+      server: "team server",
+      uri: "file:///path/with space",
+    });
+  });
+
+  it("splits unknown server names at the first whitespace while keeping spaces inside the URI", () => {
+    assert.deepEqual(parseResourceArguments("local mock://docs/readme", names), {
+      server: "local",
+      uri: "mock://docs/readme",
+    });
+    assert.deepEqual(parseResourceArguments("unknown file:///a b/c"), {
+      server: "unknown",
+      uri: "file:///a b/c",
+    });
   });
 });
 

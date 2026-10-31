@@ -547,6 +547,7 @@ async function collectResourcesForServer(
   deps: ManagementToolDeps,
   signal: AbortSignal | undefined,
 ): Promise<ResourceToolRow> {
+  if (signal?.aborted) throw new AuthCancelledError(server.name);
   const client = server.client;
   if (!client || !client.getServerCapabilities()?.resources) {
     return { server: server.name, resources: [], templates: [], resourcesUnsupported: true };
@@ -558,6 +559,9 @@ async function collectResourcesForServer(
     });
     return { server: server.name, ...catalog };
   } catch (err) {
+    if (err instanceof AuthCancelledError || signal?.aborted) {
+      throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
+    }
     return { server: server.name, resources: [], templates: [], error: formatErrorMessage(err) };
   }
 }
@@ -568,6 +572,7 @@ async function listResourceRows(
   filter: string | undefined,
   signal: AbortSignal | undefined,
 ): Promise<{ servers: ResourceToolRow[]; stoppedServers: string[] }> {
+  if (signal?.aborted) throw new AuthCancelledError(filter ?? "mcp_list_resources");
   const all = deps.manager.getAllServers();
   if (filter) {
     const target = all.find((server) => server.name === filter);

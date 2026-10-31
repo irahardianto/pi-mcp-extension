@@ -198,11 +198,11 @@ function describeResourceContent(content: PiResourceContent): string {
 
 function formatResourcePreview(serverName: string, uri: string, content: PiResourceContent[]): string {
   const header = `pi-mcp: ${sanitizeTerminalText(serverName, { maxLength: 64 })} — ${sanitizeTerminalText(uri, { maxLength: RESOURCE_FIELD_MAX_LENGTH })}`;
-  if (content.length === 0) return `${header}\n(empty resource)`;
-  const body = content.map(describeResourceContent).join("\n");
+  const body = sanitizeTerminalText(content.map(describeResourceContent).join("\n"), { maxLength: 1200 });
   // WHY: a notification is a single terminal line, so server-controlled resource content is
-  // sanitized and bounded before it reaches the UI.
-  return `${header}\n${sanitizeTerminalText(body, { maxLength: 1200 })}`;
+  // sanitized and bounded before it reaches the UI; an empty text payload renders the same
+  // placeholder as an empty contents array instead of a trailing blank line.
+  return `${header}\n${body || "(empty resource)"}`;
 }
 
 /** Row for `/mcp:resources` with no server argument: resource and template counts per server. */
@@ -292,7 +292,8 @@ async function handleMcpResources(
   ctx: ExtensionCommandContext,
   deps: RegisterCommandsDeps,
 ): Promise<void> {
-  const { server: serverName, uri } = parseResourceArguments(args);
+  const serverNames = deps.manager.getAllServers().map((server) => server.name);
+  const { server: serverName, uri } = parseResourceArguments(args, serverNames);
   if (!serverName) return notifyResourceSummary(deps, ctx);
   const target = resolveResourceTarget(serverName, ctx, deps);
   if (!target) return;

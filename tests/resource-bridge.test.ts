@@ -152,6 +152,37 @@ it("discards a catalog that finished after a list_changed invalidated it", async
   assert.equal(listCalls, 2, "the invalidated response must not have been cached");
 });
 
+it("does not let a slow stale fetch overwrite a newer generation's cached catalog", async () => {
+  const staleGate = createGate();
+  let call = 0;
+  const client = fakeClient({
+    listResources: async () => {
+      call += 1;
+      const currentCall = call;
+      if (currentCall === 1) await staleGate.promise;
+      return { resources: [{ uri: `mock://v${currentCall}`, name: `v${currentCall}` }] };
+    },
+  });
+  const bridge = new ResourceBridge();
+
+  // Gen-0 request starts and stalls in flight.
+  const staleInFlight = bridge.getCatalog("srv", client, OPTIONS);
+  // list_changed advances generation to 1 while gen-0 is still in flight.
+  bridge.invalidate("srv");
+  // Gen-1 request completes first and caches v2 under generation 1.
+  const fresh = await bridge.getCatalog("srv", client, OPTIONS);
+  assert.deepEqual(fresh.resources.map((r) => r.uri), ["mock://v2"]);
+
+  // Now the slow gen-0 request settles; it must NOT clobber the gen-1 cache entry.
+  staleGate.open();
+  const stale = await staleInFlight;
+  assert.deepEqual(stale.resources.map((r) => r.uri), ["mock://v1"]);
+
+  const cachedAfterStale = await bridge.getCatalog("srv", client, OPTIONS);
+  assert.deepEqual(cachedAfterStale.resources.map((r) => r.uri), ["mock://v2"]);
+  assert.equal(call, 2, "gen-1 catalog must remain cached after the slower gen-0 fetch settles");
+});
+
 it("does not resurrect a catalog fetched for a server that was forgotten mid-flight", async () => {
   const gate = createGate();
   let listCalls = 0;
@@ -185,6 +216,62 @@ it("forgets a server's generation and catalog on forget()", async () => {
   assert.equal(calls().listCalls, 2);
 });
 
+it("treats a -32601 resources/list response as no resources while keeping templates", async () => {
+  const client = fakeClient({
+    listResources: async () => {
+      throw Object.assign(new Error("Method not found"), { code: -32601 });
+    },
+    listResourceTemplates: async () => ({
+      resourceTemplates: [{ uriTemplate: "mock://item/{id}", name: "item" }],
+    }),
+  });
+
+  const catalog = await new ResourceBridge().getCatalog("srv", client, OPTIONS);
+
+  assert.deepEqual(catalog.resources, []);
+  assert.deepEqual(catalog.templates.map((t) => t.uriTemplate), ["mock://item/{id}"]);
+});
+
+it("stops at the 100-page guard when a malfunctioning server never clears nextCursor", async () => {
+  let pages = 0;
+  const client = fakeClient({
+    listResources: async () => {
+      pages += 1;
+      return { resources: [{ uri: `mock://p/${pages}`, name: `p${pages}` }], nextCursor: `cursor-${pages}` };
+    },
+  });
+
+  const catalog = await new ResourceBridge().getCatalog("srv", client, OPTIONS);
+
+  assert.equal(pages, 100);
+  assert.equal(catalog.resources.length, 100);
+});
+
+it("falls back to client.request when typed SDK resource helpers are absent", async () => {
+  const methods: string[] = [];
+  const client = {
+    request: async (req: { method: string; params?: Record<string, unknown> }) => {
+      methods.push(req.method);
+      if (req.method === "resources/list") {
+        return { resources: [{ uri: "mock://raw", name: "raw" }] };
+      }
+      if (req.method === "resources/templates/list") {
+        return { resourceTemplates: [{ uriTemplate: "mock://tpl/{id}", name: "tpl" }] };
+      }
+      return { contents: [{ uri: String(req.params?.["uri"] ?? ""), text: "raw body" }] };
+    },
+  } as unknown as Client;
+  const bridge = new ResourceBridge();
+
+  const catalog = await bridge.getCatalog("srv", client, OPTIONS);
+  const content = await bridge.readResource("srv", client, "mock://raw", OPTIONS);
+
+  assert.deepEqual(catalog.resources.map((r) => r.uri), ["mock://raw"]);
+  assert.deepEqual(catalog.templates.map((t) => t.uriTemplate), ["mock://tpl/{id}"]);
+  assert.deepEqual(content, [{ type: "text", text: "raw body" }]);
+  assert.deepEqual(methods, ["resources/list", "resources/templates/list", "resources/read"]);
+});
+
 it("converts text, empty text, image and binary resource contents", async () => {
   const client = fakeClient({
     readResource: async ({ uri }: { uri: string }) => ({
@@ -193,6 +280,7 @@ it("converts text, empty text, image and binary resource contents", async () => 
         { uri, mimeType: "text/markdown", text: "# Title" },
         { uri: "mock://image", mimeType: "image/png", blob: TINY_PNG },
         { uri: "mock://bin", mimeType: "application/octet-stream", blob: "AAECAwQ=" },
+        { uri: "mock://untyped-bin", blob: "AAEC" },
       ],
     }),
   });
@@ -204,11 +292,16 @@ it("converts text, empty text, image and binary resource contents", async () => 
     { type: "text", text: "# Title" },
     { type: "image", data: TINY_PNG, mimeType: "image/png" },
     { type: "text", text: "[Binary resource: mock://bin (application/octet-stream, 5 bytes)]" },
+    { type: "text", text: "[Binary resource: mock://untyped-bin (application/octet-stream, 3 bytes)]" },
   ]);
 });
 
-it("falls back to a URI placeholder for an unrecognised content entry", () => {
-  assert.deepEqual(convertResourceContents([{ uri: "mock://odd" }]), [{ type: "text", text: "[Resource: mock://odd]" }]);
+it("falls back to a URI placeholder or string coercion for unrecognised content entries", () => {
+  assert.deepEqual(convertResourceContents([{ uri: "mock://odd" }, null, "raw"]), [
+    { type: "text", text: "[Resource: mock://odd]" },
+    { type: "text", text: "null" },
+    { type: "text", text: "raw" },
+  ]);
 });
 
 it("rejects an already-aborted catalog request as a cancellation", async () => {
@@ -233,6 +326,42 @@ it("maps an SDK request timeout to McpError(\"timeout\")", async () => {
     new ResourceBridge().readResource("srv", client, "mock://slow", OPTIONS),
     (err: unknown) => err instanceof McpError && err.code === "timeout",
   );
+});
+
+it("redacts secrets and strips terminal escape sequences in resource failure messages", async () => {
+  const client = fakeClient({
+    readResource: async () => {
+      throw new Error("GET https://api.example.com/resource?api_key=sk-secret-value-123 failed: \x1b[31mboom\x1b[0m");
+    },
+  });
+
+  await assert.rejects(
+    new ResourceBridge().readResource("srv", client, "mock://secret", OPTIONS),
+    (err: unknown) => {
+      assert.ok(err instanceof McpError);
+      assert.ok(!err.message.includes("sk-secret-value-123"), "secret query parameter must be redacted");
+      assert.ok(!err.message.includes("\x1b"), "ANSI escape sequence must be stripped");
+      assert.match(err.message, /\[REDACTED\]/);
+      return true;
+    },
+  );
+});
+
+it("sanitizes ANSI escape sequences in /mcp:resources catalog rendering", () => {
+  const text = formatResourceCatalog("srv\x1b[31m", {
+    resources: [
+      {
+        uri: "mock://\x1b[32mdoc",
+        name: "name\x1b[0m",
+        description: "desc\x1b]0;pwn\x07",
+        mimeType: "text/\x1b[1mplain",
+      },
+    ],
+    templates: [],
+  });
+
+  assert.ok(!/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(text), "catalog output must not contain control characters");
+  assert.match(text, /mock:\/\/doc — desc — text\/plain/);
 });
 
 it("bounds the /mcp:resources catalog rendering for a huge catalog", () => {
@@ -372,6 +501,13 @@ it("lists and reads mock-server resources through the agent tools", async () => 
     await assert.rejects(listResources({ server: "other" }), /is not connected/);
     await assert.rejects(listResources({ server: "missing" }), /Unknown MCP server name/);
 
+    const abortedController = new AbortController();
+    abortedController.abort();
+    await assert.rejects(
+      mockExt.tools.get("mcp_list_resources").execute("", {}, abortedController.signal, undefined, ctx),
+      (err: unknown) => err instanceof AuthCancelledError,
+    );
+
     const read = async (uri: string) =>
       (await mockExt.tools.get("mcp_read_resource").execute("", { server: "mock", uri }, undefined, undefined, ctx)).content;
 
@@ -456,9 +592,13 @@ it("serves /mcp:resources summaries, listings, reads, and errors", async () => {
   const session = await startMockSession();
   const { extension: mockExt, ctx } = session;
   try {
-    await mockExt.tools.get("mcp_connect").execute("", { name: "mock" }, undefined, undefined, ctx);
     const command = mockExt.commands.get("mcp:resources");
     assert.ok(command, "mcp:resources must be registered");
+
+    await command.handler("", ctx);
+    assert.match(lastNotification(session).message, /No connected MCP servers/);
+
+    await mockExt.tools.get("mcp_connect").execute("", { name: "mock" }, undefined, undefined, ctx);
 
     await command.handler("", ctx);
     assert.match(lastNotification(session).message, /pi-mcp: MCP resources\n {2}mock — 4 resource\(s\), 1 template\(s\)/);
@@ -469,6 +609,9 @@ it("serves /mcp:resources summaries, listings, reads, and errors", async () => {
 
     await command.handler("mock mock://docs/readme", ctx);
     assert.match(lastNotification(session).message, /Hello from the mock resource/);
+
+    await command.handler("mock mock://empty", ctx);
+    assert.match(lastNotification(session).message, /\(empty resource\)/);
 
     await command.handler("mock mock://image", ctx);
     assert.match(lastNotification(session).message, /\[image image\/png, \d+ base64 chars\]/);

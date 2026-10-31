@@ -19,7 +19,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { AuthCancelledError, McpError } from "./errors.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
-import { reportDiagnostic } from "./debug-log.js";
+import { redactSecrets, reportDiagnostic } from "./debug-log.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -58,12 +59,12 @@ export type PiResourceContent =
 /** Upper bound on pages per list method, so a malfunctioning server cannot page us forever. */
 const MAX_PAGES = 100;
 
-interface ResourcePage<T> {
+export interface ResourcePage<T> {
   items: T[];
   nextCursor: string | undefined;
 }
 
-// ─── Pagination ───────────────────────────────────────────────────────────────
+// ─── Pagination & method-not-found degradation ────────────────────────────────
 
 function reportPaginationLimit(serverName: string, method: string): void {
   reportDiagnostic({
@@ -76,10 +77,36 @@ function reportPaginationLimit(serverName: string, method: string): void {
 }
 
 /**
- * Follow a cursor across pages until the server stops sending one.
+ * True for a JSON-RPC `-32601 Method not found` response.
+ * WHY: A server may advertise the `resources` capability and still not implement
+ * `resources/templates/list` (templates are optional in practice). That answer means
+ * "this server has no templates", not "the catalog failed".
+ */
+function isMethodNotFoundError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null || !("code" in err)) return false;
+  return (err as { code?: unknown }).code === -32601;
+}
+
+/**
+ * Follow a cursor across pages until the server stops sending one, degrading a JSON-RPC
+ * `-32601 Method not found` response to an empty list.
  * Aborts surface as {@link AuthCancelledError}; every other failure reaches the caller.
  */
-async function collectPages<T>(
+export async function collectPages<T>(
+  serverName: string,
+  method: string,
+  signal: AbortSignal | undefined,
+  fetchPage: (cursor: string | undefined) => Promise<ResourcePage<T>>,
+): Promise<T[]> {
+  try {
+    return await collectCursorPages(serverName, method, signal, fetchPage);
+  } catch (err) {
+    if (isMethodNotFoundError(err)) return [];
+    throw err;
+  }
+}
+
+async function collectCursorPages<T>(
   serverName: string,
   method: string,
   signal: AbortSignal | undefined,
@@ -109,21 +136,20 @@ function requestOptionsFor(options: ResourceRequestOptions): { timeout: number; 
   };
 }
 
+function cursorParams(cursor: string | undefined): { cursor: string } | undefined {
+  return cursor ? { cursor } : undefined;
+}
+
 /** Fetch one `resources/list` page through the typed helper, falling back to a raw request. */
 function fetchResourcesPage(
   client: Client,
   cursor: string | undefined,
   options: ResourceRequestOptions,
 ): Promise<ListResourcesResult> {
-  const requestOptions = requestOptionsFor(options);
-  if (typeof client.listResources === "function") {
-    return client.listResources(cursor ? { cursor } : undefined, requestOptions);
-  }
-  return client.request(
-    { method: "resources/list", params: cursor ? { cursor } : {} },
-    ListResourcesResultSchema,
-    requestOptions,
-  );
+  const reqOpts = requestOptionsFor(options);
+  const params = cursorParams(cursor);
+  if (typeof client.listResources === "function") return client.listResources(params, reqOpts);
+  return client.request({ method: "resources/list", params: params ?? {} }, ListResourcesResultSchema, reqOpts);
 }
 
 /** Fetch one `resources/templates/list` page. */
@@ -132,14 +158,13 @@ function fetchResourceTemplatesPage(
   cursor: string | undefined,
   options: ResourceRequestOptions,
 ): Promise<ListResourceTemplatesResult> {
-  const requestOptions = requestOptionsFor(options);
-  if (typeof client.listResourceTemplates === "function") {
-    return client.listResourceTemplates(cursor ? { cursor } : undefined, requestOptions);
-  }
+  const reqOpts = requestOptionsFor(options);
+  const params = cursorParams(cursor);
+  if (typeof client.listResourceTemplates === "function") return client.listResourceTemplates(params, reqOpts);
   return client.request(
-    { method: "resources/templates/list", params: cursor ? { cursor } : {} },
+    { method: "resources/templates/list", params: params ?? {} },
     ListResourceTemplatesResultSchema,
-    requestOptions,
+    reqOpts,
   );
 }
 
@@ -151,56 +176,28 @@ function readResourceOnce(client: Client, uri: string, options: ResourceRequestO
   return client.request({ method: "resources/read", params: { uri } }, ReadResourceResultSchema, requestOptions);
 }
 
-// ─── Method-not-found degradation ─────────────────────────────────────────────
-
-/**
- * True for a JSON-RPC `-32601 Method not found` response.
- * WHY: A server may advertise the `resources` capability and still not implement
- * `resources/templates/list` (templates are optional in practice). That answer means
- * "this server has no templates", not "the catalog failed".
- */
-function isMethodNotFoundError(err: unknown): boolean {
-  if (typeof err !== "object" || err === null || !("code" in err)) return false;
-  return (err as { code?: unknown }).code === -32601;
-}
-
 // ─── Discovery ────────────────────────────────────────────────────────────────
 
-async function listAllResources(
+export async function listAllResources(
   client: Client,
   serverName: string,
   options: ResourceRequestOptions,
 ): Promise<McpResourceDefinition[]> {
-  try {
-    return await collectPages<McpResourceDefinition>(serverName, "resources/list", options.signal, async (cursor) => {
-      const result = await fetchResourcesPage(client, cursor, options);
-      return { items: result.resources.map(toResourceDefinition), nextCursor: result.nextCursor };
-    });
-  } catch (err) {
-    if (isMethodNotFoundError(err)) return [];
-    throw err;
-  }
+  return collectPages(serverName, "resources/list", options.signal, async (cursor) => {
+    const result = await fetchResourcesPage(client, cursor, options);
+    return { items: result.resources.map(toResourceDefinition), nextCursor: result.nextCursor };
+  });
 }
 
-async function listAllResourceTemplates(
+export async function listAllResourceTemplates(
   client: Client,
   serverName: string,
   options: ResourceRequestOptions,
 ): Promise<McpResourceTemplateDefinition[]> {
-  try {
-    return await collectPages<McpResourceTemplateDefinition>(
-      serverName,
-      "resources/templates/list",
-      options.signal,
-      async (cursor) => {
-        const result = await fetchResourceTemplatesPage(client, cursor, options);
-        return { items: result.resourceTemplates.map(toResourceTemplateDefinition), nextCursor: result.nextCursor };
-      },
-    );
-  } catch (err) {
-    if (isMethodNotFoundError(err)) return [];
-    throw err;
-  }
+  return collectPages(serverName, "resources/templates/list", options.signal, async (cursor) => {
+    const result = await fetchResourceTemplatesPage(client, cursor, options);
+    return { items: result.resourceTemplates.map(toResourceTemplateDefinition), nextCursor: result.nextCursor };
+  });
 }
 
 function toResourceDefinition(resource: ListResourcesResult["resources"][number]): McpResourceDefinition {
@@ -268,6 +265,15 @@ interface CachedCatalog {
   catalog: ResourceCatalog;
 }
 
+function cloneCatalog(catalog: ResourceCatalog): ResourceCatalog {
+  return { resources: [...catalog.resources], templates: [...catalog.templates] };
+}
+
+function formatFailureDetail(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String((err as { message?: unknown } | null)?.message ?? err);
+  return redactSecrets(sanitizeTerminalText(raw));
+}
+
 /**
  * Caches each server's resource catalog and serves `resources/read` on demand.
  *
@@ -310,14 +316,16 @@ export class ResourceBridge {
     const generation = this._generation(serverName);
     const cached = this.catalogs.get(serverName);
     if (cached?.generation === generation) {
-      return { resources: [...cached.catalog.resources], templates: [...cached.catalog.templates] };
+      return cloneCatalog(cached.catalog);
     }
     const catalog = await this._fetchCatalog(serverName, client, options);
-    // WHY: the entry is stamped with the generation it was fetched under, so a list_changed
-    // that lands while these pages are in flight makes the next lookup miss and refetch
-    // instead of serving a catalog the server has already replaced.
-    this.catalogs.set(serverName, { generation, catalog });
-    return catalog;
+    // WHY: only cache when the generation has not advanced while these pages were in flight;
+    // otherwise a slow stale response would overwrite a newer generation's catalog or
+    // repopulate a server that was forgotten while in flight.
+    if (this._generation(serverName) === generation) {
+      this.catalogs.set(serverName, { generation, catalog });
+    }
+    return cloneCatalog(catalog);
   }
 
   /** Read one resource and convert its contents into Pi content blocks. */
@@ -375,7 +383,7 @@ export class ResourceBridge {
       await this.onAuthError?.(serverName, err);
     }
     throw new McpError(
-      `MCP resource request failed for ${serverName}: ${err instanceof Error ? err.message : String(err)}`,
+      `MCP resource request failed for ${serverName}: ${formatFailureDetail(err)}`,
       serverName,
       isSdkTimeoutError(err) ? "timeout" : "protocol",
       err,
