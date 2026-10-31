@@ -371,18 +371,19 @@ function convertMultiTypeSchema(
   return Type.Union(orderUnionMembers(members), opts);
 }
 
-/** Convert one tuple rest schema (an object schema or a boolean) to a TypeBox schema. */
-function convertTupleRestSchema(
-  rest: unknown,
-  ctx: ConversionContext,
-): TSchema | boolean | undefined {
+/**
+ * Convert one tuple rest schema (an object schema or a boolean) to a TypeBox schema.
+ * Any other value (`undefined`, `null`, a number, a string, an array) is not a schema
+ * keyword: later positions stay unconstrained instead of inheriting the closed default.
+ */
+function convertTupleRestSchema(rest: unknown, ctx: ConversionContext): TSchema | boolean {
   if (typeof rest === "boolean") {
     return rest;
   }
   if (isPlainObject(rest)) {
     return convertJsonSchemaToTypebox(rest, ctx.rootDefs, ctx.effectiveRoot, ctx.seenRefs);
   }
-  return undefined;
+  return true;
 }
 
 /**
@@ -392,18 +393,16 @@ function convertTupleRestSchema(
  * rejects every rest element with `schema is false` in Pi's `validateToolArguments`.
  * TypeBox types `TTuple.additionalItems` as the literal `false` and `Type.TupleOptions()`
  * drops the key, so this override is runtime-only: any `Type.Instantiate`-style rebuild of a
- * tuple loses it and has to re-apply it.
+ * tuple loses it and has to re-apply it. The rest schema is also validated but never
+ * `Value.Convert`-coerced — TypeBox's tuple converter only visits the declared positions —
+ * so `["ls", "1"]` stays a string and is rejected where a plain array would coerce it.
  */
 function withTupleRestSchema(
   rest: unknown,
   opts: Record<string, unknown>,
   ctx: ConversionContext,
 ): Record<string, unknown> {
-  const restSchema = convertTupleRestSchema(rest, ctx);
-  if (restSchema === undefined) {
-    return opts;
-  }
-  return { ...opts, additionalItems: restSchema };
+  return { ...opts, additionalItems: convertTupleRestSchema(rest, ctx) };
 }
 
 /**
@@ -416,9 +415,9 @@ function withTupleRestSchema(
  */
 function tupleRestKeyword(hasPrefixItems: boolean, schema: Record<string, unknown>): unknown {
   if (!hasPrefixItems) {
-    return schema["additionalItems"] ?? true;
+    return schema["additionalItems"];
   }
-  return schema["items"] ?? schema["additionalItems"] ?? true;
+  return schema["items"] ?? schema["additionalItems"];
 }
 
 function convertArraySchema(

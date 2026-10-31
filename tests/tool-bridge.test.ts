@@ -828,6 +828,17 @@ describe("convertJsonSchemaToTypebox", () => {
       /command\.1: must be integer/,
       "rest elements are still validated against the rest schema",
     );
+    // Rest elements are validated but not Value.Convert-coerced — TypeBox's tuple converter
+    // only walks the declared positions — so "5" is rejected here where a plain array
+    // with `items: { type: "integer" }` would have coerced it.
+    assert.throws(
+      () =>
+        validateToolArguments(
+          { name: "run", description: "run", parameters },
+          { type: "toolCall", id: "call_3", name: "run", arguments: { command: ["ls", "5"] } },
+        ),
+      /command\.1: must be integer/,
+    );
 
     // `items: true` admits anything, `items: false` closes the tuple, and an absent rest
     // keyword is unconstrained in both drafts (so a lone `prefixItems` is open too).
@@ -864,6 +875,12 @@ describe("convertJsonSchemaToTypebox", () => {
       prefixItems: [{ type: "string" }],
     }) as SchemaJson;
     assert.equal(noRest.additionalItems, true);
+    const invalidRest = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }],
+      items: 0,
+    }) as SchemaJson;
+    assert.equal(invalidRest.additionalItems, true, "a non-schema rest value is not a closure");
     const looseTupleParameters = convertJsonSchemaToTypebox({
       type: "object",
       properties: { v: { type: "array", prefixItems: [{ type: "string" }] } },
@@ -909,6 +926,37 @@ describe("convertJsonSchemaToTypebox", () => {
     const refRestSchema = refRest.additionalItems as SchemaJson;
     assert.equal(refRestSchema.type, "object");
     assert.equal(refRestSchema.properties.n?.type, "integer");
+
+    // End-to-end: the resolved `$ref` rest schema validates rest elements through a real tool.
+    const refParameters = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        v: {
+          type: "array",
+          prefixItems: [{ type: "string" }],
+          items: { $ref: "#/$defs/Cmd" },
+        },
+      },
+      required: ["v"],
+      $defs: {
+        Cmd: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] },
+      },
+    });
+    assert.deepEqual(
+      validateToolArguments(
+        { name: "run", description: "run", parameters: refParameters },
+        { type: "toolCall", id: "call_5", name: "run", arguments: { v: ["a", { n: 1 }] } },
+      ),
+      { v: ["a", { n: 1 }] },
+    );
+    assert.throws(
+      () =>
+        validateToolArguments(
+          { name: "run", description: "run", parameters: refParameters },
+          { type: "toolCall", id: "call_6", name: "run", arguments: { v: ["a", { n: "x" }] } },
+        ),
+      /v\.1\.n: must be integer/,
+    );
   });
 });
 
