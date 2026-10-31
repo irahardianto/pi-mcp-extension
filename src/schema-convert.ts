@@ -371,16 +371,56 @@ function convertMultiTypeSchema(
   return Type.Union(orderUnionMembers(members), opts);
 }
 
+/** Convert one tuple rest schema (an object schema or a boolean) to a TypeBox schema. */
+function convertTupleRestSchema(
+  rest: unknown,
+  ctx: ConversionContext,
+): TSchema | boolean | undefined {
+  if (typeof rest === "boolean") {
+    return rest;
+  }
+  if (isPlainObject(rest)) {
+    return convertJsonSchemaToTypebox(rest, ctx.rootDefs, ctx.effectiveRoot, ctx.seenRefs);
+  }
+  return undefined;
+}
+
+/**
+ * Add a tuple's rest schema to its TypeBox options as `additionalItems`.
+ * WHY: `Type.Tuple` forces `additionalItems: false`, so a variadic tuple such as
+ * `{ prefixItems: [{ type: "string" }], items: { type: "integer" } }` (`[string, ...integer[]]`)
+ * rejects every rest element with `schema is false` in Pi's `validateToolArguments`.
+ */
+function withTupleRestSchema(
+  rest: unknown,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): Record<string, unknown> {
+  const restSchema = convertTupleRestSchema(rest, ctx);
+  if (restSchema === undefined) {
+    return opts;
+  }
+  return { ...opts, additionalItems: restSchema };
+}
+
+/** The rest schema of a tuple: 2020-12 `items` after `prefixItems`, else draft-07 `additionalItems`. */
+function tupleRestSchema(hasPrefixItems: boolean, schema: Record<string, unknown>): unknown {
+  if (!hasPrefixItems) {
+    return schema["additionalItems"];
+  }
+  return schema["items"] ?? schema["additionalItems"];
+}
+
 function convertArraySchema(
   schema: Record<string, unknown>,
   opts: Record<string, unknown>,
   ctx: ConversionContext,
 ): TSchema {
-  const tupleItems = Array.isArray(schema["prefixItems"])
+  const prefixItems = Array.isArray(schema["prefixItems"])
     ? (schema["prefixItems"] as unknown[])
-    : Array.isArray(schema["items"])
-      ? (schema["items"] as unknown[])
-      : undefined;
+    : undefined;
+  const tupleItems =
+    prefixItems ?? (Array.isArray(schema["items"]) ? (schema["items"] as unknown[]) : undefined);
   if (tupleItems) {
     return Type.Tuple(
       tupleItems.map((item) =>
@@ -391,7 +431,7 @@ function convertArraySchema(
           ctx.seenRefs,
         ),
       ),
-      opts,
+      withTupleRestSchema(tupleRestSchema(prefixItems !== undefined, schema), opts, ctx),
     );
   }
   const items = schema["items"];
@@ -655,7 +695,9 @@ function resolveNonTypedSchema(
  * Convert a JSON Schema object to a TypeBox schema.
  * Handles the common subset used by real-world MCP servers:
  *   - Primitives (string, number, integer, boolean, null)
- *   - Arrays, tuples (prefixItems / array items), objects (with required/optional/additionalProperties)
+ *   - Arrays, tuples (prefixItems / array items, with a variadic `items` after
+ *     `prefixItems` or `additionalItems` after a draft-07 tuple), objects
+ *     (with required/optional/additionalProperties)
  *   - Enums and const (string, numeric, boolean, and nullable enums → Union of Literals)
  *   - Nullable and multi-type arrays ("type": ["string", "null"]) with Type.Null() ordered first
  *   - Cycle-safe $ref (#, #/$defs/, #/definitions/, and arbitrary RFC 6901 JSON Pointers)

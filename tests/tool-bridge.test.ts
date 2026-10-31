@@ -79,6 +79,7 @@ interface SchemaJson extends TSchema {
   properties: SchemaProps;
   patternProperties?: Record<string, SchemaJson>;
   additionalProperties: SchemaJson;
+  additionalItems?: SchemaJson | boolean;
   items: SchemaJson & SchemaTuple;
   anyOf: SchemaTuple;
   oneOf: SchemaTuple;
@@ -787,6 +788,92 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.equal(constrainedArr.minItems, 1);
     assert.equal(constrainedArr.maxItems, 10);
     assert.equal(constrainedArr.uniqueItems, true);
+  });
+
+  it("preserves variadic tuple rest schemas for prefixItems/items and draft-07 additionalItems", async () => {
+    const { validateToolArguments } = await import("@earendil-works/pi-ai");
+
+    // JSON Schema 2020-12: `prefixItems` + sibling `items` describes [string, ...integer[]].
+    const variadic = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }],
+      items: { type: "integer" },
+    }) as SchemaJson;
+    assert.equal((variadic.additionalItems as SchemaJson).type, "integer");
+
+    // End-to-end Pi validation: rest elements must reach the tuple's rest schema instead of
+    // hitting Type.Tuple's default `additionalItems: false` ("schema is false").
+    const parameters = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        command: {
+          type: "array",
+          prefixItems: [{ type: "string" }],
+          items: { type: "integer" },
+        },
+      },
+      required: ["command"],
+    });
+    const validated = validateToolArguments(
+      { name: "run", description: "run", parameters },
+      { type: "toolCall", id: "call_1", name: "run", arguments: { command: ["ls", 1, 2] } },
+    );
+    assert.deepEqual(validated, { command: ["ls", 1, 2] });
+    assert.throws(
+      () =>
+        validateToolArguments(
+          { name: "run", description: "run", parameters },
+          { type: "toolCall", id: "call_2", name: "run", arguments: { command: ["ls", "nope"] } },
+        ),
+      /command\.1: must be integer/,
+      "rest elements are still validated against the rest schema",
+    );
+
+    // `items: true` admits anything, `items: false` and a missing rest schema stay strict.
+    const anyRest = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }],
+      items: true,
+    }) as SchemaJson;
+    assert.equal(anyRest.additionalItems, true);
+    const closedRest = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }],
+      items: false,
+    }) as SchemaJson;
+    assert.equal(closedRest.additionalItems, false);
+    const noRest = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }],
+    }) as SchemaJson;
+    assert.equal(noRest.additionalItems, false);
+
+    // Draft-07 tuples carry the rest schema in `additionalItems` next to an array `items`.
+    const draft07Rest = convertJsonSchemaToTypebox({
+      type: "array",
+      items: [{ type: "string" }],
+      additionalItems: { type: "boolean" },
+    }) as SchemaJson;
+    assert.equal((draft07Rest.additionalItems as SchemaJson).type, "boolean");
+    const draft07Closed = convertJsonSchemaToTypebox({
+      type: "array",
+      items: [{ type: "string" }],
+      additionalItems: false,
+    }) as SchemaJson;
+    assert.equal(draft07Closed.additionalItems, false);
+
+    // A rest schema that is a `$ref` resolves against the root `$defs` like any other branch.
+    const refRest = convertJsonSchemaToTypebox({
+      type: "array",
+      prefixItems: [{ type: "string" }],
+      items: { $ref: "#/$defs/Cmd" },
+      $defs: {
+        Cmd: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] },
+      },
+    }) as SchemaJson;
+    const refRestSchema = refRest.additionalItems as SchemaJson;
+    assert.equal(refRestSchema.type, "object");
+    assert.equal(refRestSchema.properties.n?.type, "integer");
   });
 });
 
