@@ -371,16 +371,65 @@ function convertMultiTypeSchema(
   return Type.Union(orderUnionMembers(members), opts);
 }
 
+/**
+ * Convert one tuple rest schema (an object schema or a boolean) to a TypeBox schema.
+ * Any other value (`undefined`, `null`, a number, a string, an array) is not a schema
+ * keyword: later positions stay unconstrained instead of inheriting the closed default.
+ */
+function convertTupleRestSchema(rest: unknown, ctx: ConversionContext): TSchema | boolean {
+  if (typeof rest === "boolean") {
+    return rest;
+  }
+  if (isPlainObject(rest)) {
+    return convertJsonSchemaToTypebox(rest, ctx.rootDefs, ctx.effectiveRoot, ctx.seenRefs);
+  }
+  return true;
+}
+
+/**
+ * Add a tuple's rest schema to its TypeBox options as `additionalItems`.
+ * WHY: `Type.Tuple` forces `additionalItems: false`, so a variadic tuple such as
+ * `{ prefixItems: [{ type: "string" }], items: { type: "integer" } }` (`[string, ...integer[]]`)
+ * rejects every rest element with `schema is false` in Pi's `validateToolArguments`.
+ * TypeBox types `TTuple.additionalItems` as the literal `false` and `Type.TupleOptions()`
+ * drops the key, so this override is runtime-only: any `Type.Instantiate`-style rebuild of a
+ * tuple loses it and has to re-apply it. The rest schema is also validated but never
+ * `Value.Convert`-coerced — TypeBox's tuple converter only visits the declared positions —
+ * so `["ls", "1"]` stays a string and is rejected where a plain array would coerce it.
+ */
+function withTupleRestSchema(
+  rest: unknown,
+  opts: Record<string, unknown>,
+  ctx: ConversionContext,
+): Record<string, unknown> {
+  return { ...opts, additionalItems: convertTupleRestSchema(rest, ctx) };
+}
+
+/**
+ * The rest keyword of a tuple: 2020-12 `items` after `prefixItems` (falling back to a legacy
+ * sibling `additionalItems`), or draft-07 `additionalItems` after an array `items`.
+ * WHY: both drafts leave later positions unconstrained when that keyword is absent, while
+ * `Type.Tuple` defaults to `additionalItems: false` — which would reject every rest element
+ * with the same `schema is false` failure this conversion exists to prevent. A tuple is closed
+ * only when the source schema says so (`items: false` / `additionalItems: false`).
+ */
+function tupleRestKeyword(hasPrefixItems: boolean, schema: Record<string, unknown>): unknown {
+  if (!hasPrefixItems) {
+    return schema["additionalItems"];
+  }
+  return schema["items"] ?? schema["additionalItems"];
+}
+
 function convertArraySchema(
   schema: Record<string, unknown>,
   opts: Record<string, unknown>,
   ctx: ConversionContext,
 ): TSchema {
-  const tupleItems = Array.isArray(schema["prefixItems"])
+  const prefixItems = Array.isArray(schema["prefixItems"])
     ? (schema["prefixItems"] as unknown[])
-    : Array.isArray(schema["items"])
-      ? (schema["items"] as unknown[])
-      : undefined;
+    : undefined;
+  const tupleItems =
+    prefixItems ?? (Array.isArray(schema["items"]) ? (schema["items"] as unknown[]) : undefined);
   if (tupleItems) {
     return Type.Tuple(
       tupleItems.map((item) =>
@@ -391,7 +440,7 @@ function convertArraySchema(
           ctx.seenRefs,
         ),
       ),
-      opts,
+      withTupleRestSchema(tupleRestKeyword(prefixItems !== undefined, schema), opts, ctx),
     );
   }
   const items = schema["items"];
@@ -655,7 +704,9 @@ function resolveNonTypedSchema(
  * Convert a JSON Schema object to a TypeBox schema.
  * Handles the common subset used by real-world MCP servers:
  *   - Primitives (string, number, integer, boolean, null)
- *   - Arrays, tuples (prefixItems / array items), objects (with required/optional/additionalProperties)
+ *   - Arrays, tuples (prefixItems / array items, with a variadic `items` after
+ *     `prefixItems` or `additionalItems` after a draft-07 tuple), objects
+ *     (with required/optional/additionalProperties)
  *   - Enums and const (string, numeric, boolean, and nullable enums → Union of Literals)
  *   - Nullable and multi-type arrays ("type": ["string", "null"]) with Type.Null() ordered first
  *   - Cycle-safe $ref (#, #/$defs/, #/definitions/, and arbitrary RFC 6901 JSON Pointers)
