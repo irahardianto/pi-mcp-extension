@@ -292,10 +292,13 @@ export class ResourceBridge {
     this.catalogs.delete(serverName);
   }
 
-  /** Forget all state for a server that stopped or left the config. */
+  /** Forget a server's cached catalog when it stops or leaves the config. */
   forget(serverName: string): void {
+    // WHY: advance the generation instead of deleting it. A page set that was in flight when
+    // the server stopped would otherwise be stamped with the same generation a restarted
+    // server reads, resurrecting a catalog fetched from the previous client.
+    this.generations.set(serverName, this._generation(serverName) + 1);
     this.catalogs.delete(serverName);
-    this.generations.delete(serverName);
   }
 
   /** Return the server's resources and templates, fetching the catalog on first use. */

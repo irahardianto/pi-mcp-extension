@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import extension from "../src/index.js";
+import { formatResourceCatalog } from "../src/register-commands.js";
 import { ResourceBridge, convertResourceContents } from "../src/resource-bridge.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
@@ -151,6 +152,28 @@ it("discards a catalog that finished after a list_changed invalidated it", async
   assert.equal(listCalls, 2, "the invalidated response must not have been cached");
 });
 
+it("does not resurrect a catalog fetched for a server that was forgotten mid-flight", async () => {
+  const gate = createGate();
+  let listCalls = 0;
+  const client = fakeClient({
+    listResources: async () => {
+      listCalls += 1;
+      if (listCalls === 1) await gate.promise;
+      return { resources: [{ uri: listCalls === 1 ? "mock://dead-client" : "mock://new-client", name: "r" }] };
+    },
+  });
+  const bridge = new ResourceBridge();
+
+  const inFlight = bridge.getCatalog("srv", client, OPTIONS);
+  bridge.forget("srv");
+  gate.open();
+  await inFlight;
+
+  const afterRestart = await bridge.getCatalog("srv", client, OPTIONS);
+  assert.deepEqual(afterRestart.resources.map((resource) => resource.uri), ["mock://new-client"]);
+  assert.equal(listCalls, 2, "a forgotten server must not serve the previous client's catalog");
+});
+
 it("forgets a server's generation and catalog on forget()", async () => {
   const { client, calls } = pagedClient([{ resources: [{ uri: "mock://a", name: "a" }] }]);
   const bridge = new ResourceBridge();
@@ -212,6 +235,17 @@ it("maps an SDK request timeout to McpError(\"timeout\")", async () => {
   );
 });
 
+it("bounds the /mcp:resources catalog rendering for a huge catalog", () => {
+  const resources = Array.from({ length: 5000 }, (_, index) => ({ uri: `mock://r/${index}`, name: `r${index}` }));
+
+  const text = formatResourceCatalog("srv", { resources, templates: [] });
+
+  const lines = text.split("\n");
+  assert.equal(lines.length, 52, "header + 50 rows + one summary line");
+  assert.match(text, /5000 resource\(s\)/);
+  assert.match(lines.at(-1) ?? "", /… and 4950 more/);
+});
+
 it("routes a 401 during resources/read to the auth callback", async () => {
   const client = fakeClient({
     readResource: async () => {
@@ -243,7 +277,7 @@ interface MockSession {
   notifications: Array<{ message: string; type?: "info" | "warning" | "error" }>;
 }
 
-async function startMockSession(): Promise<MockSession> {
+async function startMockSession(extraServers: Record<string, unknown> = {}): Promise<MockSession> {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-resources-"));
   const notifications: MockSession["notifications"] = [];
   await mkdir(join(dir, ".pi"));
@@ -254,6 +288,7 @@ async function startMockSession(): Promise<MockSession> {
       mcpServers: {
         mock: { command: "node", args: ["--import", TSX_ESM_LOADER, MOCK_SERVER_PATH], lifecycle: "lazy" },
         other: { command: "node", args: ["--import", TSX_ESM_LOADER, MOCK_SERVER_PATH], lifecycle: "lazy" },
+        ...extraServers,
       },
     }),
   );
@@ -280,6 +315,32 @@ async function stopMockSession(session: MockSession): Promise<void> {
 function lastNotification(session: MockSession): { message: string; type?: "info" | "warning" | "error" } {
   const last = session.notifications.at(-1);
   assert.ok(last, "expected a UI notification");
+  return last;
+}
+
+interface ListedResources {
+  servers: Array<{ server: string; resources: ResourceItem[]; templates: TemplateItem[]; resourcesUnsupported?: boolean; error?: string }>;
+  stoppedServers: string[];
+}
+
+/**
+ * Poll `mcp_list_resources` until the catalog shows `expected` resources for its first row.
+ * The list_changed notification travels over stdio, so there is no promise to await; polling a
+ * bounded deadline beats a fixed sleep that flakes when the round trip is slower than it.
+ */
+async function waitForCatalogRows(
+  listResources: () => Promise<ListedResources>,
+  expected: number,
+): Promise<ListedResources> {
+  const deadline = Date.now() + 5000;
+  let last = await listResources();
+  while ((last.servers[0]?.resources.length ?? 0) !== expected) {
+    if (Date.now() > deadline) {
+      throw new Error(`catalog did not reach ${expected} resources within 5s (last: ${last.servers[0]?.resources.length ?? 0})`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    last = await listResources();
+  }
   return last;
 }
 
@@ -332,6 +393,41 @@ it("lists and reads mock-server resources through the agent tools", async () => 
   }
 });
 
+it("keeps healthy catalogs when one server fails and notes a capability-less server", async () => {
+  const mockServerEntry = (env: Record<string, string>) => ({
+    command: "node",
+    args: ["--import", TSX_ESM_LOADER, MOCK_SERVER_PATH],
+    lifecycle: "lazy",
+    env,
+  });
+  const session = await startMockSession({
+    broken: mockServerEntry({ MOCK_FAIL_RESOURCES: "1" }),
+    plain: mockServerEntry({ MOCK_NO_RESOURCES: "1" }),
+  });
+  const { extension: mockExt, ctx } = session;
+  try {
+    for (const name of ["mock", "broken", "plain"]) {
+      await mockExt.tools.get("mcp_connect").execute("", { name }, undefined, undefined, ctx);
+    }
+    const listed: ListedResources = JSON.parse(
+      (await mockExt.tools.get("mcp_list_resources").execute("", {}, undefined, undefined, ctx)).content[0].text,
+    );
+    const rows = new Map(listed.servers.map((row) => [row.server, row]));
+    assert.equal(rows.get("mock")?.resources.length, 4, "a failing server must not hide a healthy catalog");
+    assert.match(rows.get("broken")?.error ?? "", /MCP resource request failed for broken/);
+    assert.deepEqual(rows.get("broken")?.resources, []);
+    assert.equal(rows.get("plain")?.resourcesUnsupported, true, "a capability-less server is reported, not asked");
+    assert.deepEqual(listed.stoppedServers, ["other"]);
+
+    await assert.rejects(
+      mockExt.tools.get("mcp_read_resource").execute("", { server: "plain", uri: "mock://docs/readme" }, undefined, undefined, ctx),
+      /does not expose MCP resources/,
+    );
+  } finally {
+    await stopMockSession(session);
+  }
+});
+
 it("re-lists resources after notifications/resources/list_changed", async () => {
   const session = await startMockSession();
   const { extension: mockExt, ctx } = session;
@@ -346,12 +442,11 @@ it("re-lists resources after notifications/resources/list_changed", async () => 
     const addResourceTool = [...mockExt.tools.keys()].find((name) => name.includes("add_resource"));
     assert.ok(addResourceTool, "mock server must expose add_resource");
     await mockExt.tools.get(addResourceTool).execute("", {}, undefined, undefined, ctx);
-    // The notification is handled asynchronously over stdio; give it one round trip to land.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    const afterChange = await listResources();
-    assert.equal(afterChange.servers[0].resources.length, 5, "a cached catalog must not survive list_changed");
-    assert.ok(afterChange.servers[0].resources.some((resource: ResourceItem) => resource.uri === "mock://generated/1"));
+    const afterChange = await waitForCatalogRows(listResources, 5);
+    assert.ok(
+      afterChange.servers[0]?.resources.some((resource) => resource.uri === "mock://generated/1"),
+      "a cached catalog must not survive list_changed",
+    );
   } finally {
     await stopMockSession(session);
   }

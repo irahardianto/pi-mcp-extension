@@ -235,7 +235,7 @@ Server-name arguments provide autocomplete suggestions from the configured MCP s
 | `/mcp:auth <name>` | Connect (or force a fresh reconnect if already `ready`) using stored OAuth credentials and client registration; request browser authorization only if needed |
 | `/mcp:auth <name> --reset` | Discard stored tokens and client registration (re-running Dynamic Client Registration) and request fresh authorization (`--reset` may appear before or after `<name>`) |
 | `/mcp:resources` | Show resource and template counts for every connected server |
-| `/mcp:resources <name>` | List one server's resources (`uri`, description, MIME type) and URI templates |
+| `/mcp:resources <name>` | List one server's resources (`uri`, description, MIME type) and URI templates, capped at 50 rows plus an "and N more" line |
 | `/mcp:resources <name> <uri>` | Read one resource (template URIs filled in) and preview its text or image summary in a notification |
 
 In addition to user slash commands, built-in **agent tools** let the LLM inspect servers, connect them, and read their resources directly:
@@ -244,8 +244,8 @@ In addition to user slash commands, built-in **agent tools** let the LLM inspect
 |---|---|---|
 | `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active`), `auth` credential summary, `source` (`"global"` / `"project"` / `"extension"` / `"unknown"`), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
 | `mcp_connect` | `{ name: string }` | Connect one named server, run interactive OAuth if needed, and verify that discovered tools are active before returning success (returns fixed actionable categories on failure instead of raw server response text) |
-| `mcp_list_resources` | `{ server?: string }` | List `resources/list` entries (`uri`, `name`, `description`, `mimeType`) and `resources/templates/list` URI templates for connected servers, naming configured servers that are stopped and servers that do not advertise the `resources` capability (read-only) |
-| `mcp_read_resource` | `{ server: string, uri: string }` | Read one resource with `resources/read`: text resources return their text (including empty text), `image/*` blobs return an image block, and other binary blobs return a `[Binary resource: uri (mimeType, N bytes)]` summary instead of filling the context window (read-only) |
+| `mcp_list_resources` | `{ server?: string }` | List `resources/list` entries (`uri`, `name`, `description`, `mimeType`) and `resources/templates/list` URI templates for connected servers, naming configured servers that are stopped (`stoppedServers`), servers that do not advertise the `resources` capability (`resourcesUnsupported`), and servers whose listing failed (`error`) without dropping the healthy servers' rows (read-only) |
+| `mcp_read_resource` | `{ server: string, uri: string }` | Read one resource with `resources/read`: text resources return their text (including empty text), `image/*` blobs return an image block, and other binary blobs return a `[Binary resource: uri (mimeType, N bytes)]` summary instead of filling the context window; a server without the `resources` capability is reported as such rather than as a protocol error (read-only) |
 
 `mcp_status` returns a JSON array of [`ServerStatusRow`](./src/server-status.ts) objects:
 

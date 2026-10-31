@@ -533,12 +533,14 @@ interface ResourceToolRow {
   resources: McpResourceDefinition[];
   templates: McpResourceTemplateDefinition[];
   resourcesUnsupported?: boolean;
+  error?: string;
 }
 
 /**
  * Collect one server's catalog.
  * WHY: a server that never advertised the `resources` capability must not be asked — the raw
- * request would come back as a protocol error rather than an empty catalog.
+ * request would come back as a protocol error rather than an empty catalog. A server that does
+ * advertise it but fails keeps its row instead of rejecting every other server's listing.
  */
 async function collectResourcesForServer(
   server: ManagedServer,
@@ -549,11 +551,15 @@ async function collectResourcesForServer(
   if (!client || !client.getServerCapabilities()?.resources) {
     return { server: server.name, resources: [], templates: [], resourcesUnsupported: true };
   }
-  const catalog = await deps.resources.getCatalog(server.name, client, {
-    requestTimeoutMs: deps.manager.resolveRequestTimeoutMs(server),
-    ...(signal ? { signal } : {}),
-  });
-  return { server: server.name, ...catalog };
+  try {
+    const catalog = await deps.resources.getCatalog(server.name, client, {
+      requestTimeoutMs: deps.manager.resolveRequestTimeoutMs(server),
+      ...(signal ? { signal } : {}),
+    });
+    return { server: server.name, ...catalog };
+  } catch (err) {
+    return { server: server.name, resources: [], templates: [], error: formatErrorMessage(err) };
+  }
 }
 
 /** Gather `mcp_list_resources` rows for every connected server, or one explicitly named server. */
@@ -589,6 +595,12 @@ async function readResourceForTool(
   const client = target.client;
   if (!client || target.state !== "ready") {
     throw new Error(`MCP server ${serverName} is not connected. Use mcp_connect to connect it.`);
+  }
+  // WHY: without this a capability-less server answers resources/read with JSON-RPC -32601,
+  // which surfaces as a cryptic protocol error instead of the same actionable wording the
+  // listing and /mcp:resources use.
+  if (!client.getServerCapabilities()?.resources) {
+    throw new McpError(`MCP server ${serverName} does not expose MCP resources`, serverName, "protocol");
   }
   return deps.resources.readResource(serverName, client, uri, {
     requestTimeoutMs: deps.manager.resolveRequestTimeoutMs(target),

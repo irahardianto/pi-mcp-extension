@@ -167,7 +167,10 @@ function formatResourceLine(label: string, detail: string | undefined, mimeType:
   return `  ${parts.join(" — ")}`;
 }
 
-function formatResourceCatalog(serverName: string, catalog: ResourceCatalog): string {
+/** Maximum catalog rows rendered in one notification; the rest are summarized. */
+const MAX_CATALOG_ROWS = 50;
+
+export function formatResourceCatalog(serverName: string, catalog: ResourceCatalog): string {
   const header = `pi-mcp: ${sanitizeTerminalText(serverName, { maxLength: 64 })} — ${catalog.resources.length} resource(s), ${catalog.templates.length} template(s)`;
   const rows = [
     ...catalog.resources.map((resource) =>
@@ -178,7 +181,12 @@ function formatResourceCatalog(serverName: string, catalog: ResourceCatalog): st
     ),
   ];
   if (rows.length === 0) return `${header}\n  (none)`;
-  return [header, ...rows].join("\n");
+  const shown = rows.slice(0, MAX_CATALOG_ROWS);
+  const hidden = rows.length - shown.length;
+  // WHY: a spec-conformant server may advertise thousands of entries (100 pages × 100 rows),
+  // and this string reaches a terminal notification — bound it like the read preview.
+  if (hidden > 0) shown.push(`  … and ${hidden} more`);
+  return [header, ...shown].join("\n");
 }
 
 function describeResourceContent(content: PiResourceContent): string {

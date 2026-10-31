@@ -19,12 +19,17 @@ import {
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
+// WHY: capability and failure modes are env-driven so the extension tests can exercise a
+// server that advertises no resources, and one whose resources/list fails on request.
+const NO_RESOURCES = process.env["MOCK_NO_RESOURCES"] === "1";
+const FAIL_RESOURCES = process.env["MOCK_FAIL_RESOURCES"] === "1";
+
 const server = new Server(
   { name: "pi-mcp-test-server", version: "1.0.0" },
   {
     capabilities: {
       tools: { listChanged: true },
-      resources: { listChanged: true },
+      ...(NO_RESOURCES ? {} : { resources: { listChanged: true } }),
     },
   },
 );
@@ -128,36 +133,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-  resources: RESOURCES,
-}));
+if (!NO_RESOURCES) {
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    if (FAIL_RESOURCES) throw new Error("resources/list failed (mock)");
+    return { resources: RESOURCES };
+  });
 
-server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
-  resourceTemplates: RESOURCE_TEMPLATES,
-}));
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    resourceTemplates: RESOURCE_TEMPLATES,
+  }));
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const { uri } = request.params;
-  if (uri === "mock://docs/readme") {
-    return { contents: [{ uri, mimeType: "text/markdown", text: "# Mock readme\n\nHello from the mock resource." }] };
-  }
-  if (uri === "mock://empty") {
-    return { contents: [{ uri, mimeType: "text/plain", text: "" }] };
-  }
-  if (uri === "mock://image") {
-    return { contents: [{ uri, mimeType: "image/png", blob: TINY_PNG }] };
-  }
-  if (uri === "mock://binary") {
-    return { contents: [{ uri, mimeType: "application/octet-stream", blob: "AAECAwQ=" }] };
-  }
-  const templateMatch = /^mock:\/\/item\/(.+)$/.exec(uri);
-  if (templateMatch) {
-    return {
-      contents: [{ uri, mimeType: "application/json", text: JSON.stringify({ id: templateMatch[1] }) }],
-    };
-  }
-  throw new Error(`Unknown resource: ${uri}`);
-});
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+    if (uri === "mock://docs/readme") {
+      return { contents: [{ uri, mimeType: "text/markdown", text: "# Mock readme\n\nHello from the mock resource." }] };
+    }
+    if (uri === "mock://empty") {
+      return { contents: [{ uri, mimeType: "text/plain", text: "" }] };
+    }
+    if (uri === "mock://image") {
+      return { contents: [{ uri, mimeType: "image/png", blob: TINY_PNG }] };
+    }
+    if (uri === "mock://binary") {
+      return { contents: [{ uri, mimeType: "application/octet-stream", blob: "AAECAwQ=" }] };
+    }
+    const templateMatch = /^mock:\/\/item\/(.+)$/.exec(uri);
+    if (templateMatch) {
+      return {
+        contents: [{ uri, mimeType: "application/json", text: JSON.stringify({ id: templateMatch[1] }) }],
+      };
+    }
+    throw new Error(`Unknown resource: ${uri}`);
+  });
+}
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
