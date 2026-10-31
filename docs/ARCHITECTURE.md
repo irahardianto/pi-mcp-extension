@@ -8,10 +8,11 @@ branch, and the invariants called out in [AGENTS.md](../AGENTS.md) are cited whe
 apply.
 
 The extension has no build step: Pi loads the entry module as TypeScript directly. The
-entry wires four collaborators — a **connection coordinator**, a **server manager**, a
-**tool bridge**, and an **OAuth provider** — around the Pi `ExtensionAPI`. Configuration,
-credentials, and child processes are the only places that touch the filesystem, the
-network, the clock, or PIDs; policy and transforms stay as pure functions.
+entry wires five collaborators — a **connection coordinator**, a **server manager**, a
+**tool bridge**, a **resource bridge**, and an **OAuth provider** — around the Pi
+`ExtensionAPI`. Configuration, credentials, and child processes are the only places that
+touch the filesystem, the network, the clock, or PIDs; policy and transforms stay as
+pure functions.
 
 ---
 
@@ -24,6 +25,7 @@ flowchart TD
     subgraph Entry["Extension entry (default export)"]
         Coord["ConnectionCoordinator<br/>in-flight connects, authQueue, startup prompts, teardown"]
         Bridge["ToolBridge<br/>discovery, naming, activation"]
+        Res["ResourceBridge<br/>paginated catalog cache, resources/read"]
     end
 
     Mgr["ServerManager<br/>per-server lifecycle"]
@@ -40,6 +42,7 @@ flowchart TD
     Coord --> Mgr
     Mgr --> Tp
     Mgr --> Bridge
+    Mgr --> Res
     Tp --> Servers
     Tp --> Provider
     Provider <--> State
@@ -48,15 +51,18 @@ flowchart TD
     Bridge <--> Registry
 ```
 
-- The **entry** loads config, constructs the four collaborators, and registers
+- The **entry** loads config, constructs the collaborators, and registers
   `session_start` / `mcp_servers_change` / `session_shutdown`, the `/mcp*` commands, and
-  the `mcp_status` / `mcp_connect` tools. It registers them even when bootstrap config
-  loading fails, so a later `session_start` in another directory can still load a valid
-  project config.
+  the `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource` tools. It
+  registers them even when bootstrap config loading fails, so a later `session_start` in
+  another directory can still load a valid project config.
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
   server connects and disconnects.
+- **ResourceBridge** lazily caches each server's `resources/list` + `resources/templates/list`
+  catalog (invalidated by `notifications/resources/list_changed` and dropped on stop or
+  removal) and converts `resources/read` payloads into Pi text/image content blocks.
 - **McpOAuthProvider** is the SDK `OAuthClientProvider`. It reads and writes per-server
   state on disk and is serialized against other Pi processes by a lock file. The
   **CallbackServer** is a loopback HTTP listener used only by the interactive flow.
@@ -80,7 +86,7 @@ stateDiagram-v2
     starting --> stopped : "auth-required (raise AuthRequiredError)"
     starting --> stopped : "give-up: retries exhausted"
     starting --> stopped : "cancelled (stop / abort / reload)"
-    ready --> ready : "tools/list_changed refresh"
+    ready --> ready : "tools/list_changed refresh / resources/list_changed invalidate"
     ready --> starting : "onclose / onerror / health-check failure (_recover)"
     ready --> stopped : "stop / abort / reload (_shutdown)"
 
@@ -109,7 +115,9 @@ what to do:
 While `ready`, three independent recovery paths exist:
 
 - `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-registers the
-  server's tools and deactivates ones the server no longer advertises.
+  server's tools and deactivates ones the server no longer advertises;
+  `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
+  server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,
   each is time-bounded by the effective timeout, and a failure triggers `_recover()`.
 - an unexpected transport close (`client.onclose`) or a stream error (`client.onerror`)

@@ -147,7 +147,7 @@ PTY, and no ANSI scraping:
 | stdin | expected stdout |
 |---|---|
 | `{"id":"1","type":"prompt","message":"/mcp"}` | `response` for `1`, then a `notify` record with `MCP: 1/1 servers ready` and `✓ mock (ready)` |
-| `{"id":"2","type":"prompt","message":"/mcp mock"}` | `notify` with `Server: mock`, `State:  ready`, `Source: global` (or `project`), `Tools: 5/5 active` |
+| `{"id":"2","type":"prompt","message":"/mcp mock"}` | `notify` with `Server: mock`, `State:  ready`, `Source: global` (or `project`), `Tools: 6/6 active` |
 | `{"id":"3","type":"prompt","message":"/mcp:stop mock"}` | `notify` with `pi-mcp: Stopped mock` |
 | `{"id":"4","type":"prompt","message":"/mcp:start mock"}` | `notify` with `pi-mcp: Started mock` |
 | `{"id":"5","type":"new_session"}` | `response` for `5` with `data.cancelled: false`; a following `/mcp` reports the servers ready again |
@@ -345,7 +345,7 @@ Paste these with their result into the PR description. The headless items come
 from `smoke.mjs` and the two RPC transcripts above.
 
 - [ ] **stdio server, lifecycle** (headless): `/mcp` reports every server ready;
-      `/mcp mock` shows `State:  ready`, `Tools: 5/5 active`, and its source;
+      `/mcp mock` shows `State:  ready`, `Tools: 6/6 active`, and its source;
       `/mcp:stop mock` then `/mcp:start mock` restores it.
 - [ ] **tool call** (TUI, needs a model): ask Pi to call the fixture's `echo`
       tool (`mcp_mock_echo` with the default prefix) and check the reply.

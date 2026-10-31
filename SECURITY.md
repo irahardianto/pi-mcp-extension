@@ -2,15 +2,15 @@
 
 ## Supported Versions
 
-Only the latest minor version receives bug fixes and security updates. A new minor line (`1.11.0`) replaces the previous one as the supported line as soon as it is published; the previous line then receives no further fixes. Within the supported line, fixes ship to npm as patch releases (`1.10.0` → `1.10.1`), so staying on `latest` always keeps you supported.
+Only the latest minor version receives bug fixes and security updates. A new minor line (`1.12.0`) replaces the previous one as the supported line as soon as it is published; the previous line then receives no further fixes. Within the supported line, fixes ship to npm as patch releases (`1.11.0` → `1.11.1`), so staying on `latest` always keeps you supported.
 
 The table names the supported line as `major.minor.x`, so it stays accurate across patch releases:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.11.x  | :white_check_mark: |
-| 1.10.x  | :x:                |
-| < 1.10  | :x:                |
+| 1.12.x  | :white_check_mark: |
+| 1.11.x  | :x:                |
+| < 1.11  | :x:                |
 
 This table is maintained by hand: the release workflow bumps `package.json` and `CHANGELOG.md` automatically, so a `feat:` (minor) or breaking (major) change must update it in the same pull request (see [AGENTS.md](AGENTS.md#commits--release)).
 
@@ -35,7 +35,7 @@ Security issues in `pi-mcp-extension`'s core logic, configuration handling, auth
 - **Project trust boundary bypass:** Loading or executing untrusted project-level configuration (`<cwd>/.pi/mcp.json`) when `ctx.isProjectTrusted()` is `false`.
 - **OAuth callback attacks:** CSRF vulnerabilities, bypass of callback `state` parameter validation on success or error redirects, or listening on non-loopback interfaces.
 - **Command / shell injection:** Unsanitized parameters or authorization URLs passed to OS openers or shell processes.
-- **Terminal escape sequence injection:** Failure to sanitize raw ANSI/VT control sequences from MCP server `stderr` or output before display.
+- **Terminal escape sequence injection:** Failure to sanitize raw ANSI/VT control sequences from MCP server `stderr` or output before display, including resource names, URIs, descriptions, and `resources/read` content surfaced by `/mcp:resources`.
 - **Insecure file permissions:** Writing sensitive credential caches or lockfiles (`<hash>.json`, `<hash>.json.lock`) with permissions looser than `0o600` inside `0o700` directories.
 - **Supply-chain security:** Vulnerabilities in this package's release workflows, dependency chain, or published npm packages.
 

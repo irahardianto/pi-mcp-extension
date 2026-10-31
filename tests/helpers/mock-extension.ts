@@ -54,6 +54,7 @@ export interface MockCommand {
   name?: string;
   description?: string;
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+  getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
   [key: string]: unknown;
 }
 

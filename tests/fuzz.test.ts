@@ -44,6 +44,9 @@ import {
 } from "../src/auth-challenge.js";
 import { McpError } from "../src/errors.js";
 import { redactSecrets } from "../src/debug-log-format.js";
+import { parseResourceArguments } from "../src/commands.js";
+import { convertResourceContents } from "../src/resource-bridge.js";
+import { formatResourceCatalog } from "../src/register-commands.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -1179,3 +1182,58 @@ describe("fuzz: redactSecrets", () => {
     );
   });
 });
+
+// ─── Suite 9: Resource bridge & /mcp:resources helpers ───────────────────────
+
+describe("fuzz: resource bridge & /mcp:resources", () => {
+  const trimmedToken = fc
+    .stringMatching(/^[^\s][\x20-\x7e]{0,40}$/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  it("parseResourceArguments round-trips configured server names (including spaces) and URIs", () => {
+    fc.assert(
+      fc.property(trimmedToken, trimmedToken, (server, uri) => {
+        assert.deepEqual(parseResourceArguments(`  ${server}  `, [server]), { server, uri: "" });
+        assert.deepEqual(parseResourceArguments(`  ${server}   ${uri}  `, [server]), { server, uri });
+      }),
+      testOptions(),
+    );
+  });
+
+  it("convertResourceContents preserves arbitrary string text (including empty string) and never throws on arbitrary items", () => {
+    fc.assert(
+      fc.property(fc.array(fc.anything(), { maxLength: 20 }), arbitraryString, (items, text) => {
+        const converted = convertResourceContents([...items, { uri: "mock://t", text }]);
+        assert.equal(converted.length, items.length + 1);
+        assert.deepEqual(converted.at(-1), { type: "text", text });
+      }),
+      testOptions(),
+    );
+  });
+
+  it("formatResourceCatalog strips C0/C1/ESC control characters and caps output at 52 lines", () => {
+    const resourceArb = fc.record({
+      uri: arbitraryString,
+      name: arbitraryString,
+      description: fc.option(arbitraryString, { nil: undefined }),
+      mimeType: fc.option(arbitraryString, { nil: undefined }),
+    });
+    fc.assert(
+      fc.property(
+        arbitraryString,
+        fc.array(resourceArb, { maxLength: 80 }),
+        (serverName, resources) => {
+          const rendered = formatResourceCatalog(serverName, { resources, templates: [] });
+          assert.ok(
+            !/[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(rendered),
+            `Rendered catalog contained control characters: ${JSON.stringify(rendered)}`,
+          );
+          assert.ok(rendered.split("\n").length <= 52);
+        },
+      ),
+      testOptions(),
+    );
+  });
+});
+

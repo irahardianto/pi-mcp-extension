@@ -27,6 +27,35 @@ export function parseAuthArguments(args = "", serverNames: string[] = []): { nam
   return stripResetFlag(name);
 }
 
+/** Parsed `/mcp:resources [server] [uri]` arguments. */
+export interface ResourceArguments {
+  server: string;
+  uri: string;
+}
+
+function findMatchingServerPrefix(trimmed: string, serverNames: readonly string[]): string | undefined {
+  const sorted = [...serverNames].sort((a, b) => b.length - a.length);
+  return sorted.find((name) => name.length > 0 && trimmed.startsWith(name) && /\s/.test(trimmed[name.length] ?? ""));
+}
+
+/**
+ * Split `/mcp:resources` arguments into an optional server name and an optional URI.
+ * Exact and prefix matches against configured `serverNames` are checked first so server names
+ * containing spaces (`"team server"`) are preserved, and the URI keeps everything after the
+ * server delimiter so a URI containing spaces (`file:///path/with space`) is not truncated.
+ */
+export function parseResourceArguments(args = "", serverNames: readonly string[] = []): ResourceArguments {
+  const trimmed = args.trim();
+  if (!trimmed) return { server: "", uri: "" };
+  if (serverNames.includes(trimmed)) return { server: trimmed, uri: "" };
+  const matchedServer = findMatchingServerPrefix(trimmed, serverNames);
+  if (matchedServer) return { server: matchedServer, uri: trimmed.slice(matchedServer.length).trim() };
+  const separator = trimmed.search(/\s/);
+  return separator === -1
+    ? { server: trimmed, uri: "" }
+    : { server: trimmed.slice(0, separator), uri: trimmed.slice(separator).trim() };
+}
+
 export interface ServerCompletionEntry {
   name: string;
   state: string;

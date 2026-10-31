@@ -40,6 +40,12 @@ import {
 import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import * as Type from "typebox";
 import { ToolBridge } from "./tool-bridge.js";
+import {
+  ResourceBridge,
+  type McpResourceDefinition,
+  type McpResourceTemplateDefinition,
+  type PiResourceContent,
+} from "./resource-bridge.js";
 import { McpError, AuthCancelledError } from "./errors.js";
 import {
   ConnectionCoordinator,
@@ -130,6 +136,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // ── 2. Initialize bridge components ──────────────────────────────────────
   const manager = new ServerManager(config, paths.authStorageDir);
   const bridge = new ToolBridge(config.settings, pi);
+  const resources = new ResourceBridge();
   const callbackServer = paths.callbackServer ?? new CallbackServer();
   const coordinator = new ConnectionCoordinator({
     manager,
@@ -158,7 +165,10 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       },
     );
   });
-  manager.setServerStoppedCallback((name) => bridge.deactivateServer(name));
+  manager.setServerStoppedCallback((name) => {
+    bridge.deactivateServer(name);
+    resources.forget(name);
+  });
   manager.setRecoveryFailedCallback((serverName, error) => {
     coordinator.handleRecoveryFailed(serverName, error);
   });
@@ -168,7 +178,12 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     // survives a server that has since connected cleanly.
     coordinator.syncStatus();
   });
-  bridge.setAuthErrorCallback(async (serverName) => {
+  manager.setResourceListChangedCallback((name) => {
+    // WHY: resources are listed on demand, so a notification only has to make the cached
+    // catalog stale; the next read re-fetches it from the same client.
+    resources.invalidate(name);
+  });
+  const handleAuthError = async (serverName: string): Promise<void> => {
     const authError = await manager.handleUnauthorizedServerError(serverName);
     if (authError) {
       // WHY: A mid-session 401/403 stops the server synchronously, which cancels the
@@ -176,7 +191,11 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       // failure here or the re-auth warning and the footer hint never appear.
       coordinator.handleRecoveryFailed(serverName, authError);
     }
-  });
+  };
+  bridge.setAuthErrorCallback(handleAuthError);
+  // WHY: a resources/* request can be the first call to hit an expired token, so it needs
+  // the same re-authorization path as tools/call.
+  resources.setAuthErrorCallback(handleAuthError);
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
@@ -305,6 +324,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     for (const name of removedOrChanged) {
       coordinator.cancelServer(name);
       bridge.removeServer(name);
+      resources.forget(name);
       await manager.removeServer(name);
     }
     if (removedOrChanged.length > 0) {
@@ -347,7 +367,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // ── 4. Slash commands ───────────────────────────────────────────────────
   const getProvenance = (): ConfigProvenance =>
     withExtensionServers(fileProvenance, Object.keys(extensionServers));
-  registerCommands(pi, { manager, coordinator, bridge, getProvenance });
+  registerCommands(pi, { manager, coordinator, bridge, resources, getProvenance });
 
   const authorize = (serverName: string, ctx: ExtensionContext, signal: AbortSignal, reset: boolean) =>
     runAuthorize(
@@ -364,13 +384,14 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       reset,
     );
 
-  registerManagementTools(pi, { manager, coordinator, bridge, getProvenance });
+  registerManagementTools(pi, { manager, coordinator, bridge, resources, getProvenance });
 }
 
 interface ManagementToolDeps {
   manager: ServerManager;
   coordinator: ConnectionCoordinator;
   bridge: ToolBridge;
+  resources: ResourceBridge;
   getProvenance: () => ConfigProvenance;
 }
 
@@ -472,5 +493,123 @@ function registerManagementTools(
       }
       return { content: [{ type: "text", text: `MCP server ${name} ready; tools discovered and active.` }], details: {} };
     },
+  });
+
+  pi.registerTool({
+    name: "mcp_list_resources",
+    label: "List MCP resources",
+    description: "List MCP resources and URI templates exposed by connected servers. Use mcp_read_resource to read one by URI.",
+    promptSnippet: "Discover read-only MCP resources (documents, schemas, data streams) and URI templates, optionally for one server.",
+    parameters: Type.Object({
+      server: Type.Optional(Type.String({ description: "Exact configured MCP server name (default: all connected servers)" })),
+    }),
+    annotations: { readOnlyHint: true },
+    async execute(_id, { server }, signal) {
+      const rows = await listResourceRows(deps, server, signal);
+      return { content: [{ type: "text", text: JSON.stringify(rows) }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "mcp_read_resource",
+    label: "Read MCP resource",
+    description: "Read one MCP resource by server and URI. Text resources return their text; image blobs return an image; other binary blobs return a size summary.",
+    promptSnippet: "Read an MCP resource document or data stream by its URI from a connected server.",
+    parameters: Type.Object({
+      server: Type.String({ description: "Exact configured MCP server name" }),
+      uri: Type.String({ description: "Resource URI, or a URI template filled in by the caller" }),
+    }),
+    annotations: { readOnlyHint: true },
+    async execute(_id, { server, uri }, signal) {
+      const content = await readResourceForTool(deps, server, uri, signal);
+      return { content, details: {} };
+    },
+  });
+}
+
+/** One `mcp_list_resources` row: a connected server's resources and templates. */
+interface ResourceToolRow {
+  server: string;
+  resources: McpResourceDefinition[];
+  templates: McpResourceTemplateDefinition[];
+  resourcesUnsupported?: boolean;
+  error?: string;
+}
+
+/**
+ * Collect one server's catalog.
+ * WHY: a server that never advertised the `resources` capability must not be asked — the raw
+ * request would come back as a protocol error rather than an empty catalog. A server that does
+ * advertise it but fails keeps its row instead of rejecting every other server's listing.
+ */
+async function collectResourcesForServer(
+  server: ManagedServer,
+  deps: ManagementToolDeps,
+  signal: AbortSignal | undefined,
+): Promise<ResourceToolRow> {
+  if (signal?.aborted) throw new AuthCancelledError(server.name);
+  const client = server.client;
+  if (!client || !client.getServerCapabilities()?.resources) {
+    return { server: server.name, resources: [], templates: [], resourcesUnsupported: true };
+  }
+  try {
+    const catalog = await deps.resources.getCatalog(server.name, client, {
+      requestTimeoutMs: deps.manager.resolveRequestTimeoutMs(server),
+      ...(signal ? { signal } : {}),
+    });
+    return { server: server.name, ...catalog };
+  } catch (err) {
+    if (err instanceof AuthCancelledError || signal?.aborted) {
+      throw err instanceof AuthCancelledError ? err : new AuthCancelledError(server.name);
+    }
+    return { server: server.name, resources: [], templates: [], error: formatErrorMessage(err) };
+  }
+}
+
+/** Gather `mcp_list_resources` rows for every connected server, or one explicitly named server. */
+async function listResourceRows(
+  deps: ManagementToolDeps,
+  filter: string | undefined,
+  signal: AbortSignal | undefined,
+): Promise<{ servers: ResourceToolRow[]; stoppedServers: string[] }> {
+  if (signal?.aborted) throw new AuthCancelledError(filter ?? "mcp_list_resources");
+  const all = deps.manager.getAllServers();
+  if (filter) {
+    const target = all.find((server) => server.name === filter);
+    if (!target) throw new Error("Unknown MCP server name. Use mcp_status to list configured servers.");
+    if (target.state !== "ready") {
+      throw new Error(`MCP server ${filter} is not connected. Use mcp_connect to connect it.`);
+    }
+    return { servers: [await collectResourcesForServer(target, deps, signal)], stoppedServers: [] };
+  }
+  const connected = all.filter((server) => server.state === "ready");
+  const servers = await Promise.all(connected.map((server) => collectResourcesForServer(server, deps, signal)));
+  const stoppedServers = all.filter((server) => server.state !== "ready").map((server) => server.name);
+  return { servers, stoppedServers };
+}
+
+/** Resolve the server for `mcp_read_resource` and read one URI from its live client. */
+async function readResourceForTool(
+  deps: ManagementToolDeps,
+  serverName: string,
+  uri: string,
+  signal: AbortSignal | undefined,
+): Promise<PiResourceContent[]> {
+  if (signal?.aborted) throw new AuthCancelledError(serverName);
+  const target = deps.manager.getServer(serverName);
+  if (!target) throw new Error("Unknown MCP server name. Use mcp_status to list configured servers.");
+  const client = target.client;
+  if (!client || target.state !== "ready") {
+    throw new Error(`MCP server ${serverName} is not connected. Use mcp_connect to connect it.`);
+  }
+  // WHY: without this a capability-less server answers resources/read with JSON-RPC -32601,
+  // which surfaces as a cryptic protocol error instead of the same actionable wording the
+  // listing and /mcp:resources use.
+  if (!client.getServerCapabilities()?.resources) {
+    throw new McpError(`MCP server ${serverName} does not expose MCP resources`, serverName, "protocol");
+  }
+  return deps.resources.readResource(serverName, client, uri, {
+    requestTimeoutMs: deps.manager.resolveRequestTimeoutMs(target),
+    ...(signal ? { signal } : {}),
   });
 }
