@@ -829,7 +829,8 @@ describe("convertJsonSchemaToTypebox", () => {
       "rest elements are still validated against the rest schema",
     );
 
-    // `items: true` admits anything, `items: false` and a missing rest schema stay strict.
+    // `items: true` admits anything, `items: false` closes the tuple, and an absent rest
+    // keyword is unconstrained in both drafts (so a lone `prefixItems` is open too).
     const anyRest = convertJsonSchemaToTypebox({
       type: "array",
       prefixItems: [{ type: "string" }],
@@ -842,11 +843,40 @@ describe("convertJsonSchemaToTypebox", () => {
       items: false,
     }) as SchemaJson;
     assert.equal(closedRest.additionalItems, false);
+    const closedTupleParameters = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        v: { type: "array", prefixItems: [{ type: "string" }], items: false },
+      },
+      required: ["v"],
+    });
+    assert.throws(
+      () =>
+        validateToolArguments(
+          { name: "run", description: "run", parameters: closedTupleParameters },
+          { type: "toolCall", id: "call_4", name: "run", arguments: { v: ["a", 1] } },
+        ),
+      /v\.1: schema is false/,
+      "an explicit items: false still closes the tuple",
+    );
     const noRest = convertJsonSchemaToTypebox({
       type: "array",
       prefixItems: [{ type: "string" }],
     }) as SchemaJson;
-    assert.equal(noRest.additionalItems, false);
+    assert.equal(noRest.additionalItems, true);
+    const looseTupleParameters = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: { v: { type: "array", prefixItems: [{ type: "string" }] } },
+      required: ["v"],
+    });
+    assert.deepEqual(
+      validateToolArguments(
+        { name: "run", description: "run", parameters: looseTupleParameters },
+        { type: "toolCall", id: "call_3", name: "run", arguments: { v: ["a", 1] } },
+      ),
+      { v: ["a", 1] },
+      "prefixItems alone leaves the rest of the array unconstrained",
+    );
 
     // Draft-07 tuples carry the rest schema in `additionalItems` next to an array `items`.
     const draft07Rest = convertJsonSchemaToTypebox({
@@ -861,6 +891,11 @@ describe("convertJsonSchemaToTypebox", () => {
       additionalItems: false,
     }) as SchemaJson;
     assert.equal(draft07Closed.additionalItems, false);
+    const draft07Loose = convertJsonSchemaToTypebox({
+      type: "array",
+      items: [{ type: "string" }],
+    }) as SchemaJson;
+    assert.equal(draft07Loose.additionalItems, true);
 
     // A rest schema that is a `$ref` resolves against the root `$defs` like any other branch.
     const refRest = convertJsonSchemaToTypebox({

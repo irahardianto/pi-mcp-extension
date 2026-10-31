@@ -390,6 +390,9 @@ function convertTupleRestSchema(
  * WHY: `Type.Tuple` forces `additionalItems: false`, so a variadic tuple such as
  * `{ prefixItems: [{ type: "string" }], items: { type: "integer" } }` (`[string, ...integer[]]`)
  * rejects every rest element with `schema is false` in Pi's `validateToolArguments`.
+ * TypeBox types `TTuple.additionalItems` as the literal `false` and `Type.TupleOptions()`
+ * drops the key, so this override is runtime-only: any `Type.Instantiate`-style rebuild of a
+ * tuple loses it and has to re-apply it.
  */
 function withTupleRestSchema(
   rest: unknown,
@@ -403,12 +406,19 @@ function withTupleRestSchema(
   return { ...opts, additionalItems: restSchema };
 }
 
-/** The rest schema of a tuple: 2020-12 `items` after `prefixItems`, else draft-07 `additionalItems`. */
-function tupleRestSchema(hasPrefixItems: boolean, schema: Record<string, unknown>): unknown {
+/**
+ * The rest keyword of a tuple: 2020-12 `items` after `prefixItems` (falling back to a legacy
+ * sibling `additionalItems`), or draft-07 `additionalItems` after an array `items`.
+ * WHY: both drafts leave later positions unconstrained when that keyword is absent, while
+ * `Type.Tuple` defaults to `additionalItems: false` — which would reject every rest element
+ * with the same `schema is false` failure this conversion exists to prevent. A tuple is closed
+ * only when the source schema says so (`items: false` / `additionalItems: false`).
+ */
+function tupleRestKeyword(hasPrefixItems: boolean, schema: Record<string, unknown>): unknown {
   if (!hasPrefixItems) {
-    return schema["additionalItems"];
+    return schema["additionalItems"] ?? true;
   }
-  return schema["items"] ?? schema["additionalItems"];
+  return schema["items"] ?? schema["additionalItems"] ?? true;
 }
 
 function convertArraySchema(
@@ -431,7 +441,7 @@ function convertArraySchema(
           ctx.seenRefs,
         ),
       ),
-      withTupleRestSchema(tupleRestSchema(prefixItems !== undefined, schema), opts, ctx),
+      withTupleRestSchema(tupleRestKeyword(prefixItems !== undefined, schema), opts, ctx),
     );
   }
   const items = schema["items"];
