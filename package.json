@@ -43,6 +43,7 @@
     "typebox": "*"
   },
   "overrides": {
+    "minimatch": "^11.0.4",
     "undici": "^8.12.3"
   },
   "devDependencies": {
