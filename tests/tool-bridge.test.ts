@@ -426,6 +426,147 @@ describe("convertJsonSchemaToTypebox", () => {
     assert.ok(typeof schema === "object");
   });
 
+  it("percent-decodes RFC 6901 §6 fragment tokens so encoded $defs names resolve", () => {
+    const schema = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        response: { $ref: "#/$defs/Response%5BItem%5D" },
+        profile: { $ref: "#/$defs/User%20Profile" },
+      },
+      required: ["response", "profile"],
+      $defs: {
+        "Response[Item]": {
+          type: "object",
+          properties: { total: { type: "integer" } },
+          required: ["total"],
+        },
+        "User Profile": {
+          type: "object",
+          properties: { username: { type: "string" } },
+          required: ["username"],
+        },
+      },
+    }) as SchemaJson;
+    const props = schema.properties as Record<string, SchemaJson>;
+    assert.equal(props.response?.type, "object", "%5B/%5D must decode to the generic def name");
+    assert.equal(
+      (props.response?.properties as Record<string, SchemaJson>).total?.type,
+      "integer",
+      "resolved def must keep its own properties",
+    );
+    assert.equal(props.profile?.type, "object", "%20 must decode to a space");
+    assert.equal(
+      (props.profile?.properties as Record<string, SchemaJson>).username?.type,
+      "string",
+    );
+  });
+
+  it("decodes a fragment token before unescaping §4 escapes (§6 encoding wraps the pointer)", () => {
+    const schema = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/a%7E1b",
+      $defs: { "a/b": { type: "string" }, "a~1b": { type: "boolean" } },
+    }) as SchemaJson;
+    // "%7E1" is the encoded escape sequence "~1", which §4 turns into "/" -- so this points at
+    // the key "a/b", not at a literal "a~1b" key. Decoding after unescaping would pick the wrong one.
+    assert.equal(schema.type, "string", "%7E1 must decode to ~1 and then unescape to /");
+  });
+
+  it("treats a malformed percent escape in a fragment as a literal token instead of throwing", () => {
+    const schema = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        literal: { $ref: "#/$defs/Bad%ZZName" },
+        unknown: { $ref: "#/$defs/Lost%E0%A4%A" },
+      },
+      $defs: { "Bad%ZZName": { type: "string" } },
+    }) as SchemaJson;
+    const props = schema.properties as Record<string, SchemaJson>;
+    assert.equal(props.literal?.type, "string", "malformed escapes fall back to the raw token");
+    assert.deepEqual(props.unknown, {}, "an unresolvable malformed ref still degrades to Any");
+  });
+
+  it("decodes percent-encoded traversal segments, not just the $defs name", () => {
+    const schema = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/Envelope%20Props/properties/user%2Dname",
+      $defs: {
+        "Envelope Props": { type: "object", properties: { "user-name": { type: "integer" } } },
+      },
+    }) as SchemaJson;
+    assert.equal(schema.type, "integer", "nested pointer segments decode independently");
+  });
+
+  it("reads an encoded slash as a key first, then as a separator", () => {
+    const literalKey = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/a%2Fb",
+      $defs: { "a/b": { type: "string" }, a: { b: { type: "integer" } } },
+    }) as SchemaJson;
+    // The pointer is split before decoding, so "%2F" reaches the definition keyed "a/b" — a key
+    // containing "/" is spelled "~1" in pointer form, so this is the ordinary reading.
+    assert.equal(literalKey.type, "string");
+
+    const separator = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/a%2Fb",
+      $defs: { a: { b: { type: "integer" } } },
+    }) as SchemaJson;
+    // A resolver that decodes the whole fragment before splitting sees a separator here; the
+    // fallback reaches the subtree instead of degrading the schema to Any.
+    assert.equal(separator.type, "integer");
+  });
+
+  it("resolves the official JSON-Schema-Test-Suite escaped-pointer cases", () => {
+    // draft2020-12/ref.json: "escaped pointer ref" and "refs with quote".
+    const escaped = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        tilde: { $ref: "#/$defs/tilde~0field" },
+        slash: { $ref: "#/$defs/slash~1field" },
+        percent: { $ref: "#/$defs/percent%25field" },
+      },
+      $defs: {
+        "tilde~field": { type: "integer" },
+        "slash/field": { type: "integer" },
+        "percent%field": { type: "integer" },
+      },
+    }) as SchemaJson;
+    const props = escaped.properties as Record<string, SchemaJson>;
+    for (const key of ["tilde", "slash", "percent"]) {
+      assert.equal(props[key]?.type, "integer", `$ref for "${key}" must resolve`);
+    }
+
+    const quote = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: { 'foo"bar': { $ref: "#/$defs/foo%22bar" } },
+      $defs: { 'foo"bar': { type: "number" } },
+    }) as SchemaJson;
+    const quoted = quote.properties as Record<string, SchemaJson>;
+    assert.equal(quoted['foo"bar']?.type, "number", "%22 must decode to a double quote");
+  });
+
+  it("decodes escaped tildes (%7E0 -> ~) and multibyte UTF-8 in a token", () => {
+    const tilde = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/a%7E0b",
+      $defs: { "a~b": { type: "boolean" }, "a~0b": { type: "string" } },
+    }) as SchemaJson;
+    assert.equal(tilde.type, "boolean", "%7E0 must decode to ~0 and then unescape to ~");
+
+    const multibyte = convertJsonSchemaToTypebox({
+      $ref: "#/$defs/caf%C3%A9",
+      $defs: { café: { type: "integer" } },
+    }) as SchemaJson;
+    assert.equal(multibyte.type, "integer", "multi-byte escapes decode as one code point");
+  });
+
+  it("falls back to the undecoded token when a server emits a literal % in a definition name", () => {
+    const schema = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: { raw: { $ref: "#/$defs/with%20literal" } },
+      $defs: { "with%20literal": { type: "string" } },
+    }) as SchemaJson;
+    // "with%20literal" decodes to "with literal" and misses; the raw token must still be tried,
+    // because a server that skips §6 encoding would otherwise lose the schema it used to get.
+    assert.equal((schema.properties as Record<string, SchemaJson>).raw?.type, "string");
+  });
+
   it("handles nullable types: {type: ['string', 'null']} with Null first to prevent Value.Convert coercion", async () => {
     const { Value } = await import("typebox/value");
     const schema = convertJsonSchemaToTypebox({
