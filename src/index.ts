@@ -34,6 +34,7 @@ import { registerCommands } from "./register-commands.js";
 import { ServerManager, type ManagedServer } from "./server-manager.js";
 import {
   collectServerStatus,
+  getServerInstructions,
   toStatusRow,
   type ServerStatusRow,
 } from "./server-status.js";
@@ -491,10 +492,9 @@ function registerManagementTools(
       if (activity.active !== activity.discovered) {
         throw new Error("MCP server connected, but some discovered tools are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered and active counts.");
       }
-      const server = manager.getServer(name);
-      const status = server === undefined ? undefined : await collectStatusRow(server, deps, deps.getProvenance());
+      const instructions = getServerInstructions(manager.getServer(name));
       const ready = `MCP server ${name} ready; tools discovered and active.`;
-      const text = status?.instructions === undefined ? ready : `${ready}\nInstructions: ${status.instructions}`;
+      const text = instructions === undefined ? ready : `${ready}\nInstructions: ${instructions}`;
       return { content: [{ type: "text", text }], details: {} };
     },
   });

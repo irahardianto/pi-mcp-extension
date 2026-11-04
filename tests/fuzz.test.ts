@@ -47,6 +47,7 @@ import { redactSecrets } from "../src/debug-log-format.js";
 import { parseResourceArguments } from "../src/commands.js";
 import { convertResourceContents } from "../src/resource-bridge.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
+import { sanitizeServerInstructions } from "../src/server-status.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -1273,6 +1274,30 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
           assert.ok(linkOut.text.includes(" — Use mcp_read_resource to read]"));
         }
       }),
+      testOptions(),
+    );
+  });
+
+  it("sanitizeServerInstructions strips controls, masks credentials, bounds to <= 500 chars, and is idempotent", () => {
+    fc.assert(
+      fc.property(
+        arbitraryString,
+        fc.oneof(...credentialCarriers),
+        (raw, carrier) => {
+          const out = sanitizeServerInstructions(raw);
+          if (out !== undefined) {
+            assert.ok(out.length > 0 && out.length <= 500);
+            assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(out));
+            assert.equal(sanitizeServerInstructions(out), out, "Must be idempotent");
+          }
+
+          const withEscapedCarrier = `\u001b[31m${carrier.text}\u001b[0m`;
+          const redacted = sanitizeServerInstructions(withEscapedCarrier);
+          assert.ok(redacted !== undefined);
+          assert.equal(redacted.includes(carrier.secret), false);
+          assert.equal(sanitizeServerInstructions(redacted), redacted);
+        },
+      ),
       testOptions(),
     );
   });

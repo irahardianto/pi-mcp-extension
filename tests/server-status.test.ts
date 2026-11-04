@@ -19,6 +19,8 @@ import {
   formatServerDetail,
   formatStatusAuth,
   formatStatusError,
+  getServerInstructions,
+  sanitizeServerInstructions,
   toStatusRow,
   type ServerStatusSnapshot,
 } from "../src/server-status.js";
@@ -279,6 +281,22 @@ describe("collectServerStatus", () => {
     for (const state of ["stopped", "starting"] as const) {
       assert.equal(Object.hasOwn(await statusWithInstructions("stale instructions", state), "instructions"), false);
     }
+    assert.equal(getServerInstructions(undefined), undefined);
+    for (const nonString of [null, 42, {}, []]) {
+      assert.equal(sanitizeServerInstructions(nonString), undefined);
+    }
+  });
+
+  it("sanitizes and redacts raw snapshot.instructions when formatServerDetail or toStatusRow is called directly", () => {
+    const rawSnapshot = snapshot({
+      state: "ready",
+      instructions: "  Use \u001b[31msearch\u001b[0m; api_key=raw-secret  ",
+    });
+    const row = toStatusRow(rawSnapshot);
+    assert.equal(row.instructions, "Use search; api_key=[REDACTED]");
+    const detail = formatServerDetail(rawSnapshot, withExtensionServers(provenanceInput(), []));
+    assert.match(detail, /^Instructions: Use search; api_key=\[REDACTED\]$/m);
+    assert.doesNotMatch(detail, /raw-secret|\u001b/);
   });
 
   it("skips the credential probe entirely for a server without auth config", async () => {

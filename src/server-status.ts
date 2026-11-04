@@ -116,6 +116,7 @@ function isDefined(value: string | undefined): value is string {
 
 /** `/mcp <name>` detail view: config provenance, tool counts, credentials, and next steps. */
 export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: ConfigProvenance): string {
+  const instructions = sanitizeServerInstructions(snapshot.instructions);
   const lines: Array<string | undefined> = [
     `Server: ${sanitizeTerminalText(snapshot.name)}`,
     `State:  ${snapshot.state}`,
@@ -124,7 +125,7 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
     `Lifecycle: ${snapshot.lifecycle}`,
     `Source: ${formatServerSource(snapshot.source)}`,
     `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active`,
-    snapshot.instructions === undefined ? undefined : `Instructions: ${snapshot.instructions}`,
+    instructions === undefined ? undefined : `Instructions: ${instructions}`,
     snapshot.auth === undefined ? undefined : `OAuth: ${snapshot.auth}`,
     formatProjectConfigNote(provenance),
     // WHY: a connect/stream failure usually quotes the request URL, and that URL can carry a
@@ -137,6 +138,7 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
 
 /** `mcp_status` row for one server. */
 export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
+  const instructions = sanitizeServerInstructions(snapshot.instructions);
   return {
     name: snapshot.name,
     lifecycle: snapshot.lifecycle,
@@ -145,7 +147,7 @@ export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
     auth: snapshot.auth ?? "not configured",
     error: formatStatusError(snapshot.lastError),
     source: formatServerSource(snapshot.source),
-    ...(snapshot.instructions === undefined ? {} : { instructions: snapshot.instructions }),
+    ...(instructions === undefined ? {} : { instructions }),
   };
 }
 
@@ -174,19 +176,27 @@ async function summarizeAuth(params: CollectServerStatusParams): Promise<string 
   }
 }
 
-function serverInstructions(server: ManagedServer): string | undefined {
-  if (server.state !== "ready") return undefined;
-  const raw = server.client?.getInstructions();
-  if (raw === undefined) return undefined;
+/**
+ * Sanitize raw MCP initialize-handshake instructions: strip terminal escapes,
+ * redact credential-shaped substrings, and bound to 500 UTF-16 code units.
+ */
+export function sanitizeServerInstructions(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
   // WHY: remove escapes before redaction so they cannot hide a credential key;
   // bound the redacted result so masking cannot grow it beyond the UI budget.
   const cleaned = sanitizeTerminalText(raw, { maxLength: raw.length }).trim();
   return sanitizeTerminalText(redactSecrets(cleaned), { maxLength: 500 }).trim() || undefined;
 }
 
+/** Read and sanitize handshake instructions from a ready server. */
+export function getServerInstructions(server: ManagedServer | undefined): string | undefined {
+  if (server?.state !== "ready") return undefined;
+  return sanitizeServerInstructions(server.client?.getInstructions());
+}
+
 export async function collectServerStatus(params: CollectServerStatusParams): Promise<ServerStatusSnapshot> {
   const { server } = params;
-  const instructions = serverInstructions(server);
+  const instructions = getServerInstructions(server);
   return {
     name: server.name,
     state: server.state,

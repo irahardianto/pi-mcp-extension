@@ -7,7 +7,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- Connected MCP servers' initialize-handshake instructions are available in `/mcp <name>`, `mcp_status`, and successful `mcp_connect` results. Guidance is secret-redacted, terminal-sanitized, and bounded to 500 characters; absent or blank guidance is omitted.
+- Connected MCP servers' initialize-handshake instructions are available in `/mcp <name>`, `mcp_status`, and successful `mcp_connect` results. Guidance is secret-redacted, terminal-sanitized, and bounded to 500 characters; absent or blank guidance is omitted (#256).
+
+## [1.12.4] - 2026-11-04
 
 ### Fixed
 - Tool results now summarize `resource_link` entries with their URI, label, metadata, and a `mcp_read_resource` hint. Embedded image resources reach the model as image blocks, and other blobs include their MIME type and decoded byte count (#255).
