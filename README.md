@@ -395,8 +395,6 @@ Implements the **MCP 2025-03-26** specification for tool and resource clients:
 | `notifications/message` (structured logging) | ✅ |
 | `isError: true` distinction (protocol vs tool errors, non-text filtered on error) | ✅ |
 | Tool annotations (`readOnlyHint`, `destructiveHint`, etc.) | ✅ |
-| Prompts bridge | ⏳ v2 |
-| Sampling | ⏳ v2 |
 
 ## Contributing / Architecture
 
