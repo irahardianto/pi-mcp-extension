@@ -2,13 +2,13 @@
  * Per-server status snapshots shared by `/mcp <name>` and the `mcp_status` tool.
  *
  * `collectServerStatus` gathers connection state, tool activation counts, the OAuth
- * credential summary, and config provenance in one place; `formatServerDetail` renders
+ * credential summary, server instructions, and config provenance in one place; `formatServerDetail` renders
  * the `/mcp <name>` view and `toStatusRow` renders an `mcp_status` row from the same
  * snapshot, so the command and the tool can never drift apart.
  */
 
 import type { ServerConfig } from "./config.js";
-import { describeError, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
+import { describeError, redactSecrets, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
 import { McpError } from "./errors.js";
 import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import type { ManagedServer } from "./server-manager.js";
@@ -38,6 +38,8 @@ export interface ServerStatusSnapshot {
   lastError: Error | null;
   /** Recent sanitized stderr output, or the caller's "(no stderr output)" note. */
   recentOutput: string;
+  /** Sanitized initialize-handshake guidance, only while the server is ready. */
+  instructions?: string | undefined;
 }
 
 export interface ServerStatusRow {
@@ -48,6 +50,7 @@ export interface ServerStatusRow {
   auth: string;
   error: string | undefined;
   source: ServerConfigSource | "unknown";
+  instructions?: string | undefined;
 }
 
 export interface CollectServerStatusParams {
@@ -121,6 +124,7 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
     `Lifecycle: ${snapshot.lifecycle}`,
     `Source: ${formatServerSource(snapshot.source)}`,
     `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active`,
+    snapshot.instructions === undefined ? undefined : `Instructions: ${snapshot.instructions}`,
     snapshot.auth === undefined ? undefined : `OAuth: ${snapshot.auth}`,
     formatProjectConfigNote(provenance),
     // WHY: a connect/stream failure usually quotes the request URL, and that URL can carry a
@@ -141,6 +145,7 @@ export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
     auth: snapshot.auth ?? "not configured",
     error: formatStatusError(snapshot.lastError),
     source: formatServerSource(snapshot.source),
+    ...(snapshot.instructions === undefined ? {} : { instructions: snapshot.instructions }),
   };
 }
 
@@ -169,8 +174,19 @@ async function summarizeAuth(params: CollectServerStatusParams): Promise<string 
   }
 }
 
+function serverInstructions(server: ManagedServer): string | undefined {
+  if (server.state !== "ready") return undefined;
+  const raw = server.client?.getInstructions();
+  if (raw === undefined) return undefined;
+  // WHY: remove escapes before redaction so they cannot hide a credential key;
+  // bound the redacted result so masking cannot grow it beyond the UI budget.
+  const cleaned = sanitizeTerminalText(raw, { maxLength: raw.length }).trim();
+  return sanitizeTerminalText(redactSecrets(cleaned), { maxLength: 500 }).trim() || undefined;
+}
+
 export async function collectServerStatus(params: CollectServerStatusParams): Promise<ServerStatusSnapshot> {
   const { server } = params;
+  const instructions = serverInstructions(server);
   return {
     name: server.name,
     state: server.state,
@@ -182,5 +198,6 @@ export async function collectServerStatus(params: CollectServerStatusParams): Pr
     auth: await summarizeAuth(params),
     lastError: server.lastError,
     recentOutput: params.recentOutput ?? "",
+    ...(instructions === undefined ? {} : { instructions }),
   };
 }

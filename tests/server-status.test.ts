@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { ServerConfig } from "../src/config.js";
 import { McpError } from "../src/errors.js";
 import { AuthLockError, AuthRequiredError } from "../src/oauth-provider.js";
@@ -227,6 +228,59 @@ describe("formatServerDetail", () => {
 });
 
 describe("collectServerStatus", () => {
+  async function statusWithInstructions(raw: string | undefined, state: ManagedServer["state"] = "ready") {
+    const client = new Client({ name: "status-test", version: "1.0.0" });
+    client.getInstructions = () => raw;
+    return collectServerStatus({
+      server: managedServer({ state, client }),
+      tools: { discovered: 1, active: 1 },
+      source: "global",
+      readAuthStatus: async () => null,
+    });
+  }
+
+  it("surfaces sanitized handshake instructions in both status views", async () => {
+    const status = await statusWithInstructions("  Call search\u001b[31m first\u001b[0m.\nThen read.  ");
+    const row = JSON.parse(JSON.stringify(toStatusRow(status)));
+    assert.equal(row.instructions, "Call search first. Then read.");
+    const detail = formatServerDetail(status, withExtensionServers(provenanceInput(), []));
+    assert.match(detail, /^Instructions: Call search first\. Then read\.$/m);
+  });
+
+  it("redacts credentials after removing terminal escapes and before bounding instructions", async () => {
+    const status = await statusWithInstructions(
+      "api_\u001b[31mkey=fixture-value; https://example.test/?token=fixture-query\n" + "x".repeat(600),
+    );
+    const row = JSON.parse(JSON.stringify(toStatusRow(status)));
+    assert.match(row.instructions, /^api_key=\[REDACTED\]; https:\/\/example.test\/\?token=\[REDACTED\]/);
+    assert.equal(row.instructions.length, 500);
+    assert.ok(row.instructions.endsWith("…"));
+    assert.doesNotMatch(JSON.stringify(status), /fixture-value|fixture-query|\\u001b/);
+  });
+
+  it("bounds instructions without cutting an emoji in half", async () => {
+    const status = await statusWithInstructions("x".repeat(498) + "😀" + "more");
+    const row = JSON.parse(JSON.stringify(toStatusRow(status)));
+    assert.equal(row.instructions, "x".repeat(498) + "…");
+  });
+
+  it("trims padding before applying the instruction budget", async () => {
+    const status = await statusWithInstructions(" ".repeat(600) + "Search first." + " ".repeat(600));
+    assert.equal(JSON.parse(JSON.stringify(toStatusRow(status))).instructions, "Search first.");
+  });
+
+  it("omits absent, blank, control-only, and disconnected instructions", async () => {
+    for (const raw of [undefined, "", " \n\t ", "\u001b[31m\u001b[0m\u0007"]) {
+      const status = await statusWithInstructions(raw);
+      assert.equal(Object.hasOwn(status, "instructions"), false);
+      assert.equal(Object.hasOwn(toStatusRow(status), "instructions"), false);
+      assert.doesNotMatch(formatServerDetail(status, withExtensionServers(provenanceInput(), [])), /^Instructions:/m);
+    }
+    for (const state of ["stopped", "starting"] as const) {
+      assert.equal(Object.hasOwn(await statusWithInstructions("stale instructions", state), "instructions"), false);
+    }
+  });
+
   it("skips the credential probe entirely for a server without auth config", async () => {
     let probes = 0;
     const status = await collectServerStatus({

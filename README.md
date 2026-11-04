@@ -249,6 +249,13 @@ In addition to user slash commands, built-in **agent tools** let the LLM inspect
 
 `mcp_status` returns a JSON array of [`ServerStatusRow`](./src/server-status.ts) objects:
 
+Connected servers that provide MCP handshake instructions also include an optional
+`instructions` string. `/mcp <name>` displays the same guidance as `Instructions:`,
+and `mcp_connect` includes it after a successful connection. Instructions are
+secret-redacted, stripped of terminal controls, collapsed to one line, and capped
+at 500 UTF-16 code units. Blank instructions and stopped servers omit the field.
+These are server-provided usage hints, not trusted local policy.
+
 ```json
 [
   {

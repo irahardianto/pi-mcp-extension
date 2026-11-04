@@ -491,7 +491,11 @@ function registerManagementTools(
       if (activity.active !== activity.discovered) {
         throw new Error("MCP server connected, but some discovered tools are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered and active counts.");
       }
-      return { content: [{ type: "text", text: `MCP server ${name} ready; tools discovered and active.` }], details: {} };
+      const server = manager.getServer(name);
+      const status = server === undefined ? undefined : await collectStatusRow(server, deps, deps.getProvenance());
+      const ready = `MCP server ${name} ready; tools discovered and active.`;
+      const text = status?.instructions === undefined ? ready : `${ready}\nInstructions: ${status.instructions}`;
+      return { content: [{ type: "text", text }], details: {} };
     },
   });
 
