@@ -1373,6 +1373,27 @@ describe("ToolBridge", () => {
         return true;
       },
     );
+    callResponse = {
+      content: [
+        { type: "resource", resource: { uri: "image://preview", mimeType: "image/png", blob: "YWJj" } },
+        { type: "text", text: "Embedded render failed" },
+      ],
+      isError: true,
+    };
+    await assert.rejects(
+      () => tool.execute("call-4", {}, undefined, undefined, undefined),
+      { message: "Embedded render failed", code: "tool" },
+    );
+    callResponse = {
+      content: [
+        { type: "resource", resource: { uri: "image://preview", mimeType: "image/png", blob: "YWJj" } },
+      ],
+      isError: true,
+    };
+    await assert.rejects(
+      () => tool.execute("call-5", {}, undefined, undefined, undefined),
+      { message: "Tool reported an error", code: "tool" },
+    );
   });
 
   it("disambiguates intra-server and cross-server tool name collisions and isolates server deactivation", async () => {
@@ -1567,7 +1588,40 @@ describe("convertMcpContent", () => {
       { type: "text", text: "[Audio: audio/wav, base64 encoded]" },
       { type: "text", text: "file body" },
       { type: "text", text: "" },
-      { type: "text", text: "[Resource blob: file:///b.bin]" },
+      { type: "text", text: "[Binary resource: file:///b.bin (application/octet-stream, 2 bytes)]" },
+    ]);
+  });
+
+  it("converts embedded image and binary resources like resources/read", () => {
+    assert.deepEqual(convertMcpContent([
+      { type: "resource", resource: { uri: "image://preview", mimeType: "image/png", blob: "YWJj" } },
+      { type: "resource", resource: { uri: "file:///data", mimeType: "application/pdf", blob: "YWJj" } },
+      { type: "resource", resource: { uri: "file:///empty", blob: "" } },
+      { type: "resource", resource: { uri: "file:///empty-text", text: "", blob: "YWJj", mimeType: "image/png" } },
+    ]), [
+      { type: "image", mimeType: "image/png", data: "YWJj" },
+      { type: "text", text: "[Binary resource: file:///data (application/pdf, 3 bytes)]" },
+      { type: "text", text: "[Binary resource: file:///empty (application/octet-stream, 0 bytes)]" },
+      { type: "text", text: "" },
+    ]);
+  });
+
+  it("summarizes resource links with optional metadata and a read-resource hint", () => {
+    assert.deepEqual(convertMcpContent([
+      {
+        type: "resource_link", uri: "file:///schema.sql", name: "schema.sql",
+        title: "Database Schema", mimeType: "application/sql", size: 12, description: "Table definitions.",
+      },
+      { type: "resource_link", uri: "file:///empty", name: "empty", size: 0 },
+      { type: "resource_link", uri: "file:///bare" },
+      { type: "resource_link" },
+      { type: "resource_link", uri: "file:///fallback", title: 42, name: "fallback", mimeType: " ", size: -1, description: null },
+    ]), [
+      { type: "text", text: '[Resource link: file:///schema.sql "Database Schema" (application/sql, 12 bytes) — Use mcp_read_resource to read]\nTable definitions.' },
+      { type: "text", text: '[Resource link: file:///empty "empty" (0 bytes) — Use mcp_read_resource to read]' },
+      { type: "text", text: "[Resource link: file:///bare — Use mcp_read_resource to read]" },
+      { type: "text", text: "[Resource link: unknown — Use mcp_read_resource to read]" },
+      { type: "text", text: '[Resource link: file:///fallback "fallback" — Use mcp_read_resource to read]' },
     ]);
   });
 });

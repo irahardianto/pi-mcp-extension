@@ -261,7 +261,7 @@ export function convertResourceContents(contents: readonly unknown[]): PiResourc
   return contents.map(convertResourceContent);
 }
 
-function convertResourceContent(item: unknown): PiResourceContent {
+export function convertResourceContent(item: unknown): PiResourceContent {
   if (typeof item !== "object" || item === null) {
     return { type: "text", text: String(item) };
   }
