@@ -9,7 +9,7 @@
  *   - AbortSignal → SDK's built-in cancellation (notifications/cancelled)
  *   - Protocol error vs tool execution error distinction
  *   - Activate/deactivate pattern (register once, toggle on server state change)
- *   - Image content → ImageContent passthrough; audio/resource → text description
+ *   - Images and embedded image resources → ImageContent; resource links → read hints
  */
 
 import { createHash } from "node:crypto";
@@ -21,6 +21,7 @@ import type { Settings } from "./config.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
+import { convertResourceContent } from "./resource-bridge.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -69,13 +70,31 @@ export function buildToolName(
 type PiTextContent = { type: "text"; text: string };
 type PiImageContent = { type: "image"; data: string; mimeType: string };
 
-function convertResourceContent(obj: Record<string, unknown>): PiTextContent {
-  const r = obj["resource"] as Record<string, unknown> | undefined;
-  // WHY: Check `typeof r?.["text"] === "string"` rather than truthiness so
-  // empty text resources (`text: ""`) are preserved as `""` instead of `[Resource: uri]`.
-  if (typeof r?.["text"] === "string") return { type: "text", text: r["text"] };
-  if (r?.["blob"]) return { type: "text", text: `[Resource blob: ${String(r["uri"])}]` };
-  return { type: "text", text: `[Resource: ${String(r?.["uri"] ?? "unknown")}]` };
+function pickNonEmptyText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function convertResourceLink(obj: Record<string, unknown>): PiTextContent {
+  const uri = pickNonEmptyText(obj["uri"]) ?? "unknown";
+  const title = pickNonEmptyText(obj["title"]) ?? pickNonEmptyText(obj["name"]);
+  const label = title ? ` ${JSON.stringify(title)}` : "";
+  const details: string[] = [];
+  const mimeType = pickNonEmptyText(obj["mimeType"]);
+  if (mimeType) {
+    details.push(mimeType);
+  }
+  if (typeof obj["size"] === "number" && Number.isSafeInteger(obj["size"]) && obj["size"] >= 0) {
+    details.push(`${obj["size"]} bytes`);
+  }
+  const metadata = details.length > 0 ? ` (${details.join(", ")})` : "";
+  const descriptionText = pickNonEmptyText(obj["description"]);
+  const description = descriptionText ? `\n${descriptionText}` : "";
+  return {
+    type: "text",
+    text: `[Resource link: ${uri}${label}${metadata} — Use mcp_read_resource to read]${description}`,
+  };
 }
 
 function convertNonTextContent(obj: Record<string, unknown>): PiImageContent | PiTextContent | undefined {
@@ -93,9 +112,10 @@ function convertNonTextContent(obj: Record<string, unknown>): PiImageContent | P
     };
   }
   if (obj["type"] === "resource") {
-    return convertResourceContent(obj);
+    const resource = obj["resource"];
+    return convertResourceContent(typeof resource === "object" && resource !== null ? resource : {});
   }
-  return undefined;
+  return obj["type"] === "resource_link" ? convertResourceLink(obj) : undefined;
 }
 
 function convertMcpContentItem(item: unknown): PiTextContent | PiImageContent {

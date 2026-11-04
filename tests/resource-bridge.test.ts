@@ -307,11 +307,22 @@ it("converts text, empty text, image and binary resource contents", async () => 
 });
 
 it("falls back to a URI placeholder or string coercion for unrecognised content entries", () => {
-  assert.deepEqual(convertResourceContents([{ uri: "mock://odd" }, null, "raw"]), [
-    { type: "text", text: "[Resource: mock://odd]" },
-    { type: "text", text: "null" },
-    { type: "text", text: "raw" },
-  ]);
+  assert.deepEqual(
+    convertResourceContents([
+      { uri: "mock://odd" },
+      { uri: "   " },
+      { uri: { toString: false }, blob: "AAEC" },
+      null,
+      "raw",
+    ]),
+    [
+      { type: "text", text: "[Resource: mock://odd]" },
+      { type: "text", text: "[Resource: unknown]" },
+      { type: "text", text: "[Binary resource: unknown (application/octet-stream, 3 bytes)]" },
+      { type: "text", text: "null" },
+      { type: "text", text: "raw" },
+    ],
+  );
 });
 
 it("rejects an already-aborted catalog request on both cold and warm caches", async () => {
