@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.12.4] - 2026-11-04
+
 ### Fixed
 - Tool results now summarize `resource_link` entries with their URI, label, metadata, and a `mcp_read_resource` hint. Embedded image resources reach the model as image blocks, and other blobs include their MIME type and decoded byte count (#255).
 
