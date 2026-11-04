@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-04
+
 ### Added
 - Connected MCP servers' initialize-handshake instructions are available in `/mcp <name>`, `mcp_status`, and successful `mcp_connect` results. Guidance is secret-redacted, terminal-sanitized, and bounded to 500 characters; absent or blank guidance is omitted (#256).
 
