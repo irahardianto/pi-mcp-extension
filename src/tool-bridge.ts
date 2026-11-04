@@ -70,20 +70,27 @@ export function buildToolName(
 type PiTextContent = { type: "text"; text: string };
 type PiImageContent = { type: "image"; data: string; mimeType: string };
 
+function pickNonEmptyText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function convertResourceLink(obj: Record<string, unknown>): PiTextContent {
-  const uri = String(obj["uri"] ?? "unknown");
-  const title = typeof obj["title"] === "string" ? obj["title"] : obj["name"];
-  const label = typeof title === "string" && title.length > 0 ? ` ${JSON.stringify(title)}` : "";
+  const uri = pickNonEmptyText(obj["uri"]) ?? "unknown";
+  const title = pickNonEmptyText(obj["title"]) ?? pickNonEmptyText(obj["name"]);
+  const label = title ? ` ${JSON.stringify(title)}` : "";
   const details: string[] = [];
-  if (typeof obj["mimeType"] === "string" && obj["mimeType"].trim()) {
-    details.push(obj["mimeType"].trim());
+  const mimeType = pickNonEmptyText(obj["mimeType"]);
+  if (mimeType) {
+    details.push(mimeType);
   }
   if (typeof obj["size"] === "number" && Number.isSafeInteger(obj["size"]) && obj["size"] >= 0) {
     details.push(`${obj["size"]} bytes`);
   }
   const metadata = details.length > 0 ? ` (${details.join(", ")})` : "";
-  const description = typeof obj["description"] === "string" && obj["description"].length > 0
-    ? `\n${obj["description"]}` : "";
+  const descriptionText = pickNonEmptyText(obj["description"]);
+  const description = descriptionText ? `\n${descriptionText}` : "";
   return {
     type: "text",
     text: `[Resource link: ${uri}${label}${metadata} — Use mcp_read_resource to read]${description}`,
@@ -105,7 +112,8 @@ function convertNonTextContent(obj: Record<string, unknown>): PiImageContent | P
     };
   }
   if (obj["type"] === "resource") {
-    return convertResourceContent(obj["resource"] ?? {});
+    const resource = obj["resource"];
+    return convertResourceContent(typeof resource === "object" && resource !== null ? resource : {});
   }
   return obj["type"] === "resource_link" ? convertResourceLink(obj) : undefined;
 }

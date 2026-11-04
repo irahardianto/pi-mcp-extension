@@ -35,7 +35,7 @@ import {
   orderUnionMembers,
   convertJsonSchemaToTypebox,
 } from "../src/schema-convert.js";
-import { buildToolName } from "../src/tool-bridge.js";
+import { buildToolName, convertMcpContent } from "../src/tool-bridge.js";
 import { parseRegisteredServerConfig } from "../src/config.js";
 import { stripJsonComments } from "../src/jsonc.js";
 import {
@@ -1232,6 +1232,47 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
           assert.ok(rendered.split("\n").length <= 52);
         },
       ),
+      testOptions(),
+    );
+  });
+
+  it("convertMcpContent matches convertResourceContents for embedded resources and formats arbitrary resource_link blocks without throwing", () => {
+    const resourcePayloadArb = fc.record(
+      {
+        uri: fc.anything(),
+        text: fc.anything(),
+        blob: fc.anything(),
+        mimeType: fc.anything(),
+      },
+      { requiredKeys: [] },
+    );
+    const resourceLinkArb = fc.record(
+      {
+        type: fc.constant("resource_link" as const),
+        uri: fc.anything(),
+        name: fc.anything(),
+        title: fc.anything(),
+        mimeType: fc.anything(),
+        size: fc.anything(),
+        description: fc.anything(),
+      },
+      { requiredKeys: ["type"] },
+    );
+
+    fc.assert(
+      fc.property(resourcePayloadArb, resourceLinkArb, (resource, link) => {
+        const [embeddedOut, linkOut] = convertMcpContent([
+          { type: "resource", resource },
+          link,
+        ]);
+        const [readOut] = convertResourceContents([resource]);
+        assert.deepEqual(embeddedOut, readOut);
+        assert.equal(linkOut?.type, "text");
+        if (linkOut?.type === "text") {
+          assert.ok(linkOut.text.startsWith("[Resource link: "));
+          assert.ok(linkOut.text.includes(" — Use mcp_read_resource to read]"));
+        }
+      }),
       testOptions(),
     );
   });

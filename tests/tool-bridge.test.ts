@@ -1598,11 +1598,15 @@ describe("convertMcpContent", () => {
       { type: "resource", resource: { uri: "file:///data", mimeType: "application/pdf", blob: "YWJj" } },
       { type: "resource", resource: { uri: "file:///empty", blob: "" } },
       { type: "resource", resource: { uri: "file:///empty-text", text: "", blob: "YWJj", mimeType: "image/png" } },
+      { type: "resource", resource: "invalid-primitive" },
+      { type: "resource", resource: null },
     ]), [
       { type: "image", mimeType: "image/png", data: "YWJj" },
       { type: "text", text: "[Binary resource: file:///data (application/pdf, 3 bytes)]" },
       { type: "text", text: "[Binary resource: file:///empty (application/octet-stream, 0 bytes)]" },
       { type: "text", text: "" },
+      { type: "text", text: "[Resource: unknown]" },
+      { type: "text", text: "[Resource: unknown]" },
     ]);
   });
 
@@ -1616,12 +1620,16 @@ describe("convertMcpContent", () => {
       { type: "resource_link", uri: "file:///bare" },
       { type: "resource_link" },
       { type: "resource_link", uri: "file:///fallback", title: 42, name: "fallback", mimeType: " ", size: -1, description: null },
+      { type: "resource_link", uri: "file:///blank-title", title: "   ", name: "blank-title", description: "   " },
+      { type: "resource_link", uri: "   ", title: "", name: "" },
     ]), [
       { type: "text", text: '[Resource link: file:///schema.sql "Database Schema" (application/sql, 12 bytes) — Use mcp_read_resource to read]\nTable definitions.' },
       { type: "text", text: '[Resource link: file:///empty "empty" (0 bytes) — Use mcp_read_resource to read]' },
       { type: "text", text: "[Resource link: file:///bare — Use mcp_read_resource to read]" },
       { type: "text", text: "[Resource link: unknown — Use mcp_read_resource to read]" },
       { type: "text", text: '[Resource link: file:///fallback "fallback" — Use mcp_read_resource to read]' },
+      { type: "text", text: '[Resource link: file:///blank-title "blank-title" — Use mcp_read_resource to read]' },
+      { type: "text", text: "[Resource link: unknown — Use mcp_read_resource to read]" },
     ]);
   });
 });
