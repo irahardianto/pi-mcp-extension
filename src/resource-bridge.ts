@@ -261,6 +261,11 @@ export function convertResourceContents(contents: readonly unknown[]): PiResourc
   return contents.map(convertResourceContent);
 }
 
+function resolveResourceUri(raw: unknown): string {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed.length > 0 ? trimmed : "unknown";
+}
+
 export function convertResourceContent(item: unknown): PiResourceContent {
   if (typeof item !== "object" || item === null) {
     return { type: "text", text: String(item) };
@@ -274,7 +279,7 @@ export function convertResourceContent(item: unknown): PiResourceContent {
   if (typeof entry["blob"] === "string") {
     return convertBlobResource(entry);
   }
-  return { type: "text", text: `[Resource: ${String(entry["uri"] ?? "unknown")}]` };
+  return { type: "text", text: `[Resource: ${resolveResourceUri(entry["uri"])}]` };
 }
 
 function resolveBlobMimeType(raw: unknown): string {
@@ -283,9 +288,9 @@ function resolveBlobMimeType(raw: unknown): string {
 }
 
 function convertBlobResource(entry: Record<string, unknown>): PiResourceContent {
-  const uri = String(entry["uri"] ?? "unknown");
+  const uri = resolveResourceUri(entry["uri"]);
   const mimeType = resolveBlobMimeType(entry["mimeType"]);
-  const blob = String(entry["blob"]);
+  const blob = entry["blob"] as string;
   if (mimeType.startsWith("image/")) {
     return { type: "image", data: blob, mimeType };
   }
