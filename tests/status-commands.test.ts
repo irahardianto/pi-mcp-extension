@@ -36,7 +36,7 @@ function detailFor(messages: string[], serverName: string): string {
 async function readStatusRows(
   tools: ReturnType<typeof createMockExtension>["tools"],
   ctx: ReturnType<typeof createMockContext>,
-): Promise<Array<{ name: string; source?: string; auth?: string; error?: string }>> {
+): Promise<Array<{ name: string; source?: string; auth?: string; error?: string; instructions?: string }>> {
   const result = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
   return JSON.parse(result.content[0].text);
 }
@@ -128,6 +128,39 @@ it("reports config provenance, tool activation, and an untrusted project in /mcp
     );
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("surfaces sanitized server instructions after connecting and drops them after stopping", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-status-instructions-"));
+  const mockExt = createMockExtension();
+  const messages: string[] = [];
+  const ctx = createMockContext({ cwd: dir, hasUI: true, ui: { notify: (message: string) => messages.push(message) } });
+  const expected = "Search first. api_key=[REDACTED]; then read.";
+  try {
+    await writeFile(join(dir, "global.json"), JSON.stringify({
+      mcpServers: {
+        guided: {
+          ...stdioServer(),
+          lifecycle: "lazy",
+          env: { MOCK_INSTRUCTIONS: "  Search\u001b[31m first\u001b[0m.\napi_key=fixture-value; then read.  " },
+        },
+      },
+    }));
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.equal(Object.hasOwn((await readStatusRows(mockExt.tools, ctx))[0] ?? {}, "instructions"), false);
+    const connected = await mockExt.tools.get("mcp_connect").execute("", { name: "guided" }, undefined, undefined, ctx);
+    assert.ok(connected.content[0].text.endsWith(`\nInstructions: ${expected}`));
+    assert.equal((await readStatusRows(mockExt.tools, ctx))[0]?.instructions, expected);
+    await mockExt.commands.get("mcp").handler("guided", ctx);
+    assert.ok(detailFor(messages, "guided").includes(`\nInstructions: ${expected}\n`));
+    assert.equal(messages.join("\n").includes("fixture-value"), false);
+    await mockExt.commands.get("mcp:stop").handler("guided", ctx);
+    assert.equal(Object.hasOwn((await readStatusRows(mockExt.tools, ctx))[0] ?? {}, "instructions"), false);
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -23,10 +23,12 @@ import {
 // server that advertises no resources, and one whose resources/list fails on request.
 const NO_RESOURCES = process.env["MOCK_NO_RESOURCES"] === "1";
 const FAIL_RESOURCES = process.env["MOCK_FAIL_RESOURCES"] === "1";
+const INSTRUCTIONS = process.env["MOCK_INSTRUCTIONS"];
 
 const server = new Server(
   { name: "pi-mcp-test-server", version: "1.0.0" },
   {
+    ...(INSTRUCTIONS === undefined ? {} : { instructions: INSTRUCTIONS }),
     capabilities: {
       tools: { listChanged: true },
       ...(NO_RESOURCES ? {} : { resources: { listChanged: true } }),
