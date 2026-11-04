@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.12.3] - 2026-11-04
+
+## [1.12.2] - 2026-11-03
+
 ### Fixed
 - Tool results now summarize `resource_link` entries with their URI, label, metadata, and a `mcp_read_resource` hint. Embedded image resources reach the model as image blocks, and other blobs include their MIME type and decoded byte count (#255).
 - `$ref` values whose target name is percent-encoded in the URI fragment now resolve instead of silently degrading to `Type.Any()`. RFC 6901 §6 represents a `#/…` pointer as a URI fragment, so a definition such as `$defs["Response[Item]"]` (e.g. a generic `Response<Item>` or `$defs["User Profile"]`) is referenced as `#/$defs/Response%5BItem%5D`; `resolveRefTarget` split the fragment on `/` and unescaped `~1`/`~0` but never percent-decoded the segments, so the property lookup missed and `convertJsonSchemaToTypebox` handed Pi an unconstrained `{}` schema — a tool that then accepted arguments the server rejects. The fragment is now split on `/` and each token percent-decoded before §4 unescaping (decoding first is required: `%7E1` denotes the escape sequence `~1`, i.e. `/`, not a literal `~1` key), which matches how ajv resolves fragments and covers the escaped-pointer cases in the official JSON-Schema-Test-Suite (`tilde~0field`, `slash~1field`, `percent%25field`, `foo%22bar`). Two fallbacks run only when that token-wise reading misses, so they can add a resolution but never change one: the undecoded tokens, so a server that emits a literal `%` in a definition name keeps resolving; and a whole-fragment decode, so a resolver that treats `%2F` as a separator still reaches the subtree. A malformed escape (`%ZZ`, a truncated `%E0%A4%A`) is looked up literally rather than throwing out of `tools/list` conversion — a definition named `Bad%ZZName` still resolves, and otherwise the `$ref` degrades like any unresolvable one (#210).
