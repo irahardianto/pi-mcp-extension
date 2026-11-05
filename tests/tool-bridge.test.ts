@@ -1561,6 +1561,88 @@ describe("ToolBridge", () => {
   });
 });
 
+describe("ToolBridge annotations passthrough", () => {
+  async function registerWithAnnotations(annotations?: unknown): Promise<TestToolDefinition> {
+    const registeredTools: TestToolDefinition[] = [];
+    let annotationActiveTools: string[] = [];
+
+    const mockPi = {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getActiveTools: () => annotationActiveTools,
+      setActiveTools: (names: string[]) => { annotationActiveTools = names; },
+    };
+
+    const mockClient = {
+      request: async () => ({
+        tools: [{
+          name: "delete_record",
+          description: "Delete a record",
+          inputSchema: { type: "object", properties: {}, required: [] },
+          ...(annotations === undefined ? {} : { annotations }),
+        }],
+      }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+    await bridge.refreshTools("myserver", mockClient);
+
+    return registeredTools[0]!;
+  }
+
+  it("passes boolean hints through to registerTool", async () => {
+    const tool = await registerWithAnnotations({ destructiveHint: true, readOnlyHint: false });
+    assert.deepEqual(tool.annotations, { destructiveHint: true, readOnlyHint: false });
+  });
+
+  it("passes all four hints", async () => {
+    const tool = await registerWithAnnotations({
+      destructiveHint: true,
+      readOnlyHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    assert.deepEqual(tool.annotations, {
+      destructiveHint: true,
+      readOnlyHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+  });
+
+  it("omits the annotations key when the tool has none", async () => {
+    const tool = await registerWithAnnotations();
+    assert.equal("annotations" in tool, false);
+  });
+
+  it("omits the annotations key when only a title is present, and still uses it as the label", async () => {
+    const tool = await registerWithAnnotations({ title: "Just a title" });
+    assert.equal("annotations" in tool, false);
+    assert.equal(tool.label, "Just a title");
+  });
+
+  it("does not copy the title into the structured annotations", async () => {
+    const tool = await registerWithAnnotations({ title: "Delete", destructiveHint: true });
+    assert.deepEqual(tool.annotations, { destructiveHint: true });
+  });
+
+  it("ignores non-boolean values and keeps the valid hints", async () => {
+    // WHY: the real SDK schema rejects these before the bridge sees them; this simulates a bad payload.
+    const tool = await registerWithAnnotations({
+      destructiveHint: "yes",
+      readOnlyHint: 1,
+      openWorldHint: {},
+      idempotentHint: true,
+    });
+    assert.deepEqual(tool.annotations, { idempotentHint: true });
+  });
+
+  it("keeps the hints in the description text", async () => {
+    const tool = await registerWithAnnotations({ destructiveHint: true });
+    assert.ok(tool.description.includes("⚠️ destructive"));
+  });
+});
+
 // ── Content Conversion ────────────────────────────────────────────────────────
 
 describe("convertMcpContent", () => {

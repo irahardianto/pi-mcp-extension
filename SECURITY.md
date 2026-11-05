@@ -2,13 +2,14 @@
 
 ## Supported Versions
 
-Only the latest minor version receives bug fixes and security updates. A new minor line (`1.13.0`) replaces the previous one as the supported line as soon as it is published; the previous line then receives no further fixes. Within the supported line, fixes ship to npm as patch releases (`1.11.0` → `1.11.1`), so staying on `latest` always keeps you supported.
+Only the latest minor version receives bug fixes and security updates. A new minor line (`1.14.0`) replaces the previous one as the supported line as soon as it is published; the previous line then receives no further fixes. Within the supported line, fixes ship to npm as patch releases (`1.11.0` → `1.11.1`), so staying on `latest` always keeps you supported.
 
 The table names the supported line as `major.minor.x`, so it stays accurate across patch releases:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.13.x  | :white_check_mark: |
+| 1.14.x  | :white_check_mark: |
+| 1.13.x  | :x:                |
 | 1.12.x  | :x:                |
 | 1.11.x  | :x:                |
 | < 1.11  | :x:                |

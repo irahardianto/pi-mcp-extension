@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Bridged MCP tools now carry their structured annotations into Pi (#253). `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` were only appended to the tool description as text, so every tool was registered with `annotations: undefined` and Pi permission extensions could not tell a read-only tool from a destructive one. The hints are now also passed to `registerTool` as `annotations`: only strictly boolean values are copied (`false` is kept), `title` stays the tool's label, and the field is omitted when a tool has no usable hint. Descriptions and labels are unchanged.
+
 ## [1.13.0] - 2026-11-04
 
 ### Added
