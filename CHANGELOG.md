@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Extension-registered servers survive concurrent registration bursts correctly (#216). Pi's MCP registry emits `mcp_servers_change` synchronously for every `register()`/`unregister()` (`void this.emit(...)`, which never awaits an earlier listener), so two registrations in one turn ran two reconciles at once. Each reconcile awaits child-process teardown in `ServerManager.removeServer`, so the second one saw a half-shut-down entry, finished first, and the first one's resume then re-added a server that had just been unregistered — or deleted the entry the second one had just replaced, leaving its stdio child running with no owner (`session_shutdown` cannot kill a server that is no longer in the map). Reconciles now run through one serialized queue whose turn re-reads `pi.getMcpServers()` instead of applying its event's snapshot, so a burst collapses to the state that is current when the turn runs; a turn also bails at its checkpoints once its session has switched or shut down. `ServerManager.removeServer` deletes the map entry only when it still holds the instance it just shut down, so an in-flight removal can never drop a replacement. Change events are ignored while no session is active (before `session_start` and after `session_shutdown`), matching the built-in MCP extension, since servers spawned then would be attached to no session; `session_start` reads the registry itself and, when a registration arrived while it was still starting servers, reconciles once more when it finishes instead of waiting for an unrelated later event.
+
 ## [1.14.0] - 2026-11-06
 
 ### Added
@@ -15,9 +18,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - Connected MCP servers' initialize-handshake instructions are available in `/mcp <name>`, `mcp_status`, and successful `mcp_connect` results. Guidance is secret-redacted, terminal-sanitized, and bounded to 500 characters; absent or blank guidance is omitted (#256).
-
-### Fixed
-- Extension-registered servers survive concurrent registration bursts correctly (#216). Pi's MCP registry emits `mcp_servers_change` synchronously for every `register()`/`unregister()` (`void this.emit(...)`, which never awaits an earlier listener), so two registrations in one turn ran two reconciles at once. Each reconcile awaits child-process teardown in `ServerManager.removeServer`, so the second one saw a half-shut-down entry, finished first, and the first one's resume then re-added a server that had just been unregistered — or deleted the entry the second one had just replaced, leaving its stdio child running with no owner (`session_shutdown` cannot kill a server that is no longer in the map). Reconciles now run through one serialized queue whose turn re-reads `pi.getMcpServers()` instead of applying its event's snapshot, so a burst collapses to the state that is current when the turn runs; a turn also bails at its checkpoints once its session has switched or shut down. `ServerManager.removeServer` deletes the map entry only when it still holds the instance it just shut down, so an in-flight removal can never drop a replacement. Change events are ignored while no session is active (before `session_start` and after `session_shutdown`), matching the built-in MCP extension, since servers spawned then would be attached to no session; `session_start` reads the registry itself and now reconciles once more when it finishes, so a server registered during startup is not lost.
 
 ## [1.12.4] - 2026-11-04
 
