@@ -118,10 +118,11 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // reconcile turn that falls back to a stale event payload would apply superseded state.
   const hasRegisteredServersSource =
     typeof (pi as { getMcpServers?: () => RegisteredMcpServer[] }).getMcpServers === "function";
+  let latestEventEntries: RegisteredMcpServer[] = [];
   const getRegisteredEntries = (): RegisteredMcpServer[] =>
     hasRegisteredServersSource
       ? (pi as { getMcpServers: () => RegisteredMcpServer[] }).getMcpServers()
-      : [];
+      : latestEventEntries;
 
   let extensionServers = collectRegisteredServers(
     getRegisteredEntries(),
@@ -212,20 +213,26 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   // live registry collapses a burst into the state that is current when the turn runs.
   let sessionActive = false;
   let sessionEpoch = 0;
-  // Counts every `mcp_servers_change` notification, so session_start can tell whether a
+  // Counts every `mcp_servers_change` notification and the latest count already reconciled,
+  // so a burst of events collapses into one turn and session_start can tell whether a
   // registration landed after it snapshotted the registry.
   let changeEventCount = 0;
+  let appliedChangeCount = 0;
   let reconcileQueue: Promise<void> = Promise.resolve();
 
-  const applyServers = (next: Record<string, ServerConfig>): void => {
+  const applyServers = (next: Record<string, ServerConfig>, snapshotCount: number): void => {
     extensionServers = next;
     config = mergeWithRegisteredServers(fileConfig, next);
+    appliedChangeCount = snapshotCount;
   };
 
-  const enqueueServerReconcile = (
-    eventEntries: RegisteredMcpServer[],
-    ctx: ExtensionContext,
-  ): Promise<void> => {
+  const removeAppliedServer = (name: string): void => {
+    const { [name]: _removed, ...remaining } = extensionServers;
+    extensionServers = remaining;
+    config = mergeWithRegisteredServers(fileConfig, remaining);
+  };
+
+  const enqueueServerReconcile = (ctx: ExtensionContext): Promise<void> => {
     const epoch = sessionEpoch;
     // WHY: Pi's registry announces every register()/unregister(), including during extension
     // loading (before session_start has checked trust and read <cwd>/.pi/mcp.json) and after
@@ -234,22 +241,23 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     // aborted). session_start reads the registry itself, so the turn just no-ops instead.
     const isCurrent = () => sessionActive && epoch === sessionEpoch;
     const turn = reconcileQueue.then(() =>
-      isCurrent()
-        ? reconcileRegisteredServers(
-            {
-              manager,
-              coordinator,
-              bridge,
-              resources,
-              fileConfig,
-              appliedServers: extensionServers,
-              registeredEntries: hasRegisteredServersSource ? getRegisteredEntries() : eventEntries,
-              isCurrent,
-              applyServers,
-            },
-            ctx,
-          )
-        : undefined,
+      reconcileRegisteredServers(
+        {
+          manager,
+          coordinator,
+          bridge,
+          resources,
+          fileConfig,
+          appliedServers: extensionServers,
+          registeredEntries: getRegisteredEntries(),
+          appliedChangeCount,
+          getChangeCount: () => changeEventCount,
+          isCurrent,
+          removeAppliedServer,
+          applyServers,
+        },
+        ctx,
+      ),
     );
     // WHY: the emitter is fire-and-forget, so a rejected turn would become an unhandled
     // rejection; report it instead and keep the queue usable for later registrations.
@@ -306,6 +314,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         settings: { ...DEFAULT_SETTINGS },
         mcpServers: {},
       };
+      appliedChangeCount = changeEventCount;
       extensionServers = collectRegisteredServers(
         getRegisteredEntries(),
         fileConfig.mcpServers,
@@ -328,6 +337,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
 
     fileConfig = nextLoaded.config;
     fileProvenance = nextLoaded;
+    appliedChangeCount = changeEventCount;
     extensionServers = collectRegisteredServers(
       getRegisteredEntries(),
       fileConfig.mcpServers,
@@ -367,32 +377,32 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   };
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
-    // WHY: a queued reconcile belongs to the session that queued it; bumping the epoch makes
-    // any turn still in flight bail at its next checkpoint instead of applying old state.
+    // WHY: a queued reconcile belongs to the session that queued it; marking the session
+    // inactive and bumping the epoch makes any turn still in flight bail at its next
+    // checkpoint, and keeps change events arriving during startSession from racing config
+    // loading or teardown.
+    sessionActive = false;
     sessionEpoch += 1;
-    // Baseline for "did a registration arrive while session_start was running?" — such an
-    // event is ignored (there is no active session yet), so it needs one reconcile afterwards.
-    const changesAtStart = changeEventCount;
     try {
       await startSession(ctx);
     } finally {
       sessionActive = true;
-      // WHY: reconcile only when a registration actually landed during startup. An
-      // unconditional turn would re-collect the registry on every session start and repeat the
-      // per-entry config-error notification startSession already surfaced.
-      if (changeEventCount !== changesAtStart) {
-        await enqueueServerReconcile([], ctx);
+      // WHY: reconcile only when a registration landed after startSession snapshotted the
+      // registry. An unconditional turn would re-collect the registry on every session start
+      // and repeat the per-entry config-error notification startSession already surfaced.
+      if (changeEventCount !== appliedChangeCount) {
+        await enqueueServerReconcile(ctx);
       }
     }
   });
 
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
   pi.on("mcp_servers_change", (event, ctx: ExtensionContext) => {
+    if (Array.isArray((event as { servers?: unknown })?.servers)) {
+      latestEventEntries = (event as { servers: RegisteredMcpServer[] }).servers;
+    }
     changeEventCount += 1;
-    const entries = Array.isArray((event as { servers?: unknown })?.servers)
-      ? ((event as { servers: RegisteredMcpServer[] }).servers)
-      : getRegisteredEntries();
-    return enqueueServerReconcile(entries, ctx);
+    return enqueueServerReconcile(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
@@ -451,24 +461,62 @@ interface RegistrationReconcileDeps {
   appliedServers: Record<string, ServerConfig>;
   /** The registry as it is when the turn runs; an event's own snapshot is already stale. */
   registeredEntries: readonly RegisteredMcpServer[];
+  /** Change counter already applied when this turn begins. */
+  appliedChangeCount: number;
+  /** Live change counter, re-read after each async teardown step to detect supersession. */
+  getChangeCount: () => number;
   /** False once the session that queued this turn has switched or shut down. */
   isCurrent: () => boolean;
+  /** Drops a single removed server from the applied state before awaiting its teardown. */
+  removeAppliedServer: (name: string) => void;
   /** Publishes the applied registrations and merged config before eager servers start. */
-  applyServers: (next: Record<string, ServerConfig>) => void;
+  applyServers: (next: Record<string, ServerConfig>, snapshotCount: number) => void;
+}
+
+function findRemovedOrChangedServers(
+  appliedServers: Record<string, ServerConfig>,
+  nextServers: Record<string, ServerConfig>,
+): string[] {
+  const removedOrChanged: string[] = [];
+  for (const [name, prevCfg] of Object.entries(appliedServers)) {
+    const nextCfg = nextServers[name];
+    if (!nextCfg || JSON.stringify(prevCfg) !== JSON.stringify(nextCfg)) {
+      removedOrChanged.push(name);
+    }
+  }
+  return removedOrChanged;
+}
+
+function stageAddedServers(
+  manager: ServerManager,
+  nextServers: Record<string, ServerConfig>,
+): Array<[string, ServerConfig]> {
+  const addedEager: Array<[string, ServerConfig]> = [];
+  for (const [name, nextCfg] of Object.entries(nextServers)) {
+    if (manager.getServer(name)) continue;
+    manager.setServer(name, nextCfg);
+    if (nextCfg.lifecycle === "eager") {
+      addedEager.push([name, nextCfg]);
+    }
+  }
+  return addedEager;
 }
 
 /**
  * Bring the manager, bridge, and config in line with the current registrations.
  *
- * `isCurrent` is re-checked at the turn's entry and after each removal await, so a session that
- * switches or shuts down while a teardown is in flight stops the turn before it re-adds anything.
- * An eager start already running when the session ends is not this guard's job: session
- * teardown aborts those connect attempts and shuts the servers down.
+ * `isCurrent` and `getChangeCount` are checked at entry and after each removal await, so a
+ * session switch/shutdown or a newer registration that arrived while a teardown was in flight
+ * stops the turn before it re-adds or starts superseded servers. An eager start already running
+ * when the session ends is aborted by session teardown.
  */
 async function reconcileRegisteredServers(
   deps: RegistrationReconcileDeps,
   ctx: ExtensionContext,
 ): Promise<void> {
+  const snapshotCount = deps.getChangeCount();
+  if (!deps.isCurrent() || deps.appliedChangeCount === snapshotCount) return;
+
   deps.coordinator.setActiveContext(ctx);
   setDiagnosticUi(ctx.ui, ctx.hasUI);
 
@@ -481,38 +529,21 @@ async function reconcileRegisteredServers(
     },
   );
 
-  const removedOrChanged: string[] = [];
-  for (const [name, prevCfg] of Object.entries(deps.appliedServers)) {
-    const nextCfg = nextExtensionServers[name];
-    if (!nextCfg || JSON.stringify(prevCfg) !== JSON.stringify(nextCfg)) {
-      removedOrChanged.push(name);
-    }
-  }
-
+  const removedOrChanged = findRemovedOrChangedServers(deps.appliedServers, nextExtensionServers);
   for (const name of removedOrChanged) {
     deps.coordinator.cancelServer(name);
     deps.bridge.removeServer(name);
     deps.resources.forget(name);
+    deps.removeAppliedServer(name);
     await deps.manager.removeServer(name);
-    // WHY: the next step re-adds servers, which must never happen for a session that has gone
-    // away while this teardown was awaiting the child process.
-    if (!deps.isCurrent()) return;
-  }
-  if (removedOrChanged.length > 0) {
     deps.coordinator.syncStatus(ctx);
+    // WHY: the next step re-adds and starts servers, which must never happen when the
+    // session went away or a newer registration superseded this snapshot during teardown.
+    if (!deps.isCurrent() || deps.getChangeCount() !== snapshotCount) return;
   }
 
-  const addedEager: Array<[string, ServerConfig]> = [];
-  for (const [name, nextCfg] of Object.entries(nextExtensionServers)) {
-    if (!deps.manager.getServer(name)) {
-      deps.manager.setServer(name, nextCfg);
-      if (nextCfg.lifecycle === "eager") {
-        addedEager.push([name, nextCfg]);
-      }
-    }
-  }
-
-  deps.applyServers(nextExtensionServers);
+  const addedEager = stageAddedServers(deps.manager, nextExtensionServers);
+  deps.applyServers(nextExtensionServers, snapshotCount);
 
   if (addedEager.length > 0) {
     await deps.coordinator.startEagerServers(addedEager, ctx);

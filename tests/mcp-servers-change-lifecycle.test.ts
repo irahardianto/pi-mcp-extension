@@ -244,4 +244,232 @@ describe("mcp_servers_change reconciliation (#216)", () => {
       await harness.cleanup();
     }
   });
+
+  it("skips starting a superseded config when a newer change event arrives during removeServer teardown", async () => {
+    const harness = await createChangeHarness({ servers: [serverEntry("ext_srv")] });
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      const markerFile = join(harness.dir, "superseded-spawned.txt");
+      const superseded: RegisteredMcpServer[] = [
+        {
+          name: "ext_srv",
+          config: {
+            command: process.execPath,
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(markerFile)}, "spawned");`,
+            ],
+          },
+          extensionPath: "/ext/a.ts",
+        },
+      ];
+
+      // Start Turn 1 with `superseded`, then wait one microtask so Turn 1 enters
+      // reconcileRegisteredServers and suspends inside `await manager.removeServer("ext_srv")`
+      // before Event 2 unregisters the server.
+      harness.setRegistered(superseded);
+      const first = harness.emitChange(superseded);
+      await Promise.resolve();
+      harness.setRegistered([]);
+      const second = harness.emitChange([]);
+      await Promise.all([first, second]);
+
+      let markerCreated = false;
+      try {
+        await writeFile(markerFile, "", { flag: "r" });
+        markerCreated = true;
+      } catch {
+        markerCreated = false;
+      }
+      assert.equal(
+        markerCreated,
+        false,
+        "a config superseded while removeServer was awaiting child teardown must never be spawned",
+      );
+      assert.deepEqual(await harness.status(), []);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("coalesces a synchronous registration burst so a malformed entry is reported once", async () => {
+    const notifications: string[] = [];
+    const harness = await createChangeHarness({
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      const badEntry = { name: "bad", config: {}, extensionPath: "/ext/a.ts" } as unknown as RegisteredMcpServer;
+      const first = [badEntry];
+      const second = [badEntry, serverEntry("ext_good")];
+      harness.setRegistered(first);
+      const p1 = harness.emitChange(first);
+      harness.setRegistered(second);
+      const p2 = harness.emitChange(second);
+      await Promise.all([p1, p2]);
+
+      const configErrors = notifications.filter((message) => message.includes("Config error"));
+      assert.equal(
+        configErrors.length,
+        1,
+        `a burst of registrations must validate once for the coalesced turn, got: ${JSON.stringify(configErrors)}`,
+      );
+      assert.deepEqual(
+        (await harness.status()).map((row) => [row.name, row.state]),
+        [["ext_good", "ready"]],
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("gates change events during a subsequent session_start reload so they do not race startSession", async () => {
+    const notifications: string[] = [];
+    let harness: Awaited<ReturnType<typeof createChangeHarness>> | undefined;
+    let reloadPhase = false;
+    let emittedDuringReload = false;
+    const badEntry = { name: "bad", config: {}, extensionPath: "/ext/a.ts" } as unknown as RegisteredMcpServer;
+
+    harness = await createChangeHarness({
+      servers: [serverEntry("ext_first")],
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+        setStatus: () => {
+          if (!reloadPhase || emittedDuringReload) return;
+          emittedDuringReload = true;
+          const next = [badEntry, serverEntry("ext_first"), serverEntry("ext_reload")];
+          harness?.setRegistered(next);
+          void harness?.emitChange(next);
+        },
+      },
+    });
+
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+      reloadPhase = true;
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      const rows = await harness.status();
+      assert.ok(
+        rows.some((row) => row.name === "ext_reload" && row.state === "ready"),
+        `server registered during a subsequent session_start must be adopted: ${JSON.stringify(rows)}`,
+      );
+      const configErrors = notifications.filter((message) => message.includes("Config error"));
+      assert.equal(
+        configErrors.length,
+        1,
+        `change event during a subsequent session_start must reconcile once in finally, got: ${JSON.stringify(configErrors)}`,
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("keeps config in sync with ServerManager when a session switch interrupts an in-flight removal", async () => {
+    const notifications: string[] = [];
+    const harness = await createChangeHarness({
+      servers: [serverEntry("ext_srv")],
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      // Start removing ext_srv, let Turn 1 enter removeServer("ext_srv"), then re-register
+      // the same config and switch sessions while the old child teardown is still in flight.
+      harness.setRegistered([]);
+      const unregister = harness.emitChange([]);
+      await Promise.resolve();
+
+      harness.setRegistered([serverEntry("ext_srv")]);
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+      await unregister;
+
+      assert.deepEqual(
+        (await harness.status()).map((row) => [row.name, row.state]),
+        [["ext_srv", "ready"]],
+        "the new session must rebuild and start ext_srv after an interrupted removal",
+      );
+      assert.deepEqual(
+        notifications.filter((message) => message.includes("Unknown server")),
+        [],
+        `must never fail with Unknown server: ${JSON.stringify(notifications)}`,
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("collapses bursts and preserves startup registrations when the host only supplies event.servers", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-event-only-"));
+    const globalConfigPath = join(dir, "global-mcp.json");
+    await writeFile(globalConfigPath, JSON.stringify({ settings: { maxRetries: 0 } }));
+
+    const mockExt = createMockExtension();
+    // Simulate a host without pi.getMcpServers() where registrations arrive only on event.servers.
+    delete (mockExt.api as { getMcpServers?: unknown }).getMcpServers;
+
+    let emittedDuringStartup = false;
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: false,
+      isProjectTrusted: () => {
+        if (!emittedDuringStartup) {
+          emittedDuringStartup = true;
+          void mockExt.events.get("mcp_servers_change")(
+            { type: "mcp_servers_change", servers: [serverEntry("ext_event")] },
+            ctx,
+          );
+        }
+        return true;
+      },
+    });
+
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath });
+    try {
+      await mockExt.events.get("session_start")({}, ctx);
+      const afterStart = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string }>;
+      assert.deepEqual(
+        afterStart.map((row) => [row.name, row.state]),
+        [["ext_event", "ready"]],
+        "post-startup reconcile must retain the event.servers payload when getMcpServers is absent",
+      );
+
+      // Burst: update followed by unregister via event.servers only.
+      const p1 = mockExt.events.get("mcp_servers_change")(
+        { type: "mcp_servers_change", servers: [serverEntry("ext_event", { timeout: 45 })] },
+        ctx,
+      );
+      const p2 = mockExt.events.get("mcp_servers_change")(
+        { type: "mcp_servers_change", servers: [] },
+        ctx,
+      );
+      await Promise.all([p1, p2]);
+
+      const afterBurst = JSON.parse(
+        (await mockExt.tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text,
+      ) as Array<{ name: string; state: string }>;
+      assert.deepEqual(afterBurst, [], "event.servers fallback must collapse bursts to the latest event payload");
+    } finally {
+      await mockExt.events.get("session_shutdown")?.({}, ctx);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
+
