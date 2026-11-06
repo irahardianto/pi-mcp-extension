@@ -27,7 +27,7 @@
 - **Stable tool names** — Sanitized, collision-avoiding names (`<prefix>_<server>_<tool>`, max 64 chars) that stay constant across reconnects
 - **No tool churn** — Activate/deactivate pattern ensures tools don't flicker during reconnection
 - **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects, including Pi 1.3.0 partial overrides), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
-- **Rich tool results & annotations** — MCP `text`, `image` (`ImageContent`), `structuredContent`, embedded `resource` text/images/binary blobs, `resource_link` hints, and `audio` fallback descriptions, plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` surfaced in tool descriptions
+- **Rich tool results & annotations** — MCP `text`, `image` (`ImageContent`), `structuredContent`, embedded `resource` text/images/binary blobs, `resource_link` hints, and `audio` fallback descriptions, plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` surfaced in tool descriptions and passed to Pi as structured tool `annotations` (boolean hints only), so permission extensions can inspect them
 - **On-demand agent tools & commands** — `mcp_status`, `mcp_connect`, `mcp_list_resources`, and `mcp_read_resource` agent tools plus `/mcp`, `/mcp <name>` (with config provenance and failure hints), `/mcp:start`, `/mcp:stop`, `/mcp:auth`, and `/mcp:resources` slash commands with server-name autocomplete
 - **Structured error handling** — Distinct error codes (`config`, `connection`, `auth`, `timeout`, `protocol`, `tool`) and actionable failure hints
 - **Redacted debug logging** — Opt-in `PI_MCP_DEBUG=1` JSON Lines log (`<agent dir>/logs/pi-mcp.log`, `0600`, ~2 MB rotation) with automatic secret masking and zero TUI `stderr` noise
@@ -401,7 +401,7 @@ Implements the **MCP 2025-03-26** specification for tool and resource clients:
 | `notifications/cancelled` (AbortSignal) | ✅ |
 | `notifications/message` (structured logging) | ✅ |
 | `isError: true` distinction (protocol vs tool errors, non-text filtered on error) | ✅ |
-| Tool annotations (`readOnlyHint`, `destructiveHint`, etc.) | ✅ |
+| Tool annotations (`readOnlyHint`, `destructiveHint`, etc.) in descriptions and as structured Pi `annotations` | ✅ |
 
 ## Contributing / Architecture
 

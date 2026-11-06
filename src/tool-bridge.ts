@@ -5,7 +5,7 @@
  *   - Paginated tools/list (cursor loop per spec)
  *   - JSON Schema → TypeBox conversion (common types + Type.Any() fallback)
  *   - Tool name sanitization (Pi-compatible identifiers)
- *   - Tool annotations → description hints
+ *   - Tool annotations → description hints + structured Pi `annotations`
  *   - AbortSignal → SDK's built-in cancellation (notifications/cancelled)
  *   - Protocol error vs tool execution error distinction
  *   - Activate/deactivate pattern (register once, toggle on server state change)
@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolAnnotations } from "@earendil-works/pi-coding-agent";
 import { McpError, AuthCancelledError } from "./errors.js";
 import type { Settings } from "./config.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
@@ -171,6 +171,30 @@ function buildToolDescription(
   if (annotations.idempotentHint) hints.push("idempotent");
   if (annotations.openWorldHint) hints.push("may have side effects");
   return hints.length > 0 ? `${description} [${hints.join(", ")}]` : description;
+}
+
+const ANNOTATION_HINT_KEYS = [
+  "readOnlyHint",
+  "destructiveHint",
+  "idempotentHint",
+  "openWorldHint",
+] as const;
+
+/**
+ * Build the structured `annotations` Pi reads from a registered tool, so permission extensions
+ * can inspect the hints. Copies only the four boolean hints (keeping `false`), ignores `title`
+ * and non-boolean values, and returns `undefined` when none apply so the field is omitted.
+ */
+function buildToolAnnotations(
+  annotations: McpToolDefinition["annotations"],
+): ToolAnnotations | undefined {
+  if (!annotations) return undefined;
+  const result: ToolAnnotations = {};
+  for (const key of ANNOTATION_HINT_KEYS) {
+    const value = annotations[key];
+    if (typeof value === "boolean") result[key] = value;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 /** Call tools/call through the typed helper when present, else a raw JSON-RPC request. */
@@ -484,6 +508,7 @@ export class ToolBridge {
   ): void {
     const annotations = tool.annotations;
     const description = buildToolDescription(tool, annotations);
+    const toolAnnotations = buildToolAnnotations(annotations);
     const runTool = (params: unknown, signal: AbortSignal | undefined) =>
       this._executeToolCall(serverName, tool.name, client, params, signal);
     // WHY: `execute` runs with `this` bound to the registered-tool literal rather than the
@@ -497,6 +522,7 @@ export class ToolBridge {
       description,
       promptSnippet: description.slice(0, 120),
       parameters: convertJsonSchemaToTypebox(tool.inputSchema),
+      ...(toolAnnotations ? { annotations: toolAnnotations } : {}),
 
       async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
         try {
