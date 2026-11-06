@@ -114,9 +114,13 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     });
   }
 
+  // WHY: deciding this once keeps the "can we read the live registry?" answer stable; a
+  // reconcile turn that falls back to a stale event payload would apply superseded state.
+  const hasRegisteredServersSource =
+    typeof (pi as { getMcpServers?: () => RegisteredMcpServer[] }).getMcpServers === "function";
   const getRegisteredEntries = (): RegisteredMcpServer[] =>
-    typeof (pi as { getMcpServers?: () => RegisteredMcpServer[] }).getMcpServers === "function"
-      ? pi.getMcpServers()
+    hasRegisteredServersSource
+      ? (pi as { getMcpServers: () => RegisteredMcpServer[] }).getMcpServers()
       : [];
 
   let extensionServers = collectRegisteredServers(
@@ -199,7 +203,72 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   resources.setAuthErrorCallback(handleAuthError);
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
-  pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+  // WHY: Pi's MCP registry emits `mcp_servers_change` synchronously for every register() and
+  // unregister() (`void this.emit(...)` in the runner, which does not wait for earlier
+  // listeners), so a burst of registrations runs concurrent reconciles. Each reconcile awaits
+  // process teardown, so the second one sees a half-shut-down server, finishes first, and the
+  // first one's resume then resurrects an unregistered server — or deletes a server the second
+  // one just registered, orphaning its stdio child. One serialized queue whose turns re-read the
+  // live registry collapses a burst into the state that is current when the turn runs.
+  let sessionActive = false;
+  let sessionEpoch = 0;
+  // Counts every `mcp_servers_change` notification, so session_start can tell whether a
+  // registration landed after it snapshotted the registry.
+  let changeEventCount = 0;
+  let reconcileQueue: Promise<void> = Promise.resolve();
+
+  const applyServers = (next: Record<string, ServerConfig>): void => {
+    extensionServers = next;
+    config = mergeWithRegisteredServers(fileConfig, next);
+  };
+
+  const enqueueServerReconcile = (
+    eventEntries: RegisteredMcpServer[],
+    ctx: ExtensionContext,
+  ): Promise<void> => {
+    const epoch = sessionEpoch;
+    // WHY: Pi's registry announces every register()/unregister(), including during extension
+    // loading (before session_start has checked trust and read <cwd>/.pi/mcp.json) and after
+    // session_shutdown. Spawning servers then attaches child processes to no session; the
+    // built-in MCP extension ignores those events the same way (its session signal starts
+    // aborted). session_start reads the registry itself, so the turn just no-ops instead.
+    const isCurrent = () => sessionActive && epoch === sessionEpoch;
+    const turn = reconcileQueue.then(() =>
+      isCurrent()
+        ? reconcileRegisteredServers(
+            {
+              manager,
+              coordinator,
+              bridge,
+              resources,
+              fileConfig,
+              appliedServers: extensionServers,
+              registeredEntries: hasRegisteredServersSource ? getRegisteredEntries() : eventEntries,
+              isCurrent,
+              applyServers,
+            },
+            ctx,
+          )
+        : undefined,
+    );
+    // WHY: the emitter is fire-and-forget, so a rejected turn would become an unhandled
+    // rejection; report it instead and keep the queue usable for later registrations.
+    reconcileQueue = turn.catch((err: unknown) => {
+      const { kind, message } = describeError(err);
+      reportDiagnostic({
+        level: "error",
+        event: "servers.change_error",
+        message: `Failed to apply MCP server registration change: ${message}`,
+        fields: { kind },
+      });
+      if (isCurrent()) {
+        ctx.ui.notify(`pi-mcp: Failed to apply server registration change — ${message}`, "error");
+      }
+    });
+    return reconcileQueue;
+  };
+
+  const startSession = async (ctx: ExtensionContext): Promise<void> => {
     coordinator.setActiveContext(ctx);
     // WHY: While a UI is active, the extension never writes to Pi's stderr —
     // the TUI owns that stream. Diagnostics go to the debug log instead, and
@@ -295,62 +364,44 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     );
 
     await coordinator.startEagerServers(eagerServers, ctx);
+  };
+
+  pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+    // WHY: a queued reconcile belongs to the session that queued it; bumping the epoch makes
+    // any turn still in flight bail at its next checkpoint instead of applying old state.
+    sessionEpoch += 1;
+    // Baseline for "did a registration arrive while session_start was running?" — such an
+    // event is ignored (there is no active session yet), so it needs one reconcile afterwards.
+    const changesAtStart = changeEventCount;
+    try {
+      await startSession(ctx);
+    } finally {
+      sessionActive = true;
+      // WHY: reconcile only when a registration actually landed during startup. An
+      // unconditional turn would re-collect the registry on every session start and repeat the
+      // per-entry config-error notification startSession already surfaced.
+      if (changeEventCount !== changesAtStart) {
+        await enqueueServerReconcile([], ctx);
+      }
+    }
   });
 
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
-  pi.on("mcp_servers_change", async (event, ctx: ExtensionContext) => {
-    coordinator.setActiveContext(ctx);
-    setDiagnosticUi(ctx.ui, ctx.hasUI);
+  pi.on("mcp_servers_change", (event, ctx: ExtensionContext) => {
+    changeEventCount += 1;
     const entries = Array.isArray((event as { servers?: unknown })?.servers)
       ? ((event as { servers: RegisteredMcpServer[] }).servers)
       : getRegisteredEntries();
-
-    const nextExtensionServers = collectRegisteredServers(
-      entries,
-      fileConfig.mcpServers,
-      (err) => {
-        const msg = formatErrorMessage(err);
-        ctx.ui.notify(`pi-mcp: Config error — ${msg}`, "error");
-      },
-    );
-
-    const removedOrChanged: string[] = [];
-    for (const [name, prevCfg] of Object.entries(extensionServers)) {
-      const nextCfg = nextExtensionServers[name];
-      if (!nextCfg || JSON.stringify(prevCfg) !== JSON.stringify(nextCfg)) {
-        removedOrChanged.push(name);
-      }
-    }
-
-    for (const name of removedOrChanged) {
-      coordinator.cancelServer(name);
-      bridge.removeServer(name);
-      resources.forget(name);
-      await manager.removeServer(name);
-    }
-    if (removedOrChanged.length > 0) {
-      coordinator.syncStatus(ctx);
-    }
-
-    const addedEager: Array<[string, ServerConfig]> = [];
-    for (const [name, nextCfg] of Object.entries(nextExtensionServers)) {
-      if (!manager.getServer(name)) {
-        manager.setServer(name, nextCfg);
-        if (nextCfg.lifecycle === "eager") {
-          addedEager.push([name, nextCfg]);
-        }
-      }
-    }
-
-    extensionServers = nextExtensionServers;
-    config = mergeWithRegisteredServers(fileConfig, extensionServers);
-
-    if (addedEager.length > 0) {
-      await coordinator.startEagerServers(addedEager, ctx);
-    }
+    return enqueueServerReconcile(entries, ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
+    // WHY: invalidate before tearing down so a queued reconcile observes a dead session and
+    // bails, then drain the queue after teardown so shutdown never returns while a turn is
+    // still spawning children. Teardown runs first because it is what aborts an eager start
+    // the in-flight turn is waiting on.
+    sessionActive = false;
+    sessionEpoch += 1;
     reportDiagnostic({
       level: "info",
       event: "session.teardown",
@@ -360,6 +411,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     await coordinator.teardown(ctx, { removeServers: false });
     coordinator.setActiveContext(undefined);
     setDiagnosticUi(null, false);
+    await reconcileQueue;
     // WHY: Flush the queued debug-log writes before the process may exit, so a
     // bug report attached right after the session ends is not missing events.
     await getDebugLog()?.flush();
@@ -386,6 +438,85 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     );
 
   registerManagementTools(pi, { manager, coordinator, bridge, resources, getProvenance });
+}
+
+interface RegistrationReconcileDeps {
+  manager: ServerManager;
+  coordinator: ConnectionCoordinator;
+  bridge: ToolBridge;
+  resources: ResourceBridge;
+  /** File-backed config; extension registrations are merged on top of it. */
+  fileConfig: McpConfig;
+  /** Registrations currently in effect, diffed against the new snapshot. */
+  appliedServers: Record<string, ServerConfig>;
+  /** The registry as it is when the turn runs; an event's own snapshot is already stale. */
+  registeredEntries: readonly RegisteredMcpServer[];
+  /** False once the session that queued this turn has switched or shut down. */
+  isCurrent: () => boolean;
+  /** Publishes the applied registrations and merged config before eager servers start. */
+  applyServers: (next: Record<string, ServerConfig>) => void;
+}
+
+/**
+ * Bring the manager, bridge, and config in line with the current registrations.
+ *
+ * `isCurrent` is re-checked at the turn's entry and after each removal await, so a session that
+ * switches or shuts down while a teardown is in flight stops the turn before it re-adds anything.
+ * An eager start already running when the session ends is not this guard's job: session
+ * teardown aborts those connect attempts and shuts the servers down.
+ */
+async function reconcileRegisteredServers(
+  deps: RegistrationReconcileDeps,
+  ctx: ExtensionContext,
+): Promise<void> {
+  deps.coordinator.setActiveContext(ctx);
+  setDiagnosticUi(ctx.ui, ctx.hasUI);
+
+  const nextExtensionServers = collectRegisteredServers(
+    deps.registeredEntries,
+    deps.fileConfig.mcpServers,
+    (err) => {
+      const msg = formatErrorMessage(err);
+      ctx.ui.notify(`pi-mcp: Config error — ${msg}`, "error");
+    },
+  );
+
+  const removedOrChanged: string[] = [];
+  for (const [name, prevCfg] of Object.entries(deps.appliedServers)) {
+    const nextCfg = nextExtensionServers[name];
+    if (!nextCfg || JSON.stringify(prevCfg) !== JSON.stringify(nextCfg)) {
+      removedOrChanged.push(name);
+    }
+  }
+
+  for (const name of removedOrChanged) {
+    deps.coordinator.cancelServer(name);
+    deps.bridge.removeServer(name);
+    deps.resources.forget(name);
+    await deps.manager.removeServer(name);
+    // WHY: the next step re-adds servers, which must never happen for a session that has gone
+    // away while this teardown was awaiting the child process.
+    if (!deps.isCurrent()) return;
+  }
+  if (removedOrChanged.length > 0) {
+    deps.coordinator.syncStatus(ctx);
+  }
+
+  const addedEager: Array<[string, ServerConfig]> = [];
+  for (const [name, nextCfg] of Object.entries(nextExtensionServers)) {
+    if (!deps.manager.getServer(name)) {
+      deps.manager.setServer(name, nextCfg);
+      if (nextCfg.lifecycle === "eager") {
+        addedEager.push([name, nextCfg]);
+      }
+    }
+  }
+
+  deps.applyServers(nextExtensionServers);
+
+  if (addedEager.length > 0) {
+    await deps.coordinator.startEagerServers(addedEager, ctx);
+  }
 }
 
 interface ManagementToolDeps {
