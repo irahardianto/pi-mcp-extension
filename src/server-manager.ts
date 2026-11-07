@@ -462,7 +462,13 @@ export class ServerManager {
     const server = this.servers.get(name);
     if (!server) return;
     await this._shutdown(server);
-    this.servers.delete(name);
+    // WHY: _shutdown awaits child-process teardown, and the registration reconcile installs a
+    // replacement right after removing the changed entry — it can land in that window. Deleting
+    // by name alone would drop that live entry and orphan its stdio child, which nothing can
+    // then terminate.
+    if (this.servers.get(name) === server) {
+      this.servers.delete(name);
+    }
   }
 
   /**
