@@ -65,6 +65,69 @@ export function buildToolName(
   return `${safe.slice(0, MAX_TOOL_NAME_LEN - 9)}_${hash}`;
 }
 
+/** True when sanitizing the raw tool name loses nothing (already a valid Pi identifier body). */
+function isLosslessToolName(rawToolName: string): boolean {
+  return /^[a-zA-Z0-9_]+$/.test(rawToolName);
+}
+
+/** Compare strings by Unicode code point, not by UTF-16 code unit. */
+function compareCodePoints(a: string, b: string): number {
+  const left = Array.from(a, (ch) => ch.codePointAt(0) ?? 0);
+  const right = Array.from(b, (ch) => ch.codePointAt(0) ?? 0);
+  const shared = Math.min(left.length, right.length);
+  for (let i = 0; i < shared; i++) {
+    const diff = (left[i] ?? 0) - (right[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return left.length - right.length;
+}
+
+/**
+ * Order a server's tools so Pi-name assignment depends only on the tool set and never on
+ * the order `tools/list` happened to return (#213): a lossless raw name wins the unhashed
+ * `<prefix>_<server>_<tool>` identifier over one that needs character substitution
+ * (`my_tool` over `my-tool`), and remaining ties fall back to code-point order of the raw
+ * name. Without a total order here, the first response's order decided which colliding
+ * tool owned the unhashed name, so a reconnect could silently swap tool targets.
+ */
+function compareToolsForNameAssignment(a: McpToolDefinition, b: McpToolDefinition): number {
+  const aLossless = isLosslessToolName(a.name);
+  const bLossless = isLosslessToolName(b.name);
+  if (aLossless !== bLossless) return aLossless ? -1 : 1;
+  return compareCodePoints(a.name, b.name);
+}
+
+/**
+ * Order a server's tools for Pi-name assignment. The server's own `tools/list` order is kept —
+ * so registration order, and the tool order Pi shows the model, only move where they must —
+ * except that tools competing for the same unhashed identifier are emitted as one deterministic
+ * group in the position of the group's first member. Which tool the server listed first is not
+ * part of the MCP contract, so it must not decide who wins that identifier (#213).
+ */
+function orderToolsForNameAssignment(
+  prefix: string,
+  serverName: string,
+  tools: readonly McpToolDefinition[],
+): readonly McpToolDefinition[] {
+  const groups = new Map<string, McpToolDefinition[]>();
+  for (const tool of tools) {
+    const baseName = buildToolName(prefix, serverName, tool.name, false);
+    const group = groups.get(baseName);
+    if (group) group.push(tool);
+    else groups.set(baseName, [tool]);
+  }
+
+  const emitted = new Set<string>();
+  const ordered: McpToolDefinition[] = [];
+  for (const tool of tools) {
+    const baseName = buildToolName(prefix, serverName, tool.name, false);
+    if (emitted.has(baseName)) continue;
+    emitted.add(baseName);
+    ordered.push(...(groups.get(baseName) ?? []).sort(compareToolsForNameAssignment));
+  }
+  return ordered;
+}
+
 // ─── Content Conversion ───────────────────────────────────────────────────────
 
 type PiTextContent = { type: "text"; text: string };
@@ -438,7 +501,11 @@ export class ToolBridge {
 
     // Build the set of currently valid Pi tool names for this server
     const currentToolNames = new Set<string>();
-    for (const tool of tools) {
+    // WHY: `tools/list` order carries no meaning (a server may reorder it freely), so colliding
+    // names are assigned over a deterministic order of the tool set — otherwise the exact-match
+    // tool could lose the unhashed name to a lossy one and a later refresh would swap which MCP
+    // tool that name executes (#213).
+    for (const tool of orderToolsForNameAssignment(this.settings.toolPrefix, serverName, tools)) {
       const piName = this._resolveUniqueToolName(serverName, tool.name, currentToolNames);
       currentToolNames.add(piName);
       this.toolOwners.set(piName, serverName);

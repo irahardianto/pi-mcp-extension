@@ -35,7 +35,9 @@ import {
   orderUnionMembers,
   convertJsonSchemaToTypebox,
 } from "../src/schema-convert.js";
-import { buildToolName, convertMcpContent } from "../src/tool-bridge.js";
+import { buildToolName, convertMcpContent, ToolBridge } from "../src/tool-bridge.js";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { parseRegisteredServerConfig } from "../src/config.js";
 import { stripJsonComments } from "../src/jsonc.js";
 import {
@@ -738,6 +740,92 @@ describe("fuzz: buildToolName", () => {
           nameHyphen,
           nameUnderscore,
           "Distinct raw inputs must produce distinct hashed tool names under forceHash",
+        );
+      }),
+      testOptions(),
+    );
+  });
+});
+
+// ─── Suite 6b: ToolBridge intra-server name assignment ────────────────────────
+
+describe("fuzz: ToolBridge intra-server name assignment", () => {
+  /** The Pi name → raw MCP tool name map a server's tool set gets, read back through dispatch. */
+  async function assignmentFor(toolNames: readonly string[]): Promise<string> {
+    const registered = new Map<string, ToolDefinition>();
+    let active: string[] = [];
+    const bridge = new ToolBridge(
+      { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+      {
+        registerTool: (t: unknown) => {
+          const tool = t as ToolDefinition;
+          registered.set(tool.name, tool);
+        },
+        getActiveTools: () => active,
+        setActiveTools: (names: string[]) => {
+          active = names;
+        },
+      },
+    );
+
+    let called = "";
+    const client = {
+      request: async () => ({
+        tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+      callTool: async (params: { name: string }) => {
+        called = params.name;
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+    } as unknown as Client;
+    await bridge.refreshTools("alpha", client);
+
+    const pairs: string[] = [];
+    for (const piName of [...active].sort()) {
+      const tool = registered.get(piName);
+      assert.ok(tool, `${piName} must be registered`);
+      await tool.execute("call", {}, undefined, undefined, undefined as never);
+      pairs.push(`${piName}=${called}`);
+    }
+    assert.equal(pairs.length, toolNames.length, "every tool must stay independently addressable");
+    return pairs.join("|");
+  }
+
+  it("assigns the same Pi names whatever the tools/list order, and always gives the lossless name the unhashed identifier (#213)", async () => {
+    // Every run draws a guaranteed collision group — the same logical name written with "_"
+    // (lossless) and with another separator (sanitized) — plus up to three unrelated tools, so
+    // the property exercises the collision path instead of hoping a random set produces one.
+    const stem = fc.stringMatching(/^[a-z]{1,4}$/);
+    const tail = fc.stringMatching(/^[a-z]{1,3}$/);
+    const separator = fc.constantFrom("-", ".", " ", "/");
+    const extras = fc.uniqueArray(fc.stringMatching(/^[A-Z0-9]{2,4}$/), { maxLength: 3 });
+    const toolSet = fc.tuple(stem, tail, separator, extras).map(([head, rest, sep, extraNames]) => {
+      const lossless = `${head}_${rest}`;
+      // The lossy twin is listed first, so a first-listed-wins implementation is caught.
+      return [`${head}${sep}${rest}`, lossless, ...extraNames] as const;
+    });
+
+    await fc.assert(
+      fc.asyncProperty(toolSet, async (toolNames) => {
+        const lossless = toolNames[1];
+        const unhashed = buildToolName("mcp", "alpha", lossless, false);
+        const lossyHashed = buildToolName("mcp", "alpha", toolNames[0], true);
+
+        const forward = (await assignmentFor(toolNames)).split("|");
+        const reversed = (await assignmentFor([...toolNames].reverse())).split("|");
+
+        assert.deepEqual(
+          [...reversed].sort(),
+          [...forward].sort(),
+          `tools/list order must not change name assignment for ${JSON.stringify(toolNames)}`,
+        );
+        assert.ok(
+          forward.includes(`${unhashed}=${lossless}`),
+          `the lossless name must own ${unhashed}, got ${JSON.stringify(forward)}`,
+        );
+        assert.ok(
+          forward.includes(`${lossyHashed}=${toolNames[0]}`),
+          `the sanitized name must own ${lossyHashed}, got ${JSON.stringify(forward)}`,
         );
       }),
       testOptions(),
