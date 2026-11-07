@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import {
   DEBUG_LOG_DIR_MODE,
   DEBUG_LOG_FILE_MODE,
@@ -73,8 +73,10 @@ class FakeFs {
       appendFile: async (path, data, options) => {
         const call = `append:${path}`;
         this.record(call);
-        if (!this.dirs.has(dirname(path))) {
-          // Real `appendFile` cannot create the directory either.
+        // Real `appendFile` cannot create the directory either. `dirname` returns
+        // native separators, while the logger's fixture paths are POSIX-style, so
+        // compare on one separator before the lookup.
+        if (!this.dirs.has(dirname(path).split(sep).join("/"))) {
           const err = new Error("ENOENT") as NodeJS.ErrnoException;
           err.code = "ENOENT";
           throw err;
