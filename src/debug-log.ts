@@ -154,29 +154,78 @@ export class DebugLog {
     }
     await this._rotateIfNeeded(Buffer.byteLength(line, "utf8"));
     await fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
-    if (!this.fileModeEnsured) {
+    await this._ensureFileMode();
+  }
+
+  private async _ensureFileMode(): Promise<void> {
+    if (this.fileModeEnsured) return;
+    try {
       // WHY: `mode` only applies when the file is created; an existing file may
       // have looser permissions, so the mode is enforced once per logger.
-      await fs.chmod(this.filePath, DEBUG_LOG_FILE_MODE);
+      await this.deps.fs.chmod(this.filePath, DEBUG_LOG_FILE_MODE);
       this.fileModeEnsured = true;
+    } catch (err) {
+      // WHY: A peer Pi process sharing this log rotated `pi-mcp.log` between the
+      // append and this chmod, so it already holds the line. Leaving the flag
+      // false re-applies the mode on the file the next write creates instead of
+      // reporting a logger failure for a race that lost nothing.
+      if (!isErrnoException(err, "ENOENT")) throw err;
     }
   }
 
   private async _rotateIfNeeded(incomingBytes: number): Promise<void> {
-    const fs = this.deps.fs;
-    let size = 0;
-    try {
-      size = (await fs.stat(this.filePath)).size;
-    } catch {
-      // WHY: The log file does not exist yet — there is nothing to rotate.
-      return;
-    }
-    if (size <= 0 || size + incomingBytes <= DEBUG_LOG_MAX_BYTES) return;
-    await fs.unlink(this.rotatedFilePath).catch(() => {
-      // WHY: No previous backup to remove — the rename below creates the only one.
-    });
-    await fs.rename(this.filePath, this.rotatedFilePath);
+    const size = await this._logSize();
+    if (size === null || size <= 0) return;
+    if (size + incomingBytes <= DEBUG_LOG_MAX_BYTES) return;
+    await this._discardRotatedFile();
+    await this._rotateCurrentFile();
   }
+
+  /** Size of the log file: `0` when it is absent, `null` when it is unknown. */
+  private async _logSize(): Promise<number | null> {
+    try {
+      return (await this.deps.fs.stat(this.filePath)).size;
+    } catch (err) {
+      if (isErrnoException(err, "ENOENT")) return 0;
+      // WHY: Any other stat failure leaves the size unknown. Rotation is only an
+      // optimization — the caller appends anyway rather than dropping the line,
+      // and the cap is re-checked on the next write that can read the size.
+      return null;
+    }
+  }
+
+  private async _discardRotatedFile(): Promise<void> {
+    try {
+      await this.deps.fs.unlink(this.rotatedFilePath);
+    } catch (err) {
+      // WHY: No previous backup to remove — the rename below creates the only
+      // one. A peer process may also have removed it for its own rotation.
+      if (!isErrnoException(err, "ENOENT")) throw err;
+    }
+  }
+
+  private async _rotateCurrentFile(): Promise<void> {
+    try {
+      await this.deps.fs.rename(this.filePath, this.rotatedFilePath);
+    } catch (err) {
+      // WHY: A peer Pi process sharing this log rotates it too. `ENOENT` means it
+      // renamed `pi-mcp.log` first, and `EEXIST` means it recreated the backup
+      // after this process unlinked it on a platform whose rename does not
+      // replace the destination. Either way the incoming line is not lost: the
+      // append below writes it to the file that is left (or recreated).
+      if (!isRotatedByPeer(err)) throw err;
+    }
+  }
+}
+
+/** True when `err` is a Node.js errno exception carrying `code`. */
+function isErrnoException(err: unknown, code: string): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === code;
+}
+
+/** True when a failed rotation means another process already rotated the log. */
+function isRotatedByPeer(err: unknown): boolean {
+  return isErrnoException(err, "ENOENT") || isErrnoException(err, "EEXIST");
 }
 
 // ─── Diagnostic Sink ──────────────────────────────────────────────────────────

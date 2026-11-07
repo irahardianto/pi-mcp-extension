@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The `PI_MCP_DEBUG` log no longer drops an entry — or prints a spurious `[pi-mcp] Debug log write failed: ENOENT …` on headless `stderr` — when concurrent Pi processes rotating the shared `<agent dir>/logs/pi-mcp.log` race each other (#202). `DebugLog` writes are queued per process, so two Pi processes sharing one `agentDir` can both decide to rotate at ~2 MB: the peer's `rename(pi-mcp.log, pi-mcp.log.1)` can land between this process's `stat` and its own `rename`, which then rejects with `ENOENT` before `appendFile` ever runs, and a peer that rotates between the `appendFile` and the first-write `chmod` produced the same failure for a line that was already safely in the backup. Rotation now treats the codes a peer's rotation can produce as a lost race rather than an error — `ENOENT` from `unlink`, `rename`, or `chmod`, and `EEXIST` from a `rename` that cannot replace the backup a peer just recreated — and the append always runs, so the entry lands in whichever file is left behind or recreated; a `chmod` that loses the race leaves the mode unconfirmed, so the next write re-applies `0o600`, and a size that cannot be read now skips rotation instead of failing the write. Genuine failures still surface once through the existing `Debug log write failed:` path.
+
 ## [1.14.2] - 2026-11-07
 
 ### Fixed
