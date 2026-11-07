@@ -2127,21 +2127,24 @@ describe("removeServer identity guard (#216)", () => {
       },
     });
 
-    // The removal suspends inside _shutdown (child teardown), which is exactly the window a
-    // concurrent reconcile uses to install the replacement entry.
-    const removal = manager.removeServer("srv");
-    manager.setServer("srv", {
-      command: "node",
-      args: ["--import", "tsx/esm", MOCK_SERVER_PATH, "--replacement"],
-      transport: "stdio",
-      lifecycle: "eager",
-    });
-    await removal;
+    try {
+      // The removal suspends inside _shutdown (child teardown), which is exactly the window a
+      // concurrent reconcile uses to install the replacement entry.
+      const removal = manager.removeServer("srv");
+      manager.setServer("srv", {
+        command: "node",
+        args: ["--import", "tsx/esm", MOCK_SERVER_PATH, "--replacement"],
+        transport: "stdio",
+        lifecycle: "eager",
+      });
+      await removal;
 
-    const surviving = manager.getServer("srv");
-    assert.ok(surviving, "the replacement must not be deleted by the outgoing instance's removal");
-    assert.deepEqual(surviving.config.args.slice(-1), ["--replacement"]);
-    assert.equal(surviving.config.lifecycle, "eager");
-    await manager.shutdownAll();
+      const surviving = manager.getServer("srv");
+      assert.ok(surviving, "the replacement must not be deleted by the outgoing instance's removal");
+      assert.deepEqual(surviving.config.args.slice(-1), ["--replacement"]);
+      assert.equal(surviving.config.lifecycle, "eager");
+    } finally {
+      await manager.shutdownAll();
+    }
   });
 });

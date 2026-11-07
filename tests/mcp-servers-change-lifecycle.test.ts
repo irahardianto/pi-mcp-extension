@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -246,12 +246,23 @@ describe("mcp_servers_change reconciliation (#216)", () => {
   });
 
   it("skips starting a superseded config when a newer change event arrives during removeServer teardown", async () => {
-    const harness = await createChangeHarness({ servers: [serverEntry("ext_srv")] });
+    const notifications: string[] = [];
+    const harness = await createChangeHarness({
+      servers: [serverEntry("ext_srv")],
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
     try {
       await harness.mockExt.events.get("session_start")({}, harness.ctx);
 
       const markerFile = join(harness.dir, "superseded-spawned.txt");
+      const badEntry = { name: "bad", config: {}, extensionPath: "/ext/a.ts" } as unknown as RegisteredMcpServer;
       const superseded: RegisteredMcpServer[] = [
+        badEntry,
         {
           name: "ext_srv",
           config: {
@@ -267,27 +278,27 @@ describe("mcp_servers_change reconciliation (#216)", () => {
 
       // Start Turn 1 with `superseded`, then wait one microtask so Turn 1 enters
       // reconcileRegisteredServers and suspends inside `await manager.removeServer("ext_srv")`
-      // before Event 2 unregisters the server.
+      // before Event 2 unregisters ext_srv (keeping badEntry so we also verify badEntry is
+      // reported once for the winning snapshot rather than twice across the superseded turn).
       harness.setRegistered(superseded);
       const first = harness.emitChange(superseded);
       await Promise.resolve();
-      harness.setRegistered([]);
-      const second = harness.emitChange([]);
+      harness.setRegistered([badEntry]);
+      const second = harness.emitChange([badEntry]);
       await Promise.all([first, second]);
 
-      let markerCreated = false;
-      try {
-        await writeFile(markerFile, "", { flag: "r" });
-        markerCreated = true;
-      } catch {
-        markerCreated = false;
-      }
-      assert.equal(
-        markerCreated,
-        false,
+      await assert.rejects(
+        () => access(markerFile),
+        { code: "ENOENT" },
         "a config superseded while removeServer was awaiting child teardown must never be spawned",
       );
       assert.deepEqual(await harness.status(), []);
+      const configErrors = notifications.filter((message) => message.includes("Config error"));
+      assert.equal(
+        configErrors.length,
+        1,
+        `a turn superseded during removeServer must not duplicate config-error toasts: ${JSON.stringify(configErrors)}`,
+      );
     } finally {
       await harness.cleanup();
     }
@@ -471,5 +482,250 @@ describe("mcp_servers_change reconciliation (#216)", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
-});
 
+  it("drains an in-flight removal before session_start finishes when the server stays unregistered", async () => {
+    const harness = await createChangeHarness({ servers: [serverEntry("ext_srv")] });
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      // Start removing ext_srv, let Turn 1 call removeAppliedServer("ext_srv") and suspend
+      // inside manager.removeServer("ext_srv"), then run session_start while ext_srv stays [].
+      harness.setRegistered([]);
+      const unregister = harness.emitChange([]);
+      await Promise.resolve();
+
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+      assert.deepEqual(
+        await harness.status(),
+        [],
+        "session_start must not resolve while an unregistered server is still lingering in ServerManager",
+      );
+      await unregister;
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("aborts an in-flight reconcile eager start when a newer change unregisters or replaces the server", async () => {
+    const notifications: string[] = [];
+    const harness = await createChangeHarness({
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      // Event 1 registers an eager server that exits with code 1 once it receives initialize.
+      // Because removedOrChanged is empty, one microtask puts Turn 1 directly inside
+      // await coordinator.startEagerServers with the child process already spawned.
+      const slowFailing: RegisteredMcpServer[] = [
+        {
+          name: "ext_slow",
+          config: {
+            command: process.execPath,
+            args: ["-e", 'process.stdin.once("data", () => process.exit(1))'],
+          },
+          extensionPath: "/ext/a.ts",
+        },
+      ];
+      harness.setRegistered(slowFailing);
+      const p1 = harness.emitChange(slowFailing);
+      await Promise.resolve();
+
+      // Event 2 unregisters ext_slow while Turn 1 is inside startEagerServers, and Event 3
+      // re-registers ext_slow with the working mock server (ABA while startEagerServers is in flight).
+      harness.setRegistered([]);
+      const p2 = harness.emitChange([]);
+      const working = [serverEntry("ext_slow")];
+      harness.setRegistered(working);
+      const p3 = harness.emitChange(working);
+      await Promise.all([p1, p2, p3]);
+
+      assert.deepEqual(
+        notifications.filter((message) => message.includes("Failed to start ext_slow")),
+        [],
+        `an eager start superseded while connecting must be cancelled without toasting: ${JSON.stringify(notifications)}`,
+      );
+      assert.deepEqual(
+        (await harness.status()).map((row) => [row.name, row.state]),
+        [["ext_slow", "ready"]],
+        "re-registering the server after aborting its in-flight eager start must bring the final server up",
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("stops an in-flight reconcile eager start on session_start and keeps session inactive if shut down during startup", async () => {
+    const ctx1Notifications: string[] = [];
+    const ctx2Notifications: string[] = [];
+    const harness = await createChangeHarness({
+      servers: [serverEntry("ext_ready")],
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          ctx1Notifications.push(message);
+        },
+      },
+    });
+    const dir2 = await mkdtemp(join(tmpdir(), "pi-mcp-change-ctx2-"));
+    const ctx2 = createMockContext({
+      cwd: dir2,
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: (message: string) => {
+          ctx2Notifications.push(message);
+        },
+      },
+    });
+
+    try {
+      await harness.mockExt.events.get("session_start")({}, harness.ctx);
+
+      const slowFailing: RegisteredMcpServer[] = [
+        serverEntry("ext_ready"),
+        {
+          name: "ext_slow",
+          config: {
+            command: process.execPath,
+            args: ["-e", 'process.stdin.once("data", () => process.exit(1))'],
+          },
+          extensionPath: "/ext/a.ts",
+        },
+      ];
+      harness.setRegistered(slowFailing);
+      const p1 = harness.emitChange(slowFailing);
+      await Promise.resolve();
+
+      // Switch to ctx2 while Turn 1 is inside startEagerServers on ctx1.
+      await harness.mockExt.events.get("session_start")({}, ctx2);
+      await p1;
+
+      assert.deepEqual(
+        ctx1Notifications.filter((message) => message.includes("Failed to start ext_slow")),
+        [],
+        `the superseded session ctx1 must not toast for an eager start aborted by session_start: ${JSON.stringify(ctx1Notifications)}`,
+      );
+      assert.equal(
+        ctx2Notifications.filter((message) => message.includes("Failed to start ext_slow")).length,
+        1,
+        `the active session ctx2 must report the start failure exactly once: ${JSON.stringify(ctx2Notifications)}`,
+      );
+      assert.deepEqual(
+        (await harness.status()).map((row) => [row.name, row.state]),
+        [
+          ["ext_ready", "ready"],
+          ["ext_slow", "stopped"],
+        ],
+        "ext_ready must stay ready and ext_slow must remain in ServerManager as stopped",
+      );
+
+      // Now start a session and shut it down while runSessionStart is still in flight; the
+      // superseded startup must not mutate ServerManager after shutdown or flip sessionActive back to true.
+      harness.setRegistered([serverEntry("ext_during_shutdown")]);
+      const starting = harness.mockExt.events.get("session_start")({}, ctx2);
+      await Promise.resolve();
+      await harness.mockExt.events.get("session_shutdown")({}, ctx2);
+      await starting;
+
+      assert.ok(
+        !(await harness.status()).some((row) => row.name === "ext_during_shutdown"),
+        "a startup superseded by session_shutdown must not rebuild ServerManager after shutdown",
+      );
+
+      harness.setRegistered([serverEntry("ext_post_shutdown")]);
+      await harness.emitChange([serverEntry("ext_post_shutdown")]);
+      assert.ok(
+        !harness.mockExt.activeTools.some((name) => name.startsWith("mcp_ext_post_shutdown_")),
+        "session_start finally must not re-activate a session that was shut down while starting",
+      );
+    } finally {
+      await harness.cleanup();
+      await rm(dir2, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts a session_start eager start when mcp_servers_change replaces it, and keeps servers stopped on session_shutdown", async () => {
+    const notifications: string[] = [];
+    const slowInitial: RegisteredMcpServer = {
+      name: "ext_startup_slow",
+      config: {
+        command: process.execPath,
+        args: ["-e", 'process.stdin.once("data", () => process.exit(1))'],
+      },
+      extensionPath: "/ext/a.ts",
+    };
+    const harness = await createChangeHarness({
+      servers: [slowInitial],
+      hasUI: true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
+
+    try {
+      const startPromise = harness.mockExt.events.get("session_start")({}, harness.ctx);
+      await Promise.resolve();
+
+      // Replace ext_startup_slow with a working mock server while session_start is inside runEagerStarts.
+      const replacement = [serverEntry("ext_startup_slow")];
+      harness.setRegistered(replacement);
+      const changePromise = harness.emitChange(replacement);
+      await startPromise;
+      await changePromise;
+
+      assert.deepEqual(
+        notifications.filter((message) => message.includes("Failed to start ext_startup_slow")),
+        [],
+        `aborted initial eager start must not emit a failure toast: ${JSON.stringify(notifications)}`,
+      );
+      assert.deepEqual(
+        (await harness.status()).map((row) => [row.name, row.state]),
+        [["ext_startup_slow", "ready"]],
+        "replacement server should finish ready after session_start drains the post-startup reconcile",
+      );
+
+      // Now register a slow server via mcp_servers_change and shut the session down while it is starting.
+      const withShutdownSlow: RegisteredMcpServer[] = [
+        serverEntry("ext_startup_slow"),
+        {
+          name: "ext_shutdown_slow",
+          config: {
+            command: process.execPath,
+            args: ["-e", 'process.stdin.once("data", () => process.exit(1))'],
+          },
+          extensionPath: "/ext/a.ts",
+        },
+      ];
+      harness.setRegistered(withShutdownSlow);
+      const reconcilePromise = harness.emitChange(withShutdownSlow);
+      await Promise.resolve();
+
+      await harness.mockExt.events.get("session_shutdown")({}, harness.ctx);
+      await reconcilePromise;
+
+      assert.deepEqual(
+        notifications.filter((message) => message.includes("Failed to start ext_shutdown_slow")),
+        [],
+        `session_shutdown must not emit a failure toast for an aborted eager start: ${JSON.stringify(notifications)}`,
+      );
+      assert.deepEqual(
+        (await harness.status()).map((row) => [row.name, row.state]),
+        [
+          ["ext_startup_slow", "stopped"],
+          ["ext_shutdown_slow", "stopped"],
+        ],
+        "session_shutdown must stop in-flight extension servers without removing them from ServerManager",
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+});
