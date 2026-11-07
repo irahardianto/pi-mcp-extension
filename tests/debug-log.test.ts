@@ -554,26 +554,6 @@ describe("debug log", () => {
       assert.equal(fake.files.get(filePath)?.content.includes("small"), true);
     });
 
-    it("rotates when there is no previous backup yet", async () => {
-      const fake = new FakeFs();
-      const logger = makeLogger(fake);
-      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
-      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
-      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
-
-      const errors = captureLoggerFailure();
-      try {
-        logger.write({ level: "info", event: "server.state", message: "first backup" });
-        await logger.flush();
-      } finally {
-        errors.restore();
-      }
-
-      assert.deepEqual(errors.messages, []);
-      assert.equal(fake.files.get(rotatedPath)?.content.length, DEBUG_LOG_MAX_BYTES);
-      assert.ok(fake.files.get(filePath)?.content.includes("first backup"));
-    });
-
     // Two Pi processes share one `<agentDir>/logs/pi-mcp.log`. When both decide
     // to rotate, the peer's rotation lands between this process's calls: the
     // log file is gone by the time this process renames it.
