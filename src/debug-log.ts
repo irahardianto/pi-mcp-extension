@@ -145,8 +145,17 @@ export class DebugLog {
 
   private async _append(line: string): Promise<void> {
     await this._ensureDir();
-    await this._rotateIfNeeded(Buffer.byteLength(line, "utf8"));
-    await this.deps.fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
+    try {
+      await this._rotateIfNeeded(Buffer.byteLength(line, "utf8"));
+      await this.deps.fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
+    } catch (err) {
+      // WHY: `ENOENT` here means `<agentDir>/logs` itself disappeared after it was
+      // created. Forgetting the directory lets the *next* write recreate it
+      // instead of failing for the rest of the session; this entry is still
+      // reported through the queue's handler.
+      if (isErrnoException(err, "ENOENT")) this.dirReady = false;
+      throw err;
+    }
     await this._ensureFileMode();
   }
 
@@ -190,6 +199,11 @@ export class DebugLog {
     const size = await this._logSize();
     if (size === null || size <= 0) return;
     if (size + incomingBytes <= DEBUG_LOG_MAX_BYTES) return;
+    // WHY: Re-read immediately before renaming. A peer process that rotated this
+    // log and recreated a smaller one in between must not have that new file
+    // renamed over the backup it just produced, so a changed size means the
+    // rotation this write planned no longer applies.
+    if ((await this._logSize()) !== size) return;
     await this._rotate();
   }
 

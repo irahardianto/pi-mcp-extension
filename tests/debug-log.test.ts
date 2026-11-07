@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   DEBUG_LOG_DIR_MODE,
   DEBUG_LOG_FILE_MODE,
@@ -73,6 +73,12 @@ class FakeFs {
       appendFile: async (path, data, options) => {
         const call = `append:${path}`;
         this.record(call);
+        if (!this.dirs.has(dirname(path))) {
+          // Real `appendFile` cannot create the directory either.
+          const err = new Error("ENOENT") as NodeJS.ErrnoException;
+          err.code = "ENOENT";
+          throw err;
+        }
         const existing = this.files.get(path);
         if (existing) {
           existing.content += data;
@@ -707,30 +713,67 @@ describe("debug log", () => {
       assert.ok(fake.files.get(filePath)?.content.includes("after dir vanish"));
     });
 
-    it("still appends when the log size cannot be read", async () => {
+    it("recovers on the next write when the log directory disappears", async () => {
       const fake = new FakeFs();
+      const logger = makeLogger(fake);
       const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
-      const logger = new DebugLog("/logs", {
-        fs: {
-          ...fake.fs,
-          stat: async () => {
-            throw errnoError("EACCES");
-          },
-        },
-        now: () => new Date(0),
-      });
+      logger.write({ level: "info", event: "server.state", message: "first" });
+      await logger.flush();
+
+      // Something removes the whole directory between writes.
+      fake.files.clear();
+      fake.dirs.clear();
 
       const errors = captureLoggerFailure();
       try {
-        logger.write({ level: "info", event: "server.state", message: "size unknown" });
+        logger.write({ level: "info", event: "server.state", message: "lost" });
+        await logger.flush();
+        logger.write({ level: "info", event: "server.state", message: "recovered" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.equal(errors.messages.length, 1, "the unwritable entry is reported once");
+      assert.equal(fake.dirs.get("/logs"), DEBUG_LOG_DIR_MODE);
+      assert.ok(fake.files.get(filePath)?.content.includes("recovered"));
+      assert.ok(!fake.files.get(filePath)?.content.includes("lost"));
+    });
+
+    // The other direction of the same race: the peer's rotation completes and
+    // its own append recreates a small log. Renaming that log would replace the
+    // 2 MB backup the peer just produced, so the rotation must be dropped.
+    it("does not rotate a log a peer process replaced after the size was read", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      const peerHistory = "-".repeat(DEBUG_LOG_MAX_BYTES);
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
+      fake.after = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        fake.after = undefined;
+        // The peer rotates, then recreates the log with its own line.
+        fake.files.set(rotatedPath, { content: peerHistory, mode: DEBUG_LOG_FILE_MODE });
+        fake.files.set(filePath, { content: "peer line\n", mode: DEBUG_LOG_FILE_MODE });
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer clobber" });
         await logger.flush();
       } finally {
         errors.restore();
       }
 
       assert.deepEqual(errors.messages, []);
-      assert.ok(fake.files.get(filePath)?.content.includes("size unknown"));
-      assert.ok(!fake.calls.some((call) => call.startsWith("rename:")));
+      assert.equal(
+        fake.files.get(rotatedPath)?.content,
+        peerHistory,
+        "The recreated log must not replace the backup the peer just produced",
+      );
+      assert.ok(fake.files.get(filePath)?.content.includes("after peer clobber"));
+      assert.equal(fake.files.get(filePath)?.content.startsWith("peer line"), true);
     });
 
     it("never throws when the filesystem fails", async () => {
