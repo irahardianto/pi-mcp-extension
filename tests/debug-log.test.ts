@@ -141,11 +141,15 @@ function makeLogger(fake: FakeFs, now = new Date("2026-01-01T00:00:00.000Z")): D
 
 /**
  * Capture the headless stderr fallback (`reportLoggerFailure`) during a test.
- * `reportLoggerFailure` reports once per installed logger, so the latch is reset
- * first: each test observes only the failures of its own writes.
+ *
+ * `reportLoggerFailure` reports once per installed logger and stays silent while
+ * a UI is active, so both are reset first: without that, a failure from an
+ * earlier test would latch, or these assertions would pass vacuously because
+ * `console.error` was never the reporting path.
  */
 function captureLoggerFailure(): { messages: string[]; restore: () => void } {
   setDebugLog(null);
+  setDiagnosticUi(null, false);
   const messages: string[] = [];
   const original = console.error;
   console.error = (...args: unknown[]) => {
