@@ -750,10 +750,7 @@ describe("fuzz: buildToolName", () => {
 // ─── Suite 6b: ToolBridge intra-server name assignment ────────────────────────
 
 describe("fuzz: ToolBridge intra-server name assignment", () => {
-  /**
-   * Register a server's tool set and report `piName=rawName` for every active tool, so an
-   * assignment can be compared as a whole instead of name by name.
-   */
+  /** The Pi name → raw MCP tool name map a server's tool set gets, read back through dispatch. */
   async function assignmentFor(toolNames: readonly string[]): Promise<string> {
     const registered = new Map<string, ToolDefinition>();
     let active: string[] = [];
@@ -785,8 +782,6 @@ describe("fuzz: ToolBridge intra-server name assignment", () => {
 
     const pairs: string[] = [];
     for (const piName of [...active].sort()) {
-      assert.ok(/^[a-zA-Z0-9_]+$/.test(piName), `"${piName}" must be a Pi identifier`);
-      assert.ok(piName.length <= 64, `"${piName}" must be at most 64 characters`);
       const tool = registered.get(piName);
       assert.ok(tool, `${piName} must be registered`);
       await tool.execute("call", {}, undefined, undefined, undefined as never);
@@ -796,18 +791,41 @@ describe("fuzz: ToolBridge intra-server name assignment", () => {
     return pairs.join("|");
   }
 
-  it("assigns the same Pi names to a tool set whatever the tools/list order (#213)", async () => {
-    const rawToolName = fc.stringMatching(/^[a-zA-Z0-9_.-]{1,6}$/);
-    const toolSet = fc.uniqueArray(rawToolName, { minLength: 1, maxLength: 6 });
+  it("assigns the same Pi names whatever the tools/list order, and always gives the lossless name the unhashed identifier (#213)", async () => {
+    // Every run draws a guaranteed collision group — the same logical name written with "_"
+    // (lossless) and with another separator (sanitized) — plus up to three unrelated tools, so
+    // the property exercises the collision path instead of hoping a random set produces one.
+    const stem = fc.stringMatching(/^[a-z]{1,4}$/);
+    const tail = fc.stringMatching(/^[a-z]{1,3}$/);
+    const separator = fc.constantFrom("-", ".", " ", "/");
+    const extras = fc.uniqueArray(fc.stringMatching(/^[A-Z0-9]{2,4}$/), { maxLength: 3 });
+    const toolSet = fc.tuple(stem, tail, separator, extras).map(([head, rest, sep, extraNames]) => {
+      const lossless = `${head}_${rest}`;
+      // The lossy twin is listed first, so a first-listed-wins implementation is caught.
+      return [`${head}${sep}${rest}`, lossless, ...extraNames] as const;
+    });
 
     await fc.assert(
       fc.asyncProperty(toolSet, async (toolNames) => {
-        const forward = await assignmentFor(toolNames);
-        const reversed = await assignmentFor([...toolNames].reverse());
-        assert.equal(
-          reversed,
-          forward,
+        const lossless = toolNames[1];
+        const unhashed = buildToolName("mcp", "alpha", lossless, false);
+        const lossyHashed = buildToolName("mcp", "alpha", toolNames[0], true);
+
+        const forward = (await assignmentFor(toolNames)).split("|");
+        const reversed = (await assignmentFor([...toolNames].reverse())).split("|");
+
+        assert.deepEqual(
+          [...reversed].sort(),
+          [...forward].sort(),
           `tools/list order must not change name assignment for ${JSON.stringify(toolNames)}`,
+        );
+        assert.ok(
+          forward.includes(`${unhashed}=${lossless}`),
+          `the lossless name must own ${unhashed}, got ${JSON.stringify(forward)}`,
+        );
+        assert.ok(
+          forward.includes(`${lossyHashed}=${toolNames[0]}`),
+          `the sanitized name must own ${lossyHashed}, got ${JSON.stringify(forward)}`,
         );
       }),
       testOptions(),

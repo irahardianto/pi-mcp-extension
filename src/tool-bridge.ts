@@ -98,18 +98,34 @@ function compareToolsForNameAssignment(a: McpToolDefinition, b: McpToolDefinitio
 }
 
 /**
- * Order a server's tools for Pi-name assignment. Their `tools/list` order is preserved —
- * registration order stays what the server reported — unless two tools sanitize to the same
- * unhashed identifier, which is the only case where assignment would otherwise depend on it.
+ * Order a server's tools for Pi-name assignment. The server's own `tools/list` order is kept —
+ * so registration order, and the tool order Pi shows the model, only move where they must —
+ * except that tools competing for the same unhashed identifier are emitted as one deterministic
+ * group in the position of the group's first member. Which tool the server listed first is not
+ * part of the MCP contract, so it must not decide who wins that identifier (#213).
  */
 function orderToolsForNameAssignment(
   prefix: string,
   serverName: string,
   tools: readonly McpToolDefinition[],
 ): readonly McpToolDefinition[] {
-  const baseNames = tools.map((tool) => buildToolName(prefix, serverName, tool.name, false));
-  if (new Set(baseNames).size === baseNames.length) return tools;
-  return [...tools].sort(compareToolsForNameAssignment);
+  const groups = new Map<string, McpToolDefinition[]>();
+  for (const tool of tools) {
+    const baseName = buildToolName(prefix, serverName, tool.name, false);
+    const group = groups.get(baseName);
+    if (group) group.push(tool);
+    else groups.set(baseName, [tool]);
+  }
+
+  const emitted = new Set<string>();
+  const ordered: McpToolDefinition[] = [];
+  for (const tool of tools) {
+    const baseName = buildToolName(prefix, serverName, tool.name, false);
+    if (emitted.has(baseName)) continue;
+    emitted.add(baseName);
+    ordered.push(...(groups.get(baseName) ?? []).sort(compareToolsForNameAssignment));
+  }
+  return ordered;
 }
 
 // ─── Content Conversion ───────────────────────────────────────────────────────

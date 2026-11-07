@@ -129,6 +129,10 @@ Each of these was a real bug, and the listed suites guard it. If you touch the a
 - Trigger OAuth only on a genuine HTTP 401 (during `initialize` **and** `tools/list`) or a 403 with `insufficient_scope`. Never substring-match `"401"` in error messages. The only exception is the anchored message fallback inside `isOAuthUnauthorizedError`, after its structured checks; Semgrep `pi-mcp.no-401-substring` enforces this everywhere else.
 - Redirect URLs are loopback `http:`/`https:` with an explicit port. Validate callback `state` on success **and** on `?error=` responses. Only `http:`/`https:` authorization URLs reach the OS browser opener, and unvalidated strings never reach a shell.
 
+**Tool naming** (`tool-bridge.test.ts`, `fuzz.test.ts`): `tools/list` order is not part of the MCP contract.
+- Tools of one server that sanitize to the same unhashed identifier are assigned over a deterministic order, never in arrival order: the raw name that needs no sanitization wins the unhashed `<prefix>_<server>_<tool>` form, remaining ties break on raw-name **code-point** order (not UTF-16 unit order), and the rest take the SHA-256 hash. Otherwise a reconnect that reorders `tools/list` silently swaps which MCP tool a Pi name executes (#213).
+- Reordering stays confined to the colliding group, which is emitted at its first member's slot (winner first); unrelated tools keep the position the server gave them, and a server with no collision registers in its own order. Assignment is a function of the tool set, so a colliding sibling added later re-settles the group — the lossless name takes the unhashed identifier and the incumbent moves to its hashed name, identically in every session.
+
 **Schema conversion** (`tool-bridge.test.ts`): Pi runs `Value.Convert(schema, args)` before validating.
 - In unions, `Type.Null()` must come before `String` / `Number` / `Integer` / `Boolean`, or `null` gets coerced to `""` / `0` / `false`.
 - Keep object `properties` when `anyOf` / `oneOf` / `allOf` are present, and emit `{ type: "object", properties: {} }` (not `patternProperties`) for empty objects, because Gemini and OpenAI reject the latter.

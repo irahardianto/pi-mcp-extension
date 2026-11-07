@@ -1454,10 +1454,12 @@ describe("ToolBridge", () => {
 
   it("gives the unhashed name to the exact-match tool in an intra-server collision, whatever the tools/list order (#213)", async () => {
     const registeredTools = new Map<string, TestToolDefinition>();
+    const registrationOrder: string[] = [];
     let activeTools: string[] = [];
     const mockPi = {
       registerTool: (t: unknown) => {
         const tool = t as TestToolDefinition;
+        registrationOrder.push(tool.name);
         registeredTools.set(tool.name, tool);
       },
       getActiveTools: () => activeTools,
@@ -1491,24 +1493,42 @@ describe("ToolBridge", () => {
     };
 
     // A reconnect (or notifications/tools/list_changed) may reorder tools/list freely.
-    for (const order of [["my-tool", "my_tool"], ["my_tool", "my-tool"]]) {
-      toolsList = order;
+    const cases = [
+      {
+        list: ["read_file", "my-tool", "my_tool", "list_dir"],
+        // Only the colliding pair moves (to its first member's slot, winner first);
+        // read_file and list_dir keep the positions the server gave them.
+        registered: ["mcp_alpha_read_file", "mcp_alpha_my_tool", hashedHyphen, "mcp_alpha_list_dir"],
+      },
+      {
+        list: ["list_dir", "my_tool", "my-tool", "read_file"],
+        registered: ["mcp_alpha_list_dir", "mcp_alpha_my_tool", hashedHyphen, "mcp_alpha_read_file"],
+      },
+    ];
+    for (const { list, registered } of cases) {
+      toolsList = list;
+      registrationOrder.length = 0;
       await bridge.refreshTools("alpha", mockClient);
 
+      assert.deepEqual(
+        registrationOrder,
+        registered,
+        `only the colliding names may move for tools/list order ${list.join(",")}`,
+      );
       assert.equal(
         await dispatchThrough("mcp_alpha_my_tool"),
         "my_tool",
-        `the lossless name must own the unhashed identifier for order ${order.join(",")}`,
+        `the lossless name must own the unhashed identifier for order ${list.join(",")}`,
       );
       assert.equal(
         await dispatchThrough(hashedHyphen),
         "my-tool",
-        `the sanitized name must keep the hashed identifier for order ${order.join(",")}`,
+        `the sanitized name must keep the hashed identifier for order ${list.join(",")}`,
       );
       assert.deepEqual(
         [...activeTools].sort(),
-        [hashedHyphen, "mcp_alpha_my_tool"].sort(),
-        "the two tools must activate under the same names on every refresh",
+        [hashedHyphen, "mcp_alpha_my_tool", "mcp_alpha_read_file", "mcp_alpha_list_dir"].sort(),
+        "the tools must activate under the same names on every refresh",
       );
     }
   });
