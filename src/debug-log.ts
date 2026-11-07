@@ -207,9 +207,12 @@ export class DebugLog {
     // process already rotated it (and possibly recreated a smaller one), so
     // renaming again would overwrite the backup that peer just produced. A plain
     // peer append (`currentSize >= size`) leaves the file over the cap and still
-    // rotates.
+    // rotates. Either way, `pi-mcp.log` is no longer the pre-rotation file, so
+    // `0o600` must be re-enforced after the append.
     const currentSize = await this._logSize();
-    if (currentSize === null || currentSize < size) return;
+    if (currentSize === null) return;
+    this.fileModeEnsured = false;
+    if (currentSize < size) return;
     await this._rotate();
   }
 
@@ -218,7 +221,12 @@ export class DebugLog {
     try {
       return (await this.deps.fs.stat(this.filePath)).size;
     } catch (err) {
-      if (isErrnoException(err, "ENOENT")) return 0;
+      if (isErrnoException(err, "ENOENT")) {
+        // WHY: An absent file means the initial write has not run yet or a peer
+        // rotated `pi-mcp.log` away since this logger last ensured `0o600`.
+        this.fileModeEnsured = false;
+        return 0;
+      }
       // WHY: Any other stat failure leaves the size unknown. Rotation is only an
       // optimization — the caller appends anyway rather than dropping the line,
       // and the cap is re-checked on the next write that can read the size.
