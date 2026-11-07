@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.14.2] - 2026-11-07
+
 ### Fixed
 - Two tools from the same MCP server whose names sanitize to the same Pi identifier no longer trade places (#213). `_reconcileTools` assigned names in `tools/list` order, so a lossy name could claim the unhashed `<prefix>_<server>_<tool>` and push the tool that already matched that identifier onto the hashed fallback: with `my-tool` and `my_tool` on server `alpha`, calling `mcp_alpha_my_tool` ran `my-tool`, and a reconnect (or `notifications/tools/list_changed`) that reordered the same two tools silently swapped which MCP tool that name executed — `tools/list` order is not part of the MCP contract, so the README's stable-name guarantee did not hold. Colliding names are now assigned over a deterministic order of the tool set: the raw name that needs no substitution wins the unhashed identifier, remaining ties break by the raw name's code-point order, and every other member of the group takes its SHA-256-hashed name (or that name's numbered suffix when another server already holds it). Only the colliding group's own order can move (to its first member's slot, winner first), so every other tool keeps the name and the position the server gave it; because the result is a function of the tool set, a colliding sibling added in a later `tools/list` re-settles the group — same names in every session, no dependence on what the server listed first.
 
