@@ -1452,6 +1452,123 @@ describe("ToolBridge", () => {
     assert.ok(activeTools.includes("mcp_a_b_c"), "Server a claims canonical name once a_b is removed");
   });
 
+  it("gives the unhashed name to the exact-match tool in an intra-server collision, whatever the tools/list order (#213)", async () => {
+    const registeredTools = new Map<string, TestToolDefinition>();
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: (t: unknown) => {
+        const tool = t as TestToolDefinition;
+        registeredTools.set(tool.name, tool);
+      },
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => {
+        activeTools = names;
+      },
+    };
+
+    let toolsList: string[] = [];
+    let dispatched = "";
+    const mockClient = {
+      request: async () => ({
+        tools: toolsList.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+      callTool: async (params: { name: string }) => {
+        dispatched = params.name;
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+    } as unknown as Client;
+
+    const bridge = new ToolBridge(
+      { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+      mockPi,
+    );
+    const hashedHyphen = buildToolName("mcp", "alpha", "my-tool", true);
+    const dispatchThrough = async (piName: string): Promise<string> => {
+      const tool = registeredTools.get(piName);
+      assert.ok(tool, `${piName} must be registered`);
+      await tool.execute("call", {}, undefined, undefined, undefined);
+      return dispatched;
+    };
+
+    // A reconnect (or notifications/tools/list_changed) may reorder tools/list freely.
+    for (const order of [["my-tool", "my_tool"], ["my_tool", "my-tool"]]) {
+      toolsList = order;
+      await bridge.refreshTools("alpha", mockClient);
+
+      assert.equal(
+        await dispatchThrough("mcp_alpha_my_tool"),
+        "my_tool",
+        `the lossless name must own the unhashed identifier for order ${order.join(",")}`,
+      );
+      assert.equal(
+        await dispatchThrough(hashedHyphen),
+        "my-tool",
+        `the sanitized name must keep the hashed identifier for order ${order.join(",")}`,
+      );
+      assert.deepEqual(
+        [...activeTools].sort(),
+        [hashedHyphen, "mcp_alpha_my_tool"].sort(),
+        "the two tools must activate under the same names on every refresh",
+      );
+    }
+  });
+
+  it("breaks intra-server collision ties by raw-name code-point order, not tools/list order (#213)", async () => {
+    const registeredTools = new Map<string, TestToolDefinition>();
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: (t: unknown) => {
+        const tool = t as TestToolDefinition;
+        registeredTools.set(tool.name, tool);
+      },
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => {
+        activeTools = names;
+      },
+    };
+
+    // "a-b" (U+002D) sorts before "a.b" (U+002E). The second pair sanitizes to the same
+    // identifier (`mcp_alpha___`, one separator plus two substitutions) but orders differently
+    // by code point than by UTF-16 code unit: U+E000 precedes U+1F600 by code point, while
+    // U+1F600's lead surrogate (U+D83D) precedes U+E000 as a code unit.
+    const collected = ["a.b", "a-b", "\u{1F600}", "\uE000\uE001"];
+    let toolsList = collected;
+    let dispatched = "";
+    const mockClient = {
+      request: async () => ({
+        tools: toolsList.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+      callTool: async (params: { name: string }) => {
+        dispatched = params.name;
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+    } as unknown as Client;
+
+    const bridge = new ToolBridge(
+      { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+      mockPi,
+    );
+    const dispatchThrough = async (piName: string): Promise<string> => {
+      const tool = registeredTools.get(piName);
+      assert.ok(tool, `${piName} must be registered`);
+      await tool.execute("call", {}, undefined, undefined, undefined);
+      return dispatched;
+    };
+
+    for (const order of [collected, [...collected].reverse()]) {
+      toolsList = order;
+      await bridge.refreshTools("alpha", mockClient);
+
+      assert.equal(await dispatchThrough("mcp_alpha_a_b"), "a-b");
+      assert.equal(await dispatchThrough(buildToolName("mcp", "alpha", "a.b", true)), "a.b");
+      assert.equal(await dispatchThrough("mcp_alpha___"), "\uE000\uE001");
+      assert.equal(
+        await dispatchThrough(buildToolName("mcp", "alpha", "\u{1F600}", true)),
+        "\u{1F600}",
+      );
+    }
+  });
+
   it("discards stale out-of-order refreshTools responses via monotonic generation guard", async () => {
     const registeredTools = new Map<string, ToolDefinition>();
     let activeTools: string[] = [];

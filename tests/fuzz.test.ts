@@ -35,7 +35,9 @@ import {
   orderUnionMembers,
   convertJsonSchemaToTypebox,
 } from "../src/schema-convert.js";
-import { buildToolName, convertMcpContent } from "../src/tool-bridge.js";
+import { buildToolName, convertMcpContent, ToolBridge } from "../src/tool-bridge.js";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { parseRegisteredServerConfig } from "../src/config.js";
 import { stripJsonComments } from "../src/jsonc.js";
 import {
@@ -738,6 +740,74 @@ describe("fuzz: buildToolName", () => {
           nameHyphen,
           nameUnderscore,
           "Distinct raw inputs must produce distinct hashed tool names under forceHash",
+        );
+      }),
+      testOptions(),
+    );
+  });
+});
+
+// ─── Suite 6b: ToolBridge intra-server name assignment ────────────────────────
+
+describe("fuzz: ToolBridge intra-server name assignment", () => {
+  /**
+   * Register a server's tool set and report `piName=rawName` for every active tool, so an
+   * assignment can be compared as a whole instead of name by name.
+   */
+  async function assignmentFor(toolNames: readonly string[]): Promise<string> {
+    const registered = new Map<string, ToolDefinition>();
+    let active: string[] = [];
+    const bridge = new ToolBridge(
+      { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+      {
+        registerTool: (t: unknown) => {
+          const tool = t as ToolDefinition;
+          registered.set(tool.name, tool);
+        },
+        getActiveTools: () => active,
+        setActiveTools: (names: string[]) => {
+          active = names;
+        },
+      },
+    );
+
+    let called = "";
+    const client = {
+      request: async () => ({
+        tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+      callTool: async (params: { name: string }) => {
+        called = params.name;
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+    } as unknown as Client;
+    await bridge.refreshTools("alpha", client);
+
+    const pairs: string[] = [];
+    for (const piName of [...active].sort()) {
+      assert.ok(/^[a-zA-Z0-9_]+$/.test(piName), `"${piName}" must be a Pi identifier`);
+      assert.ok(piName.length <= 64, `"${piName}" must be at most 64 characters`);
+      const tool = registered.get(piName);
+      assert.ok(tool, `${piName} must be registered`);
+      await tool.execute("call", {}, undefined, undefined, undefined as never);
+      pairs.push(`${piName}=${called}`);
+    }
+    assert.equal(pairs.length, toolNames.length, "every tool must stay independently addressable");
+    return pairs.join("|");
+  }
+
+  it("assigns the same Pi names to a tool set whatever the tools/list order (#213)", async () => {
+    const rawToolName = fc.stringMatching(/^[a-zA-Z0-9_.-]{1,6}$/);
+    const toolSet = fc.uniqueArray(rawToolName, { minLength: 1, maxLength: 6 });
+
+    await fc.assert(
+      fc.asyncProperty(toolSet, async (toolNames) => {
+        const forward = await assignmentFor(toolNames);
+        const reversed = await assignmentFor([...toolNames].reverse());
+        assert.equal(
+          reversed,
+          forward,
+          `tools/list order must not change name assignment for ${JSON.stringify(toolNames)}`,
         );
       }),
       testOptions(),
