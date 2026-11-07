@@ -44,45 +44,59 @@ class FakeFs {
   readonly dirs = new Map<string, number>();
   readonly calls: string[] = [];
   /**
-   * Optional hook that runs before an operation, so a test can model a second
-   * Pi process touching the same log between two of this logger's calls. It may
-   * mutate `files` and may throw to fail the operation itself.
+   * Optional hooks that run around an operation, so a test can model a second
+   * Pi process touching the same log between two of this logger's calls. `before`
+   * may mutate `files` and may throw to fail the operation itself; `after` sees
+   * the operation's effect.
    */
   before?: ((call: string) => void) | undefined;
+  after?: ((call: string) => void) | undefined;
 
   private record(call: string): void {
     this.before?.(call);
     this.calls.push(call);
   }
 
+  private settle(call: string): void {
+    this.after?.(call);
+  }
+
   get fs(): DebugLogFs {
     return {
       mkdir: async (path, options) => {
-        this.record(`mkdir:${path}`);
+        const call = `mkdir:${path}`;
+        this.record(call);
         this.dirs.set(path, options?.mode ?? 0o777);
+        this.settle(call);
         return undefined;
       },
       appendFile: async (path, data, options) => {
-        this.record(`append:${path}`);
+        const call = `append:${path}`;
+        this.record(call);
         const existing = this.files.get(path);
         if (existing) {
           existing.content += data;
         } else {
           this.files.set(path, { content: data, mode: options?.mode ?? 0o666 });
         }
+        this.settle(call);
       },
       stat: async (path) => {
-        this.record(`stat:${path}`);
+        const call = `stat:${path}`;
+        this.record(call);
         const file = this.files.get(path);
         if (!file) {
           const err = new Error("ENOENT") as NodeJS.ErrnoException;
           err.code = "ENOENT";
           throw err;
         }
-        return { size: Buffer.byteLength(file.content, "utf8") };
+        const size = Buffer.byteLength(file.content, "utf8");
+        this.settle(call);
+        return { size };
       },
       rename: async (oldPath, newPath) => {
-        this.record(`rename:${oldPath}->${newPath}`);
+        const call = `rename:${oldPath}->${newPath}`;
+        this.record(call);
         const file = this.files.get(oldPath);
         if (!file) {
           const err = new Error("ENOENT") as NodeJS.ErrnoException;
@@ -91,32 +105,23 @@ class FakeFs {
         }
         this.files.delete(oldPath);
         this.files.set(newPath, file);
+        this.settle(call);
       },
       chmod: async (path, mode) => {
-        this.record(`chmod:${path}:${mode.toString(8)}`);
+        const call = `chmod:${path}:${mode.toString(8)}`;
+        this.record(call);
         const file = this.files.get(path);
+        const dir = this.dirs.get(path);
         if (file) {
           file.mode = mode;
-          return;
-        }
-        const dir = this.dirs.get(path);
-        if (dir !== undefined) {
+        } else if (dir !== undefined) {
           this.dirs.set(path, mode);
-          return;
-        }
-        const err = new Error("ENOENT") as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
-      },
-      unlink: async (path) => {
-        this.record(`unlink:${path}`);
-        if (!this.files.delete(path)) {
-          // POSIX/Windows `unlink` fails on a missing path; mirror it so tests
-          // see the same ENOENT the real filesystem produces.
+        } else {
           const err = new Error("ENOENT") as NodeJS.ErrnoException;
           err.code = "ENOENT";
           throw err;
         }
+        this.settle(call);
       },
     };
   }
@@ -510,7 +515,7 @@ describe("debug log", () => {
       const fake = new FakeFs();
       const logger = makeLogger(fake);
       const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
-      const rotatedPath = join("/logs", "pi-mcp.log.1");
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
       fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
       fake.files.set(rotatedPath, { content: "old backup", mode: DEBUG_LOG_FILE_MODE });
 
@@ -518,15 +523,13 @@ describe("debug log", () => {
       await logger.flush();
 
       assert.ok(
-        fake.calls.includes(`unlink:${rotatedPath}`),
-        `Expected the previous backup to be removed, got: ${JSON.stringify(fake.calls)}`,
-      );
-      assert.ok(
         fake.calls.includes(`rename:${filePath}->${rotatedPath}`),
         `Expected the log to be rotated, got: ${JSON.stringify(fake.calls)}`,
       );
-      const rotated = fake.files.get(rotatedPath);
-      assert.equal(rotated?.content.length, DEBUG_LOG_MAX_BYTES);
+      // One backup, replaced by the rename: the old one is gone, not deleted
+      // first (an unlink ahead of the rename is what could destroy a peer's).
+      assert.deepEqual([...fake.files.keys()].sort(), [filePath, rotatedPath].sort());
+      assert.equal(fake.files.get(rotatedPath)?.content, "x".repeat(DEBUG_LOG_MAX_BYTES));
       const current = fake.files.get(filePath);
       assert.ok(current?.content.includes("after rotation"));
       assert.ok(!current?.content.includes("xxxxxxxx"));
@@ -545,7 +548,7 @@ describe("debug log", () => {
       assert.equal(fake.files.get(filePath)?.content.includes("small"), true);
     });
 
-    it("rotates when there is no previous backup to remove", async () => {
+    it("rotates when there is no previous backup yet", async () => {
       const fake = new FakeFs();
       const logger = makeLogger(fake);
       const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
@@ -642,31 +645,66 @@ describe("debug log", () => {
       );
     });
 
-    it("appends the incoming line when a peer recreated the backup between the unlink and the rename", async () => {
+    // The destructive half of the same race: the peer rotates right after this
+    // process read the size, so its 2 MB of history is the backup this process
+    // is about to rotate into. Deleting the backup before renaming (as the
+    // logger used to) destroys that history for good.
+    it("keeps the backup a peer process just created when this process loses the rotation race", async () => {
       const fake = new FakeFs();
       const logger = makeLogger(fake);
       const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
       const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
-      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
-      fake.before = (call) => {
-        if (call !== `rename:${filePath}->${rotatedPath}`) return;
-        fake.before = undefined;
-        // A platform where renaming onto an existing backup fails instead of
-        // replacing it: the peer's rotation created the backup first.
-        fake.files.set(rotatedPath, { content: "peer backup", mode: DEBUG_LOG_FILE_MODE });
-        throw errnoError("EEXIST");
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: 0o644 });
+      const peerHistory = "-".repeat(DEBUG_LOG_MAX_BYTES);
+      fake.after = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        fake.after = undefined;
+        // The peer's rotation completes between this process's stat and rename.
+        fake.files.set(rotatedPath, { content: peerHistory, mode: DEBUG_LOG_FILE_MODE });
+        fake.files.delete(filePath);
       };
 
       const errors = captureLoggerFailure();
       try {
-        logger.write({ level: "info", event: "server.state", message: "after peer backup" });
+        logger.write({ level: "info", event: "server.state", message: "after peer rotation" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, [], "A lost rotation race is not a logger failure");
+      assert.equal(
+        fake.files.get(rotatedPath)?.content,
+        peerHistory,
+        "The peer's rotated history must survive this process's rotation attempt",
+      );
+      assert.ok(fake.files.get(filePath)?.content.includes("after peer rotation"));
+    });
+
+    it("recreates the log directory when something removes it mid-write", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const dirChmod = `chmod:/logs:${DEBUG_LOG_DIR_MODE.toString(8)}`;
+      fake.before = (call) => {
+        if (call !== dirChmod) return;
+        fake.before = undefined;
+        // The directory disappears between the mkdir and the chmod.
+        fake.dirs.delete("/logs");
+        throw errnoError("ENOENT");
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after dir vanish" });
         await logger.flush();
       } finally {
         errors.restore();
       }
 
       assert.deepEqual(errors.messages, []);
-      assert.ok(fake.files.get(filePath)?.content.includes("after peer backup"));
+      assert.equal(fake.dirs.get("/logs"), DEBUG_LOG_DIR_MODE);
+      assert.ok(fake.files.get(filePath)?.content.includes("after dir vanish"));
     });
 
     it("still appends when the log size cannot be read", async () => {
@@ -706,7 +744,6 @@ describe("debug log", () => {
         stat: async () => ({ size: 0 }),
         rename: async () => {},
         chmod: async () => {},
-        unlink: async () => {},
       };
       const logger = new DebugLog("/logs", { fs: failing, now: () => new Date(0) });
       const errors: string[] = [];

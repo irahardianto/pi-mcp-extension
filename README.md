@@ -325,7 +325,7 @@ The log is written to `<agent dir>/logs/pi-mcp.log` (JSON Lines, one event per l
 
 - **Off by default.** Without `PI_MCP_DEBUG=1` no log file is created.
 - **Private.** The directory is `0o700` and the file is `0o600`, like the OAuth credential files.
-- **Bounded.** The file is rotated to `pi-mcp.log.1` at ~2 MB; a single backup is kept. Concurrent Pi processes share the log, and losing that rotation race never drops an entry.
+- **Bounded.** The file is rotated to `pi-mcp.log.1` at ~2 MB; a single backup is kept. Concurrent Pi processes share the log, and a rotation race between them never drops an entry or destroys the backup.
 - **Redacted.** Only allow-listed field names are recorded, and a delimiter-aware pass masks anything that looks like a credential:
   - OAuth tokens, authorization codes, and PKCE verifiers
   - API keys and other JSON or key/value secrets (`api_key`, `x-api-key`, `private_key`, `password`, `secret`, `token`, and prefixed forms such as `db_password` or `aws_secret_access_key`)

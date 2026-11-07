@@ -493,7 +493,6 @@ describe("acquireAuthLock with injected fake fs and clock", () => {
         stat: async () => ({ size: 0 }),
         rename: async () => undefined,
         chmod: async () => undefined,
-        unlink: async () => undefined,
       },
     });
     setDebugLog(logger);
