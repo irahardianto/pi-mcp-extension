@@ -145,16 +145,19 @@ export class DebugLog {
 
   private async _append(line: string): Promise<void> {
     await this._ensureDir();
+    await this._rotateIfNeeded(Buffer.byteLength(line, "utf8"));
     try {
-      await this._rotateIfNeeded(Buffer.byteLength(line, "utf8"));
       await this.deps.fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
     } catch (err) {
-      // WHY: `ENOENT` here means `<agentDir>/logs` itself disappeared after it was
-      // created. Forgetting the directory lets the *next* write recreate it
-      // instead of failing for the rest of the session; this entry is still
-      // reported through the queue's handler.
-      if (isErrnoException(err, "ENOENT")) this.dirReady = false;
-      throw err;
+      // WHY: `ENOENT` on `appendFile` means `<agentDir>/logs` disappeared after
+      // it was created. Recreating the directory and retrying once keeps that
+      // from dropping the entry or tripping the once-per-process failure latch;
+      // a second failure is a real one.
+      if (!isErrnoException(err, "ENOENT")) throw err;
+      this.dirReady = false;
+      this.fileModeEnsured = false;
+      await this._ensureDir();
+      await this.deps.fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
     }
     await this._ensureFileMode();
   }
@@ -199,11 +202,14 @@ export class DebugLog {
     const size = await this._logSize();
     if (size === null || size <= 0) return;
     if (size + incomingBytes <= DEBUG_LOG_MAX_BYTES) return;
-    // WHY: Re-read immediately before renaming. A peer process that rotated this
-    // log and recreated a smaller one in between must not have that new file
-    // renamed over the backup it just produced, so a changed size means the
-    // rotation this write planned no longer applies.
-    if ((await this._logSize()) !== size) return;
+    // WHY: Re-read immediately before renaming to narrow the lock-free race
+    // window: if the log vanished or shrank (`currentSize < size`), a peer
+    // process already rotated it (and possibly recreated a smaller one), so
+    // renaming again would overwrite the backup that peer just produced. A plain
+    // peer append (`currentSize >= size`) leaves the file over the cap and still
+    // rotates.
+    const currentSize = await this._logSize();
+    if (currentSize === null || currentSize < size) return;
     await this._rotate();
   }
 
@@ -221,12 +227,12 @@ export class DebugLog {
   }
 
   private async _rotate(): Promise<void> {
+    this.fileModeEnsured = false;
     try {
       // WHY: One rename, no unlink: `rename` replaces the previous backup
-      // atomically on POSIX and on Windows, so there is no window in which the
-      // backup is missing. Deleting it first (as this used to) let a peer
-      // process that rotated in the meantime lose the 2 MB of history the
-      // backup had just preserved.
+      // directly (POSIX `rename(2)`, Windows `MoveFileExW`), so there is no
+      // unlink-before-rename gap in which a peer process that rotated in the
+      // meantime loses the 2 MB of history its backup just preserved.
       await this.deps.fs.rename(this.filePath, this.rotatedFilePath);
     } catch (err) {
       // WHY: A peer Pi process sharing this log rotated `pi-mcp.log` first, so

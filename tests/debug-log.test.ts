@@ -159,6 +159,8 @@ function captureLoggerFailure(): { messages: string[]; restore: () => void } {
     messages,
     restore: () => {
       console.error = original;
+      setDebugLog(null);
+      setDiagnosticUi(null, false);
     },
   };
 }
@@ -699,10 +701,11 @@ describe("debug log", () => {
       assert.ok(fake.files.get(filePath)?.content.includes("after dir vanish"));
     });
 
-    it("recovers on the next write when the log directory disappears", async () => {
+    it("recreates the log directory on the same write when it disappears between writes", async () => {
       const fake = new FakeFs();
       const logger = makeLogger(fake);
       const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
       logger.write({ level: "info", event: "server.state", message: "first" });
       await logger.flush();
 
@@ -712,18 +715,21 @@ describe("debug log", () => {
 
       const errors = captureLoggerFailure();
       try {
-        logger.write({ level: "info", event: "server.state", message: "lost" });
-        await logger.flush();
-        logger.write({ level: "info", event: "server.state", message: "recovered" });
+        logger.write({ level: "info", event: "server.state", message: "recovered without drop" });
         await logger.flush();
       } finally {
         errors.restore();
       }
 
-      assert.equal(errors.messages.length, 1, "the unwritable entry is reported once");
+      assert.deepEqual(errors.messages, [], "Recreating a vanished directory must not report a logger failure");
       assert.equal(fake.dirs.get("/logs"), DEBUG_LOG_DIR_MODE);
-      assert.ok(fake.files.get(filePath)?.content.includes("recovered"));
-      assert.ok(!fake.files.get(filePath)?.content.includes("lost"));
+      assert.equal(fake.files.get(filePath)?.mode, DEBUG_LOG_FILE_MODE);
+      assert.ok(fake.files.get(filePath)?.content.includes("recovered without drop"));
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        2,
+        `Expected 0o600 to be re-enforced on the recreated file, got: ${JSON.stringify(fake.calls)}`,
+      );
     });
 
     // The other direction of the same race: the peer's rotation completes and
@@ -762,6 +768,37 @@ describe("debug log", () => {
       assert.equal(fake.files.get(filePath)?.content.startsWith("peer line"), true);
     });
 
+    it("still rotates when a peer process merely appends between the two size reads", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
+      fake.after = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        fake.after = undefined;
+        const current = fake.files.get(filePath);
+        assert.ok(current);
+        current.content += "peer appended\n";
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer append" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, []);
+      assert.ok(
+        fake.files.get(rotatedPath)?.content.endsWith("peer appended\n"),
+        "The oversized log (including the peer's append) must be rotated to the backup",
+      );
+      assert.ok(fake.files.get(filePath)?.content.includes("after peer append"));
+      assert.ok(!fake.files.get(filePath)?.content.includes("peer appended"));
+    });
+
     it("never throws when the filesystem fails", async () => {
       const failing: DebugLogFs = {
         mkdir: async () => {
@@ -775,22 +812,19 @@ describe("debug log", () => {
         chmod: async () => {},
       };
       const logger = new DebugLog("/logs", { fs: failing, now: () => new Date(0) });
-      const errors: string[] = [];
-      const original = console.error;
-      console.error = (...args: unknown[]) => {
-        errors.push(args.map(String).join(" "));
-      };
+      const errors = captureLoggerFailure();
       try {
         logger.write({ level: "info", event: "server.state", message: "x" });
         await logger.flush();
         logger.write({ level: "info", event: "server.state", message: "y" });
         await logger.flush();
+
+        // The failure is reported once, and never more than once.
+        assert.equal(errors.messages.length, 1);
+        assert.ok(errors.messages[0]?.includes("Debug log write failed"));
       } finally {
-        console.error = original;
+        errors.restore();
       }
-      // The failure is reported once, and never more than once.
-      assert.equal(errors.length, 1);
-      assert.ok(errors[0]?.includes("Debug log write failed"));
     });
   });
 
