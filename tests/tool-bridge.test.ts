@@ -1260,10 +1260,14 @@ describe("ToolBridge", () => {
 
   it("keeps a re-advertised tool inactive when a policy had deactivated it before the drop", async () => {
     let activeTools: string[] = [];
+    let setActiveToolCalls = 0;
     const mockPi = {
       registerTool: () => {},
       getActiveTools: () => activeTools,
-      setActiveTools: (names: string[]) => { activeTools = names; },
+      setActiveTools: (names: string[]) => {
+        setActiveToolCalls += 1;
+        activeTools = names;
+      },
     };
 
     const readData = { name: "read_data", inputSchema: { type: "object" } };
@@ -1277,11 +1281,17 @@ describe("ToolBridge", () => {
     const bridge = new ToolBridge(settings, mockPi);
 
     await bridge.refreshTools("db", mockClient);
+    assert.equal(setActiveToolCalls, 1);
     activeTools = ["mcp_db_read_data"]; // policy deactivates the destructive tool
 
     serverTools = [readData]; // the server stops advertising it
     await bridge.refreshTools("db", mockClient);
     assert.deepEqual(activeTools, ["mcp_db_read_data"]);
+    assert.equal(
+      setActiveToolCalls,
+      1,
+      "Dropping a tool that is already inactive must not rewrite the active set",
+    );
 
     serverTools = [readData, dropTable]; // ...and later advertises it again
     await bridge.refreshTools("db", mockClient);
@@ -1290,6 +1300,11 @@ describe("ToolBridge", () => {
       activeTools,
       ["mcp_db_read_data"],
       "A re-advertised tool must keep the inactive state a policy gave it",
+    );
+    assert.equal(
+      setActiveToolCalls,
+      1,
+      "Re-advertising an inactive tool must not rewrite the active set",
     );
   });
 
@@ -1361,9 +1376,25 @@ describe("ToolBridge", () => {
       ["mcp_db_read_data", "mcp_db_slow_tool"],
       "A tool first discovered on a new connection must be activated",
     );
+
+    // Stopping while slow_tool is still registered, reconnecting when only read_data is
+    // initially listed, and then exposing slow_tool later must also activate slow_tool —
+    // the reconnect handshake must not record previous-connection tools as dropped-inactive.
+    bridge.deactivateServer("db");
+    serverTools = [readData];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_read_data"]);
+
+    serverTools = [readData, slowTool];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_read_data", "mcp_db_slow_tool"],
+      "A tool absent from a reconnect's initial list must still activate when advertised later",
+    );
   });
 
-  it("activates a new tool that recycles a dropped tool's Pi name", async () => {
+  it("activates a new tool that recycles a dropped tool's Pi name without losing the dropped tool's state", async () => {
     let activeTools: string[] = [];
     const mockPi = {
       registerTool: () => {},
@@ -1382,7 +1413,7 @@ describe("ToolBridge", () => {
     const bridge = new ToolBridge(settings, mockPi);
 
     await bridge.refreshTools("db", mockClient);
-    activeTools = []; // a policy deactivates mcp_db_a_b
+    activeTools = []; // a policy deactivates mcp_db_a_b (`a_b`)
     serverTools = []; // ...and the server drops the tool that held that name
     await bridge.refreshTools("db", mockClient);
 
@@ -1394,6 +1425,79 @@ describe("ToolBridge", () => {
       activeTools,
       ["mcp_db_a_b"],
       "A recycled Pi name belongs to a new tool and must be activated",
+    );
+
+    // Dropping `a-b` (while active at mcp_db_a_b) and re-advertising `a_b` must still
+    // remember that `a_b` was deactivated by policy rather than overwritten by `a-b`.
+    serverTools = [];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, []);
+
+    serverTools = [underscored];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      [],
+      "A dropped tool's inactive state must survive another tool temporarily recycling its Pi name",
+    );
+  });
+
+  it("preserves each tool's active state when a colliding sibling re-settles Pi names across live refreshes", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    const dashed = { name: "a-b", inputSchema: { type: "object" } };
+    const underscored = { name: "a_b", inputSchema: { type: "object" } };
+    const dashedHashed = buildToolName("mcp", "db", "a-b", true);
+    let serverTools = [dashed];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    // 1. `a-b` alone owns the unhashed name `mcp_db_a_b`; a policy deactivates it.
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_a_b"]);
+    activeTools = [];
+
+    // 2. Adding `a_b` re-settles the group: `a_b` wins `mcp_db_a_b` (and must activate as
+    //    new), while `a-b` moves to its hashed name and must stay inactive.
+    serverTools = [dashed, underscored];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_a_b"],
+      "The new lossless tool activates at the unhashed name while the shifted lossy tool stays inactive",
+    );
+
+    // 3. Dropping `a_b` moves `a-b` back into `mcp_db_a_b`; `a-b` was inactive and must
+    //    not inherit `a_b`'s active state at the unhashed name.
+    serverTools = [dashed];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      [],
+      "A deactivated lossy tool moving back to the unhashed name must stay inactive",
+    );
+
+    // 4. Re-adding `a_b` restores `a_b` as active at `mcp_db_a_b`. Now flip the policy:
+    //    deactivate `a_b` (`mcp_db_a_b`) and activate `a-b` (`dashedHashed`), then drop `a_b`.
+    serverTools = [dashed, underscored];
+    await bridge.refreshTools("db", mockClient);
+    activeTools = [dashedHashed];
+
+    serverTools = [dashed];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_a_b"],
+      "An active lossy tool moving back to the unhashed name must stay active there",
     );
   });
 
