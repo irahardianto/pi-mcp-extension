@@ -330,6 +330,14 @@ export { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
 
 // ─── Tool Bridge ──────────────────────────────────────────────────────────────
 
+/** What a tool left behind when the server stopped advertising it. */
+interface DroppedToolState {
+  /** The raw MCP tool name, so a recycled Pi name is not mistaken for this tool. */
+  readonly rawName: string;
+  /** Whether Pi had the tool active at that moment. */
+  readonly wasActive: boolean;
+}
+
 /**
  * Manages MCP tools as Pi tools for a set of servers.
  * Tools are registered once and activated/deactivated as servers connect/disconnect.
@@ -348,12 +356,17 @@ export class ToolBridge {
    */
   private readonly activeServers = new Set<string>();
   /**
-   * Per server, whether Pi had each tool active when the server stopped advertising it.
-   * A re-advertised tool is not "new", so it must come back in the state it left in — a tool
-   * a policy had deactivated stays inactive; one the bridge deactivated with the server
-   * returns active.
+   * Per server, the state each tool was in when the server stopped advertising it, keyed by
+   * the Pi name the bridge had assigned. A re-advertised tool is not "new", so it must come
+   * back in the state it left in — a tool a policy had deactivated stays inactive; one the
+   * bridge deactivated with the server returns active.
    */
-  private readonly droppedToolState = new Map<string, Map<string, boolean>>();
+  private readonly droppedToolState = new Map<string, Map<string, DroppedToolState>>();
+  /**
+   * Per server, the raw MCP tool name behind each Pi tool name the bridge assigned, so a tool
+   * the server drops can be recognised by identity when it returns under a sanitized name.
+   */
+  private readonly rawToolNames = new Map<string, Map<string, string>>();
   /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
   private readonly refreshGenerations = new Map<string, number>();
   /** Per-server request timeout overrides resolved during refreshTools. */
@@ -422,6 +435,9 @@ export class ToolBridge {
   deactivateServer(serverName: string): void {
     this._bumpRefreshGeneration(serverName);
     this.activeServers.delete(serverName);
+    // WHY: stopping the server turns every tool off, so what each one "left in" belongs to a
+    // connection that no longer exists; a fresh connect rediscovers the state from scratch.
+    this.droppedToolState.delete(serverName);
     this._deactivateServerTools(serverName);
   }
 
@@ -436,6 +452,7 @@ export class ToolBridge {
     this.serverTimeouts.delete(serverName);
     this.activeServers.delete(serverName);
     this.droppedToolState.delete(serverName);
+    this.rawToolNames.delete(serverName);
     this._deactivateServerTools(serverName);
     const existing = this.serverToolNames.get(serverName);
     if (existing) {
@@ -510,8 +527,11 @@ export class ToolBridge {
   private _reconcileTools(serverName: string, tools: McpToolDefinition[], client: Client): void {
     const registeredForServer = this.serverToolNames.get(serverName) ?? new Set<string>();
 
-    // Build the set of currently valid Pi tool names for this server
+    // Build the set of currently valid Pi tool names for this server, plus the raw name each
+    // one stands for so a dropped tool can be recognised by identity when it returns.
     const currentToolNames = new Set<string>();
+    const rawNamesBefore = this.rawToolNames.get(serverName) ?? new Map<string, string>();
+    const currentRawNames = new Map<string, string>();
     // WHY: `tools/list` order carries no meaning (a server may reorder it freely), so colliding
     // names are assigned over a deterministic order of the tool set — otherwise the exact-match
     // tool could lose the unhashed name to a lossy one and a later refresh would swap which MCP
@@ -519,6 +539,7 @@ export class ToolBridge {
     for (const tool of orderToolsForNameAssignment(this.settings.toolPrefix, serverName, tools)) {
       const piName = this._resolveUniqueToolName(serverName, tool.name, currentToolNames);
       currentToolNames.add(piName);
+      currentRawNames.set(piName, tool.name);
       this.toolOwners.set(piName, serverName);
       // Always re-register — on reconnect the client reference changes and
       // Pi's registerTool overwrites by name, so this is idempotent.
@@ -531,7 +552,8 @@ export class ToolBridge {
     const activeBeforeDrop = new Set(this.pi.getActiveTools());
     for (const existingName of registeredForServer) {
       if (currentToolNames.has(existingName)) continue;
-      this._rememberDroppedTool(serverName, existingName, activeBeforeDrop.has(existingName));
+      const rawName = rawNamesBefore.get(existingName) ?? existingName;
+      this._rememberDroppedTool(serverName, existingName, rawName, activeBeforeDrop.has(existingName));
       this._deactivateServerTool(serverName, existingName);
       if (this.toolOwners.get(existingName) === serverName) {
         this.toolOwners.delete(existingName);
@@ -539,22 +561,28 @@ export class ToolBridge {
     }
 
     this.serverToolNames.set(serverName, currentToolNames);
+    this.rawToolNames.set(serverName, currentRawNames);
     // WHY: `pi.setActiveTools` is shared with every other extension and the user, so an already
     // connected server's tool set may have been narrowed on purpose. A live `tools/list_changed`
     // therefore only activates tools this server did not register before, while a first connect
     // or a reconnect after `deactivateServer` activates the whole set (#214).
     if (this.activeServers.has(serverName)) {
-      this._activateNewTools(serverName, currentToolNames, registeredForServer);
+      this._activateNewTools(serverName, currentToolNames, registeredForServer, currentRawNames);
     } else {
       this._activateServerTools(serverName);
     }
     this.activeServers.add(serverName);
   }
 
-  /** Record whether Pi had a tool active when the server stopped advertising it. */
-  private _rememberDroppedTool(serverName: string, piName: string, wasActive: boolean): void {
-    const dropped = this.droppedToolState.get(serverName) ?? new Map<string, boolean>();
-    dropped.set(piName, wasActive);
+  /** Record the state a tool was in when the server stopped advertising it. */
+  private _rememberDroppedTool(
+    serverName: string,
+    piName: string,
+    rawName: string,
+    wasActive: boolean,
+  ): void {
+    const dropped = this.droppedToolState.get(serverName) ?? new Map<string, DroppedToolState>();
+    dropped.set(piName, { rawName, wasActive });
     this.droppedToolState.set(serverName, dropped);
   }
 
@@ -714,12 +742,26 @@ export class ToolBridge {
     serverName: string,
     currentToolNames: ReadonlySet<string>,
     registeredForServer: ReadonlySet<string>,
+    rawNameByPiName: ReadonlyMap<string, string>,
   ): void {
     const dropped = this.droppedToolState.get(serverName);
     const toActivate = [...currentToolNames].filter(
-      (name) => !registeredForServer.has(name) && dropped?.get(name) !== false,
+      (name) =>
+        !registeredForServer.has(name) &&
+        this._shouldActivateReturningTool(dropped?.get(name), rawNameByPiName.get(name)),
     );
     this._addActiveTools(toActivate);
+  }
+
+  /** Whether a tool that was not in the previous snapshot should be activated. */
+  private _shouldActivateReturningTool(
+    record: DroppedToolState | undefined,
+    rawName: string | undefined,
+  ): boolean {
+    if (record === undefined) return true;
+    // A different raw tool now holds the recycled Pi name: it was never deactivated.
+    if (record.rawName !== rawName) return true;
+    return record.wasActive;
   }
 
   /** Add tool names to Pi's active set, leaving every other entry untouched. */

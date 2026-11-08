@@ -1327,6 +1327,76 @@ describe("ToolBridge", () => {
     );
   });
 
+  it("forgets a dropped tool's state when the server is stopped, so a reconnect starts clean", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    const readData = { name: "read_data", inputSchema: { type: "object" } };
+    const slowTool = { name: "slow_tool", inputSchema: { type: "object" } };
+    let serverTools = [readData, slowTool];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    await bridge.refreshTools("db", mockClient);
+    activeTools = ["mcp_db_read_data"]; // a policy deactivates slow_tool
+    serverTools = [readData]; // the server drops it, so the drop is remembered as inactive
+    await bridge.refreshTools("db", mockClient);
+
+    bridge.deactivateServer("db"); // /mcp:stop
+    await bridge.refreshTools("db", mockClient); // reconnect, server lists only read_data
+
+    serverTools = [readData, slowTool]; // the new connection later exposes slow_tool
+    await bridge.refreshTools("db", mockClient);
+
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_read_data", "mcp_db_slow_tool"],
+      "A tool first discovered on a new connection must be activated",
+    );
+  });
+
+  it("activates a new tool that recycles a dropped tool's Pi name", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    const dashed = { name: "a-b", inputSchema: { type: "object" } };
+    const underscored = { name: "a_b", inputSchema: { type: "object" } };
+    let serverTools = [underscored];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    await bridge.refreshTools("db", mockClient);
+    activeTools = []; // a policy deactivates mcp_db_a_b
+    serverTools = []; // ...and the server drops the tool that held that name
+    await bridge.refreshTools("db", mockClient);
+
+    // `a-b` sanitizes to the same Pi name; it was never deactivated by anyone.
+    serverTools = [dashed];
+    await bridge.refreshTools("db", mockClient);
+
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_a_b"],
+      "A recycled Pi name belongs to a new tool and must be activated",
+    );
+  });
+
   it("re-activates every discovered tool after a stop and reconnect", async () => {
     let activeTools: string[] = [];
     const mockPi = {
