@@ -20,7 +20,7 @@
  * mistake.
  */
 
-import { appendFile, chmod, mkdir, rename, stat, unlink } from "node:fs/promises";
+import { appendFile, chmod, mkdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   buildLogEntry,
@@ -76,7 +76,6 @@ export interface DebugLogFs {
   stat(path: string): Promise<{ size: number }>;
   rename(oldPath: string, newPath: string): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
-  unlink(path: string): Promise<void>;
 }
 
 export interface DebugLogDeps {
@@ -92,7 +91,6 @@ export function createDefaultDebugLogDeps(): DebugLogDeps {
       stat: (path) => stat(path),
       rename: (oldPath, newPath) => rename(oldPath, newPath),
       chmod: (path, mode) => chmod(path, mode),
-      unlink: (path) => unlink(path),
     },
     now: () => new Date(),
   };
@@ -146,37 +144,116 @@ export class DebugLog {
   }
 
   private async _append(line: string): Promise<void> {
-    const fs = this.deps.fs;
-    if (!this.dirReady) {
-      await fs.mkdir(this.dir, { recursive: true, mode: DEBUG_LOG_DIR_MODE });
-      await fs.chmod(this.dir, DEBUG_LOG_DIR_MODE);
-      this.dirReady = true;
-    }
+    await this._ensureDir();
     await this._rotateIfNeeded(Buffer.byteLength(line, "utf8"));
-    await fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
-    if (!this.fileModeEnsured) {
+    try {
+      await this.deps.fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
+    } catch (err) {
+      // WHY: `ENOENT` on `appendFile` means `<agentDir>/logs` disappeared after
+      // it was created. Recreating the directory and retrying once keeps that
+      // from dropping the entry or tripping the once-per-process failure latch;
+      // a second failure is a real one.
+      if (!isErrnoException(err, "ENOENT")) throw err;
+      this.dirReady = false;
+      this.fileModeEnsured = false;
+      await this._ensureDir();
+      await this.deps.fs.appendFile(this.filePath, line, { mode: DEBUG_LOG_FILE_MODE });
+    }
+    await this._ensureFileMode();
+  }
+
+  private async _ensureDir(): Promise<void> {
+    if (this.dirReady) return;
+    try {
+      await this._createDir();
+    } catch (err) {
+      // WHY: Something removed `<agentDir>/logs` between the mkdir and the chmod
+      // (a peer Pi process pruning an agent dir, a sandbox reset). Recreating it
+      // keeps that from dropping the entry; a second failure is a real one.
+      if (!isErrnoException(err, "ENOENT")) throw err;
+      await this._createDir();
+    }
+    this.dirReady = true;
+  }
+
+  private async _createDir(): Promise<void> {
+    const fs = this.deps.fs;
+    await fs.mkdir(this.dir, { recursive: true, mode: DEBUG_LOG_DIR_MODE });
+    await fs.chmod(this.dir, DEBUG_LOG_DIR_MODE);
+  }
+
+  private async _ensureFileMode(): Promise<void> {
+    if (this.fileModeEnsured) return;
+    try {
       // WHY: `mode` only applies when the file is created; an existing file may
       // have looser permissions, so the mode is enforced once per logger.
-      await fs.chmod(this.filePath, DEBUG_LOG_FILE_MODE);
+      await this.deps.fs.chmod(this.filePath, DEBUG_LOG_FILE_MODE);
       this.fileModeEnsured = true;
+    } catch (err) {
+      // WHY: A peer Pi process sharing this log rotated `pi-mcp.log` between the
+      // append and this chmod, so it already holds the line. Leaving the flag
+      // false re-applies the mode on the file the next write creates instead of
+      // reporting a logger failure for a race that lost nothing.
+      if (!isErrnoException(err, "ENOENT")) throw err;
     }
   }
 
   private async _rotateIfNeeded(incomingBytes: number): Promise<void> {
-    const fs = this.deps.fs;
-    let size = 0;
-    try {
-      size = (await fs.stat(this.filePath)).size;
-    } catch {
-      // WHY: The log file does not exist yet — there is nothing to rotate.
-      return;
-    }
-    if (size <= 0 || size + incomingBytes <= DEBUG_LOG_MAX_BYTES) return;
-    await fs.unlink(this.rotatedFilePath).catch(() => {
-      // WHY: No previous backup to remove — the rename below creates the only one.
-    });
-    await fs.rename(this.filePath, this.rotatedFilePath);
+    const size = await this._logSize();
+    if (size === null || size <= 0) return;
+    if (size + incomingBytes <= DEBUG_LOG_MAX_BYTES) return;
+    // WHY: Re-read immediately before renaming to narrow the lock-free race
+    // window: if the log vanished or shrank (`currentSize < size`), a peer
+    // process already rotated it (and possibly recreated a smaller one), so
+    // renaming again would overwrite the backup that peer just produced. A plain
+    // peer append (`currentSize >= size`) leaves the file over the cap and still
+    // rotates. Either way, `pi-mcp.log` is no longer the pre-rotation file, so
+    // `0o600` must be re-enforced after the append.
+    const currentSize = await this._logSize();
+    if (currentSize === null) return;
+    this.fileModeEnsured = false;
+    if (currentSize < size) return;
+    await this._rotate();
   }
+
+  /** Size of the log file: `0` when it is absent, `null` when it is unknown. */
+  private async _logSize(): Promise<number | null> {
+    try {
+      return (await this.deps.fs.stat(this.filePath)).size;
+    } catch (err) {
+      if (isErrnoException(err, "ENOENT")) {
+        // WHY: An absent file means the initial write has not run yet or a peer
+        // rotated `pi-mcp.log` away since this logger last ensured `0o600`.
+        this.fileModeEnsured = false;
+        return 0;
+      }
+      // WHY: Any other stat failure leaves the size unknown. Rotation is only an
+      // optimization — the caller appends anyway rather than dropping the line,
+      // and the cap is re-checked on the next write that can read the size.
+      return null;
+    }
+  }
+
+  private async _rotate(): Promise<void> {
+    this.fileModeEnsured = false;
+    try {
+      // WHY: One rename, no unlink: `rename` replaces the previous backup
+      // directly (POSIX `rename(2)`, Windows `MoveFileExW`), so there is no
+      // unlink-before-rename gap in which a peer process that rotated in the
+      // meantime loses the 2 MB of history its backup just preserved.
+      await this.deps.fs.rename(this.filePath, this.rotatedFilePath);
+    } catch (err) {
+      // WHY: A peer Pi process sharing this log rotated `pi-mcp.log` first, so
+      // there is nothing to move — its backup is the one that stays. The append
+      // below recreates the file and writes the incoming line into it.
+      if (!isErrnoException(err, "ENOENT")) throw err;
+    }
+  }
+}
+
+/** True when `err` is a Node.js errno exception carrying `code`. */
+function isErrnoException(err: unknown, code: string): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === code;
 }
 
 // ─── Diagnostic Sink ──────────────────────────────────────────────────────────

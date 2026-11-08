@@ -2,12 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import {
   DEBUG_LOG_DIR_MODE,
   DEBUG_LOG_FILE_MODE,
   DEBUG_LOG_FILE_NAME,
   DEBUG_LOG_MAX_BYTES,
+  DEBUG_LOG_ROTATED_FILE_NAME,
   DebugLog,
   getDebugLog,
   isDebugLogEnabled,
@@ -42,34 +43,68 @@ class FakeFs {
   readonly files = new Map<string, FakeFile>();
   readonly dirs = new Map<string, number>();
   readonly calls: string[] = [];
+  /**
+   * Optional hooks that run around an operation, so a test can model a second
+   * Pi process touching the same log between two of this logger's calls. `before`
+   * may mutate `files` and may throw to fail the operation itself; `after` sees
+   * the operation's effect.
+   */
+  before?: ((call: string) => void) | undefined;
+  after?: ((call: string) => void) | undefined;
+
+  private record(call: string): void {
+    this.before?.(call);
+    this.calls.push(call);
+  }
+
+  private settle(call: string): void {
+    this.after?.(call);
+  }
 
   get fs(): DebugLogFs {
     return {
       mkdir: async (path, options) => {
-        this.calls.push(`mkdir:${path}`);
+        const call = `mkdir:${path}`;
+        this.record(call);
         this.dirs.set(path, options?.mode ?? 0o777);
+        this.settle(call);
         return undefined;
       },
       appendFile: async (path, data, options) => {
-        this.calls.push(`append:${path}`);
+        const call = `append:${path}`;
+        this.record(call);
+        // Real `appendFile` cannot create the directory either. `dirname` returns
+        // native separators, while the logger's fixture paths are POSIX-style, so
+        // compare on one separator before the lookup.
+        if (!this.dirs.has(dirname(path).split(sep).join("/"))) {
+          const err = new Error("ENOENT") as NodeJS.ErrnoException;
+          err.code = "ENOENT";
+          throw err;
+        }
         const existing = this.files.get(path);
         if (existing) {
           existing.content += data;
         } else {
           this.files.set(path, { content: data, mode: options?.mode ?? 0o666 });
         }
+        this.settle(call);
       },
       stat: async (path) => {
+        const call = `stat:${path}`;
+        this.record(call);
         const file = this.files.get(path);
         if (!file) {
           const err = new Error("ENOENT") as NodeJS.ErrnoException;
           err.code = "ENOENT";
           throw err;
         }
-        return { size: Buffer.byteLength(file.content, "utf8") };
+        const size = Buffer.byteLength(file.content, "utf8");
+        this.settle(call);
+        return { size };
       },
       rename: async (oldPath, newPath) => {
-        this.calls.push(`rename:${oldPath}->${newPath}`);
+        const call = `rename:${oldPath}->${newPath}`;
+        this.record(call);
         const file = this.files.get(oldPath);
         if (!file) {
           const err = new Error("ENOENT") as NodeJS.ErrnoException;
@@ -78,26 +113,23 @@ class FakeFs {
         }
         this.files.delete(oldPath);
         this.files.set(newPath, file);
+        this.settle(call);
       },
       chmod: async (path, mode) => {
-        this.calls.push(`chmod:${path}:${mode.toString(8)}`);
+        const call = `chmod:${path}:${mode.toString(8)}`;
+        this.record(call);
         const file = this.files.get(path);
+        const dir = this.dirs.get(path);
         if (file) {
           file.mode = mode;
-          return;
-        }
-        const dir = this.dirs.get(path);
-        if (dir !== undefined) {
+        } else if (dir !== undefined) {
           this.dirs.set(path, mode);
-          return;
+        } else {
+          const err = new Error("ENOENT") as NodeJS.ErrnoException;
+          err.code = "ENOENT";
+          throw err;
         }
-        const err = new Error("ENOENT") as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
-      },
-      unlink: async (path) => {
-        this.calls.push(`unlink:${path}`);
-        this.files.delete(path);
+        this.settle(call);
       },
     };
   }
@@ -105,6 +137,38 @@ class FakeFs {
 
 function makeLogger(fake: FakeFs, now = new Date("2026-01-01T00:00:00.000Z")): DebugLog {
   return new DebugLog("/logs", { fs: fake.fs, now: () => now });
+}
+
+/**
+ * Capture the headless stderr fallback (`reportLoggerFailure`) during a test.
+ *
+ * `reportLoggerFailure` reports once per installed logger and stays silent while
+ * a UI is active, so both are reset first: without that, a failure from an
+ * earlier test would latch, or these assertions would pass vacuously because
+ * `console.error` was never the reporting path.
+ */
+function captureLoggerFailure(): { messages: string[]; restore: () => void } {
+  setDebugLog(null);
+  setDiagnosticUi(null, false);
+  const messages: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  return {
+    messages,
+    restore: () => {
+      console.error = original;
+      setDebugLog(null);
+      setDiagnosticUi(null, false);
+    },
+  };
+}
+
+function errnoError(code: string): NodeJS.ErrnoException {
+  const err = new Error(code) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -461,11 +525,17 @@ describe("debug log", () => {
       assert.equal(parsed.server, "github");
     });
 
-    it("rotates to a single backup when the size cap is reached", async () => {
+    it("rotates to a single backup when the size cap is reached and re-enforces 0o600", async () => {
       const fake = new FakeFs();
       const logger = makeLogger(fake);
       const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
-      const rotatedPath = join("/logs", "pi-mcp.log.1");
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
+
+      // First write sets `fileModeEnsured = true` on the initial file.
+      logger.write({ level: "info", event: "server.state", message: "initial" });
+      await logger.flush();
+
       fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
       fake.files.set(rotatedPath, { content: "old backup", mode: DEBUG_LOG_FILE_MODE });
 
@@ -473,18 +543,21 @@ describe("debug log", () => {
       await logger.flush();
 
       assert.ok(
-        fake.calls.includes(`unlink:${rotatedPath}`),
-        `Expected the previous backup to be removed, got: ${JSON.stringify(fake.calls)}`,
-      );
-      assert.ok(
         fake.calls.includes(`rename:${filePath}->${rotatedPath}`),
         `Expected the log to be rotated, got: ${JSON.stringify(fake.calls)}`,
       );
-      const rotated = fake.files.get(rotatedPath);
-      assert.equal(rotated?.content.length, DEBUG_LOG_MAX_BYTES);
+      // One backup, replaced by the rename: the old one is gone, not deleted
+      // first (an unlink ahead of the rename is what could destroy a peer's).
+      assert.deepEqual([...fake.files.keys()].sort(), [filePath, rotatedPath].sort());
+      assert.equal(fake.files.get(rotatedPath)?.content, "x".repeat(DEBUG_LOG_MAX_BYTES));
       const current = fake.files.get(filePath);
       assert.ok(current?.content.includes("after rotation"));
       assert.ok(!current?.content.includes("xxxxxxxx"));
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        2,
+        `Expected 0o600 to be re-enforced on the post-rotation file, got: ${JSON.stringify(fake.calls)}`,
+      );
     });
 
     it("does not rotate while the file stays below the cap", async () => {
@@ -500,6 +573,315 @@ describe("debug log", () => {
       assert.equal(fake.files.get(filePath)?.content.includes("small"), true);
     });
 
+    // Two Pi processes share one `<agentDir>/logs/pi-mcp.log`. When both decide
+    // to rotate, the peer's rotation lands between this process's calls: the
+    // log file is gone by the time this process renames it.
+    it("appends the incoming line when a peer process rotates the log before this process renames it", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
+
+      logger.write({ level: "info", event: "server.state", message: "initial" });
+      await logger.flush();
+
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
+      fake.before = (call) => {
+        if (call !== `rename:${filePath}->${rotatedPath}`) return;
+        fake.before = undefined;
+        const rotating = fake.files.get(filePath);
+        assert.ok(rotating, "Expected this process to still see the log before the peer rotates it");
+        fake.files.set(rotatedPath, rotating);
+        fake.files.delete(filePath);
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer rotation" });
+        await logger.flush();
+
+        // A peer rotating `pi-mcp.log` away between writes (first `stat` sees ENOENT)
+        // must also reset `fileModeEnsured` so the recreated file gets 0o600.
+        fake.files.delete(filePath);
+        logger.write({ level: "info", event: "server.state", message: "after between-write rotation" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, [], "A lost rotation race is not a logger failure");
+      assert.ok(
+        fake.files.get(filePath)?.content.includes("after between-write rotation"),
+        "The line must still be appended when a peer rotated the log away between writes",
+      );
+      assert.ok(!fake.files.get(rotatedPath)?.content.includes("after peer rotation"));
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        3,
+        `Expected 0o600 to be re-enforced after each peer rotation, got: ${JSON.stringify(fake.calls)}`,
+      );
+    });
+
+    it("appends the incoming line when a peer process rotates the log between the append and the chmod", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
+      fake.files.set(filePath, { content: "x".repeat(10), mode: DEBUG_LOG_FILE_MODE });
+      fake.before = (call) => {
+        if (call !== chmodCall) return;
+        fake.before = undefined;
+        const rotated = fake.files.get(filePath);
+        assert.ok(rotated, "Expected the appended file to exist when the peer rotates it");
+        fake.files.set(rotatedPath, rotated);
+        fake.files.delete(filePath);
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer chmod race" });
+        await logger.flush();
+
+        assert.deepEqual(errors.messages, [], "A lost chmod race is not a logger failure");
+        assert.ok(
+          fake.files.get(rotatedPath)?.content.includes("after peer chmod race"),
+          "The appended line must be in the backup the peer took",
+        );
+
+        // The mode was never confirmed on that file, so the next write enforces
+        // it again on the file it creates.
+        logger.write({ level: "info", event: "server.state", message: "next write" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.equal(fake.files.get(filePath)?.mode, DEBUG_LOG_FILE_MODE);
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        2,
+        `Expected the mode to be enforced again after the lost race, got: ${JSON.stringify(fake.calls)}`,
+      );
+    });
+
+    // The destructive half of the same race: the peer rotates right after this
+    // process read the size, so its 2 MB of history is the backup this process
+    // is about to rotate into. Deleting the backup before renaming (as the
+    // logger used to) destroys that history for good.
+    it("keeps the backup a peer process just created when this process loses the rotation race", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
+
+      // First write sets `fileModeEnsured = true` before the peer rotates.
+      logger.write({ level: "info", event: "server.state", message: "initial" });
+      await logger.flush();
+
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: 0o644 });
+      const peerHistory = "-".repeat(DEBUG_LOG_MAX_BYTES);
+      fake.after = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        fake.after = undefined;
+        // The peer's rotation completes between this process's stat and rename.
+        fake.files.set(rotatedPath, { content: peerHistory, mode: DEBUG_LOG_FILE_MODE });
+        fake.files.delete(filePath);
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer rotation" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, [], "A lost rotation race is not a logger failure");
+      assert.equal(
+        fake.files.get(rotatedPath)?.content,
+        peerHistory,
+        "The peer's rotated history must survive this process's rotation attempt",
+      );
+      assert.ok(fake.files.get(filePath)?.content.includes("after peer rotation"));
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        2,
+        `Expected 0o600 to be re-enforced when this process recreates the rotated file, got: ${JSON.stringify(fake.calls)}`,
+      );
+    });
+
+    it("recreates the log directory when something removes it mid-write", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const dirChmod = `chmod:/logs:${DEBUG_LOG_DIR_MODE.toString(8)}`;
+      fake.before = (call) => {
+        if (call !== dirChmod) return;
+        fake.before = undefined;
+        // The directory disappears between the mkdir and the chmod.
+        fake.dirs.delete("/logs");
+        throw errnoError("ENOENT");
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after dir vanish" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, []);
+      assert.equal(fake.dirs.get("/logs"), DEBUG_LOG_DIR_MODE);
+      assert.ok(fake.files.get(filePath)?.content.includes("after dir vanish"));
+    });
+
+    it("recreates the log directory on the same write when it disappears between writes", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
+      logger.write({ level: "info", event: "server.state", message: "first" });
+      await logger.flush();
+
+      // Something removes the whole directory between writes.
+      fake.files.clear();
+      fake.dirs.clear();
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "recovered without drop" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, [], "Recreating a vanished directory must not report a logger failure");
+      assert.equal(fake.dirs.get("/logs"), DEBUG_LOG_DIR_MODE);
+      assert.equal(fake.files.get(filePath)?.mode, DEBUG_LOG_FILE_MODE);
+      assert.ok(fake.files.get(filePath)?.content.includes("recovered without drop"));
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        2,
+        `Expected 0o600 to be re-enforced on the recreated file, got: ${JSON.stringify(fake.calls)}`,
+      );
+    });
+
+    // The other direction of the same race: the peer's rotation completes and
+    // its own append recreates a small log. Renaming that log would replace the
+    // 2 MB backup the peer just produced, so the rotation must be dropped.
+    it("does not rotate a log a peer process replaced after the size was read", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      const chmodCall = `chmod:${filePath}:${DEBUG_LOG_FILE_MODE.toString(8)}`;
+      const peerHistory = "-".repeat(DEBUG_LOG_MAX_BYTES);
+
+      // First write sets `fileModeEnsured = true` before the peer replaces the file.
+      logger.write({ level: "info", event: "server.state", message: "initial" });
+      await logger.flush();
+
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
+      fake.after = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        fake.after = undefined;
+        // The peer rotates, then recreates the log with its own line.
+        fake.files.set(rotatedPath, { content: peerHistory, mode: DEBUG_LOG_FILE_MODE });
+        fake.files.set(filePath, { content: "peer line\n", mode: 0o644 });
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer clobber" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, []);
+      assert.equal(
+        fake.files.get(rotatedPath)?.content,
+        peerHistory,
+        "The recreated log must not replace the backup the peer just produced",
+      );
+      assert.ok(fake.files.get(filePath)?.content.includes("after peer clobber"));
+      assert.equal(fake.files.get(filePath)?.content.startsWith("peer line"), true);
+      assert.equal(fake.files.get(filePath)?.mode, DEBUG_LOG_FILE_MODE);
+      assert.equal(
+        fake.calls.filter((call) => call === chmodCall).length,
+        2,
+        `Expected 0o600 to be re-enforced on the replacement file, got: ${JSON.stringify(fake.calls)}`,
+      );
+    });
+
+    it("still rotates when a peer process merely appends between the two size reads", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      const rotatedPath = join("/logs", DEBUG_LOG_ROTATED_FILE_NAME);
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
+      fake.after = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        fake.after = undefined;
+        const current = fake.files.get(filePath);
+        assert.ok(current);
+        current.content += "peer appended\n";
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "after peer append" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, []);
+      assert.ok(
+        fake.files.get(rotatedPath)?.content.endsWith("peer appended\n"),
+        "The oversized log (including the peer's append) must be rotated to the backup",
+      );
+      assert.ok(fake.files.get(filePath)?.content.includes("after peer append"));
+      assert.ok(!fake.files.get(filePath)?.content.includes("peer appended"));
+    });
+
+    it("still appends without rotating or reporting a failure when stat fails with a non-ENOENT error", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      const filePath = join("/logs", DEBUG_LOG_FILE_NAME);
+      fake.files.set(filePath, { content: "x".repeat(DEBUG_LOG_MAX_BYTES), mode: DEBUG_LOG_FILE_MODE });
+
+      let statCalls = 0;
+      fake.before = (call) => {
+        if (call !== `stat:${filePath}`) return;
+        statCalls++;
+        // Write 1 fails on the first stat; Write 2 succeeds on the first stat
+        // and fails on the pre-rename re-read stat.
+        if (statCalls === 1 || statCalls === 3) {
+          throw errnoError("EACCES");
+        }
+      };
+
+      const errors = captureLoggerFailure();
+      try {
+        logger.write({ level: "info", event: "server.state", message: "first stat failed" });
+        await logger.flush();
+        logger.write({ level: "info", event: "server.state", message: "second stat failed" });
+        await logger.flush();
+      } finally {
+        errors.restore();
+      }
+
+      assert.deepEqual(errors.messages, []);
+      assert.ok(!fake.calls.some((call) => call.startsWith("rename:")));
+      assert.ok(fake.files.get(filePath)?.content.includes("first stat failed"));
+      assert.ok(fake.files.get(filePath)?.content.includes("second stat failed"));
+    });
+
     it("never throws when the filesystem fails", async () => {
       const failing: DebugLogFs = {
         mkdir: async () => {
@@ -511,25 +893,21 @@ describe("debug log", () => {
         stat: async () => ({ size: 0 }),
         rename: async () => {},
         chmod: async () => {},
-        unlink: async () => {},
       };
       const logger = new DebugLog("/logs", { fs: failing, now: () => new Date(0) });
-      const errors: string[] = [];
-      const original = console.error;
-      console.error = (...args: unknown[]) => {
-        errors.push(args.map(String).join(" "));
-      };
+      const errors = captureLoggerFailure();
       try {
         logger.write({ level: "info", event: "server.state", message: "x" });
         await logger.flush();
         logger.write({ level: "info", event: "server.state", message: "y" });
         await logger.flush();
+
+        // The failure is reported once, and never more than once.
+        assert.equal(errors.messages.length, 1);
+        assert.ok(errors.messages[0]?.includes("Debug log write failed"));
       } finally {
-        console.error = original;
+        errors.restore();
       }
-      // The failure is reported once, and never more than once.
-      assert.equal(errors.length, 1);
-      assert.ok(errors[0]?.includes("Debug log write failed"));
     });
   });
 
