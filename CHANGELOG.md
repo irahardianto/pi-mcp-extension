@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.14.5] - 2026-11-08
+
 ### Fixed
 - A live `notifications/tools/list_changed` refresh no longer re-activates MCP tools that another extension or a user policy deactivated while the server stayed connected (#214). `_reconcileTools` called `_activateServerTools` unconditionally, adding every discovered tool back into `pi.setActiveTools` — undoing the restriction `README.md` documents and `mcp_connect` otherwise respects, so a server exposing one additional tool silently re-enabled a destructive tool a policy had removed. The bridge now tracks which servers it has activated and not deactivated since and keys tool state by raw MCP tool name: a refresh while the server is still active activates only tools the connection has not seen before, preserves the active/inactive state of previously discovered tools even when a colliding sibling shifts their Pi identifiers, restores a re-advertised tool to the state it left in when dropped on that connection, and skips `pi.setActiveTools` altogether when the active set is unchanged. A first connect or a reconnect after a stop, background recovery, or session teardown still activates the whole discovered set and starts with a clean dropped-tool memory.
 
