@@ -135,10 +135,12 @@ and then `destroyStdioStreams()`.
 `npx`/`npm exec`/`uvx`/`sh -c` wrapper that spawns the real server as a grandchild) and signals
 it deepest-generation-first, so a wrapper death cannot re-parent a still-running server out of
 reach. Windows has no portable parent/child enumeration, so it keeps single-PID termination.
-A PID the kernel refuses to signal (`EPERM`) is not waited on: it is either recycled to another
-user's process or out of reach, so it costs no polling window and — unless a liveness probe still
-finds it signalable, in which case the refusal came from the signal rather than the process — is
-not escalated to SIGKILL either. When the root PID is refused outright the tree is not walked.
+A PID the kernel refuses to signal (`EPERM`) is never waited on, and never read as already
+exited either: when a liveness probe still finds it signalable, the refusal came from that signal
+rather than the process (SELinux/AppArmor/seccomp can deny SIGTERM and allow SIGKILL), so the
+SIGKILL escalation runs immediately. An out-of-reach root is dropped from the target list, but its
+descendants are still snapshotted and signalled — a privileged wrapper can own a server that runs
+under our uid.
 `destroyStdioStreams()` then destroys the child's `stdout`/`stderr` read ends: a survivor that
 inherited those pipes would otherwise keep the `'close'` event from ever firing and stall
 `StdioClientTransport.close()` for its full 2 × 2,000ms escalation budget. Both

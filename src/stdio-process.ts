@@ -463,9 +463,10 @@ type PidSignalOutcome =
  * POSIX liveness: a PID is alive while `kill(pid, 0)` fails with anything but ESRCH.
  *
  * WHY: EPERM means the PID is taken but belongs to a process this caller may not signal (a
- * recycled PID under another uid, a sandboxed child, PID 1). Callers that only ask whether the
- * PID is *occupied* — the auth-lock staleness check — must see that as occupied, not free;
- * teardown asks a stricter question (`isPidSignalable`).
+ * recycled PID under another uid, a sandboxed child, PID 1). A caller that asks only whether the
+ * PID is *occupied* must read that as occupied, not free; teardown asks the stricter
+ * `isPidSignalable` instead. Auth-lock's staleness check needs this reading too and keeps its own
+ * probe (`defaultIsPidAlive` in `src/auth-lock.ts`), so it does not call this one.
  */
 export function isPidAlive(pid: number, deps?: Partial<Pick<StdioProcessDeps, "kill">>): boolean {
   return signalPid(pid, 0, resolveDeps(deps)) !== "gone";
@@ -517,7 +518,7 @@ function allExited(pids: readonly number[], d: StdioProcessDeps): boolean {
  *
  * Resolves `true` when nothing that could still be running is left, which is what gates the
  * SIGKILL escalation. A PID that reported ESRCH is gone, and one that reported EPERM is not
- * ours to wait for.
+ * ours to wait for — but it is not assumed dead either.
  */
 async function signalAndWaitForExit(
   pids: readonly number[],
@@ -527,28 +528,27 @@ async function signalAndWaitForExit(
 ): Promise<boolean> {
   const attempts = pids.map((pid) => ({ pid, outcome: signalPid(pid, signal, d) }));
   const signalled = attempts.filter((a) => a.outcome === "signalled").map((a) => a.pid);
-  if (signalled.length === 0) {
-    // WHY: a refused signal is not proof of a dead target. Permission is mediated per signal
-    // on some systems — SELinux keeps separate `sigterm`/`sigkill` permissions, AppArmor
-    // matches a signal set, and a seccomp filter can match the signal argument — so SIGTERM
-    // can be refused while SIGKILL is allowed. Ask the liveness probe instead of assuming:
-    // a PID that is still signalable survives this signal and goes straight to the SIGKILL
-    // escalation, without paying for a wait window this signal can never end.
-    // Only the refused targets are re-probed: ESRCH already proved the PID was gone, and
-    // probing it again could sign a recycled PID up for a SIGKILL it has nothing to do with.
-    const refused = attempts.filter((a) => a.outcome === "denied").map((a) => a.pid);
-    return !refused.some((pid) => isPidSignalable(pid, d));
-  }
+  const refused = attempts.filter((a) => a.outcome === "denied").map((a) => a.pid);
 
-  const deadline = d.now() + timeoutMs;
-  while (d.now() < deadline) {
-    if (allExited(signalled, d)) {
-      return true;
+  // A window can only be ended by a signal that was actually delivered, so nothing is waited
+  // for when nothing was. (The refused targets still decide the result below.)
+  if (signalled.length > 0) {
+    const deadline = d.now() + timeoutMs;
+    while (d.now() < deadline && !allExited(signalled, d)) {
+      await d.sleep(25);
     }
-    await d.sleep(25);
   }
 
-  return allExited(signalled, d);
+  // WHY: a refused signal is not proof of a dead target. Permission is mediated per signal on
+  // some systems — SELinux keeps separate `sigterm`/`sigkill` permissions, AppArmor matches a
+  // signal set, and a seccomp filter can match the signal argument — so SIGTERM can be refused
+  // while SIGKILL is allowed. A refused target that a liveness probe still finds signalable
+  // therefore keeps the tree alive and sends the caller straight to the SIGKILL escalation,
+  // without paying for a wait window this signal can never end; one that is no longer
+  // signalable is out of reach (recycled to another uid, or the child changed credentials) and
+  // counts as gone. ESRCH targets are never re-probed: that verdict is final, and re-probing a
+  // recycled PID could sign it up for a SIGKILL it has nothing to do with.
+  return allExited(signalled, d) && !refused.some((pid) => isPidSignalable(pid, d));
 }
 
 /**
@@ -577,24 +577,25 @@ export async function ensurePidTerminated(
   deps?: Partial<StdioProcessDeps>,
 ): Promise<void> {
   const d = resolveDeps(deps);
-  // WHY: the guard asks "is this PID still ours to signal?", not "does some process hold this
-  // PID?" — a PID we cannot signal cannot be waited on, and the child it replaced is gone or
-  // out of reach. It also skips the descendant snapshot, which shells out to `ps` on macOS, on
-  // every teardown whose child exited before we got here (the second call each teardown path
-  // makes is the common case).
-  // A tree behind an unsignalable root is deliberately not walked either: once that process has
-  // exited its children are re-parented to init, so a snapshot of its PID finds another user's
-  // tree — processes no signal of ours reaches — not the orphans we would want to kill.
-  if (!pid || !isPidSignalable(pid, d)) {
-    return;
-  }
+  if (!pid) return;
+  const root = signalPid(pid, 0, d);
+  // WHY: ESRCH is the only verdict that says the PID is free — nothing to snapshot, nothing to
+  // signal. EPERM does not describe the tree: the root may be out of reach while descendants
+  // are ours (a privileged wrapper that dropped to our uid for the real server), so they are
+  // still signalled below.
+  if (root === "gone") return;
 
   // WHY: Snapshot before signalling any PID: a wrapper that exits first re-parents its
-  // children to init, after which they can no longer be found by parent PID.
+  // children to init, after which they can no longer be found by parent PID. The snapshot runs
+  // even for an out-of-reach root, because that root may still own signalable descendants.
   const descendants = await d.listDescendantPids(pid);
-  if (await signalAndWaitForExit([...descendants, pid], "SIGTERM", 500, d)) {
-    return;
-  }
+  const targets = descendants.filter((candidate) => isPidSignalable(candidate, d));
+  // WHY: a root nobody can signal is skipped as a target — no wait window can end it — but it
+  // must not hide the descendants that a signal can still reach.
+  if (root === "signalled") targets.push(pid);
+  if (targets.length === 0) return;
+
+  if (await signalAndWaitForExit(targets, "SIGTERM", 500, d)) return;
 
   await escalateToSigkill(pid, descendants, d);
 }

@@ -618,8 +618,41 @@ setInterval(() => {}, 1000);
 
       // Only the liveness probe: no SIGTERM/SIGKILL against a PID we do not own.
       assert.deepEqual(calls, [{ pid: 12345, signal: 0 }]);
-      // The descendant snapshot shells out to `ps` on macOS, so a recycled PID must not pay for it.
-      assert.equal(scans, 0);
+      // The snapshot still runs — an out-of-reach root can own descendants that are ours.
+      assert.equal(scans, 1);
+    });
+
+    it("signals the reachable descendants of a root nobody can signal", async () => {
+      const calls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+      let descendantAlive = true;
+      const deps: StdioProcessDeps = {
+        kill: (pid, signal) => {
+          calls.push({ pid, signal });
+          // A privileged wrapper: alive, but out of reach for every signal including 0.
+          if (pid === 5000) {
+            throw createEpermError();
+          }
+          if (signal === "SIGTERM") {
+            descendantAlive = false;
+          }
+          if (signal === 0 && !descendantAlive) {
+            throw createEsrchError();
+          }
+        },
+        sleep: async () => {
+          throw new Error("the reachable descendant exits without a wait window");
+        },
+        now: () => 0,
+        listDescendantPids: async () => [6000],
+      };
+
+      await ensurePidTerminated(5000, deps);
+
+      // The wrapper is never signalled, but its descendant — which we can reach — still is.
+      assert.deepEqual(
+        calls.filter((c) => c.signal !== 0).map((c) => [c.pid, c.signal]),
+        [[6000, "SIGTERM"]],
+      );
     });
 
     it("escalates to SIGKILL when only SIGTERM is refused (policy-mediated permissions)", async () => {
@@ -663,9 +696,9 @@ setInterval(() => {}, 1000);
       assert.deepEqual(sleeps, []);
     });
 
-    it("waits only for the targets that accepted the signal", async () => {
+    it("waits only for the targets that accepted the signal, then escalates the refused root", async () => {
       let currentNow = 0;
-      let descendantPolls = 0;
+      let descendantDead = false;
       const polls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
       const sleeps: number[] = [];
 
@@ -675,16 +708,19 @@ setInterval(() => {}, 1000);
           if (pid === 1000 && signal !== 0) {
             throw createEpermError();
           }
-          if (pid === 1001 && signal === 0) {
-            descendantPolls += 1;
-            if (descendantPolls > 2) {
-              throw createEsrchError();
-            }
+          if (pid === 1001 && signal === 0 && descendantDead) {
+            throw createEsrchError();
           }
         },
         sleep: async (ms) => {
           sleeps.push(ms);
           currentNow += ms;
+          // The descendant honours SIGTERM and is gone once 50ms of the window have elapsed.
+          // Time-based on purpose: the probe count is an implementation detail this test must
+          // not depend on.
+          if (currentNow >= 50) {
+            descendantDead = true;
+          }
         },
         now: () => currentNow,
         listDescendantPids: async () => [1001],
@@ -692,10 +728,15 @@ setInterval(() => {}, 1000);
 
       await ensurePidTerminated(1000, deps);
 
-      // The wrapper refuses SIGTERM; the descendant honours it, so only the descendant is polled.
-      assert.equal(polls.filter((c) => c.pid === 1000 && c.signal === 0).length, 1);
-      assert.ok(!polls.some((c) => c.signal === "SIGKILL"));
+      // The wrapper refuses SIGTERM; the descendant honours it, so only the descendant's exit is
+      // polled — and the wrapper, still signalable, is then escalated to SIGKILL instead of
+      // being left running or waited on for a window it can never end.
       assert.deepEqual(sleeps, [25, 25]);
+      assert.deepEqual(
+        polls.filter((c) => c.signal === "SIGKILL").map((c) => c.pid),
+        [1000],
+      );
+      assert.ok(!polls.some((c) => c.pid === 1001 && c.signal === "SIGKILL"));
     });
   });
 
