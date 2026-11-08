@@ -347,6 +347,13 @@ export class ToolBridge {
    * active set by another extension or a user policy, and a refresh must not undo that.
    */
   private readonly activeServers = new Set<string>();
+  /**
+   * Per server, whether Pi had each tool active when the server stopped advertising it.
+   * A re-advertised tool is not "new", so it must come back in the state it left in — a tool
+   * a policy had deactivated stays inactive; one the bridge deactivated with the server
+   * returns active.
+   */
+  private readonly droppedToolState = new Map<string, Map<string, boolean>>();
   /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
   private readonly refreshGenerations = new Map<string, number>();
   /** Per-server request timeout overrides resolved during refreshTools. */
@@ -428,6 +435,7 @@ export class ToolBridge {
     this._bumpRefreshGeneration(serverName);
     this.serverTimeouts.delete(serverName);
     this.activeServers.delete(serverName);
+    this.droppedToolState.delete(serverName);
     this._deactivateServerTools(serverName);
     const existing = this.serverToolNames.get(serverName);
     if (existing) {
@@ -438,12 +446,6 @@ export class ToolBridge {
       }
       this.serverToolNames.delete(serverName);
     }
-  }
-
-  /** Re-activate all Pi tools belonging to a server (called on reconnect). */
-  activateServer(serverName: string): void {
-    this.activeServers.add(serverName);
-    this._activateServerTools(serverName);
   }
 
   // ─── Internal ───────────────────────────────────────────────────────────────
@@ -523,9 +525,13 @@ export class ToolBridge {
       this._registerTool(piName, serverName, tool, client);
     }
 
-    // Deactivate tools that were removed from the server (no longer in tools/list)
+    // Deactivate tools that were removed from the server (no longer in tools/list), recording
+    // the state each one leaves in so a later re-advertisement restores it instead of
+    // re-activating a tool another extension or a policy had deactivated (#214).
+    const activeBeforeDrop = new Set(this.pi.getActiveTools());
     for (const existingName of registeredForServer) {
       if (currentToolNames.has(existingName)) continue;
+      this._rememberDroppedTool(serverName, existingName, activeBeforeDrop.has(existingName));
       this._deactivateServerTool(serverName, existingName);
       if (this.toolOwners.get(existingName) === serverName) {
         this.toolOwners.delete(existingName);
@@ -538,11 +544,18 @@ export class ToolBridge {
     // therefore only activates tools this server did not register before, while a first connect
     // or a reconnect after `deactivateServer` activates the whole set (#214).
     if (this.activeServers.has(serverName)) {
-      this._activateNewTools(currentToolNames, registeredForServer);
+      this._activateNewTools(serverName, currentToolNames, registeredForServer);
     } else {
       this._activateServerTools(serverName);
     }
     this.activeServers.add(serverName);
+  }
+
+  /** Record whether Pi had a tool active when the server stopped advertising it. */
+  private _rememberDroppedTool(serverName: string, piName: string, wasActive: boolean): void {
+    const dropped = this.droppedToolState.get(serverName) ?? new Map<string, boolean>();
+    dropped.set(piName, wasActive);
+    this.droppedToolState.set(serverName, dropped);
   }
 
   private _isToolNameTaken(name: string, serverName: string, seenInBatch: ReadonlySet<string>): boolean {
@@ -692,14 +705,21 @@ export class ToolBridge {
   }
 
   /**
-   * Activate only the tools this server discovered for the first time, leaving the
-   * active/inactive state of every previously registered tool exactly as Pi reports it.
+   * Activate the tools this server did not register before, leaving the active/inactive state
+   * of every previously registered tool exactly as Pi reports it. A tool that is merely new to
+   * this snapshot (the server dropped it earlier and is re-advertising it now) is restored to
+   * the state it left in rather than assumed newly discovered.
    */
   private _activateNewTools(
+    serverName: string,
     currentToolNames: ReadonlySet<string>,
     registeredForServer: ReadonlySet<string>,
   ): void {
-    this._addActiveTools([...currentToolNames].filter((name) => !registeredForServer.has(name)));
+    const dropped = this.droppedToolState.get(serverName);
+    const toActivate = [...currentToolNames].filter(
+      (name) => !registeredForServer.has(name) && dropped?.get(name) !== false,
+    );
+    this._addActiveTools(toActivate);
   }
 
   /** Add tool names to Pi's active set, leaving every other entry untouched. */

@@ -1209,10 +1209,14 @@ describe("ToolBridge", () => {
 
   it("keeps externally deactivated tools inactive across a live tools/list_changed refresh", async () => {
     let activeTools: string[] = [];
+    let setActiveToolCalls = 0;
     const mockPi = {
       registerTool: () => {},
       getActiveTools: () => activeTools,
-      setActiveTools: (names: string[]) => { activeTools = names; },
+      setActiveTools: (names: string[]) => {
+        setActiveToolCalls += 1;
+        activeTools = names;
+      },
     };
 
     let serverTools = [
@@ -1228,6 +1232,7 @@ describe("ToolBridge", () => {
 
     await bridge.refreshTools("db", mockClient);
     assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+    assert.equal(setActiveToolCalls, 1, "The first connect activates the whole discovered set");
 
     // Another extension or a user policy narrows the active set while the server stays ready.
     activeTools = ["mcp_db_read_data"];
@@ -1241,11 +1246,85 @@ describe("ToolBridge", () => {
       ["mcp_db_read_data", "mcp_db_list_tables"],
       "A live refresh must not re-activate a tool another extension deactivated",
     );
+    assert.equal(setActiveToolCalls, 2);
 
     // A refresh that discovers nothing new must leave a narrowed set untouched.
     activeTools = [];
     await bridge.refreshTools("db", mockClient);
-    assert.deepEqual(activeTools, [], "A no-op refresh must not write the active set at all");
+    assert.equal(
+      setActiveToolCalls,
+      2,
+      "A no-op refresh must not write the active set at all",
+    );
+  });
+
+  it("keeps a re-advertised tool inactive when a policy had deactivated it before the drop", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    const readData = { name: "read_data", inputSchema: { type: "object" } };
+    const dropTable = { name: "drop_table", inputSchema: { type: "object" } };
+    let serverTools = [readData, dropTable];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    await bridge.refreshTools("db", mockClient);
+    activeTools = ["mcp_db_read_data"]; // policy deactivates the destructive tool
+
+    serverTools = [readData]; // the server stops advertising it
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_read_data"]);
+
+    serverTools = [readData, dropTable]; // ...and later advertises it again
+    await bridge.refreshTools("db", mockClient);
+
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_read_data"],
+      "A re-advertised tool must keep the inactive state a policy gave it",
+    );
+  });
+
+  it("restores a re-advertised tool that the server had dropped while it was active", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    const readData = { name: "read_data", inputSchema: { type: "object" } };
+    const dropTable = { name: "drop_table", inputSchema: { type: "object" } };
+    let serverTools = [readData, dropTable];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+
+    serverTools = [readData];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_read_data"], "A dropped tool is deactivated");
+
+    serverTools = [readData, dropTable];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_read_data", "mcp_db_drop_table"],
+      "A tool the bridge deactivated with the server comes back active",
+    );
   });
 
   it("re-activates every discovered tool after a stop and reconnect", async () => {
