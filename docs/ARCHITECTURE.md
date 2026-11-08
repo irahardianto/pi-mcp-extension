@@ -127,14 +127,18 @@ While `ready`, three independent recovery paths exist:
 microtask; the generation guard prevents a stop during cleanup from being resurrected.
 `_shutdown()` aborts the controller, clears the retry and health timers, resets `state`,
 deactivates tools, closes the client, and — for stdio — runs
-`ensurePidTerminated()` (SIGTERM → bounded wait → SIGKILL) and then
-`destroyStdioStreams()`.
+`ensurePidTerminated()` (SIGTERM → bounded wait → SIGKILL, for the PIDs that accept a signal)
+and then `destroyStdioStreams()`.
 
 `ensurePidTerminated()` snapshots the child's descendant tree first
 (`/proc/<pid>/task/*/children` on Linux, `ps -A -o pid=,ppid=` on other POSIX systems — e.g. an
 `npx`/`npm exec`/`uvx`/`sh -c` wrapper that spawns the real server as a grandchild) and signals
 it deepest-generation-first, so a wrapper death cannot re-parent a still-running server out of
 reach. Windows has no portable parent/child enumeration, so it keeps single-PID termination.
+A PID the kernel refuses to signal (`EPERM`) is not waited on: it is either recycled to another
+user's process or out of reach, so it costs no polling window and — unless a liveness probe still
+finds it signalable, in which case the refusal came from the signal rather than the process — is
+not escalated to SIGKILL either. When the root PID is refused outright the tree is not walked.
 `destroyStdioStreams()` then destroys the child's `stdout`/`stderr` read ends: a survivor that
 inherited those pipes would otherwise keep the `'close'` event from ever firing and stall
 `StdioClientTransport.close()` for its full 2 × 2,000ms escalation budget. Both

@@ -493,11 +493,16 @@ function signalPid(
 /**
  * A PID this teardown can still act on: alive *and* signalable.
  *
- * WHY: a PID the caller cannot signal is not one a bounded wait can make progress on. Our own
- * child can only ever answer "signalled" or "gone" — it inherits our uid, so EPERM cannot name
- * it — which makes EPERM proof that the child has exited and the PID has been recycled to a
- * process we do not own. Polling such a PID re-reads the same EPERM every 25ms until the
- * timeout, and escalating to SIGKILL only buys a second refused signal.
+ * WHY: a PID the caller cannot signal is not one a bounded wait can make progress on. `EPERM`
+ * means no signal of ours reaches that PID — the child has exited and the PID was recycled to a
+ * process under another uid, the child changed credentials (a wrapper that `setuid`s), or a
+ * policy layer refuses the signal — so polling it re-reads the same `EPERM` every 25ms until
+ * the timeout, and escalating to SIGKILL only buys a second refused signal.
+ *
+ * This answers "can we still reach it", never "is it our child": a PID recycled to another
+ * process of the *same* uid stays signalable and is signalled, exactly as before this guard
+ * existed. Identity would need the child's start time compared against `/proc/<pid>/stat`, and
+ * the `ChildProcess` handle is gone by the time teardown runs.
  */
 function isPidSignalable(pid: number, d: StdioProcessDeps): boolean {
   return signalPid(pid, 0, d) === "signalled";
@@ -510,9 +515,9 @@ function allExited(pids: readonly number[], d: StdioProcessDeps): boolean {
 /**
  * Send `signal` to the PIDs that accept it, then wait only for those to exit.
  *
- * Resolves `true` when nothing we actually signalled is left, which is what gates the SIGKILL
- * escalation. A PID that reported ESRCH or EPERM is never waited on: a refused signal is not a
- * delivered one, and polling cannot change that verdict.
+ * Resolves `true` when nothing that could still be running is left, which is what gates the
+ * SIGKILL escalation. A PID that reported ESRCH is gone, and one that reported EPERM is not
+ * ours to wait for.
  */
 async function signalAndWaitForExit(
   pids: readonly number[],
@@ -520,11 +525,19 @@ async function signalAndWaitForExit(
   timeoutMs: number,
   d: StdioProcessDeps,
 ): Promise<boolean> {
-  const signalled = pids.filter((pid) => signalPid(pid, signal, d) === "signalled");
-  // Nothing accepts the signal: the tree is already gone (ESRCH) or out of reach (EPERM),
-  // so there is nothing left to wait for.
+  const attempts = pids.map((pid) => ({ pid, outcome: signalPid(pid, signal, d) }));
+  const signalled = attempts.filter((a) => a.outcome === "signalled").map((a) => a.pid);
   if (signalled.length === 0) {
-    return true;
+    // WHY: a refused signal is not proof of a dead target. Permission is mediated per signal
+    // on some systems — SELinux keeps separate `sigterm`/`sigkill` permissions, AppArmor
+    // matches a signal set, and a seccomp filter can match the signal argument — so SIGTERM
+    // can be refused while SIGKILL is allowed. Ask the liveness probe instead of assuming:
+    // a PID that is still signalable survives this signal and goes straight to the SIGKILL
+    // escalation, without paying for a wait window this signal can never end.
+    // Only the refused targets are re-probed: ESRCH already proved the PID was gone, and
+    // probing it again could sign a recycled PID up for a SIGKILL it has nothing to do with.
+    const refused = attempts.filter((a) => a.outcome === "denied").map((a) => a.pid);
+    return !refused.some((pid) => isPidSignalable(pid, d));
   }
 
   const deadline = d.now() + timeoutMs;
@@ -565,9 +578,13 @@ export async function ensurePidTerminated(
 ): Promise<void> {
   const d = resolveDeps(deps);
   // WHY: the guard asks "is this PID still ours to signal?", not "does some process hold this
-  // PID?" — a recycled PID belongs to a process we may not touch, and the child it replaced is
-  // already gone. Bailing here also skips the descendant snapshot, which shells out to `ps` on
-  // macOS, on every teardown whose child exited before we got here.
+  // PID?" — a PID we cannot signal cannot be waited on, and the child it replaced is gone or
+  // out of reach. It also skips the descendant snapshot, which shells out to `ps` on macOS, on
+  // every teardown whose child exited before we got here (the second call each teardown path
+  // makes is the common case).
+  // A tree behind an unsignalable root is deliberately not walked either: once that process has
+  // exited its children are re-parented to init, so a snapshot of its PID finds another user's
+  // tree — processes no signal of ours reaches — not the orphans we would want to kill.
   if (!pid || !isPidSignalable(pid, d)) {
     return;
   }

@@ -622,31 +622,45 @@ setInterval(() => {}, 1000);
       assert.equal(scans, 0);
     });
 
-    it("does not wait or escalate when only SIGTERM is refused with EPERM", async () => {
+    it("escalates to SIGKILL when only SIGTERM is refused (policy-mediated permissions)", async () => {
+      let currentNow = 0;
+      let dead = false;
       const signals: Array<NodeJS.Signals | number | undefined> = [];
-      const scans: number[] = [];
+      const sleeps: number[] = [];
+
       const deps: StdioProcessDeps = {
         kill: (_pid, signal) => {
           signals.push(signal);
-          if (signal !== 0) {
+          if (signal === 0 && dead) {
+            throw createEsrchError();
+          }
+          // SELinux keeps separate sigterm/sigkill permissions, AppArmor matches a signal set,
+          // and a seccomp filter can match the signal argument: SIGTERM can be refused while
+          // SIGKILL is allowed.
+          if (signal === "SIGTERM") {
             throw createEpermError();
           }
+          if (signal === "SIGKILL") {
+            dead = true;
+          }
         },
-        sleep: async () => {
-          throw new Error("must not poll a PID whose signal was refused (Issue #203)");
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          currentNow += ms;
         },
-        now: () => 0,
-        listDescendantPids: async () => {
-          scans.push(1);
-          return [];
-        },
+        now: () => currentNow,
+        listDescendantPids: async () => [],
       };
 
-      await ensurePidTerminated(4321, deps);
+      await ensurePidTerminated(7777, deps);
 
-      // A refused signal was never delivered, so SIGKILL could not change the outcome either.
-      assert.deepEqual(signals, [0, "SIGTERM"]);
-      assert.equal(scans.length, 1);
+      // The refusal must not be read as "already gone": the child is still signalable, so the
+      // escalation that ends it has to run — and immediately, since SIGTERM delivered nothing.
+      assert.deepEqual(
+        signals.filter((s) => s !== 0),
+        ["SIGTERM", "SIGKILL"],
+      );
+      assert.deepEqual(sleeps, []);
     });
 
     it("waits only for the targets that accepted the signal", async () => {
