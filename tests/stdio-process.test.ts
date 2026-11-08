@@ -595,6 +595,94 @@ setInterval(() => {}, 1000);
         ["SIGTERM", "SIGKILL"],
       );
     });
+
+    it("returns immediately when the PID is not ours to signal (EPERM on kill 0)", async () => {
+      const calls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+      let scans = 0;
+      const deps: StdioProcessDeps = {
+        kill: (pid, signal) => {
+          calls.push({ pid, signal });
+          throw createEpermError();
+        },
+        sleep: async () => {
+          throw new Error("must not poll a PID the caller cannot signal (Issue #203)");
+        },
+        now: () => 0,
+        listDescendantPids: async () => {
+          scans += 1;
+          return [];
+        },
+      };
+
+      await ensurePidTerminated(12345, deps);
+
+      // Only the liveness probe: no SIGTERM/SIGKILL against a PID we do not own.
+      assert.deepEqual(calls, [{ pid: 12345, signal: 0 }]);
+      // The descendant snapshot shells out to `ps` on macOS, so a recycled PID must not pay for it.
+      assert.equal(scans, 0);
+    });
+
+    it("does not wait or escalate when only SIGTERM is refused with EPERM", async () => {
+      const signals: Array<NodeJS.Signals | number | undefined> = [];
+      const scans: number[] = [];
+      const deps: StdioProcessDeps = {
+        kill: (_pid, signal) => {
+          signals.push(signal);
+          if (signal !== 0) {
+            throw createEpermError();
+          }
+        },
+        sleep: async () => {
+          throw new Error("must not poll a PID whose signal was refused (Issue #203)");
+        },
+        now: () => 0,
+        listDescendantPids: async () => {
+          scans.push(1);
+          return [];
+        },
+      };
+
+      await ensurePidTerminated(4321, deps);
+
+      // A refused signal was never delivered, so SIGKILL could not change the outcome either.
+      assert.deepEqual(signals, [0, "SIGTERM"]);
+      assert.equal(scans.length, 1);
+    });
+
+    it("waits only for the targets that accepted the signal", async () => {
+      let currentNow = 0;
+      let descendantPolls = 0;
+      const polls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+      const sleeps: number[] = [];
+
+      const deps: StdioProcessDeps = {
+        kill: (pid, signal) => {
+          polls.push({ pid, signal });
+          if (pid === 1000 && signal !== 0) {
+            throw createEpermError();
+          }
+          if (pid === 1001 && signal === 0) {
+            descendantPolls += 1;
+            if (descendantPolls > 2) {
+              throw createEsrchError();
+            }
+          }
+        },
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          currentNow += ms;
+        },
+        now: () => currentNow,
+        listDescendantPids: async () => [1001],
+      };
+
+      await ensurePidTerminated(1000, deps);
+
+      // The wrapper refuses SIGTERM; the descendant honours it, so only the descendant is polled.
+      assert.equal(polls.filter((c) => c.pid === 1000 && c.signal === 0).length, 1);
+      assert.ok(!polls.some((c) => c.signal === "SIGKILL"));
+      assert.deepEqual(sleeps, [25, 25]);
+    });
   });
 
   describe("descendant process tree (Issue #205)", () => {

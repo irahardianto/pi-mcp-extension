@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A stdio teardown no longer spends 700ms polling a PID it cannot signal (#203). `kill(pid, 0)` answers `EPERM` — not "gone" — for a PID that was recycled to another user's process (or a signal that a sandbox refuses), so `ensurePidTerminated` read the child as alive, burned its full SIGTERM window (20 × 25ms), escalated, and burned a second SIGKILL window (8 × 25ms); both teardown paths call it twice, so one failed connect or `/mcp:stop` stalled 1,400ms. Signal attempts are now classified as delivered, gone (`ESRCH`) or refused (`EPERM`): only PIDs that accepted the signal are waited on, a refused signal is not escalated to SIGKILL, and a PID the caller cannot signal short-circuits before the descendant snapshot (which shells out to `ps` on macOS). `isPidAlive` keeps its POSIX meaning for callers that only ask whether a PID is taken (the auth-lock staleness check): `EPERM` still reads as alive.
+
 ## [1.14.3] - 2026-11-08
 
 ### Fixed

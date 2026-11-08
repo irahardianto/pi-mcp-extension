@@ -450,63 +450,92 @@ function resolveDeps(deps?: Partial<StdioProcessDeps>): StdioProcessDeps {
   };
 }
 
-export function isPidAlive(
-  pid: number,
-  deps?: Partial<Pick<StdioProcessDeps, "kill">>,
-): boolean {
-  const kill = deps?.kill ?? defaultDeps.kill;
-  try {
-    kill(pid, 0);
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-      return false;
-    }
-    return true;
-  }
+/** What one `kill(2)` attempt reported about a PID. */
+type PidSignalOutcome =
+  /** The signal was delivered: the PID resolves to a process this caller may signal. */
+  | "signalled"
+  /** ESRCH: nothing holds this PID any more. */
+  | "gone"
+  /** EPERM or another platform refusal: the PID is not this caller's to signal. */
+  | "denied";
+
+/**
+ * POSIX liveness: a PID is alive while `kill(pid, 0)` fails with anything but ESRCH.
+ *
+ * WHY: EPERM means the PID is taken but belongs to a process this caller may not signal (a
+ * recycled PID under another uid, a sandboxed child, PID 1). Callers that only ask whether the
+ * PID is *occupied* — the auth-lock staleness check — must see that as occupied, not free;
+ * teardown asks a stricter question (`isPidSignalable`).
+ */
+export function isPidAlive(pid: number, deps?: Partial<Pick<StdioProcessDeps, "kill">>): boolean {
+  return signalPid(pid, 0, resolveDeps(deps)) !== "gone";
 }
 
-/** Send `signal` to one PID; `false` when the PID was already gone (ESRCH). */
-function signalPid(pid: number, signal: NodeJS.Signals, d: StdioProcessDeps): boolean {
+function signalPid(
+  pid: number,
+  signal: NodeJS.Signals | number,
+  d: StdioProcessDeps,
+): PidSignalOutcome {
   try {
     d.kill(pid, signal);
-    return true;
+    return "signalled";
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-      return false;
+      return "gone";
     }
     // WHY: EPERM and platform refusals mean this PID cannot be signalled (a recycled PID
     // or a sandboxed process). Teardown still has to signal the rest of the tree within
     // the bounded wait instead of rejecting the caller's shutdown path.
-    return true;
+    return "denied";
   }
 }
 
-function allExited(pids: readonly number[], d: StdioProcessDeps): boolean {
-  return pids.every((pid) => !isPidAlive(pid, d));
+/**
+ * A PID this teardown can still act on: alive *and* signalable.
+ *
+ * WHY: a PID the caller cannot signal is not one a bounded wait can make progress on. Our own
+ * child can only ever answer "signalled" or "gone" — it inherits our uid, so EPERM cannot name
+ * it — which makes EPERM proof that the child has exited and the PID has been recycled to a
+ * process we do not own. Polling such a PID re-reads the same EPERM every 25ms until the
+ * timeout, and escalating to SIGKILL only buys a second refused signal.
+ */
+function isPidSignalable(pid: number, d: StdioProcessDeps): boolean {
+  return signalPid(pid, 0, d) === "signalled";
 }
 
+function allExited(pids: readonly number[], d: StdioProcessDeps): boolean {
+  return pids.every((pid) => !isPidSignalable(pid, d));
+}
+
+/**
+ * Send `signal` to the PIDs that accept it, then wait only for those to exit.
+ *
+ * Resolves `true` when nothing we actually signalled is left, which is what gates the SIGKILL
+ * escalation. A PID that reported ESRCH or EPERM is never waited on: a refused signal is not a
+ * delivered one, and polling cannot change that verdict.
+ */
 async function signalAndWaitForExit(
   pids: readonly number[],
   signal: NodeJS.Signals,
   timeoutMs: number,
   d: StdioProcessDeps,
 ): Promise<boolean> {
-  const attempted = pids.map((pid) => signalPid(pid, signal, d));
-  // Every target reported ESRCH: the tree is already gone, so there is nothing to wait for.
-  if (!attempted.some(Boolean)) {
+  const signalled = pids.filter((pid) => signalPid(pid, signal, d) === "signalled");
+  // Nothing accepts the signal: the tree is already gone (ESRCH) or out of reach (EPERM),
+  // so there is nothing left to wait for.
+  if (signalled.length === 0) {
     return true;
   }
 
   const deadline = d.now() + timeoutMs;
   while (d.now() < deadline) {
-    if (allExited(pids, d)) {
+    if (allExited(signalled, d)) {
       return true;
     }
     await d.sleep(25);
   }
 
-  return allExited(pids, d);
+  return allExited(signalled, d);
 }
 
 /**
@@ -523,9 +552,9 @@ async function escalateToSigkill(
 ): Promise<void> {
   const rescanned = await d.listDescendantPids(rootPid);
   const survivors = [...new Set([...rescanned, ...descendants])].filter((candidate) =>
-    isPidAlive(candidate, d),
+    isPidSignalable(candidate, d),
   );
-  const targets = [...survivors, rootPid].filter((candidate) => isPidAlive(candidate, d));
+  const targets = [...survivors, rootPid].filter((candidate) => isPidSignalable(candidate, d));
   if (targets.length === 0) return;
   await signalAndWaitForExit(targets, "SIGKILL", 200, d);
 }
@@ -535,7 +564,11 @@ export async function ensurePidTerminated(
   deps?: Partial<StdioProcessDeps>,
 ): Promise<void> {
   const d = resolveDeps(deps);
-  if (!pid || !isPidAlive(pid, d)) {
+  // WHY: the guard asks "is this PID still ours to signal?", not "does some process hold this
+  // PID?" — a recycled PID belongs to a process we may not touch, and the child it replaced is
+  // already gone. Bailing here also skips the descendant snapshot, which shells out to `ps` on
+  // macOS, on every teardown whose child exited before we got here.
+  if (!pid || !isPidSignalable(pid, d)) {
     return;
   }
 
