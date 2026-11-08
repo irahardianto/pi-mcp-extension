@@ -378,7 +378,7 @@ flowchart TD
 7. **AbortSignal** is wired through to `notifications/cancelled` for clean cancellation
 8. **Reconnection & recovery** uses a fixed delay schedule with configurable max retries on initial failure, health check failure, or unexpected transport close/error (`client.onclose` / `client.onerror`), while mid-session HTTP `401` / `403 insufficient_scope` invalidates stale tokens and surfaces a re-authorization hint
 9. **`list_changed` notifications** trigger re-discovery, deactivating stale tools automatically and invalidating the cached resource catalog
-10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with process-tree `SIGTERM` → `SIGKILL` and pipe cleanup for `stdio` child processes)
+10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with process-tree `SIGTERM` → `SIGKILL` — a PID the kernel refuses to signal is left alone instead of being polled — and pipe cleanup for `stdio` child processes)
 
 ## MCP Spec Compliance
 
