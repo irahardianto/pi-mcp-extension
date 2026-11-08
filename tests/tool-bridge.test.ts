@@ -1207,6 +1207,81 @@ describe("ToolBridge", () => {
     assert.deepEqual(bridge.getToolActivity("unknown"), { discovered: 0, active: 0 });
   });
 
+  it("keeps externally deactivated tools inactive across a live tools/list_changed refresh", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    let serverTools = [
+      { name: "read_data", inputSchema: { type: "object" } },
+      { name: "drop_table", inputSchema: { type: "object" } },
+    ];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+
+    // Another extension or a user policy narrows the active set while the server stays ready.
+    activeTools = ["mcp_db_read_data"];
+
+    // The server then adds a tool and announces it with notifications/tools/list_changed.
+    serverTools = [...serverTools, { name: "list_tables", inputSchema: { type: "object" } }];
+    await bridge.refreshTools("db", mockClient);
+
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_read_data", "mcp_db_list_tables"],
+      "A live refresh must not re-activate a tool another extension deactivated",
+    );
+
+    // A refresh that discovers nothing new must leave a narrowed set untouched.
+    activeTools = [];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, [], "A no-op refresh must not write the active set at all");
+  });
+
+  it("re-activates every discovered tool after a stop and reconnect", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+
+    const mockClient = {
+      request: async () => ({
+        tools: [
+          { name: "read_data", inputSchema: { type: "object" } },
+          { name: "drop_table", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+
+    // A reconnect is a fresh start: the previous restriction no longer holds.
+    bridge.deactivateServer("db");
+    assert.deepEqual(activeTools, []);
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      ["mcp_db_read_data", "mcp_db_drop_table"],
+      "Reconnecting must activate every tool the server discovers",
+    );
+  });
+
   it("deactivates server tools on disconnect", async () => {
     const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = ["mcp_myserver_echo", "mcp_myserver_count", "other_tool"];

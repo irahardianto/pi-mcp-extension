@@ -309,6 +309,8 @@ Recent output:
 
 `mcp_connect` checks current tool activation before reporting success, including when the server is already connected. If discovered tools are inactive, it reports that condition instead of overriding another extension's tool restrictions. Check the active tool policy or conflicting extension. A reconnect is not a substitute for fixing an extension that removes tools at each user turn.
 
+Tool discovery follows the same rule. When a connected server announces `notifications/tools/list_changed`, only the tools it newly exposes are activated; tools Pi currently has inactive stay inactive, and a refresh that discovers nothing new does not touch the active set at all. Stopping the server (`/mcp:stop`, a failed connect, or session teardown) deactivates its tools, so the next connect or reconnect activates the whole discovered set again.
+
 ## Debug log
 
 Set `PI_MCP_DEBUG=1` before starting Pi to record what the extension itself is doing — server state transitions, retries and backoff, OAuth refresh and cross-process lock contention, 401/403 classification, and session reloads:

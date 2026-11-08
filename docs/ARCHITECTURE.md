@@ -115,7 +115,10 @@ what to do:
 While `ready`, three independent recovery paths exist:
 
 - `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-registers the
-  server's tools and deactivates ones the server no longer advertises;
+  server's tools, deactivates ones the server no longer advertises, and activates only
+  tools the server did not expose before — the active/inactive state of tools Pi already
+  knew about is left alone, because another extension or a user policy may have removed
+  them;
   `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,

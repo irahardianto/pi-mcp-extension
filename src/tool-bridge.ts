@@ -341,6 +341,12 @@ export class ToolBridge {
   private readonly serverToolNames = new Map<string, Set<string>>();
   /** Tracks which MCP server owns each registered Pi tool name. */
   private readonly toolOwners = new Map<string, string>();
+  /**
+   * Servers whose tools this bridge has activated and not deactivated since.
+   * A server that is still in this set may have had individual tools removed from Pi's
+   * active set by another extension or a user policy, and a refresh must not undo that.
+   */
+  private readonly activeServers = new Set<string>();
   /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
   private readonly refreshGenerations = new Map<string, number>();
   /** Per-server request timeout overrides resolved during refreshTools. */
@@ -408,6 +414,7 @@ export class ToolBridge {
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */
   deactivateServer(serverName: string): void {
     this._bumpRefreshGeneration(serverName);
+    this.activeServers.delete(serverName);
     this._deactivateServerTools(serverName);
   }
 
@@ -420,6 +427,7 @@ export class ToolBridge {
   removeServerTools(serverName: string): void {
     this._bumpRefreshGeneration(serverName);
     this.serverTimeouts.delete(serverName);
+    this.activeServers.delete(serverName);
     this._deactivateServerTools(serverName);
     const existing = this.serverToolNames.get(serverName);
     if (existing) {
@@ -434,6 +442,7 @@ export class ToolBridge {
 
   /** Re-activate all Pi tools belonging to a server (called on reconnect). */
   activateServer(serverName: string): void {
+    this.activeServers.add(serverName);
     this._activateServerTools(serverName);
   }
 
@@ -524,7 +533,16 @@ export class ToolBridge {
     }
 
     this.serverToolNames.set(serverName, currentToolNames);
-    this._activateServerTools(serverName);
+    // WHY: `pi.setActiveTools` is shared with every other extension and the user, so an already
+    // connected server's tool set may have been narrowed on purpose. A live `tools/list_changed`
+    // therefore only activates tools this server did not register before, while a first connect
+    // or a reconnect after `deactivateServer` activates the whole set (#214).
+    if (this.activeServers.has(serverName)) {
+      this._activateNewTools(currentToolNames, registeredForServer);
+    } else {
+      this._activateServerTools(serverName);
+    }
+    this.activeServers.add(serverName);
   }
 
   private _isToolNameTaken(name: string, serverName: string, seenInBatch: ReadonlySet<string>): boolean {
@@ -670,8 +688,26 @@ export class ToolBridge {
     const serverTools = this.serverToolNames.get(serverName);
     if (!serverTools || serverTools.size === 0) return;
 
+    this._addActiveTools([...serverTools]);
+  }
+
+  /**
+   * Activate only the tools this server discovered for the first time, leaving the
+   * active/inactive state of every previously registered tool exactly as Pi reports it.
+   */
+  private _activateNewTools(
+    currentToolNames: ReadonlySet<string>,
+    registeredForServer: ReadonlySet<string>,
+  ): void {
+    this._addActiveTools([...currentToolNames].filter((name) => !registeredForServer.has(name)));
+  }
+
+  /** Add tool names to Pi's active set, leaving every other entry untouched. */
+  private _addActiveTools(names: readonly string[]): void {
+    if (names.length === 0) return;
+
     const currentActive = new Set(this.pi.getActiveTools());
-    for (const name of serverTools) currentActive.add(name);
+    for (const name of names) currentActive.add(name);
     this.pi.setActiveTools(Array.from(currentActive));
   }
 
