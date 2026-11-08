@@ -324,6 +324,12 @@ function normalizeRefreshArgs(
   return { isCurrent, options };
 }
 
+/** True when two tool-name lists have the same length and the same entries in order. */
+function sameToolList(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((name, index) => name === right[index]);
+}
+
 // ─── Tool Listing ─────────────────────────────────────────────────────────────
 
 export { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
@@ -521,10 +527,13 @@ export class ToolBridge {
   private _reconcileTools(serverName: string, tools: McpToolDefinition[], client: Client): void {
     const registeredForServer = this.serverToolNames.get(serverName) ?? new Set<string>();
     const ownedPreviousNames = this._ownedTools(serverName, registeredForServer);
-    const currentActive = this.pi.getActiveTools();
+    // WHY: Copy before calling `this._registerTool` — Pi's `registerTool()` runs
+    // `_refreshToolRegistry()`, which auto-activates newly registered tool names and
+    // `--tools` allowlist matches while the registration loop is still running.
+    const activeBefore = [...this.pi.getActiveTools()];
     const isLiveRefresh = this.activeServers.has(serverName);
     const previousStateByRawName = isLiveRefresh
-      ? this._snapshotActiveStateByRawName(serverName, ownedPreviousNames, new Set(currentActive))
+      ? this._snapshotActiveStateByRawName(serverName, ownedPreviousNames, new Set(activeBefore))
       : undefined;
 
     const currentToolNames = new Set<string>();
@@ -561,7 +570,7 @@ export class ToolBridge {
     this.serverToolNames.set(serverName, currentToolNames);
     this.rawToolNames.set(serverName, currentRawNames);
     this.activeServers.add(serverName);
-    this._reconcileActiveTools(ownedPreviousNames, desiredActive, currentActive);
+    this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore);
   }
 
   private _isToolNameTaken(name: string, serverName: string, seenInBatch: ReadonlySet<string>): boolean {
@@ -795,14 +804,19 @@ export class ToolBridge {
   private _reconcileActiveTools(
     ownedPreviousNames: ReadonlySet<string>,
     desiredActive: ReadonlySet<string>,
-    currentActive: readonly string[],
+    activeBefore: readonly string[],
   ): void {
-    const activeSet = new Set(currentActive);
-    const remaining = currentActive.filter(
+    const activeSet = new Set(activeBefore);
+    const remaining = activeBefore.filter(
       (name) => !ownedPreviousNames.has(name) || desiredActive.has(name),
     );
     const newlyActive = [...desiredActive].filter((name) => !activeSet.has(name));
-    if (remaining.length === currentActive.length && newlyActive.length === 0) return;
+    const unchangedBeforeLoop =
+      remaining.length === activeBefore.length && newlyActive.length === 0;
+    // WHY: Even when `desiredActive` leaves `activeBefore` unchanged, `pi.registerTool()`
+    // inside the loop may have auto-activated a newly registered hashed Pi name or a
+    // `--tools` allowlist entry; re-read `getActiveTools()` before skipping the write.
+    if (unchangedBeforeLoop && sameToolList(this.pi.getActiveTools(), activeBefore)) return;
 
     this.pi.setActiveTools(Array.from(new Set([...remaining, ...newlyActive])));
   }

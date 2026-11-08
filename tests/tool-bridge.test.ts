@@ -1535,6 +1535,72 @@ describe("ToolBridge", () => {
     );
   });
 
+  it("undoes registerTool auto-activation when a live refresh leaves the desired active set unchanged", async () => {
+    const activeTools: string[] = [];
+    const seenRegistrations = new Set<string>();
+    let allowlistReassertsAll = false;
+    // Mirrors Pi's AgentSession._refreshToolRegistry(): registering a tool name for the first
+    // time activates it automatically, and an active --tools allowlist re-adds matching tools
+    // on every registerTool() call. Also mutates activeTools in place to verify _reconcileTools
+    // snapshots the pre-registration list rather than holding a live array reference.
+    const mockPi = {
+      registerTool: (tool: { name: string }) => {
+        if ( (!seenRegistrations.has(tool.name) || allowlistReassertsAll) && !activeTools.includes(tool.name)) {
+          activeTools.push(tool.name);
+        }
+        seenRegistrations.add(tool.name);
+      },
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => {
+        activeTools.splice(0, activeTools.length, ...names);
+      },
+    };
+
+    const dashed = { name: "a-b", inputSchema: { type: "object" } };
+    const underscored = { name: "a_b", inputSchema: { type: "object" } };
+    let serverTools = [underscored];
+    const mockClient = {
+      request: async () => ({ tools: serverTools }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+
+    // 1. Connect with `a_b` (`mcp_db_a_b`), deactivate it by policy, then drop it so
+    //    `droppedToolState` remembers `a_b` as inactive.
+    await bridge.refreshTools("db", mockClient);
+    activeTools.length = 0;
+    serverTools = [];
+    await bridge.refreshTools("db", mockClient);
+
+    // 2. Advertise `a-b` alone (`mcp_db_a_b`, already in seenRegistrations), then deactivate it.
+    serverTools = [dashed];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_a_b"]);
+    activeTools.length = 0;
+
+    // 3. Re-advertise `a_b` alongside `a-b`. Both should stay inactive (`a_b` was dropped while
+    //    inactive; `a-b` was just deactivated), even though `a-b` is registered under its hashed
+    //    Pi name for the very first time and `registerTool` auto-activates that new Pi name.
+    serverTools = [dashed, underscored];
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      [],
+      "A shifted inactive tool whose new hashed Pi name is auto-activated by registerTool must be deactivated",
+    );
+
+    // 4. With `--tools` allowlist semantics (registerTool re-activating registered tools on every
+    //    call), a no-op live refresh must still preserve a policy deactivation.
+    allowlistReassertsAll = true;
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(
+      activeTools,
+      [],
+      "A no-op live refresh must undo any tool re-activation performed by registerTool",
+    );
+  });
+
   it("deactivates server tools on disconnect", async () => {
     const registeredTools: TestToolDefinition[] = [];
     let activeTools: string[] = ["mcp_myserver_echo", "mcp_myserver_count", "other_tool"];
