@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.14.4] - 2026-11-08
+
 ### Fixed
 - A stdio teardown no longer spends 700ms polling a PID it cannot signal (#203). `kill(pid, 0)` answers `EPERM` — not "gone" — for a PID that was recycled to another user's process (or for a signal a policy layer refuses), so `ensurePidTerminated` read the child as alive, burned its full SIGTERM window (20 × 25ms), escalated, and burned a second SIGKILL window (8 × 25ms); both teardown paths call it twice, so one failed connect or `/mcp:stop` stalled 1,400ms. A signal attempt is now classified as delivered, gone (`ESRCH`) or refused (`EPERM`): only the PIDs that accepted the signal are waited on, a refused signal no longer costs a wait window, and a root the caller cannot signal is dropped from the target list instead of being polled — its reachable descendants are still signalled. A refusal is not read as "already exited" either: when a liveness probe still finds the target signalable, the refusal came from that signal rather than the process — SELinux/AppArmor/seccomp can permit SIGKILL and deny SIGTERM — so the SIGKILL escalation runs at once, exactly as it did before, just without a wait that could never end.
 
