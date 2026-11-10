@@ -70,6 +70,23 @@ function isLosslessToolName(rawToolName: string): boolean {
   return /^[a-zA-Z0-9_]+$/.test(rawToolName);
 }
 
+/** Name of a provider tool definition: `{ name }` (Anthropic, Responses) or
+ * `{ function: { name } }` (Chat Completions). */
+function payloadToolName(definition: unknown): string | undefined {
+  if (typeof definition !== "object" || definition === null) return undefined;
+  const { name } = definition as { name?: unknown };
+  if (typeof name === "string") return name;
+  const { function: fn } = definition as { function?: { name?: unknown } };
+  return typeof fn?.name === "string" ? fn.name : undefined;
+}
+
+/** The `tools` array of a provider payload, when it carries one. */
+function payloadToolDefinitions(payload: unknown): unknown[] | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined;
+  const { tools } = payload as { tools?: unknown };
+  return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
+}
+
 /** Compare strings by Unicode code point, not by UTF-16 code unit. */
 function compareCodePoints(a: string, b: string): number {
   const left = Array.from(a, (ch) => ch.codePointAt(0) ?? 0);
@@ -428,6 +445,39 @@ export class ToolBridge {
     const names = this.serverToolNames.get(serverName) ?? new Set<string>();
     const active = new Set(this.pi.getActiveTools());
     return { discovered: names.size, active: [...names].filter((name) => active.has(name)).length };
+  }
+
+  /**
+   * Order this bridge's tools in an outgoing provider payload the same way they are ordered in
+   * Pi's active list, and return the payload untouched when they already are.
+   *
+   * WHY: the request's `tools` array is not built from the active list — Pi replays the
+   * transcript's tool declarations in first-appearance order and emits no delta for a pure
+   * reorder, so a server that connects after the first turn leaves its tools at the end, in
+   * connect order. Sorting the payload makes the declared tools a function of the tool set, so
+   * the prompt head stays byte-identical across sessions and a server-side prefix cache keeps
+   * its KV entries (#278).
+   */
+  orderPayloadTools(payload: unknown): unknown {
+    const tools = payloadToolDefinitions(payload);
+    if (tools === undefined) return payload;
+
+    const others: unknown[] = [];
+    const bridged: Array<{ name: string; definition: unknown }> = [];
+    for (const definition of tools) {
+      const name = payloadToolName(definition);
+      if (name === undefined || !this.toolOwners.has(name)) {
+        others.push(definition);
+        continue;
+      }
+      bridged.push({ name, definition });
+    }
+    if (bridged.length === 0) return payload;
+
+    bridged.sort((left, right) => compareCodePoints(left.name, right.name));
+    const ordered = [...others, ...bridged.map((entry) => entry.definition)];
+    const unchanged = ordered.every((definition, index) => definition === tools[index]);
+    return unchanged ? payload : { ...(payload as Record<string, unknown>), tools: ordered };
   }
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */
@@ -799,7 +849,8 @@ export class ToolBridge {
   /**
    * Reconcile a server's active tools in Pi in one write: drop any previously owned Pi tool
    * names that are not in `desiredActive`, append any `desiredActive` names not yet active,
-   * and skip `pi.setActiveTools` altogether when the active set is unchanged.
+   * order the result, and skip `pi.setActiveTools` altogether when the active list already
+   * holds exactly that set in that order.
    */
   private _reconcileActiveTools(
     ownedPreviousNames: ReadonlySet<string>,

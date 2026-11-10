@@ -403,6 +403,10 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     return enqueueServerReconcile(ctx);
   });
 
+  // Order the bridge's tools in every outgoing request so the declared order never depends on
+  // connect timing or the transcript's first-appearance order (#278).
+  pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
+
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
     // WHY: invalidate before tearing down so an in-flight startup or queued reconcile
     // observes a dead session and bails, then drain both after teardown so shutdown never

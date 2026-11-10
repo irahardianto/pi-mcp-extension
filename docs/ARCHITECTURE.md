@@ -52,8 +52,9 @@ flowchart TD
 ```
 
 - The **entry** loads config, constructs the collaborators, and registers
-  `session_start` / `mcp_servers_change` / `session_shutdown`, the `/mcp*` commands, and
-  the `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource` tools. It
+  `session_start` / `mcp_servers_change` / `session_shutdown` /
+  `before_provider_request`, the `/mcp*` commands, and the
+  `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource` tools. It
   registers them even when bootstrap config loading fails, so a later `session_start` in
   another directory can still load a valid project config.
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
@@ -61,7 +62,10 @@ flowchart TD
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
   server connects and disconnects. Each reconcile writes the active set once, with other
   extensions' tools in their existing order followed by the bridge's tools sorted by Pi name,
-  so the order is a function of the tool set rather than eager-connect timing (#278).
+  and the same order is applied to the outgoing request's `tools` array in
+  `before_provider_request` — Pi builds that array from the transcript's first-appearance
+  order, which a pure reorder never updates. The order is therefore a function of the tool set
+  rather than eager-connect timing (#278).
 - **ResourceBridge** lazily caches each server's `resources/list` + `resources/templates/list`
   catalog (invalidated by `notifications/resources/list_changed` and dropped on stop or
   removal) and converts `resources/read` payloads into Pi text/image content blocks.

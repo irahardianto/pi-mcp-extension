@@ -1600,10 +1600,9 @@ describe("ToolBridge", () => {
     assert.deepEqual(ascending, ["mcp_alpha_alpha_one", "mcp_alpha_alpha_two"]);
   });
 
-  it("restores a deterministic order when a resumed session starts with another one", async () => {
-    // A resumed session restores the active list in the order it ended with; the first connect
-    // must normalise it even though the set itself does not change (#278).
-    let activeTools: string[] = ["mcp_db_read_data", "mcp_db_drop_table"];
+  it("rewrites a stable order when another extension reorders the same set", async () => {
+    // The desired set is unchanged; only the order differs, and the bridge still normalises it.
+    let activeTools: string[] = [];
     const mockPi = {
       registerTool: () => {},
       getActiveTools: () => activeTools,
@@ -1621,8 +1620,79 @@ describe("ToolBridge", () => {
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     const bridge = new ToolBridge(settings, mockPi);
     await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
+
+    activeTools = ["mcp_db_read_data", "mcp_db_drop_table"];
+    await bridge.refreshTools("db", mockClient);
 
     assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
+  });
+
+  it("orders this bridge's tools in an outgoing provider payload", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    let activeTools: string[] = [];
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    const foreign = { type: "function", function: { name: "bash" } };
+    const payload = {
+      model: "test-model",
+      tools: [
+        { type: "function", function: { name: "mcp_db_z_tool" } },
+        foreign,
+        { type: "function", function: { name: "mcp_db_a_tool" } },
+      ],
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      model: string;
+      tools: Array<{ type?: string; name?: string; function?: { name?: string } }>;
+    };
+    const names = ordered.tools.map((tool) => tool.function?.name ?? tool.name);
+
+    assert.deepEqual(names, ["bash", "mcp_db_a_tool", "mcp_db_z_tool"]);
+    assert.equal(ordered.model, "test-model");
+    assert.equal(ordered.tools[0], foreign, "another extension's definition is reused as is");
+    assert.equal(
+      (payload.tools[0] as { function: { name: string } }).function.name,
+      "mcp_db_z_tool",
+      "The caller's payload is not mutated",
+    );
+  });
+
+  it("leaves an already ordered payload, and a payload without tools, untouched", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [{ name: "a_tool", inputSchema: { type: "object" } }],
+      }),
+    } as unknown as Client);
+
+    // Anthropic-style definitions carry `name` at the top level.
+    const unordered = { tools: [{ name: "mcp_db_a_tool" }, { name: "bash" }] };
+    const ordered = bridge.orderPayloadTools(unordered) as { tools: Array<{ name: string }> };
+    assert.deepEqual(ordered.tools.map((tool) => tool.name), ["bash", "mcp_db_a_tool"]);
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered payload is returned as is");
+
+    const withoutTools = { model: "test-model" };
+    assert.equal(bridge.orderPayloadTools(withoutTools), withoutTools);
+    assert.equal(bridge.orderPayloadTools(undefined), undefined);
   });
 
   it("keeps other extensions' tools ahead of bridged tools", async () => {
