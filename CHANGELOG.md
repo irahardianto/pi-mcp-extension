@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The active MCP tool order no longer depends on connection timing (#278). Eager servers connect concurrently and each server's tools were activated when its own connection finished, while `desiredActive` followed `tools/list` order — which the MCP spec does not define — so Pi's active tool list, the system prompt's tool section, and the declared `tools` array changed order between session starts and resumes even though the tools were identical. That invalidated a server-side prefix cache (vLLM, SGLang, llama.cpp) for the whole conversation on every resume, since the tool section sits near the start of the prompt. Each reconcile now writes one ordered active set: tools owned by another extension keep their existing relative order and the bridge's tools follow, sorted by Pi name, so the order is a function of the tool set alone. A resumed session whose restored order differs is rewritten on the first connect, and a reconcile whose set *and* order already match still writes nothing.
+
 ## [1.14.5] - 2026-11-08
 
 ### Fixed

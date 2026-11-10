@@ -811,14 +811,34 @@ export class ToolBridge {
       (name) => !ownedPreviousNames.has(name) || desiredActive.has(name),
     );
     const newlyActive = [...desiredActive].filter((name) => !activeSet.has(name));
-    const unchangedBeforeLoop =
-      remaining.length === activeBefore.length && newlyActive.length === 0;
-    // WHY: Even when `desiredActive` leaves `activeBefore` unchanged, `pi.registerTool()`
-    // inside the loop may have auto-activated a newly registered hashed Pi name or a
-    // `--tools` allowlist entry; re-read `getActiveTools()` before skipping the write.
-    if (unchangedBeforeLoop && sameToolList(this.pi.getActiveTools(), activeBefore)) return;
+    const nextActive = this._orderActiveTools(new Set([...remaining, ...newlyActive]));
+    // WHY: `pi.registerTool()` inside the loop may have auto-activated a newly registered hashed
+    // Pi name or a `--tools` allowlist entry, and a resumed session restores the order it ended
+    // with — so compare against a fresh read and write whenever the set *or* the order differs.
+    if (sameToolList(this.pi.getActiveTools(), nextActive)) return;
 
-    this.pi.setActiveTools(Array.from(new Set([...remaining, ...newlyActive])));
+    this.pi.setActiveTools(nextActive);
+  }
+
+  /**
+   * Order the active set so this bridge's tools are a pure function of the tool set: tools owned
+   * by another extension keep their relative order, and this bridge's tools follow them sorted
+   * by Pi name.
+   *
+   * WHY: a server's tools are registered as its connection completes, and `desiredActive`
+   * follows `tools/list` order, which the MCP spec does not define. Without a fixed order the
+   * active list — and with it the system prompt's tool section and the tools declared to the
+   * provider — depends on eager-connect timing, so a server-side prefix cache keyed on the
+   * prompt head misses on every session start or resume (#278).
+   */
+  private _orderActiveTools(active: ReadonlySet<string>): string[] {
+    const others: string[] = [];
+    const bridged: string[] = [];
+    for (const name of active) {
+      (this.toolOwners.has(name) ? bridged : others).push(name);
+    }
+    bridged.sort(compareCodePoints);
+    return [...others, ...bridged];
   }
 
   private _deactivateServerTools(serverName: string): void {
