@@ -87,6 +87,38 @@ function payloadToolDefinitions(payload: unknown): unknown[] | undefined {
   return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
 
+/**
+ * Sort the entries `isOwned` selects into name order inside the slots they already occupy, and
+ * return `undefined` when the result is identical to `entries`.
+ *
+ * WHY: this bridge cannot move what it does not own — another extension's tools keep the position
+ * they were given, and so does Pi's trailing Anthropic `__pi_deferred_placeholder__`, which Pi
+ * requires last — while the bridge's own tools, whose insertion order depends on which server
+ * connected first and on `tools/list` order, end up in one deterministic order (#278).
+ */
+function orderOwnedEntries<T>(
+  entries: readonly T[],
+  nameOf: (entry: T) => string | undefined,
+  isOwned: (name: string) => boolean,
+): T[] | undefined {
+  const owned: Array<{ slot: number; name: string; entry: T }> = [];
+  entries.forEach((entry, slot) => {
+    const name = nameOf(entry);
+    if (name !== undefined && isOwned(name)) owned.push({ slot, name, entry });
+  });
+  if (owned.length < 2) return undefined;
+
+  const slots = owned.map((candidate) => candidate.slot);
+  owned.sort((left, right) => compareCodePoints(left.name, right.name));
+  const ordered = [...entries];
+  owned.forEach((candidate, index) => {
+    const slot = slots[index] ?? candidate.slot;
+    ordered[slot] = candidate.entry;
+  });
+  const unchanged = ordered.every((entry, index) => entry === entries[index]);
+  return unchanged ? undefined : ordered;
+}
+
 /** Compare strings by Unicode code point, not by UTF-16 code unit. */
 function compareCodePoints(a: string, b: string): number {
   const left = Array.from(a, (ch) => ch.codePointAt(0) ?? 0);
@@ -449,35 +481,23 @@ export class ToolBridge {
 
   /**
    * Order this bridge's tools in an outgoing provider payload the same way they are ordered in
-   * Pi's active list, and return the payload untouched when they already are.
+   * Pi's active list, and return the payload untouched when they already are. Only entries this
+   * bridge owns move, and only among the slots they already occupy — an extension's tool and
+   * Pi's reserved trailing declarations keep their positions.
    *
    * WHY: the request's `tools` array is not built from the active list — Pi replays the
    * transcript's tool declarations in first-appearance order and emits no delta for a pure
    * reorder, so a server that connects after the first turn leaves its tools at the end, in
    * connect order. Sorting the payload makes the declared tools a function of the tool set, so
-   * the prompt head stays byte-identical across sessions and a server-side prefix cache keeps
-   * its KV entries (#278).
+   * the prompt head stays stable across sessions and a server-side prefix cache keeps its KV
+   * entries (#278).
    */
   orderPayloadTools(payload: unknown): unknown {
     const tools = payloadToolDefinitions(payload);
     if (tools === undefined) return payload;
 
-    const others: unknown[] = [];
-    const bridged: Array<{ name: string; definition: unknown }> = [];
-    for (const definition of tools) {
-      const name = payloadToolName(definition);
-      if (name === undefined || !this.toolOwners.has(name)) {
-        others.push(definition);
-        continue;
-      }
-      bridged.push({ name, definition });
-    }
-    if (bridged.length === 0) return payload;
-
-    bridged.sort((left, right) => compareCodePoints(left.name, right.name));
-    const ordered = [...others, ...bridged.map((entry) => entry.definition)];
-    const unchanged = ordered.every((definition, index) => definition === tools[index]);
-    return unchanged ? payload : { ...(payload as Record<string, unknown>), tools: ordered };
+    const ordered = orderOwnedEntries(tools, payloadToolName, (name) => this.toolOwners.has(name));
+    return ordered === undefined ? payload : { ...(payload as Record<string, unknown>), tools: ordered };
   }
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */
@@ -872,9 +892,9 @@ export class ToolBridge {
   }
 
   /**
-   * Order the active set so this bridge's tools are a pure function of the tool set: tools owned
-   * by another extension keep their relative order, and this bridge's tools follow them sorted
-   * by Pi name.
+   * Order the active set so this bridge's tools are a pure function of the tool set: they are
+   * sorted by Pi name among the positions they already occupy, while every entry another
+   * extension owns keeps its position.
    *
    * WHY: a server's tools are registered as its connection completes, and `desiredActive`
    * follows `tools/list` order, which the MCP spec does not define. Without a fixed order the
@@ -883,13 +903,9 @@ export class ToolBridge {
    * prompt head misses on every session start or resume (#278).
    */
   private _orderActiveTools(active: ReadonlySet<string>): string[] {
-    const others: string[] = [];
-    const bridged: string[] = [];
-    for (const name of active) {
-      (this.toolOwners.has(name) ? bridged : others).push(name);
-    }
-    bridged.sort(compareCodePoints);
-    return [...others, ...bridged];
+    const names = [...active];
+    const ordered = orderOwnedEntries(names, (name) => name, (name) => this.toolOwners.has(name));
+    return ordered ?? names;
   }
 
   private _deactivateServerTools(serverName: string): void {

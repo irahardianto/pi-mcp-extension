@@ -1661,14 +1661,52 @@ describe("ToolBridge", () => {
     };
     const names = ordered.tools.map((tool) => tool.function?.name ?? tool.name);
 
-    assert.deepEqual(names, ["bash", "mcp_db_a_tool", "mcp_db_z_tool"]);
+    assert.deepEqual(
+      names,
+      ["mcp_db_a_tool", "bash", "mcp_db_z_tool"],
+      "Only this bridge's tools move, and only among the slots they already hold",
+    );
     assert.equal(ordered.model, "test-model");
-    assert.equal(ordered.tools[0], foreign, "another extension's definition is reused as is");
+    assert.equal(ordered.tools[1], foreign, "another extension's definition keeps its slot");
     assert.equal(
       (payload.tools[0] as { function: { name: string } }).function.name,
       "mcp_db_z_tool",
       "The caller's payload is not mutated",
     );
+  });
+
+  it("keeps Pi's reserved trailing declaration in place", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    let activeTools: string[] = [];
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    // Pi appends this placeholder last on Anthropic models with native tool changes and expects
+    // it to stay there; it is not ours to move.
+    const placeholder = { name: "__pi_deferred_placeholder__", defer_loading: true };
+    const payload = {
+      tools: [{ name: "mcp_db_z_tool" }, { name: "mcp_db_a_tool" }, placeholder],
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as { tools: Array<{ name: string }> };
+
+    assert.deepEqual(ordered.tools.map((tool) => tool.name), [
+      "mcp_db_a_tool",
+      "mcp_db_z_tool",
+      "__pi_deferred_placeholder__",
+    ]);
+    assert.equal(ordered.tools[2], placeholder);
   });
 
   it("leaves an already ordered payload, and a payload without tools, untouched", async () => {
@@ -1680,14 +1718,17 @@ describe("ToolBridge", () => {
     });
     await bridge.refreshTools("db", {
       request: async () => ({
-        tools: [{ name: "a_tool", inputSchema: { type: "object" } }],
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
       }),
     } as unknown as Client);
 
     // Anthropic-style definitions carry `name` at the top level.
-    const unordered = { tools: [{ name: "mcp_db_a_tool" }, { name: "bash" }] };
+    const unordered = { tools: [{ name: "mcp_db_z_tool" }, { name: "bash" }, { name: "mcp_db_a_tool" }] };
     const ordered = bridge.orderPayloadTools(unordered) as { tools: Array<{ name: string }> };
-    assert.deepEqual(ordered.tools.map((tool) => tool.name), ["bash", "mcp_db_a_tool"]);
+    assert.deepEqual(ordered.tools.map((tool) => tool.name), ["mcp_db_a_tool", "bash", "mcp_db_z_tool"]);
     assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered payload is returned as is");
 
     const withoutTools = { model: "test-model" };
@@ -1695,7 +1736,7 @@ describe("ToolBridge", () => {
     assert.equal(bridge.orderPayloadTools(undefined), undefined);
   });
 
-  it("keeps other extensions' tools ahead of bridged tools", async () => {
+  it("keeps other extensions' tools in their own positions", async () => {
     let activeTools: string[] = ["bash", "read", "other_ext_tool"];
     const mockPi = {
       registerTool: () => {},
