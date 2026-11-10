@@ -1535,7 +1535,7 @@ describe("ToolBridge", () => {
     );
   });
 
-  it("orders bridged tools deterministically regardless of connect order", async () => {
+  it("orders bridged tools deterministically regardless of sequential connect order", async () => {
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     const clientWith = (names: string[]) =>
       ({
@@ -1572,6 +1572,52 @@ describe("ToolBridge", () => {
       "mcp_alpha_alpha_two",
       "mcp_beta_beta_one",
       "mcp_beta_beta_two",
+    ]);
+  });
+
+  it("orders bridged tools deterministically when concurrent connects finish in either order", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const clientWith = (names: string[]) =>
+      ({
+        request: async () => ({
+          tools: names.map((name) => ({ name, inputSchema: { type: "object" } })),
+        }),
+      }) as unknown as Client;
+    const connectAfter = async (
+      delayMs: number,
+      server: string,
+      bridge: ToolBridge,
+    ): Promise<void> => {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await bridge.refreshTools(server, clientWith(["one", "two"]));
+    };
+    const connectBoth = async (alphaDelayMs: number): Promise<string[]> => {
+      let activeTools: string[] = [];
+      const bridge = new ToolBridge(settings, {
+        registerTool: () => {},
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => { activeTools = names; },
+      });
+      await Promise.all([
+        connectAfter(alphaDelayMs, "alpha", bridge),
+        connectAfter(20 - alphaDelayMs, "beta", bridge),
+      ]);
+      return activeTools;
+    };
+
+    const alphaFirst = await connectBoth(0);
+    const betaFirst = await connectBoth(20);
+
+    assert.deepEqual(
+      alphaFirst,
+      betaFirst,
+      "Whichever eager connect finishes last, the active order is the same",
+    );
+    assert.deepEqual(alphaFirst, [
+      "mcp_alpha_one",
+      "mcp_alpha_two",
+      "mcp_beta_one",
+      "mcp_beta_two",
     ]);
   });
 

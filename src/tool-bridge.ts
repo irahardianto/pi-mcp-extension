@@ -112,7 +112,8 @@ function orderOwnedEntries<T>(
   owned.sort((left, right) => compareCodePoints(left.name, right.name));
   const ordered = [...entries];
   owned.forEach((candidate, index) => {
-    const slot = slots[index] ?? candidate.slot;
+    const slot = slots[index];
+    if (slot === undefined) return;
     ordered[slot] = candidate.entry;
   });
   const unchanged = ordered.every((entry, index) => entry === entries[index]);
