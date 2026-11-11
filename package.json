@@ -1,6 +1,6 @@
 {
   "name": "pi-mcp-extension",
-  "version": "1.14.5",
+  "version": "1.14.6",
   "description": "Full-featured, lightweight MCP extension for the Pi coding agent: stdio, SSE & Streamable HTTP transports, OAuth 2.1 (PKCE + DCR), lazy/eager lifecycles — minimal dependencies, zero bloat.",
   "type": "module",
   "keywords": [
