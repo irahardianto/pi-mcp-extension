@@ -148,6 +148,31 @@ describe("createConnectRaceGuard", () => {
     guard.dispose();
   });
 
+  it("uses an injected clock when timer deps are supplied", async () => {
+    const scheduled: Array<() => void> = [];
+    const cleared: unknown[] = [];
+    const handle = { id: "fake-timer" } as unknown as ReturnType<typeof setTimeout>;
+    const guard = createConnectRaceGuard(1000, new AbortController().signal, "srv", {
+      setTimeout: ((callback: () => void) => {
+        scheduled.push(callback);
+        return handle;
+      }) as unknown as typeof setTimeout,
+      clearTimeout: ((timer: unknown) => {
+        cleared.push(timer);
+      }) as unknown as typeof clearTimeout,
+    });
+
+    assert.equal(scheduled.length, 1);
+    scheduled[0]?.();
+    await assert.rejects(guard.outcome, (err: unknown) => {
+      assert.ok(err instanceof McpError);
+      assert.equal(err.message, "Connection timed out after 1000ms");
+      return true;
+    });
+    guard.dispose();
+    assert.deepEqual(cleared, [handle]);
+  });
+
   it("dispose releases both the timer and the abort listener", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const controller = new AbortController();
