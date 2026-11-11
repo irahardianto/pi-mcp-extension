@@ -570,5 +570,271 @@ describe("createTransport batch message ordering (#300)", () => {
       await new Promise<void>((resolveClose) => httpServer.close(() => resolveClose()));
     }
   });
-});
 
+  it("drains queued notifications and deferred Protocol._onclose before resolving client.close()", async () => {
+    const makeHttpTransport = () => {
+      const t = createTransport(
+        "http-srv",
+        ServerConfigSchema.parse({
+          transport: "streamable-http",
+          url: "http://127.0.0.1:9999/mcp",
+          lifecycle: "lazy",
+        }),
+      );
+      t.start = async () => {};
+      t.send = async (message: JSONRPCMessage) => {
+        if ("method" in message && "id" in message && message.method === "initialize") {
+          t.onmessage?.({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "close-drain-srv", version: "1.0.0" },
+            },
+          });
+        }
+      };
+      return t;
+    };
+
+    const transport = makeHttpTransport();
+    const clientErrors: Error[] = [];
+    let closedCount = 0;
+    const client = new Client({ name: "close-drain-client", version: "1.0.0" });
+    client.onerror = (err) => clientErrors.push(err);
+    client.onclose = () => {
+      closedCount += 1;
+    };
+    await client.connect(transport);
+
+    const seenProgress: number[] = [];
+    let callSettled = false;
+    const inFlightCall = client
+      .callTool({ name: "slow_tool", arguments: {} }, undefined, {
+        onprogress: ({ progress }) => {
+          seenProgress.push(progress);
+        },
+      })
+      .catch((err: unknown) => {
+        callSettled = true;
+        return err;
+      });
+
+    // Request ID 1 is `tools/call` (0 was `initialize`). Emit two queued notifications and
+    // immediately close the client in the same synchronous turn.
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 1, progress: 1, total: 2 },
+    });
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 1, progress: 2, total: 2 },
+    });
+
+    await client.close();
+
+    assert.deepEqual(seenProgress, [1, 2]);
+    assert.equal(closedCount, 1);
+    assert.equal(client.transport, undefined);
+    assert.equal(callSettled, true);
+    assert.deepEqual(clientErrors, []);
+    await inFlightCall;
+
+    // Because `Protocol._onclose()` completed before `client.close()` resolved, reconnecting
+    // the same Client instance immediately succeeds instead of throwing "Already connected".
+    const nextTransport = makeHttpTransport();
+    await client.connect(nextTransport);
+    await client.close();
+  });
+
+  it("isolates a throwing transport.onerror callback without wedging queued or subsequent messages", async () => {
+    const transport = createTransport("srv", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+
+    const delivered: Array<number | string> = [];
+    let onErrorCalls = 0;
+    transport.onerror = () => {
+      onErrorCalls += 1;
+      throw new Error("onerror listener exploded");
+    };
+    transport.onmessage = (msg) => {
+      if ("id" in msg && typeof msg.id === "number") {
+        if (msg.id === 1) {
+          throw new Error("deferred handler boom");
+        }
+        delivered.push(msg.id);
+      }
+    };
+    transport.onclose = () => {
+      delivered.push("closed");
+    };
+
+    // Self-reassigning the already-wrapped getter reference is a no-op (preserves wrapper identity).
+    const activeOnMessage = transport.onmessage;
+    const activeOnClose = transport.onclose;
+    transport.onmessage = activeOnMessage;
+    transport.onclose = activeOnClose;
+    assert.equal(transport.onmessage, activeOnMessage);
+    assert.equal(transport.onclose, activeOnClose);
+
+    // Queue two deferred responses behind a notification; the first deferred response throws,
+    // and `transport.onerror` throws as well.
+    transport.onmessage({ jsonrpc: "2.0", method: "notifications/progress", params: {} });
+    transport.onmessage({ jsonrpc: "2.0", id: 1, result: {} });
+    transport.onmessage({ jsonrpc: "2.0", id: 2, result: {} });
+
+    await new Promise((resolveSettle) => setImmediate(resolveSettle));
+    assert.equal(onErrorCalls, 1);
+    const expectedFirstBatch: Array<number | string> = [2];
+    assert.deepEqual(delivered, expectedFirstBatch);
+
+    // Subsequent turns must remain synchronous and unblocked (`tracker.tail === null`).
+    transport.onmessage({ jsonrpc: "2.0", id: 3, result: {} });
+    delivered.push("after-sync-3");
+    transport.onclose();
+    delivered.push("after-sync-close");
+    assert.deepEqual(delivered, [2, 3, "after-sync-3", "closed", "after-sync-close"]);
+  });
+
+  it("orders re-entrant transport.onmessage batches and synchronous onclose triggered inside a message handler", async () => {
+    // 1. Re-entrant `[notif, resp]` emitted synchronously from `transport.send()` while an outer
+    // incoming server request is still on the `transport.onmessage` call stack.
+    const reentrantTransport = createTransport("srv-reentrant", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    let pendingToolCall: { id: string | number; token: string | number } | undefined;
+    reentrantTransport.start = async () => {};
+    reentrantTransport.close = async () => {};
+    reentrantTransport.send = async (message: JSONRPCMessage) => {
+      if ("method" in message && "id" in message) {
+        if (message.method === "initialize") {
+          reentrantTransport.onmessage?.({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "reentrant-srv", version: "1.0.0" },
+            },
+          });
+          return;
+        }
+        if (message.method === "tools/call") {
+          const token = (
+            message.params as { _meta?: { progressToken?: string | number } } | undefined
+          )?._meta?.progressToken;
+          pendingToolCall = { id: message.id, token: token! };
+          // Trigger an unknown server-to-client request so `Protocol._onrequest` synchronously
+          // calls `transport.send(MethodNotFound)` while `onmessage` is on the call stack.
+          reentrantTransport.onmessage?.({
+            jsonrpc: "2.0",
+            id: 900,
+            method: "custom/unhandled_request",
+          });
+        }
+        return;
+      }
+      if ("error" in message && message.id === 900 && pendingToolCall) {
+        const { id, token } = pendingToolCall;
+        pendingToolCall = undefined;
+        reentrantTransport.onmessage?.({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: token, progress: 1, total: 1 },
+        });
+        reentrantTransport.onmessage?.({
+          jsonrpc: "2.0",
+          id,
+          result: { content: [{ type: "text", text: "ok:reentrant" }] },
+        });
+      }
+    };
+
+    const reentrantErrors: Error[] = [];
+    const reentrantClient = new Client({ name: "reentrant-client", version: "1.0.0" });
+    reentrantClient.onerror = (err) => reentrantErrors.push(err);
+    await reentrantClient.connect(reentrantTransport);
+
+    const reentrantProgress: number[] = [];
+    const reentrantRes = await reentrantClient.callTool(
+      { name: "t", arguments: {} },
+      undefined,
+      {
+        onprogress: ({ progress }) => reentrantProgress.push(progress),
+      },
+    );
+    assert.deepEqual(reentrantProgress, [1]);
+    assert.deepEqual(reentrantRes.content, [{ type: "text", text: "ok:reentrant" }]);
+    assert.deepEqual(reentrantErrors, []);
+    await reentrantClient.close();
+
+    // 2. Synchronous `transport.onclose()` invoked from a pre-hook while a notification is being
+    // dispatched synchronously on the call stack.
+    const hookTransport = createTransport("srv-hook", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    hookTransport.onmessage = (msg) => {
+      if ("method" in msg && msg.method === "notifications/progress") {
+        hookTransport.onclose?.();
+      }
+    };
+    hookTransport.start = async () => {};
+    hookTransport.close = async () => {};
+    hookTransport.send = async (message: JSONRPCMessage) => {
+      if (!("method" in message) || !("id" in message)) return;
+      if (message.method === "initialize") {
+        hookTransport.onmessage?.({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "hook-srv", version: "1.0.0" },
+          },
+        });
+        return;
+      }
+      if (message.method === "tools/call") {
+        const token = (
+          message.params as { _meta?: { progressToken?: string | number } } | undefined
+        )?._meta?.progressToken;
+        hookTransport.onmessage?.({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: token!, progress: 1, total: 1 },
+        });
+      }
+    };
+
+    const hookErrors: Error[] = [];
+    const hookClient = new Client({ name: "hook-client", version: "1.0.0" });
+    hookClient.onerror = (err) => hookErrors.push(err);
+    await hookClient.connect(hookTransport);
+
+    const hookProgress: number[] = [];
+    await assert.rejects(() =>
+      hookClient.callTool(
+        { name: "t", arguments: {} },
+        undefined,
+        {
+          onprogress: ({ progress }) => hookProgress.push(progress),
+        },
+      ),
+    );
+    assert.deepEqual(hookProgress, [1]);
+    assert.deepEqual(hookErrors, []);
+  });
+});

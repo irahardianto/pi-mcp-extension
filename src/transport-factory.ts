@@ -17,7 +17,7 @@ import { McpError } from "./errors.js";
 import type { ServerConfig } from "./config.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import { isAuthorizationHeader, stripAuthorizationHeader } from "./auth-challenge.js";
-import { reportDiagnostic } from "./debug-log.js";
+import { describeError, reportDiagnostic } from "./debug-log.js";
 import { instrumentStderr } from "./stdio-process.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -184,8 +184,6 @@ type TransportCloseHandler = NonNullable<Transport["onclose"]>;
 
 interface NotificationTurnTracker {
   tail: Promise<void> | null;
-  inMessage: boolean;
-  inClose: boolean;
   reportError: (err: unknown) => void;
 }
 
@@ -195,17 +193,34 @@ function isJsonRpcNotificationMessage(message: unknown): boolean {
   return typeof record["method"] === "string" && !("id" in record);
 }
 
-function invokeMessageSynchronously(
+/**
+ * Open a synchronous turn hold around an initial notification dispatch.
+ *
+ * WHY: Installing `tracker.tail` before `handler` runs ensures any re-entrant `onmessage` or
+ * `onclose` triggered synchronously inside `handler` queues behind this notification, while
+ * resolving `gate` in `finally` schedules the hold release strictly after `Protocol._onnotification`'s
+ * internal `Promise.resolve().then(...)` microtask.
+ */
+function dispatchNotificationWithTurnHold(
   handler: TransportMessageHandler,
   tracker: NotificationTurnTracker,
   message: Parameters<TransportMessageHandler>[0],
   extra: Parameters<TransportMessageHandler>[1],
 ): void {
-  tracker.inMessage = true;
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const hold = gate.then(() => {
+    if (tracker.tail === hold) {
+      tracker.tail = null;
+    }
+  });
+  tracker.tail = hold;
   try {
     handler(message, extra);
   } finally {
-    tracker.inMessage = false;
+    releaseGate();
   }
 }
 
@@ -239,107 +254,137 @@ function enqueueTurnStep(tracker: NotificationTurnTracker, step: () => void): vo
   tracker.tail = next;
 }
 
+async function drainTurnQueue(tracker: NotificationTurnTracker): Promise<void> {
+  while (tracker.tail !== null) {
+    await tracker.tail;
+  }
+}
+
+function reportDeferredHandlerError(
+  serverName: string,
+  transport: Transport,
+  err: unknown,
+): void {
+  const normalized = err instanceof Error ? err : new Error(String(err));
+  try {
+    transport.onerror?.(normalized);
+  } catch (onErrorErr) {
+    // WHY: Never allow a throwing `transport.onerror` listener to reject `tracker.tail`, which
+    // would strand remaining frames in the batch and permanently poison future turns.
+    const { kind, message } = describeError(onErrorErr);
+    reportDiagnostic({
+      level: "info",
+      event: "transport.onerror_error",
+      server: serverName,
+      message: `Transport onerror threw while reporting deferred handler error: ${message}`,
+      fields: { kind },
+    });
+  }
+}
+
 function wrapOrderedMessageHandler(
   handler: TransportMessageHandler,
   tracker: NotificationTurnTracker,
+  isSuperseded: () => boolean,
 ): TransportMessageHandler {
   return (message, extra) => {
-    if (tracker.inMessage) {
+    if (isSuperseded()) {
       handler(message, extra);
       return;
     }
     if (isJsonRpcNotificationMessage(message)) {
       if (tracker.tail === null) {
-        try {
-          invokeMessageSynchronously(handler, tracker, message, extra);
-        } finally {
-          enqueueTurnHold(tracker);
-        }
+        dispatchNotificationWithTurnHold(handler, tracker, message, extra);
       } else {
         enqueueTurnStep(tracker, () => {
-          invokeMessageSynchronously(handler, tracker, message, extra);
+          handler(message, extra);
         });
         enqueueTurnHold(tracker);
       }
       return;
     }
     if (tracker.tail === null) {
-      invokeMessageSynchronously(handler, tracker, message, extra);
+      handler(message, extra);
       return;
     }
     enqueueTurnStep(tracker, () => {
-      invokeMessageSynchronously(handler, tracker, message, extra);
+      handler(message, extra);
     });
   };
-}
-
-function invokeCloseSynchronously(
-  handler: TransportCloseHandler,
-  tracker: NotificationTurnTracker,
-): void {
-  tracker.inClose = true;
-  try {
-    handler();
-  } finally {
-    tracker.inClose = false;
-  }
 }
 
 function wrapOrderedCloseHandler(
   handler: TransportCloseHandler,
   tracker: NotificationTurnTracker,
+  isSuperseded: () => boolean,
 ): TransportCloseHandler {
   return () => {
-    if (tracker.inClose || tracker.tail === null) {
-      invokeCloseSynchronously(handler, tracker);
+    if (isSuperseded() || tracker.tail === null) {
+      handler();
       return;
     }
     enqueueTurnStep(tracker, () => {
-      invokeCloseSynchronously(handler, tracker);
+      handler();
     });
   };
+}
+
+function bindOrderedHandlerProperty<K extends "onmessage" | "onclose">(
+  transport: Transport,
+  key: K,
+  wrap: (
+    handler: NonNullable<Transport[K]>,
+    isSuperseded: () => boolean,
+  ) => NonNullable<Transport[K]>,
+): void {
+  let ordered: Transport[K];
+  Object.defineProperty(transport, key, {
+    configurable: true,
+    enumerable: true,
+    get: () => ordered,
+    set: (next: Transport[K]) => {
+      if (!next) {
+        ordered = undefined;
+        return;
+      }
+      if (next === ordered) return;
+      const wrapped = wrap(next, () => ordered !== undefined && ordered !== wrapped);
+      ordered = wrapped;
+    },
+  });
 }
 
 /**
  * Preserve FIFO wire order when JSON-RPC notifications, responses/requests, and close events
  * share a synchronous read batch (`StdioClientTransport.processReadBuffer()`, SSE chunks, or
- * JSON batch responses).
+ * JSON batch responses), and drain any queued turn steps before `transport.close()` resolves.
  *
  * WHY: `Protocol._onnotification` defers notification dispatch onto `Promise.resolve().then(...)`
  * while `Protocol._onresponse` and `Protocol._onclose` clear `_progressHandlers` synchronously.
  * Without ordering, a trailing `notifications/progress` frame arriving in the same chunk as its
  * `tools/call` result loses the race to `_onresponse` and is dropped as an unknown token (#300).
  */
-function instrumentTransportMessageOrder(transport: Transport): Transport {
+function instrumentTransportMessageOrder(serverName: string, transport: Transport): Transport {
   const tracker: NotificationTurnTracker = {
     tail: null,
-    inMessage: false,
-    inClose: false,
     reportError: (err: unknown) => {
-      transport.onerror?.(err instanceof Error ? err : new Error(String(err)));
+      reportDeferredHandlerError(serverName, transport, err);
     },
   };
-  let orderedOnMessage: Transport["onmessage"];
-  let orderedOnClose: Transport["onclose"];
-
-  Object.defineProperties(transport, {
-    onmessage: {
-      configurable: true,
-      enumerable: true,
-      get: () => orderedOnMessage,
-      set: (next: Transport["onmessage"]) => {
-        orderedOnMessage = next ? wrapOrderedMessageHandler(next, tracker) : undefined;
-      },
-    },
-    onclose: {
-      configurable: true,
-      enumerable: true,
-      get: () => orderedOnClose,
-      set: (next: Transport["onclose"]) => {
-        orderedOnClose = next ? wrapOrderedCloseHandler(next, tracker) : undefined;
-      },
-    },
-  });
+  bindOrderedHandlerProperty(transport, "onmessage", (next, isSuperseded) =>
+    wrapOrderedMessageHandler(next, tracker, isSuperseded),
+  );
+  bindOrderedHandlerProperty(transport, "onclose", (next, isSuperseded) =>
+    wrapOrderedCloseHandler(next, tracker, isSuperseded),
+  );
+  const origClose = transport.close.bind(transport);
+  transport.close = async (): Promise<void> => {
+    try {
+      await origClose();
+    } finally {
+      await drainTurnQueue(tracker);
+    }
+  };
   return transport;
 }
 
@@ -369,14 +414,17 @@ export function createTransport(
   switch (config.transport) {
     case "stdio":
       return instrumentTransportMessageOrder(
+        serverName,
         createStdioTransport(serverName, config, cwd, onStderr),
       );
     case "streamable-http":
       return instrumentTransportMessageOrder(
+        serverName,
         createStreamableHttpTransport(config, requestInit, authProvider),
       );
     case "sse":
       return instrumentTransportMessageOrder(
+        serverName,
         createSseTransport(config, requestInit, authProvider),
       );
   }
