@@ -60,9 +60,11 @@ describe("buildWorkspaceRoot", () => {
     });
   });
 
-  it("keeps a filesystem root useful when basename is empty", () => {
+  it("falls back to the cwd itself when basename is empty", () => {
+    // WHY: platform-neutral — pathToFileURL/basename differ between POSIX and Windows for a
+    // filesystem root, and CI runs both.
     const root = buildWorkspaceRoot("/");
-    assert.equal(root.uri, "file:///");
+    assert.equal(root.uri, pathToFileURL("/").href);
     assert.equal(root.name, basename("/") || "/");
   });
 });

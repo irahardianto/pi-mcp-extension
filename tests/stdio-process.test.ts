@@ -1068,10 +1068,16 @@ describe("resolveTransportPid", () => {
     return child;
   }
 
+  /**
+   * A transport shaped like the SDK's: `pid` is a getter over `_process`, so both disappear
+   * together when `close()` clears `_process` — only the instrumented record survives.
+   */
   function createInstrumentedTransport(child: EventEmitter & { pid: number }): object {
     return {
       _process: child,
-      pid: child.pid,
+      get pid(): number | undefined {
+        return (this as { _process?: { pid?: number } })._process?.pid;
+      },
       stderr: null,
       start(): Promise<void> {
         return Promise.resolve();
@@ -1095,9 +1101,10 @@ describe("resolveTransportPid", () => {
     });
     await (transport as { start(): Promise<void> }).start();
 
-    // WHY: StdioClientTransport.close() clears `_process` synchronously; only the
-    // instrumented record still knows the PID at teardown time.
+    // WHY: StdioClientTransport.close() clears `_process` synchronously, which also empties
+    // the `pid` getter; only the instrumented record still knows the PID at teardown time.
     delete (transport as { _process?: unknown })._process;
+    assert.equal((transport as { pid?: number }).pid, undefined);
     assert.equal(resolveTransportPid(null, transport), 4242);
   });
 
