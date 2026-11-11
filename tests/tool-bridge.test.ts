@@ -3123,9 +3123,15 @@ describe("MCP progress notifications", () => {
     assert.equal(formatProgressText({ progress: 5, total: Number.NaN }), "Progress 5");
     // WHY: the sanitizer appends `…` when it truncates, so a long blank message must be judged
     // on its untruncated text — otherwise the fallback never fires and the row renders blank.
+    // 300 and 600 spaces straddle the sanitizer's default 500-char budget, which is where its
+    // truncation marker used to turn a blank message into a "usable" one.
     assert.equal(
       formatProgressText({ progress: 6, total: 10, message: " ".repeat(300) }),
       "Progress 6/10",
+    );
+    assert.equal(
+      formatProgressText({ progress: 7, total: 10, message: " ".repeat(600) }),
+      "Progress 7/10",
     );
   });
 

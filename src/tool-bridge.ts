@@ -281,9 +281,10 @@ const PROGRESS_MESSAGE_MAX_LENGTH = 200;
  */
 export function formatProgressText(progress: Progress): string {
   const rawMessage = typeof progress.message === "string" ? progress.message : "";
-  // WHY: decide usability on the untruncated text. `sanitizeTerminalText` appends `…` when it
-  // truncates, so a long run of whitespace survives `trim()` and would suppress the fallback.
-  const message = sanitizeTerminalText(rawMessage);
+  // WHY: decide usability on the full text (`maxLength` = its own length disables truncation).
+  // `sanitizeTerminalText` appends `…` when it truncates, and that ellipsis survives `trim()`, so
+  // a long blank message would otherwise render as a blank line instead of the numeric fallback.
+  const message = sanitizeTerminalText(rawMessage, { maxLength: rawMessage.length });
   if (message.trim().length > 0) {
     // WHY: bound after redaction — a `[REDACTED]` mask is longer than the value it replaces, so
     // capping first would let the emitted line grow past the budget.
