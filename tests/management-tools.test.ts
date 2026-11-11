@@ -5,8 +5,79 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
-import { acquireAuthLock, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
+import { acquireAuthLock, AuthLockError, AuthRequiredError, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
+import { AuthCancelledError, McpError } from "../src/errors.js";
+import { formatMcpConnectError } from "../src/register-tools.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
+
+for (const { name, error, options, expected } of [
+  {
+    name: "an aborted request before reporting a protocol failure",
+    error: new McpError("private diagnostic", "server", "protocol"),
+    options: { aborted: true },
+    expected: "MCP connection cancelled. Retry when ready.",
+  },
+  {
+    name: "an authorization cancellation",
+    error: new AuthCancelledError("server"),
+    options: {},
+    expected: "MCP connection cancelled. Retry when ready.",
+  },
+  {
+    name: "an unknown server before reporting authorization requirements",
+    error: new AuthRequiredError("server"),
+    options: { serverExists: false },
+    expected: "Unknown MCP server name. Use mcp_status to list configured servers.",
+  },
+  {
+    name: "an authorization lock before the broader authorization-required error",
+    error: new AuthLockError("server", "private diagnostic"),
+    options: {},
+    expected: "Another Pi process is authorizing this server. Retry after it finishes.",
+  },
+  {
+    name: "authorization required in an interactive session",
+    error: new AuthRequiredError("server"),
+    options: {},
+    expected: "MCP authorization required. Retry with mcp_connect or /mcp:auth.",
+  },
+  {
+    name: "authorization required without a UI",
+    error: new AuthRequiredError("server"),
+    options: { hasUI: false },
+    expected: "MCP authorization requires an interactive Pi session.",
+  },
+  {
+    name: "a protocol error as a discovery failure",
+    error: new McpError("private diagnostic", "server", "protocol"),
+    options: {},
+    expected: "MCP tool discovery failed. Check the server and retry.",
+  },
+  {
+    name: "a request timeout without blaming the configuration",
+    error: new McpError("private diagnostic", "server", "timeout"),
+    options: {},
+    expected: "MCP server did not respond in time. Check that it is running and retry.",
+  },
+  {
+    name: "a generic failure without exposing its diagnostic text",
+    error: new Error("private diagnostic"),
+    options: {},
+    expected: "MCP connection failed. Check the server configuration and retry.",
+  },
+  {
+    name: "a non-Error rejection without exposing its value",
+    error: "private diagnostic",
+    options: {},
+    expected: "MCP connection failed. Check the server configuration and retry.",
+  },
+]) {
+  it(`formats ${name}`, () => {
+    assert.equal(formatMcpConnectError(error, {
+      aborted: false, serverExists: true, hasUI: true, ...options,
+    }), expected);
+  });
+}
 
 it("registers agent-visible status and connect tools without eagerly starting a lazy server", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-management-"));
