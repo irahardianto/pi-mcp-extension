@@ -373,9 +373,9 @@ export interface HealthCheckOptions {
 /**
  * Start the periodic health check, or return `null` when the server has none configured.
  *
- * The interval is deliberately non-overlapping (`pingInFlight`) and bounded per tick, and it
- * is `unref()`d so an idle server never keeps the Pi process alive. The caller keeps sole
- * ownership of the timer handle and of what a failure means.
+ * The interval is deliberately non-overlapping (`pingInFlight`) and bounded per tick. The
+ * caller keeps sole ownership of the timer handle (including whether it is referenced) and of
+ * what a failure means.
  */
 export function startHealthCheck(
   options: HealthCheckOptions,
@@ -417,9 +417,7 @@ export function startHealthCheck(
     }
   };
 
-  const timer = timers.setInterval(() => {
+  return timers.setInterval(() => {
     void runHealthCheck();
   }, options.intervalMs);
-  timer.unref();
-  return timer;
 }

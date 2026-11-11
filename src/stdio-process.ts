@@ -615,16 +615,19 @@ export function resolveTransportPid(
   recordedPid: number | null | undefined,
   transport: object | null | undefined,
 ): number | null {
-  if (typeof recordedPid === "number") return recordedPid;
-  if (!transport) return null;
+  if (!transport) return typeof recordedPid === "number" ? recordedPid : null;
   const record = childRecords.get(transport);
-  // WHY: a record outlives its child — 'close' only sets `closed` — and a released PID can be
-  // recycled to an unrelated process, which teardown would then signal. `_process` and the
-  // `pid` getter both disappear when the child exits, so only the record needs the guard.
-  const recordedChildPid = record && !record.closed ? record.process.pid : undefined;
+  // WHY: once the child we spawned has closed, every PID reachable from this transport belongs
+  // to a process that has already exited — and a released PID can be recycled to an unrelated
+  // process under the same uid, which teardown would then signal. That covers `recordedPid`
+  // too: `server.childPid` is never cleared when the child exits on its own (crash → onclose →
+  // _recover → _shutdown passes it here). Nothing that used to work is lost: a dead root ends
+  // `ensurePidTerminated` at its ESRCH liveness probe before any descendant is walked.
+  if (record?.closed) return null;
+  if (typeof recordedPid === "number") return recordedPid;
   const internal = (transport as { _process?: { pid?: number } })._process;
   const exposed = (transport as { pid?: unknown }).pid;
-  return recordedChildPid ?? internal?.pid ?? (typeof exposed === "number" ? exposed : null);
+  return record?.process.pid ?? internal?.pid ?? (typeof exposed === "number" ? exposed : null);
 }
 
 /**

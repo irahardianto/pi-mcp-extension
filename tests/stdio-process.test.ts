@@ -1108,7 +1108,7 @@ describe("resolveTransportPid", () => {
     assert.equal(resolveTransportPid(null, transport), 4242);
   });
 
-  it("ignores a recorded PID once the child has closed, so a recycled PID is never signalled", async () => {
+  it("ignores every PID source once the child has closed, including the recorded one", async () => {
     const child = createChild(6161);
     const transport = createInstrumentedTransport(child);
     instrumentStdioTransport(transport as unknown as StdioClientTransport, {
@@ -1119,7 +1119,11 @@ describe("resolveTransportPid", () => {
 
     child.emit("close", 0, null);
     delete (transport as { _process?: unknown })._process;
-    assert.equal(resolveTransportPid(null, transport), null);
+    // WHY: `server.childPid` is never cleared when the child exits by itself, so the crash →
+    // onclose → _recover → _shutdown path hands the stale PID in as `recordedPid`. A released
+    // PID can belong to an unrelated process by then; teardown must not signal it.
+    assert.equal(resolveTransportPid(6161, transport), null);
+    assert.equal(resolveTransportPid(6161, null), 6161);
   });
 
   it("falls back to the transport's own _process.pid when it was never instrumented", () => {

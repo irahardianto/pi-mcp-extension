@@ -108,8 +108,16 @@ describe("classifyClientError — stdio and odd payloads", () => {
     assert.deepEqual(classifyClientError("stdio", new Error("write EPIPE")), { kind: "ignore" });
   });
 
-  it("reads a plain-object rejection without losing its message", () => {
+  it("reads a plain-object rejection as String(...), like the pre-extraction branch", () => {
     assert.deepEqual(classifyClientError("sse", { code: -32000, message: "stream closed" }), {
+      kind: "recover",
+      event: "server.stream_error",
+      transport: "sse",
+      reason: "SSE stream error, reconnecting",
+    });
+    // A benign-looking message on a non-Error payload is NOT ignored: only an Error's own
+    // `message` is inspected, so a real dropped stream can never be swallowed by object text.
+    assert.deepEqual(classifyClientError("sse", { message: "unknown message ID: 1" }), {
       kind: "recover",
       event: "server.stream_error",
       transport: "sse",

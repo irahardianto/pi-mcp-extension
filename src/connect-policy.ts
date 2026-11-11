@@ -244,6 +244,17 @@ export type ClientErrorAction =
 /** The SDK's optional standalone-SSE GET probe answering `Failed to open SSE stream: …`. */
 const POST_ONLY_SSE_PROBE = /Failed to open SSE stream:/i;
 
+/**
+ * Message text of a `client.onerror` payload, matching the pre-extraction branch exactly.
+ *
+ * WHY: only an `Error`'s `message` is inspected. Reading `.message` off a plain-object rejection
+ * would widen the benign-JSON-RPC and POST-only-probe matches to payloads the old code
+ * recovered from, and an ignored real stream drop is worse than a spurious reconnect.
+ */
+function clientErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function classifyNonFatalClientError(rawMsg: string): ClientErrorAction {
   // WHY: a throwing notification callback is benign for the stream, but it is the only
   // ignorable error a user can act on (a server sending malformed progress), so it keeps an
@@ -270,7 +281,7 @@ function classifyStreamableHttpError(err: unknown): ClientErrorAction {
   // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
   // stream drops on established streams report "SSE stream disconnected" or
   // "Maximum reconnection attempts (0) exceeded." instead.
-  if (POST_ONLY_SSE_PROBE.test(errorMessageOf(err))) {
+  if (POST_ONLY_SSE_PROBE.test(clientErrorMessage(err))) {
     return { kind: "ignore" };
   }
   return {
@@ -289,7 +300,7 @@ function classifyStreamableHttpError(err: unknown): ClientErrorAction {
  * failure" without touching lifecycle state; the caller owns the actual recovery.
  */
 export function classifyClientError(transport: TransportType, err: unknown): ClientErrorAction {
-  const rawMsg = errorMessageOf(err);
+  const rawMsg = clientErrorMessage(err);
   if (isNonFatalClientError(rawMsg)) {
     return classifyNonFatalClientError(rawMsg);
   }

@@ -461,29 +461,6 @@ describe("startHealthCheck", () => {
     clearInterval(timer);
   });
 
-  it("unrefs the interval so an idle server never keeps the process alive", () => {
-    let unrefed = false;
-    const handle = {
-      unref: () => {
-        unrefed = true;
-        return handle;
-      },
-    } as unknown as ReturnType<typeof setInterval>;
-    const timer = startHealthCheck(
-      {
-        serverName: "srv",
-        getClient: () => fakeClient({}),
-        isReady: () => true,
-        intervalMs: 1000,
-        timeoutMs: 100,
-        signal: new AbortController().signal,
-        onPingFailure: () => {},
-      },
-      { setInterval: (() => handle) as unknown as typeof setInterval },
-    );
-    assert.equal(timer, handle);
-    assert.equal(unrefed, true);
-  });
 });
 
 // ── Client construction ──────────────────────────────────────────────────────
