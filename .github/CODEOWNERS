@@ -26,6 +26,7 @@
 /src/authorize-flow.ts @irahardianto
 /src/authorize-dialog.ts @irahardianto
 /src/oauth-provider.ts @irahardianto
+/src/oauth-policy.ts @irahardianto
 /src/oauth-status.ts @irahardianto
 /src/oauth-state-store.ts @irahardianto
 /src/auth-lock.ts @irahardianto

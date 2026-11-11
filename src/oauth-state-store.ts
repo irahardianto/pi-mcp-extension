@@ -277,21 +277,6 @@ export async function saveState(
   }
 }
 
-function isStoredStateOriginCompatible(
-  state: { serverUrl?: string | undefined; discoveryState?: unknown },
-  expectedServerUrl: string,
-): boolean {
-  if (state.serverUrl !== undefined) {
-    return urlsMatch(state.serverUrl, expectedServerUrl);
-  }
-  const discoveryState = state.discoveryState as OAuthDiscoveryState | undefined;
-  const resource = (discoveryState?.resourceMetadata as { resource?: unknown } | undefined)?.resource;
-  if (typeof resource === "string") {
-    return isResourceCompatibleWithServerUrl(resource, expectedServerUrl);
-  }
-  return true;
-}
-
 function readAndParseStoredStateSync(path: string): z.output<typeof StoredStateSchema> | undefined {
   try {
     const raw = readFileSync(path, "utf8");
@@ -315,7 +300,7 @@ export function loadStoredRedirectUrisSync(
 ): string[] | undefined {
   const data = readAndParseStoredStateSync(statePath(serverName, storageDir));
   if (!data) return undefined;
-  if (serverUrl !== undefined && !isStoredStateOriginCompatible(data, serverUrl)) {
+  if (serverUrl !== undefined && shouldDiscardStoredState(data, serverUrl)) {
     return undefined;
   }
   const uris = data.clientInfo?.redirect_uris;
