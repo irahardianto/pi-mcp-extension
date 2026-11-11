@@ -403,8 +403,14 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     return enqueueServerReconcile(ctx);
   });
 
-  // Order the bridge's tools in every outgoing request so the declared order never depends on
-  // connect timing or the transcript's first-appearance order (#278).
+  // Keep active and outgoing tool order independent of connect timing, `/tree` transcript
+  // restoration, external `setActiveTools` reorderings, and first-appearance replay (#278).
+  pi.on("session_tree", () => {
+    bridge.orderActiveTools();
+  });
+  pi.on("before_agent_start", () => {
+    bridge.orderActiveTools();
+  });
   pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
 
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {

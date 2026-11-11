@@ -457,3 +457,79 @@ it("reports a tools/list timeout from mcp_connect as a timeout, not as tool disc
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("wires session_tree, before_agent_start, and before_provider_request to keep active and declared tool order deterministic (#278)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-order-hooks-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const mockExt = createMockExtension({ activeTools: ["bash", "read"] });
+  const events = mockExt.events;
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
+      settings: { maxRetries: 0 },
+      mcpServers: { mock: { command: "node", args: ["--import", tsxEsmLoader, mock], lifecycle: "eager" } },
+    }));
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+
+    assert.ok(events.has("session_tree"), "Must register session_tree handler");
+    assert.ok(events.has("before_agent_start"), "Must register before_agent_start handler");
+    assert.ok(events.has("before_provider_request"), "Must register before_provider_request handler");
+
+    await events.get("session_start")({}, ctx);
+    const expectedActive = [...mockExt.activeTools];
+    assert.equal(expectedActive[0], "bash");
+    assert.equal(expectedActive[1], "read");
+    const ownedSorted = expectedActive.slice(2);
+    assert.ok(ownedSorted.length >= 2);
+    assert.deepEqual(ownedSorted, [...ownedSorted].sort());
+
+    // Simulate `/tree` restoring unsorted transcript tool order.
+    mockExt.activeTools = ["bash", "read", ...[...ownedSorted].reverse()];
+    await events.get("session_tree")({}, ctx);
+    assert.deepEqual(mockExt.activeTools, expectedActive);
+
+    // Simulate another extension scrambling active tool order before a turn starts;
+    // the hook must restore order and return `undefined` so it never overrides prompt options.
+    mockExt.activeTools = ["bash", "read", ...[...ownedSorted].reverse()];
+    const beforeStartResult = await events.get("before_agent_start")({}, ctx);
+    assert.equal(beforeStartResult, undefined);
+    assert.deepEqual(mockExt.activeTools, expectedActive);
+
+    const firstOwned = ownedSorted[0]!;
+    const lastOwned = ownedSorted[ownedSorted.length - 1]!;
+    const googlePayload = {
+      config: {
+        tools: [{ functionDeclarations: [{ name: lastOwned }, { name: "bash" }, { name: firstOwned }] }],
+      },
+    };
+    const orderedGoogle = (await events.get("before_provider_request")(
+      { payload: googlePayload },
+      ctx,
+    )) as typeof googlePayload;
+    assert.deepEqual(
+      orderedGoogle.config.tools[0]?.functionDeclarations.map((decl) => decl.name),
+      [firstOwned, "bash", lastOwned],
+    );
+
+    const bedrockPayload = {
+      toolConfig: {
+        tools: [{ toolSpec: { name: lastOwned } }, { toolSpec: { name: firstOwned } }, { cachePoint: { type: "default" } }],
+      },
+    };
+    const orderedBedrock = (await events.get("before_provider_request")(
+      { payload: bedrockPayload },
+      ctx,
+    )) as typeof bedrockPayload;
+    assert.deepEqual(orderedBedrock.toolConfig.tools, [
+      { toolSpec: { name: firstOwned } },
+      { toolSpec: { name: lastOwned } },
+      { cachePoint: { type: "default" } },
+    ]);
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+

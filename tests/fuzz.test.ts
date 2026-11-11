@@ -833,6 +833,242 @@ describe("fuzz: ToolBridge intra-server name assignment", () => {
   });
 });
 
+// ─── Suite 6c: ToolBridge deterministic active & payload ordering (#278) ─────
+
+describe("fuzz: ToolBridge deterministic active & payload ordering (#278)", () => {
+  function makeOrderingBridge(initialActive: string[] = []): {
+    bridge: ToolBridge;
+    getActive: () => string[];
+    setActive: (names: string[]) => void;
+    getWriteCount: () => number;
+  } {
+    let active = [...initialActive];
+    let writes = 0;
+    const bridge = new ToolBridge(
+      { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+      {
+        registerTool: () => {},
+        getActiveTools: () => [...active],
+        setActiveTools: (names: string[]) => {
+          active = [...names];
+          writes += 1;
+        },
+      },
+    );
+    return {
+      bridge,
+      getActive: () => [...active],
+      setActive: (names: string[]) => {
+        active = [...names];
+      },
+      getWriteCount: () => writes,
+    };
+  }
+
+  function makeStaticToolClient(toolNames: readonly string[]): Client {
+    return {
+      request: async () => ({
+        tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+    } as unknown as Client;
+  }
+
+  it("orderPayloadTools never throws on arbitrary values, never mutates input, and is reference-idempotent", async () => {
+    const { bridge } = makeOrderingBridge();
+    await bridge.refreshTools("srv", makeStaticToolClient(["alpha", "beta", "gamma"]));
+
+    fc.assert(
+      fc.property(fc.jsonValue(), (raw) => {
+        const snapshot = JSON.stringify(raw);
+        const once = bridge.orderPayloadTools(raw);
+        assert.equal(JSON.stringify(raw), snapshot, "input payload must not be mutated");
+        const twice = bridge.orderPayloadTools(once);
+        assert.equal(twice, once, "second call on ordered payload must return the exact reference");
+      }),
+      testOptions(),
+    );
+  });
+
+  it("converges to the same owned order across permutations, scrambles, and all four provider payload shapes", async () => {
+    const serverSpecsArb = fc.uniqueArray(
+      fc.record({
+        server: fc.stringMatching(/^[a-z]{2,6}$/),
+        tools: fc.uniqueArray(fc.stringMatching(/^[a-z0-9]{2,6}$/), { minLength: 1, maxLength: 3 }),
+      }),
+      { selector: (spec) => spec.server, minLength: 2, maxLength: 3 },
+    );
+    const foreignArb = fc.uniqueArray(
+      fc.stringMatching(/^ext_[a-z]{2,5}$/),
+      { minLength: 1, maxLength: 3 },
+    );
+
+    await fc.assert(
+      fc.asyncProperty(
+        serverSpecsArb,
+        foreignArb,
+        fc.nat(),
+        async (specs, foreignNames, seedNat) => {
+          const forwardSpecs = specs;
+          const reversedSpecs = [...specs]
+            .reverse()
+            .map((spec) => ({ server: spec.server, tools: [...spec.tools].reverse() }));
+
+          const runA = makeOrderingBridge(foreignNames);
+          for (const spec of forwardSpecs) {
+            await runA.bridge.refreshTools(spec.server, makeStaticToolClient(spec.tools));
+          }
+          const runB = makeOrderingBridge(foreignNames);
+          for (const spec of reversedSpecs) {
+            await runB.bridge.refreshTools(spec.server, makeStaticToolClient(spec.tools));
+          }
+          assert.deepEqual(
+            runA.getActive(),
+            runB.getActive(),
+            "connect and tools/list order must not change active tool order",
+          );
+
+          const allOwnedSorted = runA.getActive().slice(foreignNames.length);
+          assert.ok(allOwnedSorted.length >= 2);
+          // Drop one owned tool to simulate an inactive policy-filtered tool, interleave foreign
+          // tools, and reverse the remaining active owned tools to simulate `/tree` restoration.
+          const droppedIndex = seedNat % allOwnedSorted.length;
+          const droppedOwned = allOwnedSorted[droppedIndex]!;
+          const activeOwnedReversed = allOwnedSorted
+            .filter((_, idx) => idx !== droppedIndex)
+            .reverse();
+          const scrambled = [
+            foreignNames[0]!,
+            ...activeOwnedReversed,
+            ...foreignNames.slice(1),
+          ];
+
+          runA.setActive(scrambled);
+          const writesBefore = runA.getWriteCount();
+          runA.bridge.orderActiveTools();
+          const normalizedActive = runA.getActive();
+          assert.equal(normalizedActive.includes(droppedOwned), false, "inactive tool must stay off");
+          assert.equal(normalizedActive[0], foreignNames[0]);
+          assert.deepEqual(
+            normalizedActive.slice(1 + activeOwnedReversed.length),
+            foreignNames.slice(1),
+            "foreign tools must stay in their slots",
+          );
+          assert.deepEqual(
+            normalizedActive.slice(1, 1 + activeOwnedReversed.length),
+            [...activeOwnedReversed].reverse(),
+            "active owned tools must be sorted in place",
+          );
+
+          const writesAfterFirst = runA.getWriteCount();
+          runA.bridge.orderActiveTools();
+          assert.equal(
+            runA.getWriteCount(),
+            writesAfterFirst,
+            "orderActiveTools must not call setActiveTools when already ordered",
+          );
+          if (activeOwnedReversed.length < 2) {
+            assert.equal(writesAfterFirst, writesBefore);
+          }
+
+          // Exercise all four provider payload shapes with reversed owned tools and slot markers.
+          const scrambledPayloadNames = [
+            foreignNames[0]!,
+            ...[...allOwnedSorted].reverse(),
+            ...foreignNames.slice(1),
+          ];
+          const anthropicPayload = {
+            tools: [
+              ...scrambledPayloadNames.map((name, idx) => ({
+                name,
+                ...(idx === scrambledPayloadNames.length - 1
+                  ? { cache_control: { type: "ephemeral" } }
+                  : {}),
+              })),
+              { name: "__pi_deferred_placeholder__" },
+            ],
+          };
+          const orderedAnthropic = runA.bridge.orderPayloadTools(anthropicPayload) as {
+            tools: Array<{ name: string; cache_control?: unknown }>;
+          };
+          assert.equal(runA.bridge.orderPayloadTools(orderedAnthropic), orderedAnthropic);
+          assert.equal(orderedAnthropic.tools.at(-1)?.name, "__pi_deferred_placeholder__");
+          assert.deepEqual(orderedAnthropic.tools.at(-2)?.cache_control, { type: "ephemeral" });
+          assert.deepEqual(
+            orderedAnthropic.tools.slice(1, 1 + allOwnedSorted.length).map((t) => t.name),
+            allOwnedSorted,
+          );
+
+          const chatPayload = {
+            tools: scrambledPayloadNames.map((name, idx) => ({
+              type: "function",
+              function: { name },
+              ...(idx === scrambledPayloadNames.length - 1
+                ? { cache_control: { type: "ephemeral" } }
+                : {}),
+            })),
+          };
+          const orderedChat = runA.bridge.orderPayloadTools(chatPayload) as {
+            tools: Array<{ function: { name: string }; cache_control?: unknown }>;
+          };
+          assert.equal(runA.bridge.orderPayloadTools(orderedChat), orderedChat);
+          assert.deepEqual(orderedChat.tools.at(-1)?.cache_control, { type: "ephemeral" });
+          assert.deepEqual(
+            orderedChat.tools.slice(1, 1 + allOwnedSorted.length).map((t) => t.function.name),
+            allOwnedSorted,
+          );
+
+          const searchGroup = { googleSearch: {} };
+          const googlePayload = {
+            config: {
+              tools: [
+                { functionDeclarations: scrambledPayloadNames.map((name) => ({ name })) },
+                searchGroup,
+              ],
+            },
+          };
+          const orderedGoogle = runA.bridge.orderPayloadTools(googlePayload) as {
+            config: { tools: [{ functionDeclarations: Array<{ name: string }> }, unknown] };
+          };
+          assert.equal(runA.bridge.orderPayloadTools(orderedGoogle), orderedGoogle);
+          assert.equal(orderedGoogle.config.tools[1], searchGroup);
+          assert.deepEqual(
+            orderedGoogle.config.tools[0].functionDeclarations
+              .slice(1, 1 + allOwnedSorted.length)
+              .map((t) => t.name),
+            allOwnedSorted,
+          );
+
+          const cachePoint = { cachePoint: { type: "default" } };
+          const bedrockPayload = {
+            toolConfig: {
+              tools: [
+                ...scrambledPayloadNames.map((name) => ({ toolSpec: { name } })),
+                cachePoint,
+              ],
+              toolChoice: { auto: {} },
+            },
+          };
+          const orderedBedrock = runA.bridge.orderPayloadTools(bedrockPayload) as {
+            toolConfig: {
+              tools: Array<{ toolSpec?: { name: string }; cachePoint?: unknown }>;
+              toolChoice: unknown;
+            };
+          };
+          assert.equal(runA.bridge.orderPayloadTools(orderedBedrock), orderedBedrock);
+          assert.equal(orderedBedrock.toolConfig.tools.at(-1), cachePoint);
+          assert.deepEqual(
+            orderedBedrock.toolConfig.tools
+              .slice(1, 1 + allOwnedSorted.length)
+              .map((t) => t.toolSpec?.name),
+            allOwnedSorted,
+          );
+        },
+      ),
+      testOptions(80),
+    );
+  });
+});
+
 // ─── Suite 7: stripJsonComments & parseRegisteredServerConfig ─────────────────
 
 describe("fuzz: stripJsonComments & parseRegisteredServerConfig", () => {

@@ -70,21 +70,34 @@ function isLosslessToolName(rawToolName: string): boolean {
   return /^[a-zA-Z0-9_]+$/.test(rawToolName);
 }
 
-/** Name of a provider tool definition: `{ name }` (Anthropic, Responses) or
- * `{ function: { name } }` (Chat Completions). */
-function payloadToolName(definition: unknown): string | undefined {
-  if (typeof definition !== "object" || definition === null) return undefined;
-  const { name } = definition as { name?: unknown };
-  if (typeof name === "string") return name;
-  const { function: fn } = definition as { function?: { name?: unknown } };
-  return typeof fn?.name === "string" ? fn.name : undefined;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** The `tools` array of a provider payload, when it carries one. */
-function payloadToolDefinitions(payload: unknown): unknown[] | undefined {
-  if (typeof payload !== "object" || payload === null) return undefined;
-  const { tools } = payload as { tools?: unknown };
-  return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
+function nestedStringField(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): string | undefined {
+  const nested = record[key];
+  if (!isRecord(nested)) return undefined;
+  const value = nested[field];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Name of a provider tool definition: `{ name }` (Anthropic, Responses, Gemini
+ * `functionDeclarations`), `{ function: { name } }` (Chat Completions, Mistral), or
+ * `{ toolSpec: { name } }` (Bedrock Converse).
+ */
+function payloadToolName(definition: unknown): string | undefined {
+  if (!isRecord(definition)) return undefined;
+  const name = definition["name"];
+  if (typeof name === "string") return name;
+  return (
+    nestedStringField(definition, "function", "name") ??
+    nestedStringField(definition, "toolSpec", "name")
+  );
 }
 
 /**
@@ -102,6 +115,63 @@ function withSlotCacheControl(entry: unknown, slotEntry: unknown): unknown {
     return rest;
   }
   return { ...entryRecord, cache_control: slotCache };
+}
+
+/** Order one tool-definition array in place of its owned slots, keeping slot `cache_control`. */
+function orderDefinitionList(
+  definitions: unknown,
+  isOwned: (name: string) => boolean,
+): unknown[] | undefined {
+  if (!Array.isArray(definitions) || definitions.length === 0) return undefined;
+  const ordered = orderOwnedEntries(definitions, payloadToolName, isOwned);
+  if (ordered === undefined) return undefined;
+  return ordered.map((entry, index) =>
+    entry === definitions[index] ? entry : withSlotCacheControl(entry, definitions[index]),
+  );
+}
+
+/** Order one Gemini `Tool` entry's `functionDeclarations` array when present. */
+function orderGoogleToolGroup(
+  group: unknown,
+  isOwned: (name: string) => boolean,
+): unknown {
+  if (!isRecord(group)) return group;
+  const ordered = orderDefinitionList(group["functionDeclarations"], isOwned);
+  return ordered === undefined ? group : { ...group, functionDeclarations: ordered };
+}
+
+/** Order Gemini / Vertex `config.tools[].functionDeclarations` without mutating untouched groups. */
+function orderGoogleConfigTools(
+  config: unknown,
+  isOwned: (name: string) => boolean,
+): Record<string, unknown> | undefined {
+  if (!isRecord(config) || !Array.isArray(config["tools"])) return undefined;
+  const tools = config["tools"];
+  const nextTools = tools.map((group) => orderGoogleToolGroup(group, isOwned));
+  const changed = nextTools.some((group, index) => group !== tools[index]);
+  return changed ? { ...config, tools: nextTools } : undefined;
+}
+
+/** Order Bedrock Converse `toolConfig.tools` (`{ toolSpec: { name } }`) when present. */
+function orderBedrockToolConfig(
+  toolConfig: unknown,
+  isOwned: (name: string) => boolean,
+): Record<string, unknown> | undefined {
+  if (!isRecord(toolConfig)) return undefined;
+  const ordered = orderDefinitionList(toolConfig["tools"], isOwned);
+  return ordered === undefined ? undefined : { ...toolConfig, tools: ordered };
+}
+
+/** Order nested provider tool containers: Bedrock `toolConfig.tools` or Google `config.tools`. */
+function orderNestedPayloadTools(
+  payload: Record<string, unknown>,
+  isOwned: (name: string) => boolean,
+): Record<string, unknown> | undefined {
+  const orderedToolConfig = orderBedrockToolConfig(payload["toolConfig"], isOwned);
+  if (orderedToolConfig !== undefined) return { ...payload, toolConfig: orderedToolConfig };
+
+  const orderedGoogleConfig = orderGoogleConfigTools(payload["config"], isOwned);
+  return orderedGoogleConfig === undefined ? undefined : { ...payload, config: orderedGoogleConfig };
 }
 
 /**
@@ -498,29 +568,46 @@ export class ToolBridge {
   }
 
   /**
-   * Order this bridge's tools in an outgoing provider payload the same way they are ordered in
-   * Pi's active list, and return the payload untouched when they already are. Only entries this
-   * bridge owns move, and only among the slots they already occupy — an extension's tool and
-   * Pi's reserved trailing declarations keep their positions.
+   * Re-apply this bridge's deterministic tool order to Pi's active list when owned tools have
+   * been reordered externally, and do nothing when already ordered.
    *
-   * WHY: the request's `tools` array is not built from the active list — Pi replays the
-   * transcript's tool declarations in first-appearance order and emits no delta for a pure
-   * reorder, so a server that connects after the first turn leaves its tools at the end, in
-   * connect order. Sorting the payload makes the declared tools a function of the tool set, so
-   * the prompt head stays stable across sessions and a server-side prefix cache keeps its KV
-   * entries (#278).
+   * WHY: `/tree` navigation (`session_tree`) restores active tools from the transcript's
+   * first-appearance order without re-running `refreshTools`, and another extension may call
+   * `pi.setActiveTools` between connects; re-normalizing keeps `sections.tools` in the system
+   * prompt aligned with `orderPayloadTools` without re-activating inactive tools (#278).
+   */
+  orderActiveTools(): void {
+    const current = this.pi.getActiveTools();
+    const ordered = orderOwnedEntries(
+      current,
+      (name) => name,
+      (name) => this.toolOwners.has(name),
+    );
+    if (ordered === undefined) return;
+    this.pi.setActiveTools(ordered);
+  }
+
+  /**
+   * Order this bridge's tools in an outgoing provider payload the same way they are ordered in
+   * Pi's active list — across top-level `tools` (Anthropic, OpenAI Chat Completions & Responses,
+   * Mistral), AWS Bedrock Converse `toolConfig.tools`, and Google/Vertex
+   * `config.tools[].functionDeclarations` — and return the payload untouched when they already
+   * are. Only entries this bridge owns move, and only among the slots they already occupy:
+   * another extension's tool and Pi's reserved trailing declarations (`__pi_deferred_placeholder__`,
+   * `cachePoint`, non-function Gemini tool groups) keep their positions.
+   *
+   * WHY: request tool arrays are not built from the active list — Pi replays the transcript's
+   * tool declarations in first-appearance order and emits no delta for a pure reorder, so a
+   * server that connects after the first turn leaves its tools at the end, in connect order.
+   * Sorting the payload makes the declared tools a function of the tool set, so the prompt head
+   * stays stable across sessions and a server-side prefix cache keeps its KV entries (#278).
    */
   orderPayloadTools(payload: unknown): unknown {
-    const tools = payloadToolDefinitions(payload);
-    if (tools === undefined) return payload;
-
-    const ordered = orderOwnedEntries(tools, payloadToolName, (name) => this.toolOwners.has(name));
-    if (ordered === undefined) return payload;
-
-    const withCacheControl = ordered.map((entry, index) =>
-      entry === tools[index] ? entry : withSlotCacheControl(entry, tools[index]),
-    );
-    return { ...(payload as Record<string, unknown>), tools: withCacheControl };
+    if (!isRecord(payload)) return payload;
+    const isOwned = (name: string): boolean => this.toolOwners.has(name);
+    const orderedTopLevel = orderDefinitionList(payload["tools"], isOwned);
+    if (orderedTopLevel !== undefined) return { ...payload, tools: orderedTopLevel };
+    return orderNestedPayloadTools(payload, isOwned) ?? payload;
   }
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */

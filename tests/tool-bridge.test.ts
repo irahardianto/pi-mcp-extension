@@ -1808,6 +1808,163 @@ describe("ToolBridge", () => {
     assert.equal(bridge.orderPayloadTools(undefined), undefined);
   });
 
+  it("orders Google/Vertex config.tools[].functionDeclarations and leaves non-function tool groups untouched", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    const googleSearchGroup = { googleSearch: {} };
+    const foreignRead = { name: "read", description: "Read file" };
+    const functionGroup = {
+      functionDeclarations: [
+        { name: "mcp_db_z_tool" },
+        foreignRead,
+        { name: "mcp_db_a_tool" },
+      ],
+    };
+    const payload = {
+      model: "gemini-2.5-pro",
+      contents: [],
+      config: {
+        systemInstruction: "sys",
+        tools: [googleSearchGroup, functionGroup],
+      },
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      model: string;
+      config: {
+        systemInstruction: string;
+        tools: Array<{ googleSearch?: Record<string, never>; functionDeclarations?: Array<{ name: string }> }>;
+      };
+    };
+
+    assert.equal(ordered.config.tools[0], googleSearchGroup, "non-function Gemini tool group keeps its reference");
+    assert.deepEqual(
+      ordered.config.tools[1]?.functionDeclarations?.map((decl) => decl.name),
+      ["mcp_db_a_tool", "read", "mcp_db_z_tool"],
+    );
+    assert.equal(ordered.config.tools[1]?.functionDeclarations?.[1], foreignRead);
+    assert.equal(
+      functionGroup.functionDeclarations[0]?.name,
+      "mcp_db_z_tool",
+      "The caller's Google payload is not mutated",
+    );
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered Google payload is returned as is");
+  });
+
+  it("orders AWS Bedrock Converse toolConfig.tools and keeps trailing cachePoint and toolChoice intact", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    const foreignBash = { toolSpec: { name: "bash" } };
+    const cachePoint = { cachePoint: { type: "default" } };
+    const toolChoice = { auto: {} };
+    const payload = {
+      modelId: "anthropic.claude-sonnet-4-6",
+      toolConfig: {
+        tools: [
+          { toolSpec: { name: "mcp_db_z_tool" } },
+          foreignBash,
+          { toolSpec: { name: "mcp_db_a_tool" } },
+          cachePoint,
+        ],
+        toolChoice,
+      },
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      modelId: string;
+      toolConfig: {
+        tools: Array<{ toolSpec?: { name: string }; cachePoint?: { type: string } }>;
+        toolChoice: unknown;
+      };
+    };
+
+    assert.deepEqual(ordered.toolConfig.tools, [
+      { toolSpec: { name: "mcp_db_a_tool" } },
+      foreignBash,
+      { toolSpec: { name: "mcp_db_z_tool" } },
+      cachePoint,
+    ]);
+    assert.equal(ordered.toolConfig.tools[1], foreignBash);
+    assert.equal(ordered.toolConfig.tools[3], cachePoint);
+    assert.equal(ordered.toolConfig.toolChoice, toolChoice);
+    assert.equal(
+      (payload.toolConfig.tools[0] as { toolSpec: { name: string } }).toolSpec.name,
+      "mcp_db_z_tool",
+      "The caller's Bedrock payload is not mutated",
+    );
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered Bedrock payload is returned as is");
+  });
+
+  it("re-orders active owned tools on orderActiveTools without re-activating inactive tools or writing when ordered", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    let activeTools: string[] = ["bash"];
+    let writes = 0;
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => {
+        writes += 1;
+        activeTools = names;
+      },
+    });
+    const clientFor = (name: string): Client =>
+      ({
+        request: async () => ({
+          tools: [{ name, inputSchema: { type: "object" } }],
+        }),
+      }) as unknown as Client;
+
+    await bridge.refreshTools("alpha", clientFor("a_tool"));
+    await bridge.refreshTools("beta", clientFor("b_tool"));
+    await bridge.refreshTools("gamma", clientFor("g_tool"));
+    assert.deepEqual(activeTools, ["bash", "mcp_alpha_a_tool", "mcp_beta_b_tool", "mcp_gamma_g_tool"]);
+
+    const writesAfterConnect = writes;
+    bridge.orderActiveTools();
+    assert.equal(writes, writesAfterConnect, "Already-ordered active list must not trigger setActiveTools");
+
+    // Simulate `/tree` restoring transcript first-appearance order after `beta` connected mid-session.
+    activeTools = ["bash", "mcp_alpha_a_tool", "mcp_gamma_g_tool", "mcp_beta_b_tool"];
+    bridge.orderActiveTools();
+    assert.deepEqual(activeTools, ["bash", "mcp_alpha_a_tool", "mcp_beta_b_tool", "mcp_gamma_g_tool"]);
+    assert.equal(writes, writesAfterConnect + 1);
+
+    // Simulate `/tree` navigating back to an earlier branch where `beta` was not active yet.
+    activeTools = ["mcp_gamma_g_tool", "bash", "mcp_alpha_a_tool"];
+    bridge.orderActiveTools();
+    assert.deepEqual(
+      activeTools,
+      ["mcp_alpha_a_tool", "bash", "mcp_gamma_g_tool"],
+      "Inactive server tools must stay inactive while active owned slots are ordered",
+    );
+  });
+
   it("keeps other extensions' tools in their own positions", async () => {
     let activeTools: string[] = ["bash", "read", "other_ext_tool"];
     const mockPi = {
