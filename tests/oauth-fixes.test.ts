@@ -2087,7 +2087,7 @@ describe("OAuth Security Fixes", () => {
     });
 
     it("should classify 401, 403 insufficient_scope, and wrapped protocol errors accurately without false-positiving on unrelated 401 substrings (Issues 23.3, 23.4)", async () => {
-      const { isOAuthUnauthorizedError } = await import("../src/server-manager.js");
+      const { isOAuthUnauthorizedError } = await import("../src/connect-policy.js");
       const { McpError } = await import("../src/errors.js");
 
       // True positives

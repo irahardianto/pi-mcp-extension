@@ -25,7 +25,8 @@ import assert from "node:assert/strict";
 import fc from "fast-check";
 import * as Type from "typebox";
 import type { TSchema } from "typebox";
-import { sanitizeStderrLine, isOAuthUnauthorizedError } from "../src/server-manager.js";
+import { sanitizeStderrLine } from "../src/server-manager.js";
+import { isOAuthUnauthorizedError } from "../src/connect-policy.js";
 import {
   isSafeAuthorizationUrl,
   parseCallbackUrl,
