@@ -7,6 +7,7 @@
  *   - Tool name sanitization (Pi-compatible identifiers)
  *   - Tool annotations → description hints + structured Pi `annotations`
  *   - AbortSignal → SDK's built-in cancellation (notifications/cancelled)
+ *   - notifications/progress → sanitized, redacted live tool updates + inactivity timeout reset
  *   - Protocol error vs tool execution error distinction
  *   - Activate/deactivate pattern (register once, toggle on server state change)
  *   - Images and embedded image resources → ImageContent; resource links → read hints
@@ -281,19 +282,22 @@ const PROGRESS_MESSAGE_MAX_LENGTH = 200;
  */
 export function formatProgressText(progress: Progress): string {
   const rawMessage = typeof progress.message === "string" ? progress.message : "";
-  // WHY: decide usability on the full text (`maxLength` = its own length disables truncation).
-  // `sanitizeTerminalText` appends `…` when it truncates, and that ellipsis survives `trim()`, so
-  // a long blank message would otherwise render as a blank line instead of the numeric fallback.
-  const message = sanitizeTerminalText(rawMessage, { maxLength: rawMessage.length });
-  if (message.trim().length > 0) {
+  // WHY: decide usability on the full text (`maxLength` = its own length disables truncation) and
+  // trim surrounding whitespace first. `sanitizeTerminalText` appends `…` when it truncates and
+  // turns trailing newlines into spaces, so untrimmed padding would either defeat the fallback,
+  // consume the 200-char budget into a blank `   …` row, or split dedupe across `msg` vs `msg\n`.
+  const message = sanitizeTerminalText(rawMessage, { maxLength: rawMessage.length }).trim();
+  if (message.length > 0) {
     // WHY: bound after redaction — a `[REDACTED]` mask is longer than the value it replaces, so
-    // capping first would let the emitted line grow past the budget.
+    // capping first would let the emitted line grow past the budget (or slice a token before the
+    // redactor can recognise it).
     return sanitizeTerminalText(redactSecrets(message), {
       maxLength: PROGRESS_MESSAGE_MAX_LENGTH,
     });
   }
+  const current = Number.isFinite(progress.progress) ? String(progress.progress) : "?";
   const total = Number.isFinite(progress.total) ? `/${progress.total}` : "";
-  return `Progress ${progress.progress}${total}`;
+  return `Progress ${current}${total}`;
 }
 
 /**

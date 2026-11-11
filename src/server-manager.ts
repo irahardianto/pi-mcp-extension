@@ -38,6 +38,8 @@ import {
 import { createTransport } from "./transport-factory.js";
 import {
   classifyConnectFailure,
+  isNonFatalClientError,
+  isNotificationHandlerError,
   isOAuthUnauthorizedError,
   isSdkTimeoutError,
   type ConnectFailureAction,
@@ -869,14 +871,19 @@ export class ServerManager {
       return;
     }
     const rawMsg = err instanceof Error ? err.message : String(err);
-    if (
-      /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
-        rawMsg,
-      )
-    ) {
+    const msg = sanitizeTerminalText(rawMsg);
+    if (isNonFatalClientError(rawMsg)) {
+      if (isNotificationHandlerError(rawMsg)) {
+        reportDiagnostic({
+          level: "info",
+          event: "server.notification_error",
+          server: server.name,
+          message: msg,
+          fields: { transport: server.config.transport },
+        });
+      }
       return;
     }
-    const msg = sanitizeTerminalText(rawMsg);
     if (server.config.transport === "sse") {
       reportDiagnostic({
         level: "warn",

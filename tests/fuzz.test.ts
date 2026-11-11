@@ -35,7 +35,12 @@ import {
   orderUnionMembers,
   convertJsonSchemaToTypebox,
 } from "../src/schema-convert.js";
-import { buildToolName, convertMcpContent, ToolBridge } from "../src/tool-bridge.js";
+import {
+  buildToolName,
+  convertMcpContent,
+  formatProgressText,
+  ToolBridge,
+} from "../src/tool-bridge.js";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { parseRegisteredServerConfig } from "../src/config.js";
@@ -1634,7 +1639,8 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
       fc.property(
         arbitraryString,
         fc.oneof(...credentialCarriers),
-        (raw, carrier) => {
+        fc.integer({ min: 0, max: 510 }),
+        (raw, carrier, prefixLen) => {
           const out = sanitizeServerInstructions(raw);
           if (out !== undefined) {
             assert.ok(out.length > 0 && out.length <= 500);
@@ -1642,11 +1648,63 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
             assert.equal(sanitizeServerInstructions(out), out, "Must be idempotent");
           }
 
-          const withEscapedCarrier = `\u001b[31m${carrier.text}\u001b[0m`;
+          const withEscapedCarrier = `${"x".repeat(prefixLen)} \u001b[31m${carrier.text}\u001b[0m`;
           const redacted = sanitizeServerInstructions(withEscapedCarrier);
           assert.ok(redacted !== undefined);
-          assert.equal(redacted.includes(carrier.secret), false);
+          assert.ok(redacted.length > 0 && redacted.length <= 500);
+          if (!"x".repeat(prefixLen).includes(carrier.secret)) {
+            assert.equal(redacted.includes(carrier.secret), false);
+          }
           assert.equal(sanitizeServerInstructions(redacted), redacted);
+        },
+      ),
+      testOptions(),
+    );
+  });
+
+  it("formatProgressText strips controls, masks credentials, trims padding before the 200-char bound, and is idempotent", () => {
+    const paddedMessageArb = fc.oneof(
+      arbitraryString,
+      fc
+        .tuple(fc.integer({ min: 0, max: 300 }), arbitraryString)
+        .map(([spaces, body]) => `${" ".repeat(spaces)}${body}\n`),
+    );
+
+    fc.assert(
+      fc.property(
+        fc.double(),
+        fc.option(fc.double(), { nil: undefined }),
+        fc.option(paddedMessageArb, { nil: undefined }),
+        fc.oneof(...credentialCarriers),
+        fc.integer({ min: 0, max: 210 }),
+        (progress, total, message, carrier, prefixLen) => {
+          const base = {
+            progress,
+            ...(total === undefined ? {} : { total }),
+          };
+          const out = formatProgressText({
+            ...base,
+            ...(message === undefined ? {} : { message }),
+          });
+          assert.ok(out.length > 0 && out.length <= 200);
+          assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(out));
+          assert.ok(
+            out.replace(/…$/, "").trim().length > 0,
+            `Rendered progress line must never be blank or whitespace + ellipsis: ${JSON.stringify(out)}`,
+          );
+          assert.equal(formatProgressText({ ...base, message: out }), out, "Must be idempotent");
+
+          const escapedSecretMsg = `${"x".repeat(prefixLen)} \u001b[31m${carrier.text}\u001b[0m`;
+          const redacted = formatProgressText({ progress: 1, total: 2, message: escapedSecretMsg });
+          assert.ok(redacted.length > 0 && redacted.length <= 200);
+          assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(redacted));
+          // When the carrier itself fit before truncation, none of the secret may appear; when
+          // truncation cut inside the carrier, redaction already ran first so the secret still
+          // cannot appear unless `carrier.secret` happened to match the `"x"` padding prefix.
+          if (!"x".repeat(prefixLen).includes(carrier.secret)) {
+            assert.equal(redacted.includes(carrier.secret), false);
+          }
+          assert.equal(formatProgressText({ progress: 1, total: 2, message: redacted }), redacted);
         },
       ),
       testOptions(),

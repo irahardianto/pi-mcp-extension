@@ -239,6 +239,46 @@ function readBareValue(
   return end > start ? { end, delimiter: "" } : undefined;
 }
 
+const REDACTED_MASKS: readonly string[] = [
+  "[REDACTED]",
+  '"[REDACTED]"',
+  "'[REDACTED]'",
+  '\\"[REDACTED]\\"',
+  "\\'[REDACTED]\\'",
+];
+
+const AUTH_SCHEME_NAMES: readonly string[] = [
+  "bearer",
+  "basic",
+  "digest",
+  "token",
+  "apikey",
+  "dpop",
+  "oauth",
+  "negotiate",
+];
+
+/**
+ * True when `text.slice(start)` is an already-redacted mask (or known `Authorization` scheme
+ * prefix) that post-redaction length capping sliced with a trailing `…` (`[REDACTED…`,
+ * `"[RED…`, `Authorization: Bea…`, `token=…`). Skipping it keeps `redactSecrets` + truncation
+ * idempotent without sparing any free secret characters.
+ */
+function isTruncatedRedactedTail(
+  text: string,
+  start: number,
+  terminators: Set<string>,
+): boolean {
+  if (!text.endsWith("…")) return false;
+  const body = text.slice(start, -1);
+  if (REDACTED_MASKS.some((mask) => mask.startsWith(body))) return true;
+  const lower = body.toLowerCase();
+  return (
+    terminators === AUTHORIZATION_VALUE_TERMINATORS &&
+    AUTH_SCHEME_NAMES.some((scheme) => scheme.startsWith(lower))
+  );
+}
+
 /**
  * Read the credential value that starts at `start`, honouring its opening delimiter: a quoted
  * value runs to its matching quote, a `{`/`[` value runs to its matching bracket, and an
@@ -249,6 +289,7 @@ function readCredentialValue(
   start: number,
   terminators: Set<string> = UNQUOTED_VALUE_TERMINATORS,
 ): CredentialValue | undefined {
+  if (isTruncatedRedactedTail(text, start, terminators)) return undefined;
   // An out-of-range start yields an empty opening and falls through to `readBareValue`, which
   // returns `undefined` for an empty value.
   const quote = openingQuoteAt(text, start);

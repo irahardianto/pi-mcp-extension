@@ -3085,11 +3085,12 @@ describe("MCP progress notifications", () => {
 
     captured.onProgress?.({ progress: 1, total: 3, message: "compiling" });
     captured.onProgress?.({ progress: 1, total: 3, message: "compiling" });
+    captured.onProgress?.({ progress: 1, total: 3, message: "compiling\n" });
     captured.onProgress?.({ progress: 2, total: 3 });
     assert.deepEqual(
       updates.map((u) => u.content[0]?.text),
       ["compiling", "Progress 2/3"],
-      "each distinct line reaches Pi once, and a repeated line does not re-render the row",
+      "each distinct line reaches Pi once, and a repeated or trailing-newline line does not re-render the row",
     );
   });
 
@@ -3121,6 +3122,8 @@ describe("MCP progress notifications", () => {
       "Progress 4/10",
     );
     assert.equal(formatProgressText({ progress: 5, total: Number.NaN }), "Progress 5");
+    assert.equal(formatProgressText({ progress: Number.NaN, total: 10 }), "Progress ?/10");
+    assert.equal(formatProgressText({ progress: Number.POSITIVE_INFINITY }), "Progress ?");
     // WHY: the sanitizer appends `…` when it truncates, so a long blank message must be judged
     // on its untruncated text — otherwise the fallback never fires and the row renders blank.
     // 300 and 600 spaces straddle the sanitizer's default 500-char budget, which is where its
@@ -3132,6 +3135,17 @@ describe("MCP progress notifications", () => {
     assert.equal(
       formatProgressText({ progress: 7, total: 10, message: " ".repeat(600) }),
       "Progress 7/10",
+    );
+  });
+
+  it("trims surrounding whitespace before capping so padded messages keep their text", () => {
+    assert.equal(
+      formatProgressText({ progress: 3, total: 10, message: `${" ".repeat(250)}Deploying\n` }),
+      "Deploying",
+    );
+    assert.equal(
+      formatProgressText({ progress: 3, total: 10, message: "  Step 1/5\r\n" }),
+      "Step 1/5",
     );
   });
 
