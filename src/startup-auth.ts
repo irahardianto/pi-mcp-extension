@@ -8,8 +8,8 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { redactSecrets } from "./debug-log.js";
 import { McpError, AuthCancelledError } from "./errors.js";
+import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
 export const startupAuthNowOption = "Authorize now";

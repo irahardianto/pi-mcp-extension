@@ -19,7 +19,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { AuthCancelledError, McpError } from "./errors.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
-import { redactSecrets, reportDiagnostic } from "./debug-log.js";
+import { reportDiagnostic } from "./debug-log.js";
+import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────

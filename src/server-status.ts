@@ -8,10 +8,11 @@
  */
 
 import type { ServerConfig } from "./config.js";
-import { describeError, redactSecrets, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
+import { describeError, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
 import { McpError } from "./errors.js";
 import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
 import type { ManagedServer } from "./server-manager.js";
+import { redactSecrets } from "./secret-redaction.js";
 import {
   formatProjectConfigNote,
   formatServerSource,

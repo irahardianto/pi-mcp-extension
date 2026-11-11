@@ -43,4 +43,5 @@
 # Diagnostic log file writer, field allow-listing, and secret redaction
 /src/debug-log.ts @irahardianto
 /src/debug-log-format.ts @irahardianto
+/src/secret-redaction.ts @irahardianto
 /src/terminal-text.ts @irahardianto
