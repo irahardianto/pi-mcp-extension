@@ -2,6 +2,16 @@
  * Pure URL validation and parsing helpers for MCP OAuth authorization and callbacks.
  */
 
+export const DEFAULT_PORT = 19876;
+export const DEFAULT_HOST = "127.0.0.1";
+export const CALLBACK_PATH = "/callback";
+
+export interface CallbackServerConfig {
+  preferredPort: number;
+  host: string;
+  allowPortFallback: boolean;
+}
+
 export type CallbackUrlValidationReason =
   | "invalid_url"
   | "wrong_origin"
@@ -32,6 +42,58 @@ export function isLocalCallbackHost(hostname: string): boolean {
     hostname === "::1" ||
     hostname === "[::1]"
   );
+}
+
+/**
+ * Build callback server settings from the configured OAuth redirect URL.
+ *
+ * Local HTTP redirect URLs must use a fixed listener port because OAuth
+ * providers require exact redirect URI registration. When no local redirect URL
+ * is configured, the callback server keeps the historical default behavior and
+ * scans forward from the default port if needed.
+ */
+export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): CallbackServerConfig {
+  // WHY: Only treat `undefined` (omitted) as default; an explicit empty string `""`
+  // must fall through to `new URL("")` and throw a validation error.
+  if (redirectUrl === undefined) {
+    return {
+      preferredPort: DEFAULT_PORT,
+      host: DEFAULT_HOST,
+      allowPortFallback: true,
+    };
+  }
+
+  const url = new URL(redirectUrl);
+  if (url.protocol !== "http:" || !isLocalCallbackHost(url.hostname)) {
+    throw new Error("Manual OAuth redirect URL must use HTTP with localhost, 127.0.0.1, or ::1");
+  }
+
+  if (url.hash) {
+    throw new Error("Manual OAuth redirect URL must not include a fragment");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("Manual OAuth redirect URL must not include credentials");
+  }
+
+  if (url.pathname !== CALLBACK_PATH) {
+    throw new Error(`Local OAuth redirect URL must use path ${CALLBACK_PATH}`);
+  }
+
+  if (!url.port) {
+    throw new Error("Manual OAuth redirect URL must include an explicit port (e.g. http://127.0.0.1:19876/callback)");
+  }
+
+  const preferredPort = Number(url.port);
+  if (preferredPort === 0) {
+    throw new Error("Manual OAuth redirect URL must use a fixed non-zero port");
+  }
+
+  return {
+    preferredPort,
+    host: url.hostname === "[::1]" ? "::1" : url.hostname,
+    allowPortFallback: false,
+  };
 }
 
 /**
@@ -72,8 +134,8 @@ function expectedRedirectUrl(redirectUrl: string | URL): URL {
 /** Reject a callback URL whose origin or path differs from the configured redirect URL. */
 function assertRedirectTargetMatches(url: URL, redirectUrl: string | URL | undefined): void {
   if (redirectUrl === undefined) {
-    if (url.pathname !== "/callback") {
-      throw new CallbackUrlValidationError("wrong_path", "Redirect URL path must be /callback");
+    if (url.pathname !== CALLBACK_PATH) {
+      throw new CallbackUrlValidationError("wrong_path", `Redirect URL path must be ${CALLBACK_PATH}`);
     }
     return;
   }

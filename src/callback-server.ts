@@ -8,17 +8,18 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
 import type { Socket } from "net";
 import { URL } from "url";
-import { CallbackUrlValidationError, isLocalCallbackHost, parseCallbackUrl } from "./callback-url.js";
+import {
+  CallbackUrlValidationError,
+  DEFAULT_HOST,
+  DEFAULT_PORT,
+  parseCallbackUrl,
+} from "./callback-url.js";
 
 interface PendingAuth {
   resolve: (code: string) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
-
-const DEFAULT_PORT = 19876;
-const DEFAULT_HOST = "127.0.0.1";
-const CALLBACK_PATH = "/callback";
 
 export interface CallbackServerOptions {
   /** Host to bind. Defaults to 127.0.0.1 for local-only callbacks. */
@@ -27,11 +28,6 @@ export interface CallbackServerOptions {
   allowPortFallback?: boolean | undefined;
 }
 
-export interface CallbackServerConfig {
-  preferredPort: number;
-  host: string;
-  allowPortFallback: boolean;
-}
 const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 const HTML_SUCCESS = `<!DOCTYPE html>
@@ -69,58 +65,6 @@ function escapeHtml(text: string): string {
  */
 function isAddressInUseError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "EADDRINUSE";
-}
-
-/**
- * Build callback server settings from the configured OAuth redirect URL.
- *
- * Local HTTP redirect URLs must use a fixed listener port because OAuth
- * providers require exact redirect URI registration. When no local redirect URL
- * is configured, the callback server keeps the historical default behavior and
- * scans forward from the default port if needed.
- */
-export function callbackServerConfigFromRedirectUrl(redirectUrl?: string): CallbackServerConfig {
-  // WHY: Only treat `undefined` (omitted) as default; an explicit empty string `""`
-  // must fall through to `new URL("")` and throw a validation error.
-  if (redirectUrl === undefined) {
-    return {
-      preferredPort: DEFAULT_PORT,
-      host: DEFAULT_HOST,
-      allowPortFallback: true,
-    };
-  }
-
-  const url = new URL(redirectUrl);
-  if (url.protocol !== "http:" || !isLocalCallbackHost(url.hostname)) {
-    throw new Error("Manual OAuth redirect URL must use HTTP with localhost, 127.0.0.1, or ::1");
-  }
-
-  if (url.hash) {
-    throw new Error("Manual OAuth redirect URL must not include a fragment");
-  }
-
-  if (url.username || url.password) {
-    throw new Error("Manual OAuth redirect URL must not include credentials");
-  }
-
-  if (url.pathname !== CALLBACK_PATH) {
-    throw new Error(`Local OAuth redirect URL must use path ${CALLBACK_PATH}`);
-  }
-
-  if (!url.port) {
-    throw new Error("Manual OAuth redirect URL must include an explicit port (e.g. http://127.0.0.1:19876/callback)");
-  }
-
-  const preferredPort = Number(url.port);
-  if (preferredPort === 0) {
-    throw new Error("Manual OAuth redirect URL must use a fixed non-zero port");
-  }
-
-  return {
-    preferredPort,
-    host: url.hostname === "[::1]" ? "::1" : url.hostname,
-    allowPortFallback: false,
-  };
 }
 
 /**
@@ -385,5 +329,6 @@ export class CallbackServer {
   }
 }
 
-// Export constants for testing/config
-export { DEFAULT_PORT, DEFAULT_HOST, CALLBACK_PATH, TIMEOUT_MS };
+// Export constants and pure redirect-URL config builder for backwards compatibility
+export { DEFAULT_PORT, DEFAULT_HOST, TIMEOUT_MS };
+export { CALLBACK_PATH, callbackServerConfigFromRedirectUrl, type CallbackServerConfig } from "./callback-url.js";
