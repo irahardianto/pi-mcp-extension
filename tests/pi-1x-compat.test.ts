@@ -6,6 +6,18 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
 import type { RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
+import {
+  applyProjectOverrides,
+  isPlainObject,
+  isProjectOverrideEntry,
+  normalizeAuthConfigAliases,
+  normalizeServerConfigAliases,
+  PROJECT_OVERRIDE_KEYS,
+  withRegisteredServerLifecycle,
+} from "../src/config-compat.js";
+import * as callbackUrl from "../src/callback-url.js";
+import * as callbackServer from "../src/callback-server.js";
+import { McpError } from "../src/errors.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 const mockServerPath = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
@@ -316,3 +328,255 @@ describe("Pi 1.x trust boundary and extension compatibility", () => {
     }
   });
 });
+
+describe("config-compat pure alias normalizers and project override merger", () => {
+  it("narrows plain JSON objects via isPlainObject", () => {
+    assert.equal(isPlainObject({ a: 1 }), true);
+    assert.equal(isPlainObject({}), true);
+    assert.equal(isPlainObject(null), false);
+    assert.equal(isPlainObject(undefined), false);
+    assert.equal(isPlainObject(["a"]), false);
+    assert.equal(isPlainObject("str"), false);
+    assert.equal(isPlainObject(42), false);
+  });
+
+  it("normalizes OAuth callbackUrl and callbackPort aliases without mutating the input", () => {
+    assert.equal(normalizeAuthConfigAliases(null), null);
+    assert.equal(normalizeAuthConfigAliases("oauth"), "oauth");
+    const arr = ["a"];
+    assert.equal(normalizeAuthConfigAliases(arr), arr);
+
+    const withCallbackUrl = Object.freeze({
+      callbackUrl: "http://localhost:19876/callback",
+      callbackPort: 29999,
+      scope: "read",
+    });
+    assert.deepEqual(normalizeAuthConfigAliases(withCallbackUrl), {
+      redirectUrl: "http://localhost:19876/callback",
+      scope: "read",
+    });
+
+    assert.deepEqual(normalizeAuthConfigAliases({ callbackPort: 24000 }), {
+      redirectUrl: "http://127.0.0.1:24000/callback",
+    });
+
+    assert.deepEqual(normalizeAuthConfigAliases({ callbackUrl: null, callbackPort: 24001 }), {
+      redirectUrl: "http://127.0.0.1:24001/callback",
+    });
+
+    // Non-string callbackUrl without callbackPort forwards to redirectUrl so Zod rejects it
+    assert.deepEqual(normalizeAuthConfigAliases({ callbackUrl: 12345 }), {
+      redirectUrl: 12345,
+    });
+
+    // Explicit redirectUrl wins while legacy keys are stripped
+    assert.deepEqual(
+      normalizeAuthConfigAliases({
+        redirectUrl: "http://127.0.0.1:19876/callback",
+        callbackUrl: "http://127.0.0.1:20000/callback",
+        callbackPort: 20001,
+      }),
+      { redirectUrl: "http://127.0.0.1:19876/callback" },
+    );
+  });
+
+  it("normalizes Pi 1.x server aliases (type/http/url, oauth, timeout, enabled) without mutating the input", () => {
+    assert.equal(normalizeServerConfigAliases(undefined), undefined);
+    assert.equal(normalizeServerConfigAliases(123), 123);
+    const arr = [1, 2];
+    assert.equal(normalizeServerConfigAliases(arr), arr);
+
+    const legacyHttp = Object.freeze({
+      type: "http",
+      url: "https://mcp.example.com/mcp",
+      oauth: { clientId: "cid" },
+      timeout: 15,
+      lifecycle: "eager",
+      enabled: false,
+    });
+    assert.deepEqual(normalizeServerConfigAliases(legacyHttp), {
+      type: "http",
+      transport: "streamable-http",
+      url: "https://mcp.example.com/mcp",
+      oauth: { clientId: "cid" },
+      auth: { clientId: "cid" },
+      timeout: 15,
+      requestTimeoutMs: 15000,
+      lifecycle: "lazy",
+      enabled: false,
+    });
+
+    // Explicit transport/auth/requestTimeoutMs win over legacy aliases
+    assert.deepEqual(
+      normalizeServerConfigAliases({
+        transport: "sse",
+        type: "stdio",
+        auth: { scope: "primary" },
+        oauth: { scope: "legacy" },
+        requestTimeoutMs: 5000,
+        timeout: 60,
+        enabled: true,
+        lifecycle: "eager",
+      }),
+      {
+        transport: "sse",
+        type: "stdio",
+        auth: { scope: "primary" },
+        oauth: { scope: "legacy" },
+        requestTimeoutMs: 5000,
+        timeout: 60,
+        enabled: true,
+        lifecycle: "eager",
+      },
+    );
+
+    // `type` other than "http" maps to `transport` when `transport` is omitted
+    assert.deepEqual(normalizeServerConfigAliases({ type: "sse", url: "https://example.com/sse" }), {
+      type: "sse",
+      transport: "sse",
+      url: "https://example.com/sse",
+    });
+
+    // `url` without `command` or `type`/`transport` infers `streamable-http`; `url` + `command` does not
+    assert.deepEqual(normalizeServerConfigAliases({ url: "https://example.com/mcp" }), {
+      url: "https://example.com/mcp",
+      transport: "streamable-http",
+    });
+    assert.deepEqual(normalizeServerConfigAliases({ command: "node", url: "https://example.com/mcp" }), {
+      command: "node",
+      url: "https://example.com/mcp",
+    });
+
+    // Non-object `oauth` and non-positive / non-numeric `timeout` are ignored by alias normalizers
+    assert.deepEqual(normalizeServerConfigAliases({ command: "node", oauth: ["bad"], timeout: 0 }), {
+      command: "node",
+      oauth: ["bad"],
+      timeout: 0,
+    });
+  });
+
+  it("applies extension-registered server lifecycle defaults via withRegisteredServerLifecycle", () => {
+    assert.equal(withRegisteredServerLifecycle(null), null);
+    const explicitLazy = { command: "node", lifecycle: "lazy" };
+    assert.equal(withRegisteredServerLifecycle(explicitLazy), explicitLazy);
+
+    assert.deepEqual(withRegisteredServerLifecycle({ command: "node" }), {
+      command: "node",
+      lifecycle: "eager",
+    });
+    assert.deepEqual(withRegisteredServerLifecycle({ command: "node", enabled: false }), {
+      command: "node",
+      enabled: false,
+      lifecycle: "lazy",
+    });
+  });
+
+  it("detects and merges partial Pi 1.3.0 project override entries via applyProjectOverrides", () => {
+    assert.deepEqual(PROJECT_OVERRIDE_KEYS, ["enabled", "exposure", "toolExposure", "lifecycle"]);
+    assert.equal(isProjectOverrideEntry(null), false);
+    assert.equal(isProjectOverrideEntry({ enabled: false }), true);
+    assert.equal(isProjectOverrideEntry({ command: "node", enabled: false }), false);
+    assert.equal(isProjectOverrideEntry({ url: "https://example.com/mcp" }), false);
+    assert.equal(isProjectOverrideEntry({ type: "stdio" }), false);
+    assert.equal(isProjectOverrideEntry({ transport: "sse" }), false);
+
+    // Non-object or mcpServers-less project config passes through untouched
+    assert.equal(applyProjectOverrides("raw", {}, "/proj/.pi/mcp.json"), "raw");
+    const noServers = { settings: { maxRetries: 1 } };
+    assert.equal(applyProjectOverrides(noServers, {}, "/proj/.pi/mcp.json"), noServers);
+
+    // Lifecycle override without `enabled` clears inherited `enabled: false` on global base
+    const globalRaw = Object.freeze({
+      mcpServers: Object.freeze({
+        svc: Object.freeze({ command: "node", args: ["a.js"], enabled: false }),
+      }),
+    });
+    const projectRaw = Object.freeze({
+      mcpServers: Object.freeze({
+        svc: Object.freeze({ lifecycle: "eager", exposure: "direct" }),
+        local_full: Object.freeze({ command: "python", args: ["srv.py"] }),
+      }),
+    });
+    assert.deepEqual(applyProjectOverrides(projectRaw, globalRaw, "/proj/.pi/mcp.json"), {
+      mcpServers: {
+        svc: { command: "node", args: ["a.js"], lifecycle: "eager", exposure: "direct" },
+        local_full: { command: "python", args: ["srv.py"] },
+      },
+    });
+
+    // Missing global target or non-object globalRaw throws McpError("config") naming projectPath
+    assert.throws(
+      () => applyProjectOverrides({ mcpServers: { ghost: { enabled: false } } }, undefined, "/proj/.pi/mcp.json"),
+      (err: unknown) =>
+        err instanceof McpError &&
+        err.code === "config" &&
+        err.message.includes("/proj/.pi/mcp.json") &&
+        err.message.includes("mcpServers.ghost"),
+    );
+
+    // Unsupported override keys throw McpError("config")
+    assert.throws(
+      () =>
+        applyProjectOverrides(
+          { mcpServers: { svc: { enabled: false, env: { A: "1" } } } },
+          globalRaw,
+          "/proj/.pi/mcp.json",
+        ),
+      (err: unknown) =>
+        err instanceof McpError &&
+        err.code === "config" &&
+        err.message.includes("/proj/.pi/mcp.json") &&
+        err.message.includes("found env"),
+    );
+  });
+});
+
+describe("callback-url pure redirect URL config validation and callback-server re-exports", () => {
+  it("owns callbackServerConfigFromRedirectUrl in callback-url.ts and re-exports identical bindings from callback-server.ts", () => {
+    assert.equal(
+      callbackServer.callbackServerConfigFromRedirectUrl,
+      callbackUrl.callbackServerConfigFromRedirectUrl,
+    );
+    assert.equal(callbackServer.DEFAULT_PORT, callbackUrl.DEFAULT_PORT);
+    assert.equal(callbackServer.DEFAULT_HOST, callbackUrl.DEFAULT_HOST);
+    assert.equal(callbackServer.CALLBACK_PATH, callbackUrl.CALLBACK_PATH);
+
+    assert.deepEqual(callbackUrl.callbackServerConfigFromRedirectUrl(undefined), {
+      preferredPort: 19876,
+      host: "127.0.0.1",
+      allowPortFallback: true,
+    });
+    assert.deepEqual(callbackUrl.callbackServerConfigFromRedirectUrl("http://[::1]:23456/callback"), {
+      preferredPort: 23456,
+      host: "::1",
+      allowPortFallback: false,
+    });
+
+    assert.throws(() => callbackUrl.callbackServerConfigFromRedirectUrl(""), /Invalid URL/);
+    assert.throws(
+      () => callbackUrl.callbackServerConfigFromRedirectUrl("https://127.0.0.1:19876/callback"),
+      /must use HTTP with localhost, 127\.0\.0\.1, or ::1/,
+    );
+    assert.throws(
+      () => callbackUrl.callbackServerConfigFromRedirectUrl("http://127.0.0.1:19876/callback#frag"),
+      /must not include a fragment/,
+    );
+    assert.throws(
+      () => callbackUrl.callbackServerConfigFromRedirectUrl("http://user:pass@127.0.0.1:19876/callback"),
+      /must not include credentials/,
+    );
+    assert.throws(
+      () => callbackUrl.callbackServerConfigFromRedirectUrl("http://127.0.0.1:19876/other"),
+      /must use path \/callback/,
+    );
+    assert.throws(
+      () => callbackUrl.callbackServerConfigFromRedirectUrl("http://127.0.0.1/callback"),
+      /must include an explicit port/,
+    );
+    assert.throws(
+      () => callbackUrl.callbackServerConfigFromRedirectUrl("http://127.0.0.1:0/callback"),
+      /must use a fixed non-zero port/,
+    );
+  });
+});
+
