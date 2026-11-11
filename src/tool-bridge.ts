@@ -88,6 +88,23 @@ function payloadToolDefinitions(payload: unknown): unknown[] | undefined {
 }
 
 /**
+ * Keep a slot's `cache_control` breakpoint on that slot when another tool definition moves into
+ * it: Pi's Anthropic and OpenAI-completions adapters attach `cache_control` to the last tool
+ * slot before `before_provider_request` runs, so moving that object earlier would strand later
+ * tools outside the cached prefix and diverge from a session that started in sorted order.
+ */
+function withSlotCacheControl(entry: unknown, slotEntry: unknown): unknown {
+  const entryRecord = entry as Record<string, unknown>;
+  const slotCache = (slotEntry as { cache_control?: unknown }).cache_control;
+  if (entryRecord["cache_control"] === slotCache) return entry;
+  if (slotCache === undefined) {
+    const { cache_control: _dropped, ...rest } = entryRecord;
+    return rest;
+  }
+  return { ...entryRecord, cache_control: slotCache };
+}
+
+/**
  * Sort the entries `isOwned` selects into name order inside the slots they already occupy, and
  * return `undefined` when the result is identical to `entries`.
  *
@@ -149,10 +166,10 @@ function compareToolsForNameAssignment(a: McpToolDefinition, b: McpToolDefinitio
 
 /**
  * Order a server's tools for Pi-name assignment. The server's own `tools/list` order is kept —
- * so registration order, and the tool order Pi shows the model, only move where they must —
- * except that tools competing for the same unhashed identifier are emitted as one deterministic
- * group in the position of the group's first member. Which tool the server listed first is not
- * part of the MCP contract, so it must not decide who wins that identifier (#213).
+ * so registration order only moves where it must — except that tools competing for the same
+ * unhashed identifier are emitted as one deterministic group in the position of the group's
+ * first member. Which tool the server listed first is not part of the MCP contract, so it must
+ * not decide who wins that identifier (#213).
  */
 function orderToolsForNameAssignment(
   prefix: string,
@@ -498,7 +515,12 @@ export class ToolBridge {
     if (tools === undefined) return payload;
 
     const ordered = orderOwnedEntries(tools, payloadToolName, (name) => this.toolOwners.has(name));
-    return ordered === undefined ? payload : { ...(payload as Record<string, unknown>), tools: ordered };
+    if (ordered === undefined) return payload;
+
+    const withCacheControl = ordered.map((entry, index) =>
+      entry === tools[index] ? entry : withSlotCacheControl(entry, tools[index]),
+    );
+    return { ...(payload as Record<string, unknown>), tools: withCacheControl };
   }
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */

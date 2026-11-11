@@ -60,12 +60,13 @@ flowchart TD
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
-  server connects and disconnects. Each reconcile writes the active set once, with other
-  extensions' tools in their existing order followed by the bridge's tools sorted by Pi name,
-  and the same order is applied to the outgoing request's `tools` array in
-  `before_provider_request` — Pi builds that array from the transcript's first-appearance
-  order, which a pure reorder never updates. The order is therefore a function of the tool set
-  rather than eager-connect timing (#278).
+  server connects and disconnects. Each reconcile writes the active set once, with the
+  bridge's tools sorted by Pi name among the slots they occupy and every other extension's
+  tool left at its position, and the same order is applied to the outgoing request's `tools`
+  array in `before_provider_request` (keeping any slot-level `cache_control` breakpoint on its
+  slot) — Pi builds that array from the transcript's first-appearance order, which a pure
+  reorder never updates. The order is therefore a function of the tool set rather than
+  eager-connect timing (#278).
 - **ResourceBridge** lazily caches each server's `resources/list` + `resources/templates/list`
   catalog (invalidated by `notifications/resources/list_changed` and dropped on stop or
   removal) and converts `resources/read` payloads into Pi text/image content blocks.

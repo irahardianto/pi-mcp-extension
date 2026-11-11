@@ -1577,36 +1577,50 @@ describe("ToolBridge", () => {
 
   it("orders bridged tools deterministically when concurrent connects finish in either order", async () => {
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
-    const clientWith = (names: string[]) =>
-      ({
-        request: async () => ({
-          tools: names.map((name) => ({ name, inputSchema: { type: "object" } })),
-        }),
-      }) as unknown as Client;
-    const connectAfter = async (
-      delayMs: number,
-      server: string,
-      bridge: ToolBridge,
-    ): Promise<void> => {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-      await bridge.refreshTools(server, clientWith(["one", "two"]));
+    const deferredClient = (names: string[]) => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const client = {
+        request: async () => {
+          await gate;
+          return {
+            tools: names.map((name) => ({ name, inputSchema: { type: "object" } })),
+          };
+        },
+      } as unknown as Client;
+      return { client, release };
     };
-    const connectBoth = async (alphaDelayMs: number): Promise<string[]> => {
+    const connectBoth = async (first: "alpha" | "beta"): Promise<string[]> => {
       let activeTools: string[] = [];
       const bridge = new ToolBridge(settings, {
         registerTool: () => {},
         getActiveTools: () => activeTools,
         setActiveTools: (names: string[]) => { activeTools = names; },
       });
-      await Promise.all([
-        connectAfter(alphaDelayMs, "alpha", bridge),
-        connectAfter(20 - alphaDelayMs, "beta", bridge),
+      const alpha = deferredClient(["one", "two"]);
+      const beta = deferredClient(["one", "two"]);
+      // Both refreshTools calls start together and wait on their in-flight tools/list requests.
+      const pending = Promise.all([
+        bridge.refreshTools("alpha", alpha.client),
+        bridge.refreshTools("beta", beta.client),
       ]);
+      if (first === "alpha") {
+        alpha.release();
+        await Promise.resolve();
+        beta.release();
+      } else {
+        beta.release();
+        await Promise.resolve();
+        alpha.release();
+      }
+      await pending;
       return activeTools;
     };
 
-    const alphaFirst = await connectBoth(0);
-    const betaFirst = await connectBoth(20);
+    const alphaFirst = await connectBoth("alpha");
+    const betaFirst = await connectBoth("beta");
 
     assert.deepEqual(
       alphaFirst,
@@ -1721,7 +1735,7 @@ describe("ToolBridge", () => {
     );
   });
 
-  it("keeps Pi's reserved trailing declaration in place", async () => {
+  it("keeps Pi's reserved trailing declaration and slot cache_control in place", async () => {
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     let activeTools: string[] = [];
     const bridge = new ToolBridge(settings, {
@@ -1738,21 +1752,33 @@ describe("ToolBridge", () => {
       }),
     } as unknown as Client);
 
-    // Pi appends this placeholder last on Anthropic models with native tool changes and expects
-    // it to stay there; it is not ours to move.
+    // Pi attaches `cache_control` to the last non-placeholder tool slot and appends
+    // `__pi_deferred_placeholder__` after it on Anthropic models with native tool changes.
+    // Reordering must keep the placeholder last AND keep `cache_control` anchored on slot 1
+    // so the reordered payload matches a session that started in sorted order.
+    const cacheControl = { type: "ephemeral" };
     const placeholder = { name: "__pi_deferred_placeholder__", defer_loading: true };
+    const aWithCache = { name: "mcp_db_a_tool", cache_control: cacheControl };
     const payload = {
-      tools: [{ name: "mcp_db_z_tool" }, { name: "mcp_db_a_tool" }, placeholder],
+      tools: [{ name: "mcp_db_z_tool" }, aWithCache, placeholder],
     };
 
-    const ordered = bridge.orderPayloadTools(payload) as { tools: Array<{ name: string }> };
+    const ordered = bridge.orderPayloadTools(payload) as {
+      tools: Array<{ name: string; cache_control?: unknown }>;
+    };
 
-    assert.deepEqual(ordered.tools.map((tool) => tool.name), [
-      "mcp_db_a_tool",
-      "mcp_db_z_tool",
-      "__pi_deferred_placeholder__",
+    assert.deepEqual(ordered.tools, [
+      { name: "mcp_db_a_tool" },
+      { name: "mcp_db_z_tool", cache_control: cacheControl },
+      placeholder,
     ]);
+    assert.equal("cache_control" in (ordered.tools[0] ?? {}), false);
     assert.equal(ordered.tools[2], placeholder);
+    assert.deepEqual(
+      aWithCache,
+      { name: "mcp_db_a_tool", cache_control: cacheControl },
+      "The caller's tool definition is not mutated",
+    );
   });
 
   it("leaves an already ordered payload, and a payload without tools, untouched", async () => {
