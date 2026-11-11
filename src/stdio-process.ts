@@ -599,3 +599,69 @@ export async function ensurePidTerminated(
 
   await escalateToSigkill(pid, descendants, d);
 }
+
+// ─── Teardown ─────────────────────────────────────────────────────────────────
+
+/**
+ * Narrow an unknown candidate to a positive integer OS PID (`> 0`).
+ *
+ * WHY: `process.kill(0, sig)` signals the caller's entire process group and `kill(-1, sig)`
+ * signals every process of the current uid, so only positive integer PIDs are valid targets.
+ */
+function asPositivePid(pid: unknown): number | null {
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/**
+ * The PID to tear down for a stdio transport, from the most to the least authoritative source.
+ *
+ * WHY: `server.childPid` is normally set at spawn time, but it is not the only place the PID
+ * can come from — the instrumented record outlives `_process` (which
+ * `StdioClientTransport.close()` clears synchronously), and a transport we never instrumented
+ * still exposes `pid`. Resolving all of them in one place is what keeps a connect cleanup and a
+ * shutdown from disagreeing about which process they own.
+ */
+export function resolveTransportPid(
+  recordedPid: number | null | undefined,
+  transport: object | null | undefined,
+): number | null {
+  const recorded = asPositivePid(recordedPid);
+  if (!transport) return recorded;
+  const record = childRecords.get(transport);
+  // WHY: once the child we spawned has closed, every PID reachable from this transport belongs
+  // to a process that has already exited — and a released PID can be recycled to an unrelated
+  // process under the same uid, which teardown would then signal. That covers `recordedPid`
+  // too: `server.childPid` is never cleared when the child exits on its own (crash → onclose →
+  // _recover → _shutdown passes it here). Nothing that used to work is lost: a dead root ends
+  // `ensurePidTerminated` at its ESRCH liveness probe before any descendant is walked.
+  if (record?.closed) return null;
+  const internal = (transport as { _process?: { pid?: unknown } })._process;
+  const exposed = (transport as { pid?: unknown }).pid;
+  return (
+    recorded ??
+    asPositivePid(record?.process.pid) ??
+    asPositivePid(internal?.pid) ??
+    asPositivePid(exposed)
+  );
+}
+
+/**
+ * Terminate the stdio child process tree, then release the child's pipe handles.
+ *
+ * WHY: `client.close()` waits for the child's `'close'` event, which never fires while a
+ * leaked grandchild still holds the inherited stdout/stderr write ends — the SDK then
+ * burns its full 2 × 2,000ms escalation budget. Killing the tree first and destroying the
+ * pipes afterwards keeps teardown bounded even if a descendant escaped the tree kill.
+ */
+export async function terminateStdioTree(
+  pid: number | null,
+  transport: object | null | undefined,
+  deps?: Partial<StdioProcessDeps>,
+): Promise<void> {
+  try {
+    await ensurePidTerminated(pid, deps);
+    await waitForChildClose(transport);
+  } finally {
+    destroyStdioStreams(transport);
+  }
+}
