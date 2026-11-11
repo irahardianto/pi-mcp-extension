@@ -22,7 +22,27 @@ import {
   type AuthLockHandle,
 } from "./auth-lock.js";
 import {
-  canonicalServerUrl,
+  applyStoredStateInvalidation,
+  assertIssuerBindingCompatible,
+  buildInteractiveStoredClientInfo,
+  buildNewSilentStoredClientInfo,
+  buildOAuthClientMetadata,
+  buildStaticClientInformation,
+  DEFAULT_CALLBACK_PORT,
+  DEFAULT_REDIRECT_URL,
+  hasRedirectUriMismatch,
+  isClientSecretExpired,
+  isPeerRotatedTokens,
+  mergeSilentStoredClientInfo,
+  resolveProviderRedirectUrl,
+  stampStateServerUrl,
+  toOAuthClientInformation,
+  toOAuthTokens,
+  toStoredTokens,
+  type AuthConfig,
+  type InvalidationScope,
+} from "./oauth-policy.js";
+import {
   loadState,
   loadStoredRedirectUrisSync,
   saveState,
@@ -33,129 +53,7 @@ import {
 import { describeError, reportDiagnostic } from "./debug-log.js";
 
 export { acquireAuthLock, AuthLockError, AuthRequiredError, type AcquireAuthLockOptions, type AuthLockHandle };
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-/** Auth config in mcp.json server entry. Matches the Zod AuthConfigSchema in config.ts. */
-export interface AuthConfig {
-  /** Auth type. Currently only "oauth" is supported. */
-  type?: "oauth" | undefined;
-  /**
-   * Callback URL the OAuth server redirects to after authorization.
-   * Default: auto-detected local callback server.
-   */
-  redirectUrl?: string | undefined;
-  /**
-   * Optional scope to request during authorization.
-   */
-  scope?: string | undefined;
-  /**
-   * Pre-registered client_id (skip dynamic client registration).
-   */
-  clientId?: string | undefined;
-  /**
-   * Pre-registered client_secret.
-   */
-  clientSecret?: string | undefined;
-  /** `client_name` sent with Dynamic Client Registration. Default: `pi-mcp/<server name>`. */
-  clientName?: string | undefined;
-}
-
-const DEFAULT_CALLBACK_PORT = 19876;
-const DEFAULT_REDIRECT_URL = `http://127.0.0.1:${DEFAULT_CALLBACK_PORT}/callback`;
-
-// ─── Pure Client-Information Helpers ──────────────────────────────────────────
-
-interface ClientInformationExtras {
-  client_id_issued_at: number;
-  client_secret_expires_at: number;
-  token_endpoint_auth_method: string;
-  redirect_uris: Array<string | URL>;
-}
-
-function isClientSecretExpired(info: StoredClientInfo): boolean {
-  if (info.client_secret === undefined) return false;
-  if (typeof info.client_secret_expires_at !== "number") return false;
-  if (info.client_secret_expires_at <= 0) return false;
-  return info.client_secret_expires_at * 1000 <= Date.now();
-}
-
-function hasRedirectUriMismatch(info: StoredClientInfo, redirectUrl: string): boolean {
-  if (!Array.isArray(info.redirect_uris) || info.redirect_uris.length === 0) return false;
-  return !info.redirect_uris.includes(redirectUrl);
-}
-
-function toOAuthClientInformation(info: StoredClientInfo): OAuthClientInformationMixed {
-  return {
-    client_id: info.client_id,
-    ...(info.client_secret !== undefined && { client_secret: info.client_secret }),
-    ...(info.client_id_issued_at !== undefined && { client_id_issued_at: info.client_id_issued_at }),
-    ...(info.client_secret_expires_at !== undefined && {
-      client_secret_expires_at: info.client_secret_expires_at,
-    }),
-    ...(info.token_endpoint_auth_method !== undefined && {
-      token_endpoint_auth_method: info.token_endpoint_auth_method,
-    }),
-    ...(info.redirect_uris !== undefined && { redirect_uris: info.redirect_uris }),
-    ...(info.issuer !== undefined && { issuer: info.issuer }),
-  };
-}
-
-function withoutStaticClientId<T>(hasStaticClientId: boolean, value: T | undefined): T | undefined {
-  return hasStaticClientId ? undefined : value;
-}
-
-function numberOrUndefined(value: unknown): number | undefined {
-  return typeof value === "number" ? value : undefined;
-}
-
-function stringOrUndefined(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-function redirectUrisOrUndefined(value: unknown): string[] | undefined {
-  return Array.isArray(value) ? value.map((uri) => String(uri)) : undefined;
-}
-
-function buildInteractiveStoredClientInfo(
-  clientInformation: OAuthClientInformationMixed,
-  hasStaticClientId: boolean,
-  issuerToBind: string | undefined,
-): StoredClientInfo {
-  const fullInfo = clientInformation as Partial<ClientInformationExtras>;
-  return {
-    client_id: clientInformation.client_id,
-    client_secret: withoutStaticClientId(hasStaticClientId, clientInformation.client_secret),
-    client_id_issued_at: withoutStaticClientId(
-      hasStaticClientId,
-      numberOrUndefined(fullInfo.client_id_issued_at),
-    ),
-    client_secret_expires_at: withoutStaticClientId(
-      hasStaticClientId,
-      numberOrUndefined(fullInfo.client_secret_expires_at),
-    ),
-    token_endpoint_auth_method: withoutStaticClientId(
-      hasStaticClientId,
-      stringOrUndefined(fullInfo.token_endpoint_auth_method),
-    ),
-    redirect_uris: withoutStaticClientId(
-      hasStaticClientId,
-      redirectUrisOrUndefined(fullInfo.redirect_uris),
-    ),
-    issuer: issuerToBind,
-  };
-}
-
-function isPeerRotatedTokens(
-  diskTokens: StoredTokens | undefined,
-  lastReadTokens: StoredTokens | undefined,
-): diskTokens is StoredTokens {
-  if (!diskTokens) return false;
-  return (
-    diskTokens.refresh_token !== lastReadTokens?.refresh_token ||
-    diskTokens.access_token !== lastReadTokens?.access_token
-  );
-}
+export { DEFAULT_CALLBACK_PORT, DEFAULT_REDIRECT_URL, type AuthConfig, type InvalidationScope };
 
 export interface McpOAuthProviderOptions {
   serverName: string;
@@ -214,66 +112,49 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return stored;
   }
 
+  private async _mutateInteractiveState(mutator: (state: StoredState) => boolean): Promise<void> {
+    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
+    await this.assertLockHeld?.();
+    const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
+    const shouldSave = mutator(state);
+    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
+    await this.assertLockHeld?.();
+    if (!shouldSave) return;
+    // WHY: Only write back to disk when stored state for this serverUrl actually had
+    // credentials to clear, preventing a cancelled or unauthenticated project override
+    // from overwriting another server URL's state file before new credentials are saved.
+    stampStateServerUrl(state, this.serverUrl);
+    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+  }
+
   // --- redirectUrl ---
 
   get redirectUrl(): string | URL {
-    if (this.mode === "silent") {
-      // WHY: A silent provider never starts an authorization flow, but clientMetadata.redirect_uris
-      // must still match what the client was registered with. Prefer the stored DCR redirect_uris
-      // (preserved per AGENTS.md), then the configured auth.redirectUrl, then the default 127.0.0.1:19876 callback.
-      const stored = this.getStoredRedirectUrisSync();
-      if (stored && stored.length > 0 && stored[0] !== undefined) {
-        return stored[0];
-      }
-    }
-    // WHY: In interactive mode, redirectUrl is the URL the callback server actually bound
-    // (passed in by authorize()), falling back to configured auth.redirectUrl, then the default
-    // 127.0.0.1:19876 callback URL.
-    return (
-      this.explicitRedirectUrl ??
-      this.authConfig.redirectUrl ??
-      DEFAULT_REDIRECT_URL
+    return resolveProviderRedirectUrl(
+      this.mode,
+      this.explicitRedirectUrl,
+      this.authConfig,
+      this.silent ? this.getStoredRedirectUrisSync() : undefined,
     );
   }
 
   // --- clientMetadata ---
 
   get clientMetadata(): OAuthClientMetadata {
-    // WHY: A silent provider never starts an authorization flow, but clientMetadata.redirect_uris
-    // must still match what the client was registered with. Prefer the stored DCR redirect_uris
-    // (preserved per AGENTS.md), then the configured auth.redirectUrl, then the default 127.0.0.1:19876 callback.
-    let redirectUris: string[];
-    if (this.mode === "silent") {
-      const stored = this.getStoredRedirectUrisSync();
-      if (stored && stored.length > 0) {
-        redirectUris = stored;
-      } else {
-        redirectUris = [String(this.explicitRedirectUrl ?? this.authConfig.redirectUrl ?? DEFAULT_REDIRECT_URL)];
-      }
-    } else {
-      redirectUris = [String(this.redirectUrl)];
-    }
-    return {
-      client_name: this.authConfig.clientName ?? `pi-mcp/${this.serverName}`,
-      redirect_uris: redirectUris,
-      grant_types: ["authorization_code", "refresh_token"],
-      response_types: ["code"],
-      token_endpoint_auth_method: this.authConfig.clientSecret ? "client_secret_basic" : "none",
-      ...(this.authConfig.scope && { scope: this.authConfig.scope }),
-    };
+    return buildOAuthClientMetadata(
+      this.serverName,
+      this.authConfig,
+      this.mode,
+      this.explicitRedirectUrl,
+      this.silent ? this.getStoredRedirectUrisSync() : undefined,
+    );
   }
 
   // --- clientInformation ---
 
   private async _staticClientInformation(): Promise<OAuthClientInformationMixed> {
     const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    const boundIssuer =
-      state.clientInfo?.client_id === this.authConfig.clientId ? state.clientInfo?.issuer : undefined;
-    return {
-      client_id: this.authConfig.clientId!,
-      ...(this.authConfig.clientSecret && { client_secret: this.authConfig.clientSecret }),
-      ...(boundIssuer !== undefined && { issuer: boundIssuer }),
-    };
+    return buildStaticClientInformation(this.authConfig, state.clientInfo);
   }
 
   private _cacheStoredRedirectUris(info: StoredClientInfo): void {
@@ -327,52 +208,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
     await this._saveClientInformationInteractive(clientInformation, issuerToBind);
   }
 
-  private _assertIssuerBindingCompatible(
-    existingIssuer: string | undefined,
-    nextIssuer: string | undefined,
-  ): void {
-    if (existingIssuer === undefined || nextIssuer === undefined || existingIssuer === nextIssuer) {
-      return;
-    }
-    // WHY: A stored client already bound to an authorization server issuer must never be
-    // re-bound to a different issuer. Switching authorization servers requires an explicit reset.
-    throw new McpError(
-      `OAuth client for "${this.serverName}" is already bound to authorization server ${existingIssuer} and cannot be bound to ${nextIssuer}. Run /mcp:auth ${this.serverName} --reset to re-authorize.`,
-      this.serverName,
-      "auth",
-    );
-  }
-
-  private _mergeSilentClientInfo(
-    storedClient: StoredClientInfo,
-    issuerToBind: string | undefined,
-  ): StoredClientInfo {
-    // WHY: Mirror silent saveTokens: pure issuer binding of the already-known client
-    // preserves all stored credentials and DCR metadata on disk while stamping issuer.
-    return {
-      ...storedClient,
-      client_secret: this.authConfig.clientId ? undefined : storedClient.client_secret,
-      issuer: issuerToBind ?? storedClient.issuer,
-    };
-  }
-
-  private _newSilentClientInfo(
-    clientInformation: OAuthClientInformationMixed,
-    issuerToBind: string | undefined,
-  ): StoredClientInfo {
-    return {
-      client_id: clientInformation.client_id,
-      client_secret: this.authConfig.clientId
-        ? undefined
-        : (this.authConfig.clientSecret ?? clientInformation.client_secret),
-      client_id_issued_at: undefined,
-      client_secret_expires_at: undefined,
-      token_endpoint_auth_method: undefined,
-      redirect_uris: undefined,
-      issuer: issuerToBind,
-    };
-  }
-
   private _reportClientInfoSaved(): void {
     reportDiagnostic({
       level: "info",
@@ -416,13 +251,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
         // for a new or different client_id without interactive user consent.
         throw new AuthRequiredError(this.serverName);
       }
-      this._assertIssuerBindingCompatible(storedClient?.issuer, issuerToBind);
-      if (this.serverUrl) {
-        state.serverUrl = canonicalServerUrl(this.serverUrl);
-      }
+      assertIssuerBindingCompatible(this.serverName, storedClient?.issuer, issuerToBind);
+      stampStateServerUrl(state, this.serverUrl);
       state.clientInfo = storedClient
-        ? this._mergeSilentClientInfo(storedClient, issuerToBind)
-        : this._newSilentClientInfo(clientInformation, issuerToBind);
+        ? mergeSilentStoredClientInfo(storedClient, this.authConfig, issuerToBind)
+        : buildNewSilentStoredClientInfo(clientInformation, this.authConfig, issuerToBind);
       await saveState(this.serverName, state, this.storageDir, this.isCancelled);
       this._reportClientInfoSaved();
     } catch (err) {
@@ -436,25 +269,20 @@ export class McpOAuthProvider implements OAuthClientProvider {
     clientInformation: OAuthClientInformationMixed,
     issuerToBind: string | undefined,
   ): Promise<void> {
-    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
-    await this.assertLockHeld?.();
-    const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    const storedClient = state.clientInfo;
-    if (storedClient?.client_id === clientInformation.client_id) {
-      this._assertIssuerBindingCompatible(storedClient.issuer, issuerToBind);
-    }
-    if (this.serverUrl) {
-      state.serverUrl = canonicalServerUrl(this.serverUrl);
-    }
-    const storedClientInfo = buildInteractiveStoredClientInfo(
-      clientInformation,
-      Boolean(this.authConfig.clientId),
-      issuerToBind,
-    );
-    state.clientInfo = storedClientInfo;
-    this._cacheStoredRedirectUris(storedClientInfo);
-    await this.assertLockHeld?.();
-    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+    await this._mutateInteractiveState((state) => {
+      const storedClient = state.clientInfo;
+      if (storedClient?.client_id === clientInformation.client_id) {
+        assertIssuerBindingCompatible(this.serverName, storedClient.issuer, issuerToBind);
+      }
+      const storedClientInfo = buildInteractiveStoredClientInfo(
+        clientInformation,
+        Boolean(this.authConfig.clientId),
+        issuerToBind,
+      );
+      state.clientInfo = storedClientInfo;
+      this._cacheStoredRedirectUris(storedClientInfo);
+      return true;
+    });
   }
 
   // --- tokens ---
@@ -479,83 +307,55 @@ export class McpOAuthProvider implements OAuthClientProvider {
     //   transport has no token → auth() → no refresh possible → REDIRECT
     //   → user must re-authenticate in browser
 
-    // Build OAuthTokens — only include defined fields
-    const tokens: Record<string, unknown> = {
-      access_token: storedTokens.access_token,
-    };
-    if (storedTokens.token_type !== undefined) tokens.token_type = storedTokens.token_type;
-    if (storedTokens.refresh_token !== undefined) tokens.refresh_token = storedTokens.refresh_token;
-    if (storedTokens.expires_in !== undefined) tokens.expires_in = storedTokens.expires_in;
-    if (storedTokens.scope !== undefined) tokens.scope = storedTokens.scope;
-    if (storedTokens.issuer !== undefined) tokens.issuer = storedTokens.issuer;
-    return tokens as unknown as OAuthTokens;
+    return toOAuthTokens(storedTokens);
   }
 
   // --- saveTokens ---
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
-    const storedTokens: StoredTokens = {
-      access_token: tokens.access_token,
-      token_type: tokens.token_type,
-      refresh_token: tokens.refresh_token,
-      expires_in: tokens.expires_in,
-      scope: tokens.scope,
-      saved_at: new Date().toISOString(),
-      issuer: typeof tokens.issuer === "string" ? tokens.issuer : undefined,
-    };
-
-    if (this.silent) {
-      let handle: AuthLockHandle | undefined;
-      try {
-        handle = await acquireAuthLock(this.serverName, this.storageDir);
-        const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-        if (this.serverUrl) {
-          state.serverUrl = canonicalServerUrl(this.serverUrl);
-        }
-        state.tokens = storedTokens;
-        await saveState(this.serverName, state, this.storageDir, this.isCancelled);
-        this._cachedTokens = undefined;
-        this._lastReadTokens = storedTokens;
-        this._reloadedPeerTokens = false;
+  private async _saveTokensSilent(storedTokens: StoredTokens): Promise<void> {
+    let handle: AuthLockHandle | undefined;
+    try {
+      handle = await acquireAuthLock(this.serverName, this.storageDir);
+      const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
+      stampStateServerUrl(state, this.serverUrl);
+      state.tokens = storedTokens;
+      await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+      this._cachedTokens = undefined;
+      this._lastReadTokens = storedTokens;
+      this._reloadedPeerTokens = false;
+      reportDiagnostic({
+        level: "info",
+        event: "oauth.refresh",
+        server: this.serverName,
+        message: `Refreshed OAuth tokens for "${this.serverName}"`,
+        fields: { outcome: "rotated", peerReloaded: false },
+      });
+    } catch (err) {
+      // WHY: When another process holds the interactive auth lock (e.g. during --reset),
+      // keep the refreshed tokens in memory for this session without clobbering disk state.
+      this._cachedTokens = storedTokens;
+      this._lastReadTokens = storedTokens;
+      this._reloadedPeerTokens = false;
+      if (!(err instanceof AuthLockError)) {
+        const { kind, message } = describeError(err);
         reportDiagnostic({
-          level: "info",
-          event: "oauth.refresh",
+          level: "error",
+          event: "oauth.tokens_persist_failed",
           server: this.serverName,
-          message: `Refreshed OAuth tokens for "${this.serverName}"`,
-          fields: { outcome: "rotated", peerReloaded: false },
+          message: `Failed to persist refreshed OAuth tokens for "${this.serverName}": ${message}`,
+          fields: { kind },
         });
-      } catch (err) {
-        // WHY: When another process holds the interactive auth lock (e.g. during --reset),
-        // keep the refreshed tokens in memory for this session without clobbering disk state.
-        this._cachedTokens = storedTokens;
-        this._lastReadTokens = storedTokens;
-        this._reloadedPeerTokens = false;
-        if (!(err instanceof AuthLockError)) {
-          const { kind, message } = describeError(err);
-          reportDiagnostic({
-            level: "error",
-            event: "oauth.tokens_persist_failed",
-            server: this.serverName,
-            message: `Failed to persist refreshed OAuth tokens for "${this.serverName}": ${message}`,
-            fields: { kind },
-          });
-        }
-      } finally {
-        await handle?.();
       }
-      return;
+    } finally {
+      await handle?.();
     }
+  }
 
-    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
-    await this.assertLockHeld?.();
-    const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    if (this.serverUrl) {
-      state.serverUrl = canonicalServerUrl(this.serverUrl);
-    }
-    state.tokens = storedTokens;
-    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
-    await this.assertLockHeld?.();
-    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+  private async _saveTokensInteractive(storedTokens: StoredTokens): Promise<void> {
+    await this._mutateInteractiveState((state) => {
+      state.tokens = storedTokens;
+      return true;
+    });
     this._cachedTokens = undefined;
     this._lastReadTokens = storedTokens;
     this._reloadedPeerTokens = false;
@@ -566,6 +366,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
       message: `Stored OAuth tokens for "${this.serverName}"`,
       fields: { outcome: "authorized", peerReloaded: false },
     });
+  }
+
+  async saveTokens(tokens: OAuthTokens): Promise<void> {
+    const storedTokens = toStoredTokens(tokens);
+    if (this.silent) {
+      await this._saveTokensSilent(storedTokens);
+      return;
+    }
+    await this._saveTokensInteractive(storedTokens);
   }
 
   // --- redirectToAuthorization ---
@@ -612,14 +421,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   async saveDiscoveryState(discState: OAuthDiscoveryState): Promise<void> {
     if (this.silent) return; // No shared state writes from background discovery.
-    await this.assertLockHeld?.();
-    const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    if (this.serverUrl) {
-      state.serverUrl = canonicalServerUrl(this.serverUrl);
-    }
-    state.discoveryState = discState;
-    await this.assertLockHeld?.();
-    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+    await this._mutateInteractiveState((state) => {
+      state.discoveryState = discState;
+      return true;
+    });
   }
 
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
@@ -643,48 +448,25 @@ export class McpOAuthProvider implements OAuthClientProvider {
    * Returns empty string if no state has been set (no CSRF protection).
    */
   async state(): Promise<string> {
+    // The SDK reads state() before building the authorization URL. Silent attempts must not start a browser flow.
+    if (this.silent) throw new AuthRequiredError(this.serverName);
+    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
     return this._oauthState || "";
   }
 
   // --- Credential invalidation ---
 
-  private _applyInvalidation(
-    state: StoredState,
-    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
-  ): boolean {
-    let changedDisk = false;
-    switch (scope) {
-      case "all":
-        changedDisk =
-          state.clientInfo !== undefined ||
-          state.tokens !== undefined ||
-          state.discoveryState !== undefined;
-        state.clientInfo = undefined;
-        state.tokens = undefined;
-        state.discoveryState = undefined;
-        this._codeVerifier = undefined;
-        this._cachedTokens = undefined;
-        this._storedRedirectUris = undefined;
-        break;
-      case "client":
-        changedDisk = state.clientInfo !== undefined;
-        state.clientInfo = undefined;
-        this._storedRedirectUris = undefined;
-        break;
-      case "tokens":
-        changedDisk = state.tokens !== undefined;
-        state.tokens = undefined;
-        this._cachedTokens = undefined;
-        break;
-      case "verifier":
-        this._codeVerifier = undefined;
-        break;
-      case "discovery":
-        changedDisk = state.discoveryState !== undefined;
-        state.discoveryState = undefined;
-        break;
+  private _applyInvalidation(state: StoredState, scope: InvalidationScope): boolean {
+    if (scope === "all" || scope === "client") {
+      this._storedRedirectUris = undefined;
     }
-    return changedDisk;
+    if (scope === "all" || scope === "tokens") {
+      this._cachedTokens = undefined;
+    }
+    if (scope === "all" || scope === "verifier") {
+      this._codeVerifier = undefined;
+    }
+    return applyStoredStateInvalidation(state, scope);
   }
 
   private async _readDiskStateForPeerReload(): Promise<StoredState | undefined> {
@@ -716,18 +498,14 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return true;
   }
 
-  private async _removeCredentialsFromDisk(
-    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
-  ): Promise<void> {
+  private async _removeCredentialsFromDisk(scope: InvalidationScope): Promise<void> {
     let handle: AuthLockHandle | undefined;
     try {
       handle = await acquireAuthLock(this.serverName, this.storageDir);
       const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
       const changedDisk = this._applyInvalidation(state, scope);
       if (!changedDisk) return;
-      if (this.serverUrl) {
-        state.serverUrl = canonicalServerUrl(this.serverUrl);
-      }
+      stampStateServerUrl(state, this.serverUrl);
       await saveState(this.serverName, state, this.storageDir, this.isCancelled);
     } catch {
       // WHY: Best-effort cleanup of rejected credentials on disk; if another process
@@ -737,9 +515,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
   }
 
-  private async _invalidateCredentialsSilent(
-    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
-  ): Promise<void> {
+  private async _invalidateCredentialsSilent(scope: InvalidationScope): Promise<void> {
     if (scope === "tokens" && (await this._tryReloadPeerRotatedTokens())) return;
     this._cachedTokens = undefined;
     this._reloadedPeerTokens = false;
@@ -751,26 +527,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
     throw new AuthRequiredError(this.serverName);
   }
 
-  private async _invalidateCredentialsInteractive(
-    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
-  ): Promise<void> {
-    await this.assertLockHeld?.();
-    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
-    const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
-    const changedDisk = this._applyInvalidation(state, scope);
-    await this.assertLockHeld?.();
-    if (this.isCancelled()) throw new AuthRequiredError(this.serverName, "Authorization cancelled");
-    if (!changedDisk) return;
-    // WHY: Only write back to disk when stored state for this serverUrl actually had
-    // credentials to clear, preventing a cancelled or unauthenticated project override
-    // from overwriting another server URL's state file before new credentials are saved.
-    if (this.serverUrl) {
-      state.serverUrl = canonicalServerUrl(this.serverUrl);
-    }
-    await saveState(this.serverName, state, this.storageDir, this.isCancelled);
+  private async _invalidateCredentialsInteractive(scope: InvalidationScope): Promise<void> {
+    await this._mutateInteractiveState((state) => this._applyInvalidation(state, scope));
   }
 
-  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+  async invalidateCredentials(scope: InvalidationScope): Promise<void> {
     if (this.silent) {
       await this._invalidateCredentialsSilent(scope);
       return;
@@ -780,4 +541,5 @@ export class McpOAuthProvider implements OAuthClientProvider {
 }
 
 export { getAuthStatus, invalidateStoredTokens, resetAuth } from "./oauth-status.js";
+
 
