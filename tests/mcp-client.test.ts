@@ -8,7 +8,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -60,12 +59,12 @@ describe("buildWorkspaceRoot", () => {
     });
   });
 
-  it("falls back to the cwd itself when basename is empty", () => {
+  it("keeps the existing \"workspace\" name when basename is empty", () => {
     // WHY: platform-neutral — pathToFileURL/basename differ between POSIX and Windows for a
-    // filesystem root, and CI runs both.
+    // filesystem root, and CI runs both. The fallback name is unchanged by this extraction.
     const root = buildWorkspaceRoot("/");
     assert.equal(root.uri, pathToFileURL("/").href);
-    assert.equal(root.name, basename("/") || "/");
+    assert.equal(root.name, "workspace");
   });
 });
 

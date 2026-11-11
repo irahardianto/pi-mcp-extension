@@ -618,13 +618,13 @@ export function resolveTransportPid(
   if (typeof recordedPid === "number") return recordedPid;
   if (!transport) return null;
   const record = childRecords.get(transport);
+  // WHY: a record outlives its child — 'close' only sets `closed` — and a released PID can be
+  // recycled to an unrelated process, which teardown would then signal. `_process` and the
+  // `pid` getter both disappear when the child exits, so only the record needs the guard.
+  const recordedChildPid = record && !record.closed ? record.process.pid : undefined;
   const internal = (transport as { _process?: { pid?: number } })._process;
   const exposed = (transport as { pid?: unknown }).pid;
-  return (
-    record?.process.pid ??
-    internal?.pid ??
-    (typeof exposed === "number" ? exposed : null)
-  );
+  return recordedChildPid ?? internal?.pid ?? (typeof exposed === "number" ? exposed : null);
 }
 
 /**

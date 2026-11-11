@@ -193,11 +193,17 @@ export interface WorkspaceRoot {
   name: string;
 }
 
-/** The single `roots/list` entry exposing the workspace to the server. */
+/**
+ * The single `roots/list` entry exposing the workspace to the server.
+ *
+ * The `"workspace"` fallback is kept as-is: the extracted helper must not change what a server
+ * sees for a cwd whose basename is empty (a filesystem root), even though returning the cwd
+ * itself would read more naturally.
+ */
 export function buildWorkspaceRoot(cwd: string): WorkspaceRoot {
   return {
     uri: pathToFileURL(cwd).href,
-    name: basename(cwd) || cwd,
+    name: basename(cwd) || "workspace",
   };
 }
 

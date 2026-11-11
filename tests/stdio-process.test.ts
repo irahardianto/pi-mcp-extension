@@ -1108,6 +1108,20 @@ describe("resolveTransportPid", () => {
     assert.equal(resolveTransportPid(null, transport), 4242);
   });
 
+  it("ignores a recorded PID once the child has closed, so a recycled PID is never signalled", async () => {
+    const child = createChild(6161);
+    const transport = createInstrumentedTransport(child);
+    instrumentStdioTransport(transport as unknown as StdioClientTransport, {
+      onPid: () => {},
+      onStderrLine: () => {},
+    });
+    await (transport as { start(): Promise<void> }).start();
+
+    child.emit("close", 0, null);
+    delete (transport as { _process?: unknown })._process;
+    assert.equal(resolveTransportPid(null, transport), null);
+  });
+
   it("falls back to the transport's own _process.pid when it was never instrumented", () => {
     assert.equal(resolveTransportPid(undefined, { _process: { pid: 777 } }), 777);
   });
