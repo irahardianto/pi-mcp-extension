@@ -44,7 +44,7 @@ import {
 } from "../src/tool-bridge.js";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { parseRegisteredServerConfig } from "../src/config.js";
+import { parseRegisteredServerConfig, ServerConfigSchema } from "../src/config.js";
 import { stripJsonComments } from "../src/jsonc.js";
 import {
   createHeadersFetch,
@@ -56,6 +56,7 @@ import { parseResourceArguments } from "../src/commands.js";
 import { convertResourceContents } from "../src/resource-bridge.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
 import { sanitizeServerInstructions } from "../src/server-status.js";
+import { createTransport } from "../src/transport-factory.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -1713,3 +1714,125 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
   });
 });
 
+// ─── Suite 15: Transport Read-Batch FIFO Ordering & Close Draining (#300) ────
+
+describe("fuzz: createTransport batch message ordering (#300)", () => {
+  it("preserves strict FIFO wire order across arbitrary notification/response batches, handler/onerror throws, and concurrent closes", async () => {
+    const frameArb = fc.record({
+      kind: fc.constantFrom("notif" as const, "resp" as const),
+      throwHandler: fc.boolean(),
+    });
+    const waveArb = fc.array(frameArb, { minLength: 1, maxLength: 8 });
+
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(waveArb, { minLength: 1, maxLength: 3 }),
+        fc.boolean(),
+        fc.boolean(),
+        fc.integer({ min: 1, max: 3 }),
+        async (waves, onErrorThrows, preCloseEvent, concurrentCloses) => {
+          const transport = createTransport(
+            "fuzz-http",
+            ServerConfigSchema.parse({
+              transport: "streamable-http",
+              url: "http://127.0.0.1:9999/mcp",
+              lifecycle: "lazy",
+            }),
+          );
+
+          const observed: string[] = [];
+          const expected: string[] = [];
+          let closeCount = 0;
+
+          transport.onerror = () => {
+            if (onErrorThrows) {
+              throw new Error("fuzz onerror listener boom");
+            }
+          };
+
+          transport.onmessage = (msg) => {
+            if ("method" in msg && !("id" in msg)) {
+              const params = msg.params as { seq: number; fail: boolean };
+              if (params.fail) {
+                throw new Error(`notif-${params.seq}-boom`);
+              }
+              // Mirror `Protocol._onnotification`: notification side effects run one microtask later.
+              void Promise.resolve().then(() => {
+                observed.push(`msg:${params.seq}`);
+              });
+              return;
+            }
+            if ("id" in msg && "result" in msg && typeof msg.id === "number") {
+              const res = msg.result as { fail: boolean };
+              if (res.fail) {
+                throw new Error(`resp-${msg.id}-boom`);
+              }
+              // Mirror `Protocol._onresponse`: response side effects run synchronously.
+              observed.push(`msg:${msg.id}`);
+            }
+          };
+
+          let attachedTransport: typeof transport | undefined = transport;
+          transport.onclose = () => {
+            attachedTransport = undefined;
+            closeCount += 1;
+            observed.push("close");
+          };
+
+          let seq = 0;
+          for (let w = 0; w < waves.length; w++) {
+            const wave = waves[w]!;
+            for (const frame of wave) {
+              seq += 1;
+              if (!frame.throwHandler) {
+                expected.push(`msg:${seq}`);
+              }
+              try {
+                if (frame.kind === "notif") {
+                  transport.onmessage({
+                    jsonrpc: "2.0",
+                    method: "notifications/progress",
+                    params: { seq, fail: frame.throwHandler },
+                  });
+                } else {
+                  transport.onmessage({
+                    jsonrpc: "2.0",
+                    id: seq,
+                    result: { fail: frame.throwHandler },
+                  });
+                }
+              } catch (syncErr) {
+                // Mirror `StdioClientTransport.processReadBuffer()` catching synchronous throws.
+                try {
+                  transport.onerror?.(syncErr instanceof Error ? syncErr : new Error(String(syncErr)));
+                } catch {
+                  // WHY: fuzz harness isolates simulated caller-side synchronous catch forwarding.
+                }
+              }
+            }
+            if (w < waves.length - 1) {
+              await new Promise((resolveWave) => setImmediate(resolveWave));
+            }
+          }
+
+          if (preCloseEvent) {
+            transport.onclose();
+          }
+          await Promise.all(
+            Array.from({ length: concurrentCloses }, async () => {
+              await attachedTransport?.close();
+            }),
+          );
+
+          assert.equal(
+            closeCount,
+            1,
+            `Expected close handler to fire once, got ${closeCount} (observed=${JSON.stringify(observed)})`,
+          );
+          assert.deepEqual(observed, [...expected, "close"]);
+        },
+      ),
+      testOptions(),
+    );
+  });
+});

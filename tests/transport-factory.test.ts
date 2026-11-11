@@ -837,4 +837,137 @@ describe("createTransport batch message ordering (#300)", () => {
     assert.deepEqual(hookProgress, [1]);
     assert.deepEqual(hookErrors, []);
   });
+
+  it("coalesces duplicate close() and same-turn onclose + close() while a notification is in flight", async () => {
+    const makeHttpTransport = () => {
+      const t = createTransport(
+        "http-srv",
+        ServerConfigSchema.parse({
+          transport: "streamable-http",
+          url: "http://127.0.0.1:9999/mcp",
+          lifecycle: "lazy",
+        }),
+      );
+      t.start = async () => {};
+      t.send = async (message: JSONRPCMessage) => {
+        if ("method" in message && "id" in message && message.method === "initialize") {
+          t.onmessage?.({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "dedupe-close-srv", version: "1.0.0" },
+            },
+          });
+        }
+      };
+      return t;
+    };
+
+    // 1. Concurrent `client.close()` calls (`Promise.all`) while a notification is in flight
+    // (mirrors `Client.connect`'s `void this.close()` followed by `_cleanupFailedConnect`'s `await client.close()`).
+    const t1 = makeHttpTransport();
+    let closedCount1 = 0;
+    const progress1: number[] = [];
+    const client1 = new Client({ name: "c1", version: "1.0.0" });
+    client1.onclose = () => {
+      closedCount1 += 1;
+    };
+    await client1.connect(t1);
+    const call1 = client1
+      .callTool({ name: "slow", arguments: {} }, undefined, {
+        onprogress: ({ progress }) => progress1.push(progress),
+      })
+      .catch((err: unknown) => err);
+
+    t1.onmessage?.({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 1, progress: 1, total: 1 },
+    });
+    await Promise.all([client1.close(), client1.close()]);
+    assert.deepEqual(progress1, [1]);
+    assert.equal(closedCount1, 1);
+    assert.equal(client1.transport, undefined);
+    await call1;
+
+    // 2. Underlying stream fires `transport.onclose()` right after a notification, and caller
+    // calls `await client.close()` in the same turn before `Protocol._onclose()` clears `client.transport`.
+    const t2 = makeHttpTransport();
+    let closedCount2 = 0;
+    const progress2: number[] = [];
+    const client2 = new Client({ name: "c2", version: "1.0.0" });
+    client2.onclose = () => {
+      closedCount2 += 1;
+    };
+    await client2.connect(t2);
+    const call2 = client2
+      .callTool({ name: "slow", arguments: {} }, undefined, {
+        onprogress: ({ progress }) => progress2.push(progress),
+      })
+      .catch((err: unknown) => err);
+
+    t2.onmessage?.({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 1, progress: 1, total: 1 },
+    });
+    t2.onclose?.();
+    await client2.close();
+    assert.deepEqual(progress2, [1]);
+    assert.equal(closedCount2, 1);
+    assert.equal(client2.transport, undefined);
+    await call2;
+  });
+
+  it("delivers single-write coalesced notifications and response from a real spawned stdio child process", async () => {
+    const childScript = [
+      'import { createInterface } from "node:readline";',
+      'import { writeSync } from "node:fs";',
+      "const rl = createInterface({ input: process.stdin });",
+      'rl.on("line", (line) => {',
+      "  const msg = JSON.parse(line);",
+      '  if (msg.method === "initialize") {',
+      '    writeSync(1, JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "stdio-coalesced", version: "1.0.0" } } }) + "\\n");',
+      "    return;",
+      "  }",
+      '  if (msg.method === "tools/call") {',
+      "    const progressToken = msg.params?._meta?.progressToken;",
+      '    const p1 = JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: 1, total: 2 } });',
+      '    const p2 = JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: 2, total: 2 } });',
+      '    const res = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "ok:stdio-pipe" }] } });',
+      '    writeSync(1, `${p1}\\n${p2}\\n${res}\\n`);',
+      "  }",
+      "});",
+    ].join("\n");
+
+    const transport = createTransport("stdio-coalesced", {
+      transport: "stdio",
+      command: process.execPath,
+      args: ["--input-type=module", "-e", childScript],
+      lifecycle: "lazy",
+    });
+
+    const clientErrors: Error[] = [];
+    const client = new Client({ name: "stdio-client", version: "1.0.0" });
+    client.onerror = (err) => clientErrors.push(err);
+    await client.connect(transport);
+    try {
+      const seenProgress: number[] = [];
+      const result = await client.callTool(
+        { name: "burst", arguments: {} },
+        undefined,
+        {
+          onprogress: ({ progress }) => seenProgress.push(progress),
+          resetTimeoutOnProgress: true,
+        },
+      );
+      assert.deepEqual(seenProgress, [1, 2]);
+      assert.deepEqual(result.content, [{ type: "text", text: "ok:stdio-pipe" }]);
+      assert.deepEqual(clientErrors, []);
+    } finally {
+      await client.close();
+    }
+  });
 });

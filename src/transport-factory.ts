@@ -184,6 +184,7 @@ type TransportCloseHandler = NonNullable<Transport["onclose"]>;
 
 interface NotificationTurnTracker {
   tail: Promise<void> | null;
+  closePending: boolean;
   reportError: (err: unknown) => void;
 }
 
@@ -313,19 +314,36 @@ function wrapOrderedMessageHandler(
   };
 }
 
+function enqueueDeferredClose(
+  handler: TransportCloseHandler,
+  tracker: NotificationTurnTracker,
+): void {
+  if (tracker.closePending) return;
+  tracker.closePending = true;
+  enqueueTurnStep(tracker, () => {
+    try {
+      handler();
+    } finally {
+      tracker.closePending = false;
+    }
+  });
+}
+
 function wrapOrderedCloseHandler(
   handler: TransportCloseHandler,
   tracker: NotificationTurnTracker,
   isSuperseded: () => boolean,
 ): TransportCloseHandler {
   return () => {
-    if (isSuperseded() || tracker.tail === null) {
+    if (isSuperseded()) {
       handler();
       return;
     }
-    enqueueTurnStep(tracker, () => {
-      handler();
-    });
+    if (tracker.tail === null) {
+      if (!tracker.closePending) handler();
+      return;
+    }
+    enqueueDeferredClose(handler, tracker);
   };
 }
 
@@ -354,6 +372,29 @@ function bindOrderedHandlerProperty<K extends "onmessage" | "onclose">(
   });
 }
 
+function wrapOrderedTransportClose(
+  transport: Transport,
+  tracker: NotificationTurnTracker,
+): void {
+  // WHY: Deferring `Protocol._onclose()` behind an in-flight notification leaves `client.transport`
+  // defined until the turn queue drains, so concurrent `client.close()` calls (e.g. `Client.connect`'s
+  // `void this.close()` followed by `_cleanupFailedConnect`'s `await client.close()`) both reach
+  // `transport.close()`. Memoize the close promise so `origClose()` runs once and every caller
+  // awaits the drained queue.
+  let closePromise: Promise<void> | null = null;
+  const origClose = transport.close.bind(transport);
+  transport.close = (): Promise<void> => {
+    closePromise ??= (async () => {
+      try {
+        await origClose();
+      } finally {
+        await drainTurnQueue(tracker);
+      }
+    })();
+    return closePromise;
+  };
+}
+
 /**
  * Preserve FIFO wire order when JSON-RPC notifications, responses/requests, and close events
  * share a synchronous read batch (`StdioClientTransport.processReadBuffer()`, SSE chunks, or
@@ -367,6 +408,7 @@ function bindOrderedHandlerProperty<K extends "onmessage" | "onclose">(
 function instrumentTransportMessageOrder(serverName: string, transport: Transport): Transport {
   const tracker: NotificationTurnTracker = {
     tail: null,
+    closePending: false,
     reportError: (err: unknown) => {
       reportDeferredHandlerError(serverName, transport, err);
     },
@@ -377,14 +419,7 @@ function instrumentTransportMessageOrder(serverName: string, transport: Transpor
   bindOrderedHandlerProperty(transport, "onclose", (next, isSuperseded) =>
     wrapOrderedCloseHandler(next, tracker, isSuperseded),
   );
-  const origClose = transport.close.bind(transport);
-  transport.close = async (): Promise<void> => {
-    try {
-      await origClose();
-    } finally {
-      await drainTurnQueue(tracker);
-    }
-  };
+  wrapOrderedTransportClose(transport, tracker);
   return transport;
 }
 
