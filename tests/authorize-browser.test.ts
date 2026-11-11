@@ -72,6 +72,10 @@ describe("authorize-browser", () => {
         command: "xdg-open",
         args: [sampleUrl],
       });
+      assert.deepEqual(
+        browserOpenCommand(sampleUrl),
+        browserOpenCommand(sampleUrl, process.platform),
+      );
     });
 
     it("passes shell metacharacters literally without shell splitting", () => {
@@ -112,6 +116,29 @@ describe("authorize-browser", () => {
         windowsHide: true,
       });
       assert.equal("shell" in (capturedOptions ?? {}), false);
+      assert.equal(child.unreferenced, true);
+    });
+
+    it("defaults to process.platform when deps.platform is omitted", async () => {
+      const child = new FakeBrowserChild();
+      let capturedCommand = "";
+      let capturedArgs: readonly string[] = [];
+      const url = "https://auth.example.com/authorize?state=default-platform";
+
+      await openBrowser(url, {
+        spawnProcess: (command, args) => {
+          capturedCommand = command;
+          capturedArgs = args;
+          queueMicrotask(() => {
+            child.emit("spawn");
+          });
+          return child;
+        },
+      });
+
+      const expected = browserOpenCommand(url, process.platform);
+      assert.equal(capturedCommand, expected.command);
+      assert.deepEqual(capturedArgs, expected.args);
       assert.equal(child.unreferenced, true);
     });
 
@@ -160,7 +187,7 @@ describe("authorize-browser", () => {
         assert.equal(entry.event, "auth.browser_open_failed");
         assert.equal(entry.message, "Failed to open browser: spawn open ENOENT");
         assert.equal(entry.message.includes("secret-csrf-state"), false);
-        assert.equal(entry.message.includes("auth.example.com"), false);
+        assert.equal(entry.message.includes("pkce-xyz"), false);
         assert.equal(child.unreferenced, false);
       } finally {
         setDebugLog(prevLogger);
@@ -307,7 +334,7 @@ describe("authorize-browser", () => {
             },
           },
         },
-        browserOpener: async () => {
+        browserOpener: () => {
           callCount += 1;
           if (callCount === 1) {
             throw new Error("spawn \u001b[31mxdg-open\u001b[0m ENOENT\nsecond line");
