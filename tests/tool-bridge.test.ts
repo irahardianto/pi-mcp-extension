@@ -18,6 +18,19 @@ import {
   formatProgressText,
   ToolBridge,
 } from "../src/tool-bridge.js";
+import {
+  buildToolAnnotations,
+  buildToolCallContent,
+  buildToolDescription,
+  toolErrorText,
+} from "../src/tool-content.js";
+import {
+  compareToolsForNameAssignment,
+  isLosslessToolName,
+  MAX_TOOL_NAME_LEN,
+  orderToolsForNameAssignment,
+  resolveUniqueToolName,
+} from "../src/tool-names.js";
 
 type SchemaTuple = [SchemaJson, SchemaJson, SchemaJson, SchemaJson, ...SchemaJson[]];
 type SchemaProps = Record<
@@ -1142,6 +1155,109 @@ describe("buildToolName", () => {
     assert.match(forcedA, /^mcp_a_b_c_[0-9a-f]{8}$/);
     assert.match(forcedB, /^mcp_a_b_c_[0-9a-f]{8}$/);
     assert.notEqual(forcedA, forcedB);
+  });
+});
+
+describe("orderToolsForNameAssignment and resolveUniqueToolName", () => {
+  it("identifies lossless tool names and orders lossless before lossy then by code point", () => {
+    assert.equal(isLosslessToolName("my_tool_2"), true);
+    assert.equal(isLosslessToolName("my-tool"), false);
+    assert.equal(isLosslessToolName("my.tool"), false);
+    assert.equal(isLosslessToolName(""), false);
+
+    assert.ok(
+      compareToolsForNameAssignment(
+        { name: "my_tool", inputSchema: {} },
+        { name: "my-tool", inputSchema: {} },
+      ) < 0,
+    );
+    assert.ok(
+      compareToolsForNameAssignment(
+        { name: "my-tool", inputSchema: {} },
+        { name: "my_tool", inputSchema: {} },
+      ) > 0,
+    );
+    assert.ok(
+      compareToolsForNameAssignment(
+        { name: "my-tool", inputSchema: {} },
+        { name: "my.tool", inputSchema: {} },
+      ) < 0,
+    );
+  });
+
+  it("orders colliding tools deterministically while preserving non-colliding group positions", () => {
+    const ordered = orderToolsForNameAssignment("mcp", "srv", [
+      { name: "first_unrelated", inputSchema: {} },
+      { name: "my.tool", inputSchema: {} },
+      { name: "middle_unrelated", inputSchema: {} },
+      { name: "my-tool", inputSchema: {} },
+      { name: "my_tool", inputSchema: {} },
+      { name: "last_unrelated", inputSchema: {} },
+    ]);
+    assert.deepEqual(
+      ordered.map((t) => t.name),
+      [
+        "first_unrelated",
+        "my_tool",
+        "my-tool",
+        "my.tool",
+        "middle_unrelated",
+        "last_unrelated",
+      ],
+    );
+  });
+
+  it("resolves unhashed, hashed, and cross-server suffixed unique tool names within 64 chars", () => {
+    const seenInBatch = new Set<string>();
+    const toolOwners = new Map<string, string>();
+
+    const first = resolveUniqueToolName({
+      prefix: "mcp",
+      serverName: "srv",
+      rawToolName: "my_tool",
+      seenInBatch,
+      toolOwners,
+    });
+    assert.equal(first, "mcp_srv_my_tool");
+    seenInBatch.add(first);
+
+    const second = resolveUniqueToolName({
+      prefix: "mcp",
+      serverName: "srv",
+      rawToolName: "my-tool",
+      seenInBatch,
+      toolOwners,
+    });
+    assert.equal(second, buildToolName("mcp", "srv", "my-tool", true));
+    seenInBatch.add(second);
+
+    // Same server already owning the base name in toolOwners (not in seenInBatch) may reuse it
+    const reused = resolveUniqueToolName({
+      prefix: "mcp",
+      serverName: "srv",
+      rawToolName: "existing",
+      seenInBatch: new Set(),
+      toolOwners: new Map([["mcp_srv_existing", "srv"]]),
+    });
+    assert.equal(reused, "mcp_srv_existing");
+
+    // Cross-server collision on both base and hashed candidates falls back to _2 / _3 within 64 chars
+    const longServer = "s".repeat(30);
+    const longTool = "t".repeat(30);
+    const hashed = buildToolName("mcp", longServer, longTool, true);
+    const foreignOwners = new Map<string, string>([
+      [hashed, "other_server"],
+      [`${hashed.slice(0, MAX_TOOL_NAME_LEN - 2)}_2`, "other_server"],
+    ]);
+    const suffixed = resolveUniqueToolName({
+      prefix: "mcp",
+      serverName: longServer,
+      rawToolName: longTool,
+      seenInBatch: new Set(),
+      toolOwners: foreignOwners,
+    });
+    assert.ok(suffixed.endsWith("_3"));
+    assert.ok(suffixed.length <= MAX_TOOL_NAME_LEN);
   });
 });
 
@@ -2779,6 +2895,103 @@ describe("convertMcpContent", () => {
       { type: "text", text: '[Resource link: file:///blank-title "blank-title" — Use mcp_read_resource to read]' },
       { type: "text", text: "[Resource link: unknown — Use mcp_read_resource to read]" },
     ]);
+  });
+
+  it("handles non-object items, missing block fields, and unknown content types", () => {
+    assert.deepEqual(
+      convertMcpContent([
+        null,
+        42,
+        { type: "text" },
+        { type: "image" },
+        { type: "audio" },
+        { type: "custom", payload: true },
+      ]),
+      [
+        { type: "text", text: "null" },
+        { type: "text", text: "42" },
+        { type: "text", text: "" },
+        { type: "image", data: "", mimeType: "image/png" },
+        { type: "text", text: "[Audio: unknown, base64 encoded]" },
+        { type: "text", text: '{"type":"custom","payload":true}' },
+      ],
+    );
+  });
+});
+
+describe("buildToolDescription, buildToolAnnotations, buildToolCallContent, and toolErrorText", () => {
+  it("formats tool descriptions with default fallback and annotation hints", () => {
+    assert.equal(
+      buildToolDescription({ name: "ping", inputSchema: {} }),
+      "MCP tool: ping",
+    );
+    assert.equal(
+      buildToolDescription({
+        name: "delete_all",
+        description: "Delete rows",
+        inputSchema: {},
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      }),
+      "Delete rows [read-only, ⚠️ destructive, idempotent, may have side effects]",
+    );
+    assert.equal(
+      buildToolDescription({
+        name: "noop",
+        description: "No hints enabled",
+        inputSchema: {},
+        annotations: { readOnlyHint: false, destructiveHint: false },
+      }),
+      "No hints enabled",
+    );
+  });
+
+  it("builds structured Pi tool annotations or undefined when no boolean hints apply", () => {
+    assert.equal(buildToolAnnotations(undefined), undefined);
+    assert.equal(buildToolAnnotations({ title: "Only Title" }), undefined);
+    assert.deepEqual(
+      buildToolAnnotations({
+        title: "Ignored Title",
+        readOnlyHint: true,
+        destructiveHint: false,
+      }),
+      { readOnlyHint: true, destructiveHint: false },
+    );
+  });
+
+  it("builds tool call content with structuredContent fallback and extracts text for errors", () => {
+    assert.deepEqual(
+      buildToolCallContent({
+        content: [{ type: "text", text: "from content" }],
+        structuredContent: { ignored: true },
+      }),
+      [{ type: "text", text: "from content" }],
+    );
+    assert.deepEqual(
+      buildToolCallContent({
+        content: [],
+        structuredContent: "raw structured string",
+      }),
+      [{ type: "text", text: "raw structured string" }],
+    );
+    assert.deepEqual(
+      buildToolCallContent({
+        structuredContent: { count: 2 },
+      }),
+      [{ type: "text", text: '{\n  "count": 2\n}' }],
+    );
+    assert.equal(
+      toolErrorText([
+        { type: "text", text: "first line" },
+        { type: "image", data: "YWJj", mimeType: "image/png" },
+        { type: "text", text: "second line" },
+      ]),
+      "first line\nsecond line",
+    );
   });
 });
 

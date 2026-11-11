@@ -13,10 +13,9 @@
  *   - Images and embedded image resources → ImageContent; resource links → read hints
  */
 
-import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, type Progress } from "@modelcontextprotocol/sdk/types.js";
-import type { ExtensionAPI, ToolAnnotations } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { redactSecrets } from "./debug-log.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
@@ -24,13 +23,26 @@ import type { Settings } from "./config.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
-import { convertResourceContent } from "./resource-bridge.js";
 import {
-  compareCodePoints,
+  buildToolAnnotations,
+  buildToolCallContent,
+  buildToolDescription,
+  toolErrorText,
+  type ToolCallOutcome,
+  type ToolCallResponse,
+} from "./tool-content.js";
+import {
+  orderToolsForNameAssignment,
+  resolveUniqueToolName,
+} from "./tool-names.js";
+import {
   orderOwnedEntries,
   orderPayloadToolEntries,
   sameToolList,
 } from "./tool-order.js";
+
+export { buildToolName } from "./tool-names.js";
+export { convertMcpContent } from "./tool-content.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -42,168 +54,7 @@ export type ToolRefreshOptions = {
   signal?: AbortSignal | undefined;
 };
 
-// ─── Tool Name Sanitization ───────────────────────────────────────────────────
-
-const MAX_TOOL_NAME_LEN = 64;
-
-/**
- * Build a Pi-compatible tool name.
- * Format: <prefix>_<server>_<tool>
- * Rules: [a-zA-Z0-9_], max 64 chars.
- * If truncation or collision disambiguation (`forceHash`) is needed, appends an
- * 8-char SHA-256 hex digest computed over the raw unsanitized input components.
- */
-export function buildToolName(
-  prefix: string,
-  serverName: string,
-  toolName: string,
-  forceHash = false,
-): string {
-  // WHY: Hash the raw unsanitized components separated by NUL bytes so distinct
-  // server/tool pairs that sanitize to the same "_" sequence (e.g. "my-tool" vs
-  // "my_tool", or server "a_b" + tool "c" vs server "a" + tool "b_c") never collide.
-  const hash = createHash("sha256")
-    .update(`${prefix}\0${serverName}\0${toolName}`)
-    .digest("hex")
-    .slice(0, 8);
-  const raw = `${prefix}_${serverName}_${toolName}`;
-  const safe = raw.replace(/[^a-zA-Z0-9_]/g, "_");
-  if (!forceHash && safe.length <= MAX_TOOL_NAME_LEN) {
-    return safe;
-  }
-  return `${safe.slice(0, MAX_TOOL_NAME_LEN - 9)}_${hash}`;
-}
-
-/** True when sanitizing the raw tool name loses nothing (already a valid Pi identifier body). */
-function isLosslessToolName(rawToolName: string): boolean {
-  return /^[a-zA-Z0-9_]+$/.test(rawToolName);
-}
-
-/**
- * Order a server's tools so Pi-name assignment depends only on the tool set and never on
- * the order `tools/list` happened to return (#213): a lossless raw name wins the unhashed
- * `<prefix>_<server>_<tool>` identifier over one that needs character substitution
- * (`my_tool` over `my-tool`), and remaining ties fall back to code-point order of the raw
- * name. Without a total order here, the first response's order decided which colliding
- * tool owned the unhashed name, so a reconnect could silently swap tool targets.
- */
-function compareToolsForNameAssignment(a: McpToolDefinition, b: McpToolDefinition): number {
-  const aLossless = isLosslessToolName(a.name);
-  const bLossless = isLosslessToolName(b.name);
-  if (aLossless !== bLossless) return aLossless ? -1 : 1;
-  return compareCodePoints(a.name, b.name);
-}
-
-/**
- * Order a server's tools for Pi-name assignment. The server's own `tools/list` order is kept —
- * so registration order only moves where it must — except that tools competing for the same
- * unhashed identifier are emitted as one deterministic group in the position of the group's
- * first member. Which tool the server listed first is not part of the MCP contract, so it must
- * not decide who wins that identifier (#213).
- */
-function orderToolsForNameAssignment(
-  prefix: string,
-  serverName: string,
-  tools: readonly McpToolDefinition[],
-): readonly McpToolDefinition[] {
-  const groups = new Map<string, McpToolDefinition[]>();
-  for (const tool of tools) {
-    const baseName = buildToolName(prefix, serverName, tool.name, false);
-    const group = groups.get(baseName);
-    if (group) group.push(tool);
-    else groups.set(baseName, [tool]);
-  }
-
-  const emitted = new Set<string>();
-  const ordered: McpToolDefinition[] = [];
-  for (const tool of tools) {
-    const baseName = buildToolName(prefix, serverName, tool.name, false);
-    if (emitted.has(baseName)) continue;
-    emitted.add(baseName);
-    ordered.push(...(groups.get(baseName) ?? []).sort(compareToolsForNameAssignment));
-  }
-  return ordered;
-}
-
-// ─── Content Conversion ───────────────────────────────────────────────────────
-
-type PiTextContent = { type: "text"; text: string };
-type PiImageContent = { type: "image"; data: string; mimeType: string };
-
-function pickNonEmptyText(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function convertResourceLink(obj: Record<string, unknown>): PiTextContent {
-  const uri = pickNonEmptyText(obj["uri"]) ?? "unknown";
-  const title = pickNonEmptyText(obj["title"]) ?? pickNonEmptyText(obj["name"]);
-  const label = title ? ` ${JSON.stringify(title)}` : "";
-  const details: string[] = [];
-  const mimeType = pickNonEmptyText(obj["mimeType"]);
-  if (mimeType) {
-    details.push(mimeType);
-  }
-  if (typeof obj["size"] === "number" && Number.isSafeInteger(obj["size"]) && obj["size"] >= 0) {
-    details.push(`${obj["size"]} bytes`);
-  }
-  const metadata = details.length > 0 ? ` (${details.join(", ")})` : "";
-  const descriptionText = pickNonEmptyText(obj["description"]);
-  const description = descriptionText ? `\n${descriptionText}` : "";
-  return {
-    type: "text",
-    text: `[Resource link: ${uri}${label}${metadata} — Use mcp_read_resource to read]${description}`,
-  };
-}
-
-function convertNonTextContent(obj: Record<string, unknown>): PiImageContent | PiTextContent | undefined {
-  if (obj["type"] === "image") {
-    return {
-      type: "image",
-      data: String(obj["data"] ?? ""),
-      mimeType: String(obj["mimeType"] ?? "image/png"),
-    };
-  }
-  if (obj["type"] === "audio") {
-    return {
-      type: "text",
-      text: `[Audio: ${String(obj["mimeType"] ?? "unknown")}, base64 encoded]`,
-    };
-  }
-  if (obj["type"] === "resource") {
-    const resource = obj["resource"];
-    return convertResourceContent(typeof resource === "object" && resource !== null ? resource : {});
-  }
-  return obj["type"] === "resource_link" ? convertResourceLink(obj) : undefined;
-}
-
-function convertMcpContentItem(item: unknown): PiTextContent | PiImageContent {
-  if (!item || typeof item !== "object") {
-    return { type: "text", text: String(item) };
-  }
-  const obj = item as Record<string, unknown>;
-  const nonText = convertNonTextContent(obj);
-  if (nonText) return nonText;
-  if (obj["type"] === "text") {
-    return { type: "text", text: String(obj["text"] ?? "") };
-  }
-  return { type: "text", text: JSON.stringify(item) };
-}
-
-export function convertMcpContent(items: unknown[]): (PiTextContent | PiImageContent)[] {
-  return items.map(convertMcpContentItem);
-}
-
 // ─── Tool Call Execution ──────────────────────────────────────────────────────
-
-type PiContent = PiTextContent | PiImageContent;
-
-/** Tool call result shape Pi expects from `execute`. */
-interface ToolCallOutcome {
-  content: PiContent[];
-  details: Record<string, never>;
-}
 
 /** Pi's partial-result callback — the `onUpdate` argument of a tool's `execute`. */
 export type ToolUpdateCallback = (update: ToolCallOutcome) => void;
@@ -212,58 +63,6 @@ export type ToolUpdateCallback = (update: ToolCallOutcome) => void;
 interface ToolCallOptions {
   signal: AbortSignal | undefined;
   onUpdate: ToolUpdateCallback | undefined;
-}
-
-/**
- * The subset of an SDK `tools/call` response the bridge consumes.
- * Legacy servers answer with `toolResult` instead of `content`, so every field
- * stays optional and unvalidated here — `convertMcpContent` handles the blocks.
- * The index signature keeps the SDK's compatibility result assignable.
- */
-interface ToolCallResponse {
-  [key: string]: unknown;
-  content?: unknown;
-  structuredContent?: unknown;
-  isError?: unknown;
-}
-
-/** Append the tool's annotation hints to its description so the LLM sees them. */
-function buildToolDescription(
-  tool: McpToolDefinition,
-  annotations: McpToolDefinition["annotations"],
-): string {
-  const description = tool.description ?? `MCP tool: ${tool.name}`;
-  if (!annotations) return description;
-  const hints: string[] = [];
-  if (annotations.readOnlyHint) hints.push("read-only");
-  if (annotations.destructiveHint) hints.push("⚠️ destructive");
-  if (annotations.idempotentHint) hints.push("idempotent");
-  if (annotations.openWorldHint) hints.push("may have side effects");
-  return hints.length > 0 ? `${description} [${hints.join(", ")}]` : description;
-}
-
-const ANNOTATION_HINT_KEYS = [
-  "readOnlyHint",
-  "destructiveHint",
-  "idempotentHint",
-  "openWorldHint",
-] as const;
-
-/**
- * Build the structured `annotations` Pi reads from a registered tool, so permission extensions
- * can inspect the hints. Copies only the four boolean hints (keeping `false`), ignores `title`
- * and non-boolean values, and returns `undefined` when none apply so the field is omitted.
- */
-function buildToolAnnotations(
-  annotations: McpToolDefinition["annotations"],
-): ToolAnnotations | undefined {
-  if (!annotations) return undefined;
-  const result: ToolAnnotations = {};
-  for (const key of ANNOTATION_HINT_KEYS) {
-    const value = annotations[key];
-    if (typeof value === "boolean") result[key] = value;
-  }
-  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 /** Character budget for one progress line; Pi renders the latest line while the tool runs. */
@@ -357,29 +156,6 @@ function callToolWithClient(
     CallToolResultSchema,
     requestOptions,
   );
-}
-
-/**
- * Convert a callTool result into Pi content blocks, falling back to
- * `structuredContent` when the server returned no content blocks.
- */
-function buildToolCallContent(result: ToolCallResponse): PiContent[] {
-  const content = convertMcpContent((result.content ?? []) as Array<Record<string, unknown>>);
-  if (content.length > 0 || result.structuredContent === undefined) return content;
-  const structured = result.structuredContent;
-  content.push({
-    type: "text",
-    text: typeof structured === "string" ? structured : JSON.stringify(structured, null, 2),
-  });
-  return content;
-}
-
-/** Text blocks of a failed tool call, joined into the McpError message. */
-function toolErrorText(content: readonly PiContent[]): string {
-  return content
-    .filter((c): c is PiTextContent => c.type === "text")
-    .map((c) => c.text)
-    .join("\n");
 }
 
 /** Normalize `refreshTools`' overloaded argument shapes (callback vs. options object). */
@@ -646,7 +422,13 @@ export class ToolBridge {
     // tool could lose the unhashed name to a lossy one and a later refresh would swap which MCP
     // tool that name executes (#213).
     for (const tool of orderToolsForNameAssignment(this.settings.toolPrefix, serverName, tools)) {
-      const piName = this._resolveUniqueToolName(serverName, tool.name, currentToolNames);
+      const piName = resolveUniqueToolName({
+        prefix: this.settings.toolPrefix,
+        serverName,
+        rawToolName: tool.name,
+        seenInBatch: currentToolNames,
+        toolOwners: this.toolOwners,
+      });
       currentToolNames.add(piName);
       currentRawNames.set(piName, tool.name);
       this.toolOwners.set(piName, serverName);
@@ -674,46 +456,6 @@ export class ToolBridge {
     this.rawToolNames.set(serverName, currentRawNames);
     this.activeServers.add(serverName);
     this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore);
-  }
-
-  private _isToolNameTaken(name: string, serverName: string, seenInBatch: ReadonlySet<string>): boolean {
-    if (seenInBatch.has(name)) return true;
-    const owner = this.toolOwners.get(name);
-    return owner !== undefined && owner !== serverName;
-  }
-
-  private _findSuffixedToolName(
-    hashedCandidate: string,
-    serverName: string,
-    seenInBatch: ReadonlySet<string>,
-  ): string {
-    let suffix = 2;
-    while (true) {
-      const tag = `_${suffix}`;
-      const candidate = `${hashedCandidate.slice(0, MAX_TOOL_NAME_LEN - tag.length)}${tag}`;
-      if (!this._isToolNameTaken(candidate, serverName, seenInBatch)) {
-        return candidate;
-      }
-      suffix++;
-    }
-  }
-
-  private _resolveUniqueToolName(
-    serverName: string,
-    rawToolName: string,
-    seenInBatch: ReadonlySet<string>,
-  ): string {
-    const baseCandidate = buildToolName(this.settings.toolPrefix, serverName, rawToolName, false);
-    if (!this._isToolNameTaken(baseCandidate, serverName, seenInBatch)) {
-      return baseCandidate;
-    }
-
-    const hashedCandidate = buildToolName(this.settings.toolPrefix, serverName, rawToolName, true);
-    if (!this._isToolNameTaken(hashedCandidate, serverName, seenInBatch)) {
-      return hashedCandidate;
-    }
-
-    return this._findSuffixedToolName(hashedCandidate, serverName, seenInBatch);
   }
 
   private _registerTool(

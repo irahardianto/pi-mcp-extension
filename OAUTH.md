@@ -144,7 +144,7 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### Auth Flow
 
-- **Files**: `src/authorize-flow.ts`, `src/authorize-dialog.ts`, `src/auth-challenge.ts`, `src/startup-auth.ts`, `src/connection-coordinator.ts` (triggered from `src/index.ts` for `mcp_connect` and `src/register-commands.ts` for `/mcp:start` and `/mcp:auth`)
+- **Files**: `src/authorize-flow.ts`, `src/authorize-dialog.ts`, `src/auth-challenge.ts`, `src/startup-auth.ts`, `src/connection-coordinator.ts` (triggered from `src/register-tools.ts` for `mcp_connect` and `src/register-commands.ts` for `/mcp:start` and `/mcp:auth`)
 - **Steps**:
   1. Try the stored credentials and silent refresh during the connection
   2. If browser authorization is needed in an interactive session, acquire the auth lock and start the callback server
