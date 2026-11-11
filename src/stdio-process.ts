@@ -599,3 +599,51 @@ export async function ensurePidTerminated(
 
   await escalateToSigkill(pid, descendants, d);
 }
+
+// ─── Teardown ─────────────────────────────────────────────────────────────────
+
+/**
+ * The PID to tear down for a stdio transport, from the most to the least authoritative source.
+ *
+ * WHY: `server.childPid` is normally set at spawn time, but it is not the only place the PID
+ * can come from — the instrumented record outlives `_process` (which
+ * `StdioClientTransport.close()` clears synchronously), and a transport we never instrumented
+ * still exposes `pid`. Resolving all of them in one place is what keeps a connect cleanup and a
+ * shutdown from disagreeing about which process they own.
+ */
+export function resolveTransportPid(
+  recordedPid: number | null | undefined,
+  transport: object | null | undefined,
+): number | null {
+  if (typeof recordedPid === "number") return recordedPid;
+  if (!transport) return null;
+  const record = childRecords.get(transport);
+  const internal = (transport as { _process?: { pid?: number } })._process;
+  const exposed = (transport as { pid?: unknown }).pid;
+  return (
+    record?.process.pid ??
+    internal?.pid ??
+    (typeof exposed === "number" ? exposed : null)
+  );
+}
+
+/**
+ * Terminate the stdio child process tree, then release the child's pipe handles.
+ *
+ * WHY: `client.close()` waits for the child's `'close'` event, which never fires while a
+ * leaked grandchild still holds the inherited stdout/stderr write ends — the SDK then
+ * burns its full 2 × 2,000ms escalation budget. Killing the tree first and destroying the
+ * pipes afterwards keeps teardown bounded even if a descendant escaped the tree kill.
+ */
+export async function terminateStdioTree(
+  pid: number | null,
+  transport: object | null | undefined,
+  deps?: Partial<StdioProcessDeps>,
+): Promise<void> {
+  try {
+    await ensurePidTerminated(pid, deps);
+    await waitForChildClose(transport);
+  } finally {
+    destroyStdioStreams(transport);
+  }
+}

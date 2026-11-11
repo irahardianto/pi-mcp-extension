@@ -223,6 +223,91 @@ export function isNonFatalClientError(rawMsg: string): boolean {
 
 export type TransportType = ServerConfig["transport"];
 
+/**
+ * What the lifecycle manager should do about an error reported on `client.onerror`.
+ *
+ * `ignore` covers three distinct non-failures: benign JSON-RPC races (the SDK and some servers
+ * disagree about which ids are live), stdio transports (a subprocess that dies is reported
+ * through `onclose`), and the SDK's POST-only SSE probe answering with a non-405 status.
+ * `diagnostic` names the one ignorable error worth an info-level log line.
+ */
+export type ClientErrorAction =
+  | { kind: "ignore"; diagnostic?: "server.notification_error" }
+  | {
+      kind: "recover";
+      event: "server.stream_error" | "server.auth_error";
+      transport: "sse" | "streamable-http";
+      /** Message prefix for the diagnostic, e.g. "SSE stream error, reconnecting". */
+      reason: string;
+    };
+
+/** The SDK's optional standalone-SSE GET probe answering `Failed to open SSE stream: …`. */
+const POST_ONLY_SSE_PROBE = /Failed to open SSE stream:/i;
+
+function classifyNonFatalClientError(rawMsg: string): ClientErrorAction {
+  // WHY: a throwing notification callback is benign for the stream, but it is the only
+  // ignorable error a user can act on (a server sending malformed progress), so it keeps an
+  // info-level log line instead of disappearing.
+  return isNotificationHandlerError(rawMsg)
+    ? { kind: "ignore", diagnostic: "server.notification_error" }
+    : { kind: "ignore" };
+}
+
+
+function classifyStreamableHttpError(err: unknown): ClientErrorAction {
+  if (isOAuthUnauthorizedError(err)) {
+    return {
+      kind: "recover",
+      event: "server.auth_error",
+      transport: "streamable-http",
+      reason: "HTTP auth error, recovering",
+    };
+  }
+  // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
+  // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
+  // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
+  // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
+  // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
+  // stream drops on established streams report "SSE stream disconnected" or
+  // "Maximum reconnection attempts (0) exceeded." instead.
+  if (POST_ONLY_SSE_PROBE.test(errorMessageOf(err))) {
+    return { kind: "ignore" };
+  }
+  return {
+    kind: "recover",
+    event: "server.stream_error",
+    transport: "streamable-http",
+    reason: "HTTP stream error, reconnecting",
+  };
+}
+
+/**
+ * Pure `client.onerror` classifier for the transports that report stream drops there.
+ *
+ * SSEClientTransport and StreamableHTTPClientTransport report an unexpected drop through
+ * `onerror` rather than `onclose`, so this decides between "reconnect" and "this is not a
+ * failure" without touching lifecycle state; the caller owns the actual recovery.
+ */
+export function classifyClientError(transport: TransportType, err: unknown): ClientErrorAction {
+  const rawMsg = errorMessageOf(err);
+  if (isNonFatalClientError(rawMsg)) {
+    return classifyNonFatalClientError(rawMsg);
+  }
+  if (transport === "sse") {
+    return {
+      kind: "recover",
+      event: "server.stream_error",
+      transport: "sse",
+      reason: "SSE stream error, reconnecting",
+    };
+  }
+  if (transport === "streamable-http") {
+    return classifyStreamableHttpError(err);
+  }
+  // WHY: stdio subprocess failure is reported through onclose, not onerror.
+  return { kind: "ignore" };
+}
+
 export type ConnectFailureAction =
   | { kind: "cancelled" }
   | { kind: "retry-corrupt-state" }

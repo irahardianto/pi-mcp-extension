@@ -2,63 +2,44 @@
  * Server lifecycle manager for pi-mcp.
  *
  * Manages MCP server connections using the official SDK.
- * Deliberately thin: the SDK handles protocol state, transport, and process lifecycle.
- * This module handles:
+ * Deliberately thin: the SDK handles protocol state, transport, and process lifecycle,
+ * `src/mcp-client.ts` handles the stateless client/ping adapter, and this module owns only
+ * what needs a state machine:
  *   - 3-state lifecycle per server (stopped / starting / ready)
  *   - Retry with a fixed delay schedule
- *   - roots/list capability for the MCP handshake
- *   - notifications/tools/list_changed → tool refresh callback
+ *   - Background recovery on transport close, stream error, or a failed health-check ping
  *   - Stderr capture (circular buffer)
  *   - PID tracking for safety-net SIGKILL on shutdown failure
  */
 
-import { basename } from "node:path";
-import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import {
-  ListRootsRequestSchema,
-  ToolListChangedNotificationSchema,
-  ResourceListChangedNotificationSchema,
-  LoggingMessageNotificationSchema,
-} from "@modelcontextprotocol/sdk/types.js";
 import { McpError, AuthCancelledError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } from "./oauth-provider.js";
 import type { ToolRefreshOptions } from "./tool-bridge.js";
-import { sanitizeTerminalText, type SanitizeTerminalTextOptions } from "./terminal-text.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 import { describeError, redactSecrets, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
 import {
-  destroyStdioStreams,
   ensurePidTerminated,
   instrumentStdioTransport,
-  waitForChildClose,
+  resolveTransportPid,
+  terminateStdioTree,
 } from "./stdio-process.js";
 import { createTransport } from "./transport-factory.js";
 import {
+  classifyClientError,
   classifyConnectFailure,
-  isNonFatalClientError,
-  isNotificationHandlerError,
-  isOAuthUnauthorizedError,
-  isSdkTimeoutError,
+  type ClientErrorAction,
   type ConnectFailureAction,
 } from "./connect-policy.js";
-
-export {
-  type ToolRefreshOptions,
-  AuthCancelledError,
-  sanitizeTerminalText,
-  type SanitizeTerminalTextOptions,
-};
-export {
-  classifyConnectFailure,
-  isOAuthUnauthorizedError,
-  RETRY_DELAYS_MS,
-  type ClassifyConnectFailureInput,
-  type ConnectFailureAction,
-  type TransportType,
-} from "./connect-policy.js";
+import {
+  connectClientWithTimeout,
+  createMcpClient,
+  startHealthCheck,
+  type FormattedServerLog,
+} from "./mcp-client.js";
 
 /**
  * Strip carriage returns, ANSI CSI/OSC/DCS/PM/APC escape sequences, and C0/C1
@@ -66,6 +47,11 @@ export {
  */
 export function sanitizeStderrLine(line: string): string {
   return sanitizeTerminalText(line);
+}
+
+/** Sanitized message text of a client/transport error, for diagnostics. */
+function clientErrorMessage(err: unknown): string {
+  return sanitizeTerminalText(err instanceof Error ? err.message : String(err));
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -140,72 +126,6 @@ interface ConnectFailureContext {
   err: unknown;
 }
 
-interface ConnectRaceGuard {
-  outcome: Promise<never>;
-  dispose: () => void;
-}
-
-function createConnectRaceGuard(
-  timeoutMs: number,
-  signal: AbortSignal,
-  serverName: string,
-): ConnectRaceGuard {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
-
-  const outcome = new Promise<never>((_resolve, reject) => {
-    if (signal.aborted) {
-      reject(new AuthCancelledError(serverName));
-      return;
-    }
-    onAbort = () => {
-      reject(new AuthCancelledError(serverName));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-
-    timer = setTimeout(() => {
-      reject(
-        new McpError(
-          `Connection timed out after ${timeoutMs}ms`,
-          serverName,
-          "timeout",
-        ),
-      );
-    }, timeoutMs);
-  });
-
-  const dispose = (): void => {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    if (onAbort) {
-      signal.removeEventListener("abort", onAbort);
-    }
-  };
-
-  return { outcome, dispose };
-}
-
-function rethrowNormalizedConnectError(
-  err: unknown,
-  signal: AbortSignal,
-  serverName: string,
-  timeoutMs: number,
-): never {
-  if (signal.aborted || err instanceof AuthCancelledError) {
-    throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
-  }
-  if (isSdkTimeoutError(err)) {
-    throw new McpError(
-      `Connection timed out after ${timeoutMs}ms`,
-      serverName,
-      "timeout",
-      err,
-    );
-  }
-  throw err;
-}
-
 // ─── ServerManager ────────────────────────────────────────────────────────────
 
 export class ServerManager {
@@ -220,19 +140,7 @@ export class ServerManager {
   constructor(config: McpConfig, private readonly storageDir?: string) {
     this.settings = config.settings;
     for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-      this.servers.set(name, {
-        name,
-        config: serverConfig,
-        state: "stopped",
-        client: null,
-        childPid: null,
-        retryCount: 0,
-        lastError: null,
-        stderrLog: [],
-        healthCheckTimer: null,
-        retryTimer: null,
-        stateSince: Date.now(),
-      });
+      this.setServer(name, serverConfig);
     }
   }
 
@@ -494,35 +402,6 @@ export class ServerManager {
 
   // ─── Internal ───────────────────────────────────────────────────────────────
 
-  private async _connectWithTimeoutAndSignal(
-    client: Client,
-    transport: Transport,
-    timeoutMs: number,
-    signal: AbortSignal,
-    serverName: string,
-  ): Promise<void> {
-    if (signal.aborted) {
-      throw new AuthCancelledError(serverName);
-    }
-
-    const connectPromise = client.connect(transport, { timeout: timeoutMs, signal });
-    // WHY: Attach a no-op catch handler so if the outer timeout or abort wins the race
-    // while transport.start() is still in flight, a late rejection from connect() never
-    // triggers an unhandledRejection.
-    connectPromise.catch(() => {
-      // WHY: Handled via Promise.race below.
-    });
-
-    const guard = createConnectRaceGuard(timeoutMs, signal, serverName);
-    try {
-      await Promise.race([connectPromise, guard.outcome]);
-    } catch (err) {
-      rethrowNormalizedConnectError(err, signal, serverName, timeoutMs);
-    } finally {
-      guard.dispose();
-    }
-  }
-
   private _appendStderr(server: ManagedServer, line: string): void {
     // WHY: this buffer is what `/mcp <name>` prints as "Recent output" and what
     // `getServerLogs` returns — text users paste into bug reports. A child server that echoes
@@ -579,68 +458,33 @@ export class ServerManager {
     cwd: string,
     signal: AbortSignal,
   ): Client {
-    const client = new Client(
-      { name: "pi-mcp", version: "1.0.0" },
-      {
-        capabilities: {
-          // Expose workspace root to MCP servers
-          roots: { listChanged: true },
-          // Sampling: explicitly NOT declared — not supported in v1
-        },
-      },
-    );
-
-    // Handle roots/list requests from the server
-    client.setRequestHandler(
-      ListRootsRequestSchema,
-      async () => {
-        const effectiveCwd = server.cwd ?? cwd;
-        return {
-          roots: [
-            {
-              uri: pathToFileURL(effectiveCwd).href,
-              name: basename(effectiveCwd) || "workspace",
-            },
-          ],
-        };
-      },
-    );
-
-    // tools/list_changed: re-discover tools and update Pi registrations
-    client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-      await this._handleToolListChanged(server, client, signal);
+    return createMcpClient({
+      serverName: server.name,
+      // WHY: read `server.cwd` lazily: `updateCwd()` can move the workspace root while the
+      // handshake is in flight, and roots/list must answer with the current one.
+      getCwd: () => server.cwd ?? cwd,
+      onToolsChanged: (client) => this._handleToolListChanged(server, client, signal),
+      onResourcesChanged: (client) => this._handleResourceListChanged(server, client),
+      onLogLine: (entry) => this._recordServerLog(server, entry),
     });
+  }
 
-    // resources/list_changed: drop the cached resource catalog so the next
-    // `mcp_list_resources` / `/mcp:resources` call re-reads it.
-    client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
-      this._handleResourceListChanged(server, client);
+  /**
+   * Record one `notifications/message` entry from a server.
+   *
+   * WHY: server log messages historically went to stderr; keep them visible in headless runs,
+   * where there is no /mcp ring buffer UI, and store the sanitized line for `/mcp <name>`.
+   */
+  private _recordServerLog(server: ManagedServer, entry: FormattedServerLog): void {
+    reportDiagnostic({
+      level: "info",
+      event: "server.log",
+      server: server.name,
+      message: entry.formatted,
+      fields: { logLevel: entry.safeLevel, logger: entry.safeLogger },
+      stderr: true,
     });
-
-    // notifications/message: structured logging from MCP servers
-    client.setNotificationHandler(
-      LoggingMessageNotificationSchema,
-      async (notification) => {
-        const { level = "info", logger = server.name, data } = notification.params ?? {};
-        const rawMsg = typeof data === "string" ? data : JSON.stringify(data);
-        const safeLevel = sanitizeTerminalText(String(level), { maxLength: 32 });
-        const safeLogger = sanitizeTerminalText(String(logger), { maxLength: 100 });
-        const safeMsg = sanitizeTerminalText(rawMsg ?? "");
-        reportDiagnostic({
-          level: "info",
-          event: "server.log",
-          server: server.name,
-          message: `[${safeLevel}] ${safeLogger}: ${safeMsg}`,
-          fields: { logLevel: safeLevel, logger: safeLogger },
-          // WHY: server log messages historically went to stderr; keep them
-          // visible in headless runs, where there is no /mcp ring buffer UI.
-          stderr: true,
-        });
-        this._appendStderr(server, `[${safeLevel}] ${safeLogger}: ${safeMsg}`);
-      },
-    );
-
-    return client;
+    this._appendStderr(server, entry.formatted);
   }
 
   /**
@@ -700,7 +544,13 @@ export class ServerManager {
 
   private async _handshakeAndDiscover(params: HandshakeParams): Promise<void> {
     const { server, client, transport, timeoutMs, signal, currentCwd } = params;
-    await this._connectWithTimeoutAndSignal(client, transport, timeoutMs, signal, server.name);
+    await connectClientWithTimeout({
+      client,
+      transport,
+      timeoutMs,
+      signal,
+      serverName: server.name,
+    });
     if (signal.aborted) throw new AuthCancelledError(server.name);
     if (transport instanceof StdioClientTransport && !server.childPid) {
       server.childPid = transport.pid;
@@ -732,64 +582,21 @@ export class ServerManager {
     signal: AbortSignal,
     cwd: string,
   ): void {
-    if (!server.config.healthCheckIntervalMs) {
-      return;
-    }
-    let pingInFlight = false;
-    const runHealthCheck = async (): Promise<void> => {
-      if (pingInFlight || server.state !== "ready" || !server.client || signal.aborted) {
-        return;
-      }
-      pingInFlight = true;
-      let pingTimer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const pingOptions = {
-          timeout: timeoutMs,
-          signal,
-        };
-        const pingCall = (
-          server.client.ping as (
-            opts?: { timeout?: number; signal?: AbortSignal },
-            extraOpts?: { timeout?: number; signal?: AbortSignal },
-          ) => Promise<unknown>
-        )(pingOptions, pingOptions);
-        pingCall.catch(() => {
-          // WHY: Handled via Promise.race below.
-        });
-        await Promise.race([
-          pingCall,
-          new Promise<never>((_resolve, reject) => {
-            pingTimer = setTimeout(
-              () =>
-                reject(
-                  new McpError(
-                    `Health check ping timed out after ${timeoutMs}ms`,
-                    server.name,
-                    "timeout",
-                  ),
-                ),
-              timeoutMs,
-            );
-          }),
-        ]);
-      } catch {
-        // WHY: Ping failure triggers background recovery if the server is still ready.
-        // The ping error is intentionally not kept on lastError because _recover() →
-        // _shutdown() synchronously resets lastError during teardown before any reader
-        // observes it; if reconnection fails, _recover() records the failure on lastError.
-        if (server.state === "ready" && !signal.aborted) {
-          void this._recover(server, server.cwd ?? cwd);
-        }
-      } finally {
-        if (pingTimer !== undefined) {
-          clearTimeout(pingTimer);
-        }
-        pingInFlight = false;
-      }
-    };
-    server.healthCheckTimer = setInterval(() => {
-      void runHealthCheck();
-    }, server.config.healthCheckIntervalMs);
+    server.healthCheckTimer = startHealthCheck({
+      serverName: server.name,
+      intervalMs: server.config.healthCheckIntervalMs ?? 0,
+      timeoutMs,
+      signal,
+      getClient: () => server.client,
+      isReady: () => server.state === "ready",
+      // WHY: Ping failure triggers background recovery if the server is still ready.
+      // The ping error is intentionally not kept on lastError because _recover() →
+      // _shutdown() synchronously resets lastError during teardown before any reader
+      // observes it; if reconnection fails, _recover() records the failure there.
+      onPingFailure: () => {
+        void this._recover(server, server.cwd ?? cwd);
+      },
+    });
   }
 
   // WHY: SSEClientTransport and StreamableHTTPClientTransport report unexpected
@@ -820,46 +627,6 @@ export class ServerManager {
     });
   }
 
-  private _handleStreamableHttpError(
-    server: ManagedServer,
-    client: Client,
-    signal: AbortSignal,
-    cwd: string,
-    err: unknown,
-  ): void {
-    const rawMsg = err instanceof Error ? err.message : String(err);
-    const msg = sanitizeTerminalText(rawMsg);
-    if (isOAuthUnauthorizedError(err)) {
-      reportDiagnostic({
-        level: "warn",
-        event: "server.auth_error",
-        server: server.name,
-        message: `Server ${server.name} HTTP auth error, recovering: ${msg}`,
-        fields: { transport: "streamable-http" },
-      });
-      this._scheduleErrorRecovery(server, client, signal, cwd);
-      return;
-    }
-    // WHY: After notifications/initialized, the SDK fires an unawaited optional GET probe
-    // (_startOrAuthSse) to open a standalone SSE stream. The SDK already ignores HTTP 405,
-    // so a non-auth "Failed to open SSE stream: ..." error here means a POST-only HTTP
-    // server returned a non-405 status (e.g. 404 Not Found, 400 Bad Request, 501 Not Implemented)
-    // on GET. Ignore it so POST-only servers do not enter a spurious recovery loop; genuine
-    // stream drops on established streams report "SSE stream disconnected" or
-    // "Maximum reconnection attempts (0) exceeded." instead.
-    if (/Failed to open SSE stream:/i.test(rawMsg)) {
-      return;
-    }
-    reportDiagnostic({
-      level: "warn",
-      event: "server.stream_error",
-      server: server.name,
-      message: `Server ${server.name} HTTP stream error, reconnecting: ${msg}`,
-      fields: { transport: "streamable-http" },
-    });
-    this._scheduleErrorRecovery(server, client, signal, cwd);
-  }
-
   private _handleClientError(
     server: ManagedServer,
     client: Client,
@@ -870,34 +637,39 @@ export class ServerManager {
     if (server.state !== "ready" || signal.aborted || server.client !== client) {
       return;
     }
-    const rawMsg = err instanceof Error ? err.message : String(err);
-    const msg = sanitizeTerminalText(rawMsg);
-    if (isNonFatalClientError(rawMsg)) {
-      if (isNotificationHandlerError(rawMsg)) {
-        reportDiagnostic({
-          level: "info",
-          event: "server.notification_error",
-          server: server.name,
-          message: msg,
-          fields: { transport: server.config.transport },
-        });
-      }
+    const action = classifyClientError(server.config.transport, err);
+    if (action.kind === "ignore") {
+      this._reportIgnoredClientError(server, action, err);
       return;
     }
-    if (server.config.transport === "sse") {
-      reportDiagnostic({
-        level: "warn",
-        event: "server.stream_error",
-        server: server.name,
-        message: `Server ${server.name} SSE stream error, reconnecting: ${msg}`,
-        fields: { transport: "sse" },
-      });
-      this._scheduleErrorRecovery(server, client, signal, cwd);
-      return;
-    }
-    if (server.config.transport === "streamable-http") {
-      this._handleStreamableHttpError(server, client, signal, cwd, err);
-    }
+    // WHY: deferred recovery — see the note on _scheduleErrorRecovery.
+    reportDiagnostic({
+      level: "warn",
+      event: action.event,
+      server: server.name,
+      message: `Server ${server.name} ${action.reason}: ${clientErrorMessage(err)}`,
+      fields: { transport: action.transport },
+    });
+    this._scheduleErrorRecovery(server, client, signal, cwd);
+  }
+
+  /**
+   * Log the one ignorable client error that is worth a line: a server notification whose
+   * handler threw (`notifications/progress` with malformed parameters, typically).
+   */
+  private _reportIgnoredClientError(
+    server: ManagedServer,
+    action: Extract<ClientErrorAction, { kind: "ignore" }>,
+    err: unknown,
+  ): void {
+    if (action.diagnostic !== "server.notification_error") return;
+    reportDiagnostic({
+      level: "info",
+      event: "server.notification_error",
+      server: server.name,
+      message: clientErrorMessage(err),
+      fields: { transport: server.config.transport },
+    });
   }
 
   private _wireDisconnectRecovery(
@@ -927,39 +699,16 @@ export class ServerManager {
     };
   }
 
-  /**
-   * Terminate the stdio child process tree, then release the child's pipe handles.
-   *
-   * WHY: `client.close()` waits for the child's `'close'` event, which never fires while a
-   * leaked grandchild still holds the inherited stdout/stderr write ends — the SDK then
-   * burns its full 2 × 2,000ms escalation budget. Killing the tree first and destroying the
-   * pipes afterwards keeps teardown bounded even if a descendant escaped the tree kill.
-   */
-  private async _terminateStdioTree(
-    pid: number | null,
-    transport: Transport | undefined,
-  ): Promise<void> {
-    try {
-      await ensurePidTerminated(pid);
-      await waitForChildClose(transport);
-    } finally {
-      destroyStdioStreams(transport);
-    }
-  }
-
   private async _cleanupFailedConnect(
     server: ManagedServer,
     client: Client,
     transport: Transport,
   ): Promise<void> {
-    const pid =
-      server.childPid ??
-      (transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
-      (transport instanceof StdioClientTransport ? transport.pid : null);
+    const pid = resolveTransportPid(server.childPid, transport);
     server.childPid = null;
     await Promise.allSettled([
       client.close(),
-      this._terminateStdioTree(pid, transport),
+      terminateStdioTree(pid, transport),
     ]);
     // WHY: Secondary safety check to guarantee PID termination even if transport.close()
     // or child process exit raced during the initial Promise.allSettled.
@@ -1197,10 +946,9 @@ export class ServerManager {
     server.lastError = null;
     this.onServerStopped?.(server.name);
     const client = server.client;
-    const pid =
-      server.childPid ??
-      (server.transport as unknown as { _process?: { pid?: number } })?._process?.pid ??
-      null;
+    // WHY: shared with _cleanupFailedConnect so a PID only visible through the transport
+    // (childPid already cleared, `_process` gone after close) is still terminated.
+    const pid = resolveTransportPid(server.childPid, server.transport);
     const transport = server.transport;
     server.client = null;
     server.transport = undefined;
@@ -1208,7 +956,7 @@ export class ServerManager {
 
     await Promise.allSettled([
       client?.close(),
-      this._terminateStdioTree(pid, transport),
+      terminateStdioTree(pid, transport),
     ]);
     await ensurePidTerminated(pid);
   }

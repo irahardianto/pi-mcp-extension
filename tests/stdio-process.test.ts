@@ -15,6 +15,8 @@ import {
   isPidAlive,
   listDescendantPids,
   POST_CLOSE_FLUSH_DELAY_MS,
+  resolveTransportPid,
+  terminateStdioTree,
   waitForChildClose,
   type StdioProcessDeps,
 } from "../src/stdio-process.js";
@@ -1034,3 +1036,155 @@ setInterval(() => {}, 1000);
   });
 });
 
+
+describe("resolveTransportPid", () => {
+  interface FakePipes {
+    destroyed: boolean;
+    destroy(): void;
+  }
+
+  function createPipes(): FakePipes {
+    return {
+      destroyed: false,
+      destroy(): void {
+        this.destroyed = true;
+      },
+    };
+  }
+
+  function createChild(pid: number): EventEmitter & {
+    pid: number;
+    stdout: FakePipes;
+    stderr: FakePipes;
+  } {
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number;
+      stdout: FakePipes;
+      stderr: FakePipes;
+    };
+    child.pid = pid;
+    child.stdout = createPipes();
+    child.stderr = createPipes();
+    return child;
+  }
+
+  function createInstrumentedTransport(child: EventEmitter & { pid: number }): object {
+    return {
+      _process: child,
+      pid: child.pid,
+      stderr: null,
+      start(): Promise<void> {
+        return Promise.resolve();
+      },
+      close(): Promise<void> {
+        return Promise.resolve();
+      },
+    };
+  }
+
+  it("prefers the recorded child PID over every transport source", () => {
+    assert.equal(resolveTransportPid(1234, { pid: 999 }), 1234);
+  });
+
+  it("keeps the spawned PID reachable after the SDK clears _process", async () => {
+    const child = createChild(4242);
+    const transport = createInstrumentedTransport(child);
+    instrumentStdioTransport(transport as unknown as StdioClientTransport, {
+      onPid: () => {},
+      onStderrLine: () => {},
+    });
+    await (transport as { start(): Promise<void> }).start();
+
+    // WHY: StdioClientTransport.close() clears `_process` synchronously; only the
+    // instrumented record still knows the PID at teardown time.
+    delete (transport as { _process?: unknown })._process;
+    assert.equal(resolveTransportPid(null, transport), 4242);
+  });
+
+  it("falls back to the transport's own _process.pid when it was never instrumented", () => {
+    assert.equal(resolveTransportPid(undefined, { _process: { pid: 777 } }), 777);
+  });
+
+  it("falls back to the public transport.pid last", () => {
+    assert.equal(resolveTransportPid(undefined, { pid: 555 }), 555);
+  });
+
+  it("returns null when no source knows a PID", () => {
+    assert.equal(resolveTransportPid(null, null), null);
+    assert.equal(resolveTransportPid(undefined, undefined), null);
+    assert.equal(resolveTransportPid(null, {}), null);
+    assert.equal(resolveTransportPid(null, { pid: "not-a-pid" }), null);
+  });
+});
+
+describe("terminateStdioTree", () => {
+  function createDeps(overrides: Partial<StdioProcessDeps> = {}): {
+    deps: StdioProcessDeps;
+    killed: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }>;
+  } {
+    const killed: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+    let clock = 0;
+    const deps: StdioProcessDeps = {
+      kill(pid, signal) {
+        killed.push({ pid, signal });
+      },
+      sleep(ms) {
+        clock += ms;
+        return Promise.resolve();
+      },
+      now: () => clock,
+      listDescendantPids: () => Promise.resolve([]),
+      ...overrides,
+    };
+    return { deps, killed };
+  }
+
+  it("kills the tree through the injected process deps", async () => {
+    const { deps, killed } = createDeps();
+    await terminateStdioTree(1234, null, deps);
+    assert.ok(killed.some((call) => call.signal === "SIGTERM" && call.pid === 1234));
+    assert.ok(killed.some((call) => call.signal === "SIGKILL" && call.pid === 1234));
+  });
+
+  it("is a no-op for a server with no child process", async () => {
+    const { deps, killed } = createDeps();
+    await terminateStdioTree(null, null, deps);
+    assert.deepEqual(killed, []);
+  });
+
+  it("releases the child's pipes after the tree is gone, even when a descendant held them", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 5150,
+      stdout: { destroyed: false, destroy(): void { this.destroyed = true; } },
+      stderr: { destroyed: false, destroy(): void { this.destroyed = true; } },
+    });
+    const transport = {
+      _process: child,
+      pid: 5150,
+      stderr: null,
+      start(): Promise<void> {
+        return Promise.resolve();
+      },
+      close(): Promise<void> {
+        return Promise.resolve();
+      },
+    };
+    instrumentStdioTransport(transport as unknown as StdioClientTransport, {
+      onPid: () => {},
+      onStderrLine: () => {},
+    });
+    await transport.start();
+    child.emit("close", 0, null);
+
+    const { deps } = createDeps({
+      kill() {
+        // WHY: the child already exited — teardown must not wait on a PID that is gone.
+        throw createEsrchError();
+      },
+    });
+    await terminateStdioTree(5150, transport, deps);
+
+    assert.equal(child.stdout.destroyed, true);
+    assert.equal(child.stderr.destroyed, true);
+  });
+});

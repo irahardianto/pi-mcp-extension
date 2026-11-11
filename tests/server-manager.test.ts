@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { Socket } from "node:net";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1020,22 +1021,21 @@ await server.connect(new StdioServerTransport());
     });
 
     const manager = new ServerManager(config);
-    let capturedSignal: AbortSignal | undefined;
 
-    t.mock.method(
-      manager as unknown as {
-        _connectWithTimeoutAndSignal: (
-          _client: unknown,
-          _transport: unknown,
-          _timeoutMs: number,
-          signal: AbortSignal,
-        ) => Promise<never>;
-      },
-      "_connectWithTimeoutAndSignal",
-      async (_client: unknown, _transport: unknown, _timeoutMs: number, signal: AbortSignal) => {
-        capturedSignal = signal;
+    // WHY: the handshake fails at the transport — the same place a refused TCP connect
+    // fails — because the connect race guard is now module-scoped (`src/mcp-client.ts`) and
+    // no longer overridable per manager.
+    const failingTransport = {
+      start: async (): Promise<void> => {
         throw new Error("simulated transport connection failure");
       },
+      close: async (): Promise<void> => {},
+      send: async (): Promise<void> => {},
+    };
+    t.mock.method(
+      manager,
+      "createTransport",
+      () => failingTransport as unknown as Transport,
     );
 
     const startPromise = manager.startServer("failing", process.cwd());
@@ -1045,13 +1045,35 @@ await server.connect(new StdioServerTransport());
       return true;
     });
 
-    for (let i = 0; i < maxRetries; i++) {
-      for (let tick = 0; tick < 10; tick++) {
-        await Promise.resolve();
+    // startServer() installs the attempt's controller synchronously, before its first await.
+    const capturedSignal = manager.getServer("failing")?.controller?.signal;
+
+    const abortListenerCount = (): number =>
+      capturedSignal ? EventEmitter.getEventListeners(capturedSignal, "abort").length : 0;
+
+    const failingServer = (): { retryTimer: ReturnType<typeof setTimeout> | null } | undefined =>
+      manager.getServer("failing");
+
+    // WHY: setImmediate, not timers — setTimeout is mocked, so only the real macrotask queue
+    // can make progress through the transport rejection and teardown that precede the retry wait.
+    // The armed `retryTimer` is the marker, not the listener count: the connect race guard also
+    // holds an abort listener for the duration of each attempt.
+    const drainUntilRetryPending = async (): Promise<boolean> => {
+      for (let spin = 0; spin < 500; spin++) {
+        if (failingServer()?.retryTimer !== null && abortListenerCount() === 1) return true;
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
+      return false;
+    };
+
+    for (let i = 0; i < maxRetries; i++) {
       assert.ok(capturedSignal, "Expected connection AbortSignal to be captured");
+      assert.ok(
+        await drainUntilRetryPending(),
+        `Expected retry #${i + 1} to reach its backoff wait`,
+      );
       assert.equal(
-        EventEmitter.getEventListeners(capturedSignal, "abort").length,
+        abortListenerCount(),
         1,
         `Expected 1 abort listener while retry #${i + 1} timer is pending`,
       );
@@ -1065,7 +1087,7 @@ await server.connect(new StdioServerTransport());
     assert.equal(failedServer.lastError.message, "simulated transport connection failure");
     assert.ok(capturedSignal);
     assert.equal(
-      EventEmitter.getEventListeners(capturedSignal, "abort").length,
+      abortListenerCount(),
       0,
       "Expected 0 lingering abort listeners after all retry timers fired",
     );

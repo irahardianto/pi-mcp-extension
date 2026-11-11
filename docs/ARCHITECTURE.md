@@ -137,11 +137,14 @@ While `ready`, three independent recovery paths exist:
   `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,
-  each is time-bounded by the effective timeout, and a failure triggers `_recover()`.
-- an unexpected transport close (`client.onclose`) or a fatal stream error (`client.onerror`
-  outside `isNonFatalClientError`, which ignores benign unknown-ID/token diagnostics and
-  logs uncaught notification-handler errors) triggers `_recover()`; deliberate closes abort
-  the signal first and are ignored.
+  each is time-bounded by the effective timeout, and a failure triggers `_recover()`
+  (`startHealthCheck()` in `src/mcp-client.ts` owns only the schedule; the manager supplies
+  `isReady()` and the recovery callback).
+- an unexpected transport close (`client.onclose`) or a fatal stream error triggers
+  `_recover()`; deliberate closes abort the signal first and are ignored. `client.onerror` is
+  routed by the pure `classifyClientError()` (`src/connect-policy.ts`), which drops benign
+  unknown-ID/token diagnostics and the SDK's POST-only SSE probe, logs uncaught
+  notification-handler errors without reconnecting, and recovers everything else.
 
 `_recover()` shuts the server down, bumps its `generation`, and reconnects on a
 microtask; the generation guard prevents a stop during cleanup from being resurrected.
@@ -164,8 +167,10 @@ under our uid.
 `destroyStdioStreams()` then destroys the child's `stdout`/`stderr` read ends: a survivor that
 inherited those pipes would otherwise keep the `'close'` event from ever firing and stall
 `StdioClientTransport.close()` for its full 2 × 2,000ms escalation budget. Both
-`_cleanupFailedConnect()` and `_shutdown()` go through `_terminateStdioTree()`, so a timed-out
-handshake and an explicit stop behave identically.
+`_cleanupFailedConnect()` and `_shutdown()` resolve the PID through `resolveTransportPid()`
+(recorded PID → instrumented child record → `_process.pid` → `transport.pid`) and go through
+`terminateStdioTree()` in `src/stdio-process.ts`, so a timed-out handshake and an explicit stop
+behave identically.
 
 ---
 
