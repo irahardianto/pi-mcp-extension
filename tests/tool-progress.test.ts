@@ -223,6 +223,7 @@ describe("MCP notifications/progress error isolation over streamable-http (#254)
                 tools: [
                   { name: "null_total_progress", inputSchema: { type: "object", properties: {} } },
                   { name: "valid_progress", inputSchema: { type: "object", properties: {} } },
+                  { name: "coalesced_progress", inputSchema: { type: "object", properties: {} } },
                 ],
               },
             }),
@@ -230,8 +231,34 @@ describe("MCP notifications/progress error isolation over streamable-http (#254)
           return;
         }
         if (msg.method === "tools/call") {
-          res.writeHead(200, { "content-type": "text/event-stream" });
           const progressToken = msg.params?._meta?.progressToken;
+          if (msg.params?.name === "coalesced_progress") {
+            // JSON-RPC batch over application/json: StreamableHTTPClientTransport loops synchronously
+            // (`for (const msg of responseMessages) this.onmessage?.(msg)`), matching StdioClientTransport's
+            // synchronous `processReadBuffer()` loop when notifications and result share a read batch.
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify([
+                {
+                  jsonrpc: "2.0",
+                  method: "notifications/progress",
+                  params: { progressToken, progress: 1, total: 2 },
+                },
+                {
+                  jsonrpc: "2.0",
+                  method: "notifications/progress",
+                  params: { progressToken, progress: 2, total: 2 },
+                },
+                {
+                  jsonrpc: "2.0",
+                  id: msg.id,
+                  result: { content: [{ type: "text", text: "ok:coalesced_progress" }] },
+                },
+              ]),
+            );
+            return;
+          }
+          res.writeHead(200, { "content-type": "text/event-stream" });
           const progressPayload =
             msg.params?.name === "null_total_progress"
               ? { progressToken, progress: 1, total: null, message: "token=sk-secret-value" }
@@ -294,7 +321,22 @@ describe("MCP notifications/progress error isolation over streamable-http (#254)
 
       const nullTotalTool = mockPi.tools.find((t) => t.name.includes("null_total_progress"));
       const validTool = mockPi.tools.find((t) => t.name.includes("valid_progress"));
-      assert.ok(nullTotalTool && validTool);
+      const coalescedTool = mockPi.tools.find((t) => t.name.includes("coalesced_progress"));
+      assert.ok(nullTotalTool && validTool && coalescedTool);
+
+      // 0. Coalesced JSON-RPC batch response: both progress frames and final result dispatched in one synchronous loop.
+      const coalescedUpdates: string[] = [];
+      const res0 = await coalescedTool.execute(
+        "http-call-0",
+        {},
+        undefined,
+        (update) => {
+          coalescedUpdates.push(update.content[0]?.text ?? "");
+        },
+        {},
+      );
+      assert.equal(res0.content[0]?.text, "ok:coalesced_progress");
+      assert.deepEqual(coalescedUpdates, ["Progress 1/2", "Progress 2/2"]);
 
       // 1. Server serializes `total: null` in notifications/progress once _meta.progressToken is present.
       const res1 = await nullTotalTool.execute("http-call-1", {}, undefined, () => {}, {});

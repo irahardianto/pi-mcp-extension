@@ -10,6 +10,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { createTransport, resolveStdioCwd } from "../src/transport-factory.js";
 import { ServerConfigSchema } from "../src/config.js";
 import { stripAuthorizationHeader } from "../src/auth-challenge.js";
@@ -140,3 +142,206 @@ describe("createTransport with OAuth configured", () => {
     });
   }
 });
+
+describe("createTransport batch message ordering (#300)", () => {
+  it("delivers same-turn notifications/progress frames before resolving a coalesced tools/call response", async () => {
+    const transport = createTransport("srv", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    transport.start = async () => {};
+    transport.close = async () => {};
+    transport.send = async (message: JSONRPCMessage) => {
+      if (!("method" in message) || !("id" in message)) return;
+      if (message.method === "initialize") {
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "batch-srv", version: "1.0.0" },
+          },
+        });
+        return;
+      }
+      if (message.method === "tools/call") {
+        const progressToken = (
+          message.params as { _meta?: { progressToken?: string | number } } | undefined
+        )?._meta?.progressToken;
+        // Simulate StdioClientTransport.processReadBuffer() or an SSE chunk delivering trailing
+        // progress notifications and the JSON-RPC result synchronously in the same read loop.
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: progressToken!, progress: 7, total: 8 },
+        });
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: progressToken!, progress: 8, total: 8 },
+        });
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { content: [{ type: "text", text: "Completed 8 steps" }] },
+        });
+      }
+    };
+
+    const clientErrors: Error[] = [];
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    client.onerror = (err) => clientErrors.push(err);
+    await client.connect(transport);
+
+    const seenProgress: number[] = [];
+    const result = await client.callTool(
+      { name: "report_progress", arguments: {} },
+      undefined,
+      {
+        onprogress: ({ progress }) => {
+          seenProgress.push(progress);
+        },
+        resetTimeoutOnProgress: true,
+      },
+    );
+
+    assert.deepEqual(seenProgress, [7, 8]);
+    assert.deepEqual(result.content, [{ type: "text", text: "Completed 8 steps" }]);
+    assert.deepEqual(clientErrors, []);
+    await client.close();
+  });
+
+  it("delivers a trailing notification before same-turn transport.onclose tears down handlers", async () => {
+    const transport = createTransport("srv", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    transport.start = async () => {};
+    transport.close = async () => {};
+    transport.send = async (message: JSONRPCMessage) => {
+      if (!("method" in message) || !("id" in message)) return;
+      if (message.method === "initialize") {
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "batch-srv", version: "1.0.0" },
+          },
+        });
+        return;
+      }
+      if (message.method === "tools/call") {
+        const progressToken = (
+          message.params as { _meta?: { progressToken?: string | number } } | undefined
+        )?._meta?.progressToken;
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: progressToken!, progress: 1, total: 1 },
+        });
+        transport.onclose?.();
+      }
+    };
+
+    const clientErrors: Error[] = [];
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    client.onerror = (err) => clientErrors.push(err);
+    await client.connect(transport);
+
+    const seenProgress: number[] = [];
+    await assert.rejects(() =>
+      client.callTool(
+        { name: "report_progress", arguments: {} },
+        undefined,
+        {
+          onprogress: ({ progress }) => {
+            seenProgress.push(progress);
+          },
+        },
+      ),
+    );
+
+    assert.deepEqual(seenProgress, [1]);
+    assert.deepEqual(clientErrors, []);
+  });
+
+  it("keeps non-notification dispatch synchronous when no notification is in flight", () => {
+    const transport = createTransport("srv", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    const events: string[] = [];
+    transport.onmessage = () => {
+      events.push("message");
+    };
+    transport.onclose = () => {
+      events.push("close");
+    };
+
+    transport.onmessage({ jsonrpc: "2.0", id: 1, result: {} });
+    events.push("after-message");
+    transport.onclose();
+    events.push("after-close");
+
+    assert.deepEqual(events, ["message", "after-message", "close", "after-close"]);
+  });
+
+  it("supports chained handlers, forwards deferred handler errors to onerror, and clears handlers", async () => {
+    const transport = createTransport("srv", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    const order: string[] = [];
+    const errors: string[] = [];
+    transport.onerror = (err) => errors.push(err.message);
+
+    transport.onmessage = () => {
+      order.push("inner-msg");
+    };
+    const prevMsg = transport.onmessage;
+    transport.onmessage = (msg, extra) => {
+      prevMsg?.(msg, extra);
+      if ("id" in msg) {
+        throw new Error("boom in deferred response");
+      }
+      order.push("outer-notif");
+    };
+
+    transport.onclose = () => {
+      order.push("inner-close");
+    };
+    const prevClose = transport.onclose;
+    transport.onclose = () => {
+      prevClose?.();
+      throw new Error("boom in deferred close");
+    };
+
+    transport.onmessage({ jsonrpc: "2.0", method: "notifications/progress", params: {} });
+    transport.onmessage({ jsonrpc: "2.0", id: 2, result: {} });
+    transport.onclose();
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(order, ["inner-msg", "outer-notif", "inner-msg", "inner-close"]);
+    assert.deepEqual(errors, [
+      "boom in deferred response",
+      "boom in deferred close",
+    ]);
+
+    transport.onmessage = undefined;
+    transport.onclose = undefined;
+    assert.equal(transport.onmessage, undefined);
+    assert.equal(transport.onclose, undefined);
+  });
+});
+

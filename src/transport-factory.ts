@@ -179,6 +179,139 @@ function createSseTransport(
   return transport;
 }
 
+type TransportMessageHandler = NonNullable<Transport["onmessage"]>;
+type TransportCloseHandler = NonNullable<Transport["onclose"]>;
+
+interface NotificationTurnTracker {
+  pending: number;
+  inMessage: boolean;
+  inClose: boolean;
+  reportError: (err: unknown) => void;
+}
+
+function isJsonRpcNotificationMessage(message: unknown): boolean {
+  if (typeof message !== "object" || message === null) return false;
+  const record = message as Record<string, unknown>;
+  return typeof record["method"] === "string" && !("id" in record);
+}
+
+function invokeMessageSynchronously(
+  handler: TransportMessageHandler,
+  tracker: NotificationTurnTracker,
+  message: Parameters<TransportMessageHandler>[0],
+  extra: Parameters<TransportMessageHandler>[1],
+): void {
+  tracker.inMessage = true;
+  try {
+    handler(message, extra);
+  } finally {
+    tracker.inMessage = false;
+  }
+}
+
+function wrapOrderedMessageHandler(
+  handler: TransportMessageHandler,
+  tracker: NotificationTurnTracker,
+): TransportMessageHandler {
+  return (message, extra) => {
+    if (tracker.inMessage) {
+      handler(message, extra);
+      return;
+    }
+    if (isJsonRpcNotificationMessage(message)) {
+      tracker.pending += 1;
+      try {
+        invokeMessageSynchronously(handler, tracker, message, extra);
+      } finally {
+        void Promise.resolve().then(() => {
+          tracker.pending -= 1;
+        });
+      }
+      return;
+    }
+    if (tracker.pending === 0) {
+      invokeMessageSynchronously(handler, tracker, message, extra);
+      return;
+    }
+    void Promise.resolve()
+      .then(() => {
+        invokeMessageSynchronously(handler, tracker, message, extra);
+      })
+      .catch(tracker.reportError);
+  };
+}
+
+function invokeCloseSynchronously(
+  handler: TransportCloseHandler,
+  tracker: NotificationTurnTracker,
+): void {
+  tracker.inClose = true;
+  try {
+    handler();
+  } finally {
+    tracker.inClose = false;
+  }
+}
+
+function wrapOrderedCloseHandler(
+  handler: TransportCloseHandler,
+  tracker: NotificationTurnTracker,
+): TransportCloseHandler {
+  return () => {
+    if (tracker.inClose || tracker.pending === 0) {
+      invokeCloseSynchronously(handler, tracker);
+      return;
+    }
+    void Promise.resolve()
+      .then(() => {
+        invokeCloseSynchronously(handler, tracker);
+      })
+      .catch(tracker.reportError);
+  };
+}
+
+/**
+ * Preserve wire order when a JSON-RPC notification and a response/close share a synchronous
+ * read batch (`StdioClientTransport.processReadBuffer()`, SSE chunks, or JSON batch responses).
+ *
+ * WHY: `Protocol._onnotification` defers notification dispatch onto `Promise.resolve().then(...)`
+ * while `Protocol._onresponse` and `Protocol._onclose` clear `_progressHandlers` synchronously.
+ * Without ordering, a trailing `notifications/progress` frame arriving in the same chunk as its
+ * `tools/call` result loses the race to `_onresponse` and is dropped as an unknown token (#300).
+ */
+function instrumentTransportMessageOrder(transport: Transport): Transport {
+  const tracker: NotificationTurnTracker = {
+    pending: 0,
+    inMessage: false,
+    inClose: false,
+    reportError: (err: unknown) => {
+      transport.onerror?.(err instanceof Error ? err : new Error(String(err)));
+    },
+  };
+  let orderedOnMessage: Transport["onmessage"];
+  let orderedOnClose: Transport["onclose"];
+
+  Object.defineProperties(transport, {
+    onmessage: {
+      configurable: true,
+      enumerable: true,
+      get: () => orderedOnMessage,
+      set: (next: Transport["onmessage"]) => {
+        orderedOnMessage = next ? wrapOrderedMessageHandler(next, tracker) : undefined;
+      },
+    },
+    onclose: {
+      configurable: true,
+      enumerable: true,
+      get: () => orderedOnClose,
+      set: (next: Transport["onclose"]) => {
+        orderedOnClose = next ? wrapOrderedCloseHandler(next, tracker) : undefined;
+      },
+    },
+  });
+  return transport;
+}
+
 export function createTransport(
   serverName: string,
   config: ServerConfig,
@@ -204,10 +337,16 @@ export function createTransport(
 
   switch (config.transport) {
     case "stdio":
-      return createStdioTransport(serverName, config, cwd, onStderr);
+      return instrumentTransportMessageOrder(
+        createStdioTransport(serverName, config, cwd, onStderr),
+      );
     case "streamable-http":
-      return createStreamableHttpTransport(config, requestInit, authProvider);
+      return instrumentTransportMessageOrder(
+        createStreamableHttpTransport(config, requestInit, authProvider),
+      );
     case "sse":
-      return createSseTransport(config, requestInit, authProvider);
+      return instrumentTransportMessageOrder(
+        createSseTransport(config, requestInit, authProvider),
+      );
   }
 }
