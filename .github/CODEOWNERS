@@ -21,6 +21,7 @@
 
 # Configuration parsing and project trust boundary enforcement
 /src/config.ts @irahardianto
+/src/config-compat.ts @irahardianto
 /src/session-lifecycle.ts @irahardianto
 
 # OAuth 2.1 interactive flow, state persistence, and cross-process locks

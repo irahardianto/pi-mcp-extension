@@ -16,239 +16,177 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { callbackServerConfigFromRedirectUrl } from "./callback-server.js";
+import { callbackServerConfigFromRedirectUrl } from "./callback-url.js";
+import {
+  applyProjectOverrides,
+  normalizeAuthConfigAliases,
+  normalizeServerConfigAliases,
+  withRegisteredServerLifecycle,
+} from "./config-compat.js";
 import { McpError } from "./errors.js";
 import { stripJsonComments } from "./jsonc.js";
 
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
-const AuthConfigSchema = z.preprocess(
-  (raw) => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
-    const obj = { ...(raw as Record<string, unknown>) };
-    if (obj.redirectUrl === undefined) {
-      if (typeof obj.callbackUrl === "string") {
-        obj.redirectUrl = obj.callbackUrl;
-      } else if (typeof obj.callbackPort === "number") {
-        obj.redirectUrl = `http://127.0.0.1:${obj.callbackPort}/callback`;
-      } else if (obj.callbackUrl !== undefined) {
-        obj.redirectUrl = obj.callbackUrl;
-      }
+const AuthConfigObjectSchema = z.object({
+  /** Auth type. Currently only "oauth" is supported. Default: "oauth". */
+  type: z.enum(["oauth"]).default("oauth"),
+  /**
+   * Callback URL for the OAuth redirect.
+   * Default: auto-detected local callback server.
+   */
+  redirectUrl: z.string().optional(),
+  /**
+   * Optional scope to request during authorization.
+   */
+  scope: z.string().optional(),
+  /**
+   * Pre-registered client_id (skip dynamic client registration).
+   */
+  clientId: z.string().optional(),
+  /**
+   * Pre-registered client_secret.
+   */
+  clientSecret: z.string().optional(),
+  /**
+   * `client_name` sent with Dynamic Client Registration (Pi 1.3.0 `oauth.clientName`).
+   * Default: `pi-mcp/<server name>`.
+   */
+  clientName: z.string().trim().min(1).optional(),
+  /**
+   * Pi's `/login` provider auth (`auth.provider`), accepted only so it can be rejected with a
+   * clear error: this extension runs OAuth 2.1 and cannot forward a Pi provider token.
+   */
+  provider: z.unknown().optional(),
+});
+
+function validateAuthConfig(
+  auth: z.output<typeof AuthConfigObjectSchema>,
+  ctx: z.RefinementCtx,
+): void {
+  if (auth.provider !== undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["provider"],
+      message:
+        '"auth.provider" sends a Pi /login provider token, which pi-mcp-extension does not support; ' +
+        'remove it to use OAuth 2.1, or send a static credential with "headers"',
+    });
+  }
+  if (auth.redirectUrl !== undefined) {
+    try {
+      callbackServerConfigFromRedirectUrl(auth.redirectUrl);
+    } catch (err) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["redirectUrl"],
+        message: err instanceof Error ? err.message : String(err),
+      });
     }
-    delete obj.callbackUrl;
-    delete obj.callbackPort;
-    return obj;
-  },
-  z
-    .object({
-      /** Auth type. Currently only "oauth" is supported. Default: "oauth". */
-      type: z.enum(["oauth"]).default("oauth"),
-      /**
-       * Callback URL for the OAuth redirect.
-       * Default: auto-detected local callback server.
-       */
-      redirectUrl: z.string().optional(),
-      /**
-       * Optional scope to request during authorization.
-       */
-      scope: z.string().optional(),
-      /**
-       * Pre-registered client_id (skip dynamic client registration).
-       */
-      clientId: z.string().optional(),
-      /**
-       * Pre-registered client_secret.
-       */
-      clientSecret: z.string().optional(),
-      /**
-       * `client_name` sent with Dynamic Client Registration (Pi 1.3.0 `oauth.clientName`).
-       * Default: `pi-mcp/<server name>`.
-       */
-      clientName: z.string().trim().min(1).optional(),
-      /**
-       * Pi's `/login` provider auth (`auth.provider`), accepted only so it can be rejected with a
-       * clear error: this extension runs OAuth 2.1 and cannot forward a Pi provider token.
-       */
-      provider: z.unknown().optional(),
-    })
-    .superRefine((auth, ctx) => {
-      if (auth.provider !== undefined) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["provider"],
-          message:
-            '"auth.provider" sends a Pi /login provider token, which pi-mcp-extension does not support; ' +
-            'remove it to use OAuth 2.1, or send a static credential with "headers"',
-        });
-      }
-      if (auth.redirectUrl !== undefined) {
-        try {
-          callbackServerConfigFromRedirectUrl(auth.redirectUrl);
-        } catch (err) {
-          ctx.addIssue({
-            code: "custom",
-            path: ["redirectUrl"],
-            message: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-    }),
+  }
+}
+
+const AuthConfigSchema = z.preprocess(
+  normalizeAuthConfigAliases,
+  AuthConfigObjectSchema.superRefine(validateAuthConfig),
 );
 
-/** Map legacy `type`/`url`-only entries onto an explicit `transport`. */
-function normalizeTransportAlias(obj: Record<string, unknown>): void {
-  const rawTransport = obj.transport ?? obj.type;
-  if (rawTransport === "http") {
-    obj.transport = "streamable-http";
-    return;
-  }
-  if (obj.transport !== undefined) {
-    return;
-  }
-  if (rawTransport !== undefined) {
-    obj.transport = rawTransport;
-    return;
-  }
-  if (obj.url !== undefined && obj.command === undefined) {
-    obj.transport = "streamable-http";
-  }
-}
+const ServerConfigObjectSchema = z.object({
+  /** Executable to spawn (e.g. "npx", "node", "uvx"). Required for stdio. */
+  command: z.string().optional(),
+  /** Arguments passed to command. */
+  args: z.array(z.string()).default([]),
+  /**
+   * Working directory for a stdio server (Pi 1.3.0 `cwd`). A leading `~` expands to the home
+   * directory and a relative path resolves against the session working directory.
+   */
+  cwd: z.string().min(1).optional(),
+  /**
+   * Extra environment variables passed to the child process as literals.
+   * These merge with process.env; project env overrides parent env.
+   * No ${VAR} interpolation — set vars in your shell environment instead.
+   */
+  env: z.record(z.string(), z.string()).optional(),
+  /** Transport protocol. Default: "stdio" (or "streamable-http" when "url" is provided). */
+  transport: z.enum(["stdio", "streamable-http", "sse"]).default("stdio"),
+  /**
+   * URL for streamable-http or sse transports.
+   * Must be a valid URL (e.g. "https://my-mcp-server.example.com/mcp").
+   */
+  url: z.string().url().optional(),
+  /**
+   * Static HTTP headers to include with every request (streamable-http / sse only).
+   * Useful for API-key-based auth (e.g. { "Authorization": "Bearer <key>" }).
+   * For OAuth2, use the "auth" field instead: when "auth" is set, OAuth owns the
+   * Authorization header and any Authorization entry here is ignored (other headers
+   * still apply).
+   */
+  headers: z.record(z.string(), z.string()).optional(),
+  /**
+   * OAuth2 configuration for servers that require authorization.
+   * When set, the transport will use the SDK's OAuth flow (discovery,
+   * dynamic client registration, PKCE, token refresh).
+   * Only applies to streamable-http and sse transports.
+   */
+  auth: AuthConfigSchema.optional(),
+  /**
+   * "eager" — start at session_start.
+   * "lazy"  — start manually via /mcp:start command.
+   */
+  lifecycle: z.enum(["eager", "lazy"]).default("lazy"),
+  /**
+   * Pi 1.3.0 switch: `false` keeps the entry configured but out of the eager set (normalized to
+   * `lifecycle: "lazy"`). Default: `true`.
+   */
+  enabled: z.boolean().optional(),
+  /** Per-request timeout in ms. Overrides global setting. Default: 30000. */
+  requestTimeoutMs: z.number().positive().optional(),
+  /**
+   * Opt-in heartbeat interval (ping) in ms.
+   * Only useful for long-lived connections where you want proactive liveness checks.
+   * Default: disabled.
+   */
+  healthCheckIntervalMs: z.number().positive().optional(),
+});
 
-/** Map the legacy `oauth` object onto `auth`. */
-function normalizeAuthAlias(obj: Record<string, unknown>): void {
-  if (obj.auth !== undefined) {
+function validateServerConfig(
+  cfg: z.output<typeof ServerConfigObjectSchema>,
+  ctx: z.RefinementCtx,
+): void {
+  if (cfg.transport === "stdio") {
+    if (cfg.command === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: '"command" is required for stdio transport',
+      });
+    }
+    if (cfg.auth !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["auth"],
+        message: "OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'",
+      });
+    }
     return;
   }
-  const oauth = obj.oauth;
-  if (oauth && typeof oauth === "object" && !Array.isArray(oauth)) {
-    obj.auth = oauth;
+  if (cfg.url === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      message: `"url" is required for ${cfg.transport} transport`,
+    });
   }
-}
-
-/**
- * Map Pi 1.3.0 `enabled: false` onto `lifecycle: "lazy"`. Pi keeps a disabled entry configured but
- * out of the connect set; the closest behavior here is the lazy lifecycle (manual `/mcp:start`).
- * An explicit `lifecycle: "eager"` never wins over `enabled: false`, which is what Pi does too.
- */
-function normalizeEnabledAlias(obj: Record<string, unknown>): void {
-  if (obj.enabled === false) {
-    obj.lifecycle = "lazy";
+  if (cfg.cwd !== undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["cwd"],
+      message: `"cwd" is only supported for 'stdio' transport, not '${cfg.transport}'`,
+    });
   }
-}
-
-/** Map legacy `timeout` (seconds) onto `requestTimeoutMs` (milliseconds). */
-function normalizeTimeoutAlias(obj: Record<string, unknown>): void {
-  if (obj.requestTimeoutMs !== undefined) {
-    return;
-  }
-  if (typeof obj.timeout !== "number" || obj.timeout <= 0) {
-    return;
-  }
-  obj.requestTimeoutMs = obj.timeout * 1000;
-}
-
-/** Rewrite Pi 1.x config aliases (`type`, `oauth`, `timeout`, `enabled`) before schema validation. */
-function normalizeServerConfigAliases(raw: unknown): unknown {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
-  const obj = { ...(raw as Record<string, unknown>) };
-  normalizeTransportAlias(obj);
-  normalizeAuthAlias(obj);
-  normalizeTimeoutAlias(obj);
-  normalizeEnabledAlias(obj);
-  return obj;
 }
 
 export const ServerConfigSchema = z.preprocess(
   normalizeServerConfigAliases,
-  z
-    .object({
-      /** Executable to spawn (e.g. "npx", "node", "uvx"). Required for stdio. */
-      command: z.string().optional(),
-      /** Arguments passed to command. */
-      args: z.array(z.string()).default([]),
-      /**
-       * Working directory for a stdio server (Pi 1.3.0 `cwd`). A leading `~` expands to the home
-       * directory and a relative path resolves against the session working directory.
-       */
-      cwd: z.string().min(1).optional(),
-      /**
-       * Extra environment variables passed to the child process as literals.
-       * These merge with process.env; project env overrides parent env.
-       * No ${VAR} interpolation — set vars in your shell environment instead.
-       */
-      env: z.record(z.string(), z.string()).optional(),
-      /** Transport protocol. Default: "stdio" (or "streamable-http" when "url" is provided). */
-      transport: z.enum(["stdio", "streamable-http", "sse"]).default("stdio"),
-      /**
-       * URL for streamable-http or sse transports.
-       * Must be a valid URL (e.g. "https://my-mcp-server.example.com/mcp").
-       */
-      url: z.string().url().optional(),
-      /**
-       * Static HTTP headers to include with every request (streamable-http / sse only).
-       * Useful for API-key-based auth (e.g. { "Authorization": "Bearer <key>" }).
-       * For OAuth2, use the "auth" field instead: when "auth" is set, OAuth owns the
-       * Authorization header and any Authorization entry here is ignored (other headers
-       * still apply).
-       */
-      headers: z.record(z.string(), z.string()).optional(),
-      /**
-       * OAuth2 configuration for servers that require authorization.
-       * When set, the transport will use the SDK's OAuth flow (discovery,
-       * dynamic client registration, PKCE, token refresh).
-       * Only applies to streamable-http and sse transports.
-       */
-      auth: AuthConfigSchema.optional(),
-      /**
-       * "eager" — start at session_start.
-       * "lazy"  — start manually via /mcp:start command.
-       */
-      lifecycle: z.enum(["eager", "lazy"]).default("lazy"),
-      /**
-       * Pi 1.3.0 switch: `false` keeps the entry configured but out of the eager set (normalized to
-       * `lifecycle: "lazy"`). Default: `true`.
-       */
-      enabled: z.boolean().optional(),
-      /** Per-request timeout in ms. Overrides global setting. Default: 30000. */
-      requestTimeoutMs: z.number().positive().optional(),
-      /**
-       * Opt-in heartbeat interval (ping) in ms.
-       * Only useful for long-lived connections where you want proactive liveness checks.
-       * Default: disabled.
-       */
-      healthCheckIntervalMs: z.number().positive().optional(),
-    })
-    .superRefine((cfg, ctx) => {
-      if (cfg.transport === "stdio") {
-        if (cfg.command === undefined) {
-          ctx.addIssue({
-            code: "custom",
-            message: '"command" is required for stdio transport',
-          });
-        }
-        if (cfg.auth !== undefined) {
-          ctx.addIssue({
-            code: "custom",
-            path: ["auth"],
-            message: "OAuth authentication is only supported for 'sse' and 'streamable-http' transports, not 'stdio'",
-          });
-        }
-      } else {
-        if (cfg.url === undefined) {
-          ctx.addIssue({
-            code: "custom",
-            message: `"url" is required for ${cfg.transport} transport`,
-          });
-        }
-        if (cfg.cwd !== undefined) {
-          ctx.addIssue({
-            code: "custom",
-            path: ["cwd"],
-            message: `"cwd" is only supported for 'stdio' transport, not '${cfg.transport}'`,
-          });
-        }
-      }
-    }),
+  ServerConfigObjectSchema.superRefine(validateServerConfig),
 );
 
 const DEFAULT_SETTINGS = {
@@ -295,91 +233,6 @@ const ProjectConfigSchema = z.object({
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
 });
 type ProjectConfig = z.output<typeof ProjectConfigSchema>;
-
-// ─── Pi 1.3.0 project override entries ────────────────────────────────────────
-
-/**
- * Keys a Pi 1.3.0 project entry may override on the global entry of the same name (`/mcp` writes
- * such an entry as soon as a global server is disabled or its exposure is changed for one project).
- * `exposure` / `toolExposure` are Pi-native tool-exposure settings: they are accepted so a shared
- * `mcp.json` loads, and ignored because this extension decides tool activation itself. `lifecycle`
- * is this extension's equivalent of `enabled`.
- */
-const PROJECT_OVERRIDE_KEYS = ["enabled", "exposure", "toolExposure", "lifecycle"] as const;
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** A project entry without a transport definition only overrides the global server of that name. */
-function isProjectOverrideEntry(value: unknown): value is Record<string, unknown> {
-  if (!isPlainObject(value)) return false;
-  return (
-    value.command === undefined &&
-    value.url === undefined &&
-    value.type === undefined &&
-    value.transport === undefined
-  );
-}
-
-function invalidProjectConfig(projectPath: string, detail: string): McpError {
-  return new McpError(`Invalid mcp.json at ${projectPath}:\n  ${detail}`, "<config>", "config");
-}
-
-/** Merge a partial project override onto the raw global entry, keeping the global credentials. */
-function mergeProjectOverride(
-  name: string,
-  override: Record<string, unknown>,
-  globalServers: Record<string, unknown>,
-  projectPath: string,
-): Record<string, unknown> {
-  const base = globalServers[name];
-  if (!isPlainObject(base)) {
-    throw invalidProjectConfig(
-      projectPath,
-      `mcpServers.${name}: a project override needs "command" or "url" in this file, or a global server of that name`,
-    );
-  }
-  const unsupported = Object.keys(override).filter(
-    (key) => !(PROJECT_OVERRIDE_KEYS as readonly string[]).includes(key),
-  );
-  if (unsupported.length > 0) {
-    throw invalidProjectConfig(
-      projectPath,
-      `mcpServers.${name}: a project override can only set ${PROJECT_OVERRIDE_KEYS.join(", ")} (found ${unsupported.join(", ")})`,
-    );
-  }
-  const merged: Record<string, unknown> = { ...base };
-  if (override.lifecycle !== undefined && override.enabled === undefined) {
-    delete merged.enabled;
-  }
-  for (const key of PROJECT_OVERRIDE_KEYS) {
-    if (override[key] !== undefined) {
-      merged[key] = override[key];
-    }
-  }
-  return merged;
-}
-
-/**
- * Resolve Pi 1.3.0 partial project entries (`{ "<server>": { "enabled": false } }`) against the raw
- * global file *before* validation, so `ProjectConfigSchema` sees a complete entry instead of
- * failing with `"command" is required for stdio transport` (which tore down every global server on
- * `session_start`).
- */
-function applyProjectOverrides(projectRaw: unknown, globalRaw: unknown, projectPath: string): unknown {
-  if (!isPlainObject(projectRaw) || !isPlainObject(projectRaw.mcpServers)) return projectRaw;
-  const globalServers = isPlainObject(globalRaw) && isPlainObject(globalRaw.mcpServers)
-    ? globalRaw.mcpServers
-    : {};
-  const servers: Record<string, unknown> = {};
-  for (const [name, value] of Object.entries(projectRaw.mcpServers)) {
-    servers[name] = isProjectOverrideEntry(value)
-      ? mergeProjectOverride(name, value, globalServers, projectPath)
-      : value;
-  }
-  return { ...projectRaw, mcpServers: servers };
-}
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
@@ -475,13 +328,7 @@ export function parseRegisteredServerConfig(
   raw: unknown,
   sourcePath = "<extension>",
 ): ServerConfig {
-  const rawObj = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>)
-    : undefined;
-  const withLifecycle = rawObj && rawObj.lifecycle === undefined
-    ? { ...rawObj, lifecycle: rawObj.enabled === false ? "lazy" : "eager" }
-    : raw;
-  const result = ServerConfigSchema.safeParse(withLifecycle);
+  const result = ServerConfigSchema.safeParse(withRegisteredServerLifecycle(raw));
   if (!result.success) {
     const issues = result.error.issues
       .map((i) => `  mcpServers.${name}${i.path.length ? `.${i.path.join(".")}` : ""}: ${i.message}`)
