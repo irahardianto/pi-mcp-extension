@@ -7,6 +7,7 @@
  *   - Tool name sanitization (Pi-compatible identifiers)
  *   - Tool annotations → description hints + structured Pi `annotations`
  *   - AbortSignal → SDK's built-in cancellation (notifications/cancelled)
+ *   - notifications/progress → sanitized, redacted live tool updates + inactivity timeout reset
  *   - Protocol error vs tool execution error distinction
  *   - Activate/deactivate pattern (register once, toggle on server state change)
  *   - Images and embedded image resources → ImageContent; resource links → read hints
@@ -14,9 +15,11 @@
 
 import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema, type Progress } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionAPI, ToolAnnotations } from "@earendil-works/pi-coding-agent";
 import { McpError, AuthCancelledError } from "./errors.js";
+import { redactSecrets } from "./debug-log.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 import type { Settings } from "./config.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
@@ -202,6 +205,15 @@ interface ToolCallOutcome {
   details: Record<string, never>;
 }
 
+/** Pi's partial-result callback — the `onUpdate` argument of a tool's `execute`. */
+export type ToolUpdateCallback = (update: ToolCallOutcome) => void;
+
+/** Per-call streaming and cancellation options for one `tools/call`. */
+interface ToolCallOptions {
+  signal: AbortSignal | undefined;
+  onUpdate: ToolUpdateCallback | undefined;
+}
+
 /**
  * The subset of an SDK `tools/call` response the bridge consumes.
  * Legacy servers answer with `toolResult` instead of `content`, so every field
@@ -254,19 +266,81 @@ function buildToolAnnotations(
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
+/** Character budget for one progress line; Pi renders the latest line while the tool runs. */
+const PROGRESS_MESSAGE_MAX_LENGTH = 200;
+
+/**
+ * Render one MCP `notifications/progress` payload as a single Pi-visible line.
+ *
+ * `message` is server-controlled and lands in Pi's UI stream, so it is sanitized (ANSI and
+ * control sequences stripped, length bounded) and stripped of token-like substrings first.
+ * A server that sends no usable text gets a numeric `Progress 3/10` line instead.
+ *
+ * WHY: sanitize before redacting, as `sanitizeLogText` does — the sanitizer deletes escape
+ * sequences, and an escape *inside* a credential (`\u001b[1mtoken\u001b[0m=sk-…`) hides the
+ * `key=value` shape from `redactSecrets`, which would then pass the token through verbatim.
+ */
+export function formatProgressText(progress: Progress): string {
+  const rawMessage = typeof progress.message === "string" ? progress.message : "";
+  // WHY: decide usability on the full text (`maxLength` = its own length disables truncation) and
+  // trim surrounding whitespace first. `sanitizeTerminalText` appends `…` when it truncates and
+  // turns trailing newlines into spaces, so untrimmed padding would either defeat the fallback,
+  // consume the 200-char budget into a blank `   …` row, or split dedupe across `msg` vs `msg\n`.
+  const message = sanitizeTerminalText(rawMessage, { maxLength: rawMessage.length }).trim();
+  if (message.length > 0) {
+    // WHY: bound after redaction — a `[REDACTED]` mask is longer than the value it replaces, so
+    // capping first would let the emitted line grow past the budget (or slice a token before the
+    // redactor can recognise it).
+    return sanitizeTerminalText(redactSecrets(message), {
+      maxLength: PROGRESS_MESSAGE_MAX_LENGTH,
+    });
+  }
+  const current = Number.isFinite(progress.progress) ? String(progress.progress) : "?";
+  const total = Number.isFinite(progress.total) ? `/${progress.total}` : "";
+  return `Progress ${current}${total}`;
+}
+
+/**
+ * Build the SDK `onprogress` handler for one `tools/call`.
+ *
+ * WHY: the handler is installed even when Pi passes no `onUpdate` callback. The SDK attaches
+ * `_meta.progressToken` only when `onprogress` is set, and the timer reset that keeps a long,
+ * actively-reporting tool alive (`resetTimeoutOnProgress`) hangs off that token (#254).
+ *
+ * Consecutive identical lines are dropped: some servers repeat one message on every tick, and
+ * each emission re-renders Pi's in-progress tool row.
+ */
+function createProgressReporter(
+  onUpdate: ToolUpdateCallback | undefined,
+): (progress: Progress) => void {
+  let lastText: string | undefined;
+  return (progress: Progress): void => {
+    if (!onUpdate) return;
+    const text = formatProgressText(progress);
+    if (text === lastText) return;
+    lastText = text;
+    onUpdate({ content: [{ type: "text", text }], details: {} });
+  };
+}
+
 /** Call tools/call through the typed helper when present, else a raw JSON-RPC request. */
 function callToolWithClient(
   client: Client,
   toolName: string,
   params: unknown,
   timeoutMs: number,
-  signal: AbortSignal | undefined,
+  options: ToolCallOptions,
 ): Promise<ToolCallResponse> {
   const requestOptions = {
     timeout: timeoutMs,
+    // WHY: without these two the SDK never attaches a progress token, so it drops the server's
+    // `notifications/progress` as an unknown token and keeps the original inactivity deadline —
+    // a tool that reports progress every few seconds was still killed at `requestTimeoutMs` (#254).
+    resetTimeoutOnProgress: true,
+    onprogress: createProgressReporter(options.onUpdate),
     // Pass AbortSignal to SDK — it will automatically send
     // notifications/cancelled when the signal fires
-    ...(signal ? { signal } : {}),
+    ...(options.signal ? { signal: options.signal } : {}),
   };
   if (typeof client.callTool === "function") {
     return client.callTool(
@@ -651,8 +725,11 @@ export class ToolBridge {
     const annotations = tool.annotations;
     const description = buildToolDescription(tool, annotations);
     const toolAnnotations = buildToolAnnotations(annotations);
-    const runTool = (params: unknown, signal: AbortSignal | undefined) =>
-      this._executeToolCall(serverName, tool.name, client, params, signal);
+    const runTool = (
+      params: unknown,
+      signal: AbortSignal | undefined,
+      onUpdate: ToolUpdateCallback | undefined,
+    ) => this._executeToolCall(serverName, tool.name, client, params, { signal, onUpdate });
     // WHY: `execute` runs with `this` bound to the registered-tool literal rather than the
     // bridge, so the rethrow helper is reached through a captured closure.
     const rethrowToolCallError = (err: unknown): Promise<never> =>
@@ -666,9 +743,9 @@ export class ToolBridge {
       parameters: convertJsonSchemaToTypebox(tool.inputSchema),
       ...(toolAnnotations ? { annotations: toolAnnotations } : {}),
 
-      async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      async execute(_toolCallId, params, signal, onUpdate, _ctx) {
         try {
-          return await runTool(params, signal);
+          return await runTool(params, signal, onUpdate);
         } catch (err) {
           return await rethrowToolCallError(err);
         }
@@ -707,9 +784,9 @@ export class ToolBridge {
     toolName: string,
     client: Client,
     params: unknown,
-    signal: AbortSignal | undefined,
+    options: ToolCallOptions,
   ): Promise<ToolCallOutcome> {
-    if (signal?.aborted) {
+    if (options.signal?.aborted) {
       throw new McpError("Tool execution cancelled", serverName, "protocol");
     }
 
@@ -720,13 +797,13 @@ export class ToolBridge {
         toolName,
         params,
         this.serverTimeouts.get(serverName) ?? this.settings.requestTimeoutMs,
-        signal,
+        options,
       );
     } catch (err) {
       // WHY: an abort mid-call is rejected by the SDK with its RequestTimeout error, so the
       // cancellation has to be recognised here — otherwise a caller cancellation is reported
       // as a server timeout, and blamed on the server (#209).
-      if (isCancellationError(err, signal)) {
+      if (isCancellationError(err, options.signal)) {
         throw new McpError("Tool execution cancelled", serverName, "protocol");
       }
       throw err;

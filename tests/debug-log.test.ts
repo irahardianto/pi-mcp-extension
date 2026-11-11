@@ -419,6 +419,31 @@ describe("debug log", () => {
       );
       assert.equal(redactSecrets(once), once);
     });
+
+    it("preserves already-redacted masks and Authorization schemes truncated with '…' without sparing real secrets", () => {
+      const truncated = [
+        "[Authorization: Token [REDACTED…",
+        '{"token":"[REDACTED…',
+        "'client_secret': '[RED…",
+        '{\\"api_key\\":\\"[REDACTED…',
+        "Authorization: Bea…",
+        "Authorization: Token…",
+        "token=…",
+      ];
+      for (const sample of truncated) {
+        assert.equal(redactSecrets(sample), sample);
+      }
+
+      // Any character outside the fixed mask/scheme prefix — with or without trailing `…` —
+      // is still treated as a credential value and masked.
+      assertRedacted([
+        [`token=[REDACTED_${apiKey}`, apiKey],
+        [`token=[RED${apiKey}…`, apiKey],
+        [`{"token":"[RED${apiKey}…`, apiKey],
+        [`Authorization: Bearer${apiKey}…`, apiKey],
+        [`token=…${apiKey}`, apiKey],
+      ]);
+    });
   });
 
   describe("sanitizeLogText", () => {

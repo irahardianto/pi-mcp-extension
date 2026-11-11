@@ -138,8 +138,10 @@ While `ready`, three independent recovery paths exist:
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,
   each is time-bounded by the effective timeout, and a failure triggers `_recover()`.
-- an unexpected transport close (`client.onclose`) or a stream error (`client.onerror`)
-  triggers `_recover()`; deliberate closes abort the signal first and are ignored.
+- an unexpected transport close (`client.onclose`) or a fatal stream error (`client.onerror`
+  outside `isNonFatalClientError`, which ignores benign unknown-ID/token diagnostics and
+  logs uncaught notification-handler errors) triggers `_recover()`; deliberate closes abort
+  the signal first and are ignored.
 
 `_recover()` shuts the server down, bumps its `generation`, and reconnects on a
 microtask; the generation guard prevents a stop during cleanup from being resurrected.

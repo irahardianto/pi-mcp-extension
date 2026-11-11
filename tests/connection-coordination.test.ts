@@ -1114,6 +1114,7 @@ it("should recover SSE and StreamableHTTP servers on unexpected transport errors
     };
 
     firstClient.onerror?.(new Error("Received a response for an unknown message ID: 99"));
+    firstClient.onerror?.(new Error("Uncaught error in notification handler: ZodError"));
     firstClient.onerror?.(new Error("Failed to open SSE stream: Method Not Allowed"));
     firstClient.onerror?.(new Error("Streamable HTTP error: Failed to open SSE stream: Bad Request"));
     await new Promise((r) => setTimeout(r, 30));

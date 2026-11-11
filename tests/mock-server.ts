@@ -17,6 +17,7 @@ import {
   ListResourcesRequestSchema,
   ListResourceTemplatesRequestSchema,
   ReadResourceRequestSchema,
+  type ProgressToken,
 } from "@modelcontextprotocol/sdk/types.js";
 
 // WHY: capability and failure modes are env-driven so the extension tests can exercise a
@@ -24,6 +25,9 @@ import {
 const NO_RESOURCES = process.env["MOCK_NO_RESOURCES"] === "1";
 const FAIL_RESOURCES = process.env["MOCK_FAIL_RESOURCES"] === "1";
 const INSTRUCTIONS = process.env["MOCK_INSTRUCTIONS"];
+// WHY: `notifications/progress` is opt-in so suites that only count or name tools keep seeing
+// the same six tools.
+const PROGRESS_TOOL = process.env["MOCK_PROGRESS"] === "1";
 
 const server = new Server(
   { name: "pi-mcp-test-server", version: "1.0.0" },
@@ -108,6 +112,34 @@ const TOOLS = [
       required: [],
     },
   },
+  ...(PROGRESS_TOOL
+    ? [
+        {
+          name: "report_progress",
+          description: "Emit notifications/progress for each step, then finish",
+          inputSchema: {
+            type: "object",
+            properties: {
+              steps: { type: "number", description: "Number of progress steps" },
+              stepMs: { type: "number", description: "Delay between steps in milliseconds" },
+              message: { type: "string", description: "Optional message for every step" },
+            },
+            required: [],
+          },
+        },
+        {
+          name: "silent_wait",
+          description: "Sleep for the given time without reporting any progress",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ms: { type: "number", description: "How long to sleep in milliseconds" },
+            },
+            required: [],
+          },
+        },
+      ]
+    : []),
 ];
 
 // ── Resource definitions ──────────────────────────────────────────────────────
@@ -128,6 +160,32 @@ const RESOURCE_TEMPLATES = [
 ];
 
 let generatedResources = 0;
+
+/**
+ * Emit one `notifications/progress` per step, a `stepMs` delay apart, using the caller's token.
+ * Without a token the SDK client never asked for progress, so nothing is sent (the call still
+ * takes `steps × stepMs`, which is how the timeout-reset test keeps the request alive).
+ */
+async function emitProgressSteps(
+  progressToken: ProgressToken | undefined,
+  steps: number,
+  stepMs: number,
+  message: string | undefined,
+): Promise<void> {
+  for (let step = 1; step <= steps; step++) {
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+    if (progressToken === undefined) continue;
+    await server.notification({
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress: step,
+        total: steps,
+        ...(message === undefined ? {} : { message }),
+      },
+    });
+  }
+}
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -218,6 +276,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{ type: "text", text: "Intentional failure for testing" }],
         isError: true,
       };
+
+    case "report_progress": {
+      const steps = Number(args?.["steps"] ?? 3);
+      const stepMs = Number(args?.["stepMs"] ?? 50);
+      const message = typeof args?.["message"] === "string" ? args["message"] : undefined;
+      await emitProgressSteps(request.params._meta?.progressToken, steps, stepMs, message);
+      return {
+        content: [{ type: "text", text: `Completed ${steps} steps` }],
+        isError: false,
+      };
+    }
+
+    case "silent_wait": {
+      const ms = Number(args?.["ms"] ?? 1000);
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return {
+        content: [{ type: "text", text: `Waited ${ms}ms` }],
+        isError: false,
+      };
+    }
 
     case "add_resource": {
       generatedResources += 1;

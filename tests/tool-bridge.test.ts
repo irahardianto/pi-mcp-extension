@@ -15,6 +15,7 @@ import { listAllTools } from "../src/tool-discovery.js";
 import {
   buildToolName,
   convertMcpContent,
+  formatProgressText,
   ToolBridge,
 } from "../src/tool-bridge.js";
 
@@ -3016,3 +3017,142 @@ describe("ToolBridge error classification does not swallow server JSON-RPC error
     );
   });
 });
+
+// ── MCP notifications/progress (#254) ─────────────────────────────────────────
+
+describe("MCP progress notifications", () => {
+  const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 0 };
+
+  type ProgressUpdate = { content: Array<{ type: string; text?: string }> };
+  interface CapturedCall {
+    options?: Record<string, unknown> | undefined;
+    onProgress?:
+      | ((progress: { progress: number; total?: number; message?: string }) => void)
+      | undefined;
+  }
+
+  /** Bridge + fake SDK client pair whose `tools/call` options the test can inspect. */
+  function setupBridge() {
+    const captured: CapturedCall = {};
+    const registeredTools: TestToolDefinition[] = [];
+    const bridge = new ToolBridge(settings, {
+      registerTool: (t: unknown) => registeredTools.push(t as TestToolDefinition),
+      getActiveTools: () => [],
+      setActiveTools: () => undefined,
+    });
+    const client = {
+      request: async (req: { method: string }) =>
+        req.method === "tools/list"
+          ? { tools: [{ name: "compile", inputSchema: { type: "object", properties: {} } }] }
+          : { content: [{ type: "text", text: "built" }] },
+      callTool: async (_params: unknown, _schema: unknown, options: Record<string, unknown>) => {
+        captured.options = options;
+        captured.onProgress = options["onprogress"] as CapturedCall["onProgress"];
+        return { content: [{ type: "text", text: "built" }] };
+      },
+    } as unknown as Client;
+    return { captured, registeredTools, bridge, client };
+  }
+
+  async function executeWithUpdates(
+    tool: TestToolDefinition,
+    callId: string,
+    updates: ProgressUpdate[],
+  ) {
+    return tool.execute(
+      callId,
+      {},
+      undefined,
+      (update: unknown) => {
+        updates.push(update as ProgressUpdate);
+      },
+      undefined,
+    );
+  }
+
+  it("asks the server for progress and resets the request timeout on every notification", async () => {
+    const { captured, registeredTools, bridge, client } = setupBridge();
+    await bridge.refreshTools("srv", client);
+    const updates: ProgressUpdate[] = [];
+
+    const result = await executeWithUpdates(registeredTools[0]!, "call-1", updates);
+
+    assert.equal((result.content[0] as { text?: string } | undefined)?.text, "built");
+    // WHY: without both options the SDK never attaches `_meta.progressToken`, so it drops the
+    // server's notifications and keeps the original inactivity deadline (#254).
+    assert.equal(captured.options?.["resetTimeoutOnProgress"], true);
+    assert.equal(typeof captured.onProgress, "function");
+
+    captured.onProgress?.({ progress: 1, total: 3, message: "compiling" });
+    captured.onProgress?.({ progress: 1, total: 3, message: "compiling" });
+    captured.onProgress?.({ progress: 1, total: 3, message: "compiling\n" });
+    captured.onProgress?.({ progress: 2, total: 3 });
+    assert.deepEqual(
+      updates.map((u) => u.content[0]?.text),
+      ["compiling", "Progress 2/3"],
+      "each distinct line reaches Pi once, and a repeated or trailing-newline line does not re-render the row",
+    );
+  });
+
+  it("strips terminal escapes and redacts token-like text from a server message", async () => {
+    const { captured, registeredTools, bridge, client } = setupBridge();
+    await bridge.refreshTools("srv", client);
+    const updates: ProgressUpdate[] = [];
+
+    await executeWithUpdates(registeredTools[0]!, "call-2", updates);
+    captured.onProgress?.({
+      progress: 1,
+      // WHY: the escape sits inside the credential (`token=` + ESC + `sk-…`), so redacting the raw
+      // text would miss the `key=value` shape the sanitizer only makes visible.
+      message: "\u001b[31mDeploying\u001b[0m \u001b[1mtoken\u001b[0m=sk-live-1234567890",
+    });
+
+    const text = updates[0]?.content[0]?.text ?? "";
+    assert.ok(text.includes("Deploying"), `expected the message text, got ${JSON.stringify(text)}`);
+    assert.ok(!text.includes("\u001b"), "ANSI escapes must not reach the Pi UI stream");
+    assert.ok(!text.includes("sk-live-1234567890"), "token-like text must be redacted");
+  });
+
+  it("falls back to numeric progress for empty, blank, or unusable messages", () => {
+    assert.equal(formatProgressText({ progress: 3 }), "Progress 3");
+    assert.equal(formatProgressText({ progress: 3, total: 10 }), "Progress 3/10");
+    assert.equal(formatProgressText({ progress: 3, total: 10, message: "   " }), "Progress 3/10");
+    assert.equal(
+      formatProgressText({ progress: 4, total: 10, message: "\u0000\u0007" }),
+      "Progress 4/10",
+    );
+    assert.equal(formatProgressText({ progress: 5, total: Number.NaN }), "Progress 5");
+    assert.equal(formatProgressText({ progress: Number.NaN, total: 10 }), "Progress ?/10");
+    assert.equal(formatProgressText({ progress: Number.POSITIVE_INFINITY }), "Progress ?");
+    // WHY: the sanitizer appends `…` when it truncates, so a long blank message must be judged
+    // on its untruncated text — otherwise the fallback never fires and the row renders blank.
+    // 300 and 600 spaces straddle the sanitizer's default 500-char budget, which is where its
+    // truncation marker used to turn a blank message into a "usable" one.
+    assert.equal(
+      formatProgressText({ progress: 6, total: 10, message: " ".repeat(300) }),
+      "Progress 6/10",
+    );
+    assert.equal(
+      formatProgressText({ progress: 7, total: 10, message: " ".repeat(600) }),
+      "Progress 7/10",
+    );
+  });
+
+  it("trims surrounding whitespace before capping so padded messages keep their text", () => {
+    assert.equal(
+      formatProgressText({ progress: 3, total: 10, message: `${" ".repeat(250)}Deploying\n` }),
+      "Deploying",
+    );
+    assert.equal(
+      formatProgressText({ progress: 3, total: 10, message: "  Step 1/5\r\n" }),
+      "Step 1/5",
+    );
+  });
+
+  it("keeps the rendered line within the message budget after redaction", () => {
+    const text = formatProgressText({ progress: 1, message: `${"x".repeat(192)} token=v` });
+    assert.ok(text.length <= 200, `expected at most 200 characters, got ${text.length}`);
+    assert.ok(!text.includes(" token=v"), `the credential must still be masked: ${text}`);
+  });
+});
+

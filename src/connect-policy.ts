@@ -193,6 +193,34 @@ export function isCancellationError(err: unknown, signal?: AbortSignal | undefin
   return err.name === "AbortError" || ((err as { code?: unknown }).code === -32001 && /abort/i.test(err.message));
 }
 
+/**
+ * Whether a `client.onerror` message came from `Protocol._onnotification` rejecting an
+ * incoming notification (for example `notifications/progress` carrying `total: null` once
+ * `tools/call` attaches `_meta.progressToken`, or a throwing notification callback).
+ */
+export function isNotificationHandlerError(rawMsg: string): boolean {
+  return /^Uncaught error in notification handler:/i.test(rawMsg);
+}
+
+/**
+ * Whether a `client.onerror` message is non-fatal protocol noise rather than a broken
+ * SSE / Streamable HTTP transport stream.
+ *
+ * Late responses or `notifications/progress` events for an already-settled or cancelled
+ * request report `unknown message ID` / `unknown token`, and malformed notifications or
+ * throwing notification callbacks report `Uncaught error in notification handler: …`.
+ * Reconnecting on any of these would close a healthy HTTP/SSE session and abort in-flight
+ * `tools/call` requests with `Connection closed`.
+ */
+export function isNonFatalClientError(rawMsg: string): boolean {
+  return (
+    isNotificationHandlerError(rawMsg) ||
+    /unknown message ID|Received a response for an unknown message ID|notifications\/progress|unknown token/i.test(
+      rawMsg,
+    )
+  );
+}
+
 export type TransportType = ServerConfig["transport"];
 
 export type ConnectFailureAction =

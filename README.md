@@ -20,6 +20,7 @@
 - **Multi-transport** — `stdio` subprocesses, `streamable-http` (including `"http"` and URL-only shorthand), and legacy `sse` out of the box
 - **Auto-discovery** — Paginated `tools/list` with cursor following (MCP 2025-03-26 spec)
 - **Live tool refresh** — `notifications/tools/list_changed` triggers re-discovery without restart
+- **Live tool progress** — a server's `notifications/progress` events stream into Pi as live tool-call updates (server text is sanitized and secret-redacted, repeated lines are collapsed), and every notification restarts the per-request timeout, so a long-running tool that keeps reporting — a browser flow, migration, or test runner — is no longer killed at `requestTimeoutMs` while it is demonstrably working
 - **Clean cancellation** — `AbortSignal` propagation via `notifications/cancelled`
 - **Smart reconnection** — Fixed delay retry schedule (1s → 3s → 5s → 10s → 30s), configurable max retries, automatic recovery when a server transport closes or errors unexpectedly, and mid-session HTTP `401` / `403 insufficient_scope` detection that invalidates stale tokens and prompts for re-authorization
 - **Health checks** — Opt-in periodic pings to detect stale connections
@@ -167,7 +168,7 @@ In project-level `.pi/mcp.json`, `settings` keys carry no defaults — only the 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `toolPrefix` | `string` | `"mcp"` | Prefix for registered tools: `<prefix>_<server>_<tool>`. Must match `^[a-zA-Z][a-zA-Z0-9_]*$`. |
-| `requestTimeoutMs` | `number` | `30000` | Default per-request timeout in milliseconds |
+| `requestTimeoutMs` | `number` | `30000` | Default per-request timeout in milliseconds. For `tools/call` this is an inactivity deadline: every `notifications/progress` event from the server restarts it, so page-by-page work is not cut off mid-flight. A server that reports progress indefinitely has no wall-clock cap — cancel the tool to stop it |
 | `maxRetries` | `number` | `5` | Max reconnection attempts (0–10) before giving up |
 
 ### Per-Server Config
@@ -334,7 +335,7 @@ The log is written to `<agent dir>/logs/pi-mcp.log` (JSON Lines, one event per l
   - API keys and other JSON or key/value secrets (`api_key`, `x-api-key`, `private_key`, `password`, `secret`, `token`, and prefixed forms such as `db_password` or `aws_secret_access_key`)
   - Credential-bearing query parameters on a server URL (`?api_key=…`, `?token=…`, `?code=…`)
   - `Authorization` headers in any scheme or quoting, and URL userinfo passwords (`https://user:password@host`)
-  - The same redactor protects the per-server `Recent output:` (`stderr`) buffer, the `Last error:` line in `/mcp` and `/mcp <name>`, and user-facing start/auth/recovery failure notifications.
+  - The same redactor protects the per-server `Recent output:` (`stderr`) buffer, handshake `instructions`, `notifications/progress` tool updates, the `Last error:` line in `/mcp` and `/mcp <name>`, and user-facing start/auth/recovery failure notifications.
 - **Best-effort.** A failed log write never breaks a connection or a tool call.
 
 Attach the file to a bug report. It contains no credentials.
@@ -378,7 +379,7 @@ flowchart TD
 4. **JSON Schema → TypeBox** conversion registers tools with Pi-compatible parameter schemas (preserving nullable union ordering, resolving `$ref`s cycle-safely, and inferring/flattening `allOf` object schemas)
 5. **Pi tools are registered** as `<prefix>_<server>_<tool>` (sanitized `[a-zA-Z0-9_]`, max 64 chars with an 8-char SHA-256 suffix on truncation or collision) and convert MCP `text`, `image` (`ImageContent`), `structuredContent`, `resource`, `resource_link`, and `audio` results. When one server exposes two tools that sanitize to the same identifier, the name that needed no substitution keeps the unhashed form (`my_tool` over `my-tool`), remaining ties break by the raw name's code-point order, and the assignment does not depend on `tools/list` order — so a reconnect cannot swap which MCP tool a Pi name executes. Embedded image resources become image blocks, binary resources include MIME type and byte count, and resource links include a `mcp_read_resource` hint.
 6. **Tools activate/deactivate** automatically as servers connect/disconnect, always in one deterministic order — the bridge's tools are sorted by Pi name among the slots they occupy, and other extensions' tools keep their positions — so connect timing and `tools/list` order cannot change the prompt head
-7. **AbortSignal** is wired through to `notifications/cancelled` for clean cancellation
+7. **AbortSignal and progress** are wired through to `notifications/cancelled` for clean cancellation and `notifications/progress` for live sanitized tool updates plus inactivity-timeout resets
 8. **Reconnection & recovery** uses a fixed delay schedule with configurable max retries on initial failure, health check failure, or unexpected transport close/error (`client.onclose` / `client.onerror`), while mid-session HTTP `401` / `403 insufficient_scope` invalidates stale tokens and surfaces a re-authorization hint
 9. **`list_changed` notifications** trigger re-discovery, deactivating stale tools automatically and invalidating the cached resource catalog
 10. **Session shutdown** cancels pending auth/connection flows, stops the callback server, deactivates all tools, flushes the debug log, and cleanly stops all servers (with process-tree `SIGTERM` → `SIGKILL` — a PID the kernel refuses to signal is left alone instead of being polled — and pipe cleanup for `stdio` child processes)
@@ -402,6 +403,7 @@ Implements the **MCP 2025-03-26** specification for tool and resource clients:
 | `roots/list` capability (workspace root) | ✅ |
 | `notifications/tools/list_changed` (live refresh) | ✅ |
 | `notifications/cancelled` (AbortSignal) | ✅ |
+| `notifications/progress` (live sanitized tool updates + inactivity timeout reset) | ✅ |
 | `notifications/message` (structured logging) | ✅ |
 | `isError: true` distinction (protocol vs tool errors, non-text filtered on error) | ✅ |
 | Tool annotations (`readOnlyHint`, `destructiveHint`, etc.) in descriptions and as structured Pi `annotations` | ✅ |
@@ -443,7 +445,7 @@ The test suite includes:
 - **Config & Pi 1.x / 1.3.0 compatibility** (`tests/config.test.ts`, `tests/pi-1x-compat.test.ts`) — Zod schema, JSONC comments, `$PI_CODING_AGENT_DIR` resolution, global/project merge, project trust boundary (`ctx.isProjectTrusted()`), Pi 1.3.0 `enabled: false` and partial project overrides, `stdio` `cwd`, `oauth.clientName`, Pi 1.x schema aliases (`type: "http"`, URL-only HTTP, `oauth`, `timeout`), and dynamic `pi.getMcpServers()` / `mcp_servers_change`
 - **Server lifecycle & coordination** (`tests/server-manager.test.ts`, `tests/stdio-process.test.ts`, `tests/transport-factory.test.ts`, `tests/connection-coordinator.test.ts`, `tests/connection-coordination.test.ts`) — Connect, retry, unexpected close recovery, shutdown with PID `SIGKILL` safety net, health check, concurrent connect/reset coordination, and cancellation
 - **OAuth 2.1 & auth locks** (`tests/oauth-fixes.test.ts`, `tests/authorize-flow.test.ts`, `tests/auth-lock.test.ts`, `tests/auth-commands.test.ts`, `tests/auth-arguments.test.ts`, `tests/fake-oauth-server.test.ts`) — Challenge discovery, PKCE, Dynamic Client Registration, origin and issuer binding, startup authorization prompts, headless/SSH redirect URL paste-back, URL scheme validation, cross-process lock heartbeat, and stale lock reclamation
-- **Tool bridge, status diagnostics & debug log** (`tests/tool-bridge.test.ts`, `tests/management-tools.test.ts`, `tests/server-status.test.ts`, `tests/status-commands.test.ts`, `tests/completions.test.ts`, `tests/debug-log.test.ts`) — JSON Schema → TypeBox conversion (`allOf` object inference, `$ref` cycle protection, union `null` ordering), name sanitization, image content passthrough, `isError` filtering, activate/deactivate, `mcp_status` / `mcp_connect`, `/mcp <name>` config provenance and failure hints, slash command completions, and redacted `PI_MCP_DEBUG=1` JSONL logging
+- **Tool bridge, status diagnostics & debug log** (`tests/tool-bridge.test.ts`, `tests/tool-progress.test.ts`, `tests/management-tools.test.ts`, `tests/server-status.test.ts`, `tests/status-commands.test.ts`, `tests/completions.test.ts`, `tests/debug-log.test.ts`) — JSON Schema → TypeBox conversion (`allOf` object inference, `$ref` cycle protection, union `null` ordering), name sanitization, image content passthrough, `isError` filtering, activate/deactivate, `notifications/progress` forwarding (sanitizing, redaction, dedupe, and the timeout reset over a real stdio server), `mcp_status` / `mcp_connect`, `/mcp <name>` config provenance and failure hints, slash command completions, and redacted `PI_MCP_DEBUG=1` JSONL logging
 - **Resource bridge** (`tests/resource-bridge.test.ts`) — paginated `resources/list` / `resources/templates/list`, `-32601` degradation, catalog caching with `notifications/resources/list_changed` invalidation, stale in-flight discard, text/image/binary `resources/read` conversion, abort/timeout/401 mapping, `mcp_list_resources` / `mcp_read_resource`, and `/mcp:resources`
 - **Property-based fuzzing** (`tests/fuzz.test.ts`) — `fast-check` properties covering JSONC comment stripping, callback/redirect URL validation, `WWW-Authenticate` challenge parsing, JSON Schema → TypeBox conversion, tool naming, terminal/log secret sanitization, and custom header merging
 - **Release flow & repository policy** (`tests/release.test.ts`, `tests/ruleset-audit.test.ts`, `tests/repo-policy.test.ts`) — Release PR orchestration and npm/git self-healing (`scripts/release.ts`), live GitHub ruleset drift auditing (`scripts/ruleset-audit.ts`), and CI/ESLint/Qlty policy invariants
