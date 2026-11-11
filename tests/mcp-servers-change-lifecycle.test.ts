@@ -5,6 +5,28 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
+import {
+  DEFAULT_SETTINGS,
+  SessionLifecycle,
+  abortSupersededEagerStarts,
+  collectRegisteredServers,
+  filterEagerServers,
+  findRemovedOrChangedServers,
+  isProjectTrusted,
+  loadBootstrapConfigState,
+  mergeWithRegisteredServers,
+  removeFromEagerBatch,
+  stageAddedServers,
+} from "../src/session-lifecycle.js";
+import {
+  collectRegisteredServers as collectRegisteredServersFromCommands,
+  mergeWithRegisteredServers as mergeWithRegisteredServersFromCommands,
+} from "../src/commands.js";
+import { ServerManager } from "../src/server-manager.js";
+import { ToolBridge } from "../src/tool-bridge.js";
+import { ResourceBridge } from "../src/resource-bridge.js";
+import { ConnectionCoordinator } from "../src/connection-coordinator.js";
+import type { ServerConfig } from "../src/config.js";
 import type { ExtensionUIContext, RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
@@ -726,6 +748,320 @@ describe("mcp_servers_change reconciliation (#216)", () => {
       );
     } finally {
       await harness.cleanup();
+    }
+  });
+});
+
+describe("SessionLifecycle and pure lifecycle helpers", () => {
+  const stdioEager: ServerConfig = {
+    transport: "stdio",
+    command: "node",
+    args: ["-v"],
+    lifecycle: "eager",
+  };
+  const stdioLazy: ServerConfig = {
+    transport: "stdio",
+    command: "node",
+    args: ["-v"],
+    lifecycle: "lazy",
+  };
+
+  it("re-exports collectRegisteredServers and mergeWithRegisteredServers from commands.ts", () => {
+    assert.equal(collectRegisteredServersFromCommands, collectRegisteredServers);
+    assert.equal(mergeWithRegisteredServersFromCommands, mergeWithRegisteredServers);
+  });
+
+  it("collectRegisteredServers honors mcp.json precedence, <extension> fallback, and onError", () => {
+    const errors: unknown[] = [];
+    const entries: RegisteredMcpServer[] = [
+      {
+        name: "overridden",
+        config: { command: "node", args: ["ext.js"] },
+        extensionPath: "/ext/one.ts",
+      },
+      {
+        name: "valid_ext",
+        config: { command: "node", args: ["ext.js"] },
+        extensionPath: "",
+      },
+      {
+        name: "invalid_ext",
+        config: {} as unknown as RegisteredMcpServer["config"],
+        extensionPath: "",
+      },
+    ];
+    const collected = collectRegisteredServers(
+      entries,
+      { overridden: stdioLazy },
+      (err) => errors.push(err),
+    );
+    assert.deepEqual(Object.keys(collected), ["valid_ext"]);
+    assert.equal(errors.length, 1);
+    assert.match(String(errors[0]), /<extension>/);
+
+    const merged = mergeWithRegisteredServers(
+      { settings: { ...DEFAULT_SETTINGS }, mcpServers: { overridden: stdioLazy } },
+      collected,
+    );
+    assert.equal(merged.mcpServers.overridden?.lifecycle, "lazy");
+    assert.equal(merged.mcpServers.valid_ext?.lifecycle, "eager");
+  });
+
+  it("evaluates isProjectTrusted, filterEagerServers, removeFromEagerBatch, findRemovedOrChangedServers, abortSupersededEagerStarts, and stageAddedServers", () => {
+    const trustedCtx = createMockContext({ isProjectTrusted: () => true });
+    const untrustedCtx = createMockContext({ isProjectTrusted: () => false });
+    const legacyCtx = createMockContext();
+    delete (legacyCtx as { isProjectTrusted?: unknown }).isProjectTrusted;
+
+    assert.equal(isProjectTrusted(trustedCtx), true);
+    assert.equal(isProjectTrusted(untrustedCtx), false);
+    assert.equal(isProjectTrusted(legacyCtx), true);
+
+    const eagerList = filterEagerServers({ a: stdioEager, b: stdioLazy });
+    assert.deepEqual(eagerList.map(([name]) => name), ["a"]);
+
+    removeFromEagerBatch(eagerList, "missing");
+    assert.equal(eagerList.length, 1);
+    removeFromEagerBatch(eagerList, "a");
+    assert.equal(eagerList.length, 0);
+
+    const changed = findRemovedOrChangedServers(
+      { same: stdioEager, mutated: stdioEager, removed: stdioLazy },
+      { same: { ...stdioEager }, mutated: stdioLazy },
+    );
+    assert.deepEqual(changed.sort(), ["mutated", "removed"]);
+
+    const aborted: string[] = [];
+    abortSupersededEagerStarts(new Map(), [], {}, (name) => aborted.push(name));
+    assert.equal(aborted.length, 0);
+
+    const keepEntry: RegisteredMcpServer = {
+      name: "keep",
+      config: { command: "node", args: ["-v"] },
+      extensionPath: "/ext/a.ts",
+    };
+    const parsedKeep = collectRegisteredServers([keepEntry], {}).keep!;
+    abortSupersededEagerStarts(
+      new Map<string, ServerConfig>([
+        ["keep", parsedKeep],
+        ["drop", stdioEager],
+      ]),
+      [keepEntry],
+      {},
+      (name) => aborted.push(name),
+    );
+    assert.deepEqual(aborted, ["drop"]);
+
+    const manager = new ServerManager({
+      settings: { ...DEFAULT_SETTINGS },
+      mcpServers: { existing: stdioEager },
+    });
+    const staged = stageAddedServers(manager, {
+      existing: stdioEager,
+      added_eager: stdioEager,
+      added_lazy: stdioLazy,
+    });
+    assert.deepEqual(staged.map(([name]) => name), ["added_eager"]);
+    assert.ok(manager.getServer("added_lazy"));
+  });
+
+  it("loadBootstrapConfigState ignores project config and survives malformed global config", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-bootstrap-unit-"));
+    const badGlobalPath = join(dir, "bad-global.json");
+    await writeFile(badGlobalPath, "{ invalid json");
+    const mockExt = createMockExtension({
+      mcpServers: [{ name: "ext_ok", config: { command: "node", args: ["-v"] }, extensionPath: "/ext/a.ts" }],
+    });
+    delete (mockExt.api as { getMcpServers?: unknown }).getMcpServers;
+
+    try {
+      const stateWithoutApi = await loadBootstrapConfigState(mockExt.api, {
+        bootstrapCwd: dir,
+        globalConfigPath: badGlobalPath,
+      });
+      assert.equal(stateWithoutApi.fileProvenance.projectConfigIncluded, false);
+      assert.deepEqual(stateWithoutApi.extensionServers, {});
+      assert.deepEqual(stateWithoutApi.config.settings, DEFAULT_SETTINGS);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("SessionLifecycle reports reconcile failures on active sessions and keeps reconcileQueue usable", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-lifecycle-unit-"));
+    const globalConfigPath = join(dir, "global.json");
+    await writeFile(globalConfigPath, JSON.stringify({ settings: { maxRetries: 0 } }));
+
+    let registered: RegisteredMcpServer[] = [];
+    const mockExt = createMockExtension();
+    (mockExt.api as unknown as { getMcpServers: () => RegisteredMcpServer[] }).getMcpServers = () =>
+      registered;
+
+    const initialState = await loadBootstrapConfigState(mockExt.api, {
+      bootstrapCwd: dir,
+      globalConfigPath,
+    });
+    const manager = new ServerManager(initialState.config);
+    const bridge = new ToolBridge(initialState.config.settings, mockExt.api);
+    const resources = new ResourceBridge();
+    const coordinator: ConnectionCoordinator = new ConnectionCoordinator({
+      manager,
+      bridge,
+      getConfig: () => lifecycle.getConfig(),
+      authorize: async () => {},
+      stopCallbackServer: async () => {},
+    });
+    const lifecycle: SessionLifecycle = new SessionLifecycle({
+      pi: mockExt.api,
+      globalConfigPath,
+      initialState,
+      manager,
+      coordinator,
+      bridge,
+      resources,
+    });
+
+    const notifications: string[] = [];
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
+
+    try {
+      await lifecycle.handleSessionStart(ctx);
+
+      let failOnce = true;
+      const origStartEager = coordinator.startEagerServers.bind(coordinator);
+      coordinator.startEagerServers = async (entries, targetCtx) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("boom during eager start");
+        }
+        return origStartEager(entries, targetCtx);
+      };
+
+      registered = [serverEntry("ext_boom")];
+      await lifecycle.handleServersChange({ servers: registered }, ctx);
+
+      assert.ok(
+        notifications.some((m) =>
+          m.includes("pi-mcp: Failed to apply server registration change — boom during eager start"),
+        ),
+        `expected reconcile failure notification, got: ${JSON.stringify(notifications)}`,
+      );
+      assert.equal(lifecycle.getProvenance().sources.ext_boom, "extension");
+    } finally {
+      await lifecycle.handleSessionShutdown(ctx);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("SessionLifecycle surfaces invalid extension server configs on both clean and fallback session_start reloads and recovers activeSessionStart after an eager-start rejection", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-lifecycle-fallback-"));
+    const globalConfigPath = join(dir, "global.json");
+    await writeFile(globalConfigPath, JSON.stringify({ settings: { maxRetries: 0 } }));
+
+    const invalidEntry: RegisteredMcpServer = {
+      name: "ext_invalid",
+      config: {} as unknown as RegisteredMcpServer["config"],
+      extensionPath: "/ext/broken.ts",
+    };
+    let registered: RegisteredMcpServer[] = [invalidEntry, serverEntry("ext_eager_ok")];
+    const mockExt = createMockExtension();
+    (mockExt.api as unknown as { getMcpServers: () => RegisteredMcpServer[] }).getMcpServers = () =>
+      registered;
+
+    const initialState = await loadBootstrapConfigState(mockExt.api, {
+      bootstrapCwd: dir,
+      globalConfigPath: undefined,
+    });
+    const manager = new ServerManager(initialState.config);
+    const bridge = new ToolBridge(initialState.config.settings, mockExt.api);
+    const resources = new ResourceBridge();
+    const coordinator: ConnectionCoordinator = new ConnectionCoordinator({
+      manager,
+      bridge,
+      getConfig: () => lifecycle.getConfig(),
+      authorize: async () => {},
+      stopCallbackServer: async () => {},
+    });
+    // Also verifies omitting globalConfigPath compiles under exactOptionalPropertyTypes,
+    // then constructs the test instance pointed at the temp globalConfigPath.
+    const defaultGlobalLifecycle = new SessionLifecycle({
+      pi: mockExt.api,
+      initialState,
+      manager,
+      coordinator,
+      bridge,
+      resources,
+    });
+    assert.ok(defaultGlobalLifecycle.getConfig());
+
+    const lifecycle: SessionLifecycle = new SessionLifecycle({
+      pi: mockExt.api,
+      globalConfigPath,
+      initialState,
+      manager,
+      coordinator,
+      bridge,
+      resources,
+    });
+
+    const notifications: string[] = [];
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        notify: (message: string) => {
+          notifications.push(message);
+        },
+      },
+    });
+
+    const origStartEager = coordinator.startEagerServers.bind(coordinator);
+    let rejectStartupOnce = true;
+    coordinator.startEagerServers = async (entries, targetCtx) => {
+      if (rejectStartupOnce) {
+        rejectStartupOnce = false;
+        throw new Error("startup eager explosion");
+      }
+      return origStartEager(entries, targetCtx);
+    };
+
+    try {
+      // 1. Valid global config + invalid extension server + throwing startEagerServers:
+      // commitLoadedConfig's onError fires, and activeSessionStart's .catch() keeps future turns unblocked.
+      await assert.rejects(
+        () => lifecycle.handleSessionStart(ctx),
+        /startup eager explosion/,
+      );
+      assert.ok(
+        notifications.some((m) => m.includes("pi-mcp: Config error —") && m.includes("/ext/broken.ts")),
+        `expected invalid extension config notification on clean load, got: ${JSON.stringify(notifications)}`,
+      );
+
+      // 2. Malformed global config + invalid extension server + valid eager extension server:
+      // applyFailedConfigFallback's onError fires, and the valid eager extension server still starts cleanly.
+      notifications.length = 0;
+      await writeFile(globalConfigPath, "{ broken json");
+      await lifecycle.handleSessionStart(ctx);
+
+      const configErrors = notifications.filter((m) => m.startsWith("pi-mcp: Config error —"));
+      assert.equal(configErrors.length, 2, `expected both file and extension config errors, got: ${JSON.stringify(notifications)}`);
+      assert.ok(configErrors.some((m) => m.includes(globalConfigPath)));
+      assert.ok(configErrors.some((m) => m.includes("/ext/broken.ts")));
+      assert.equal(manager.getServer("ext_eager_ok")?.state, "ready");
+    } finally {
+      registered = [];
+      await lifecycle.handleSessionShutdown(ctx);
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

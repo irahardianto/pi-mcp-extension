@@ -1,10 +1,6 @@
 /**
- * Command argument parsing, tab completions, and extension-registered server
- * config merging helpers for `/mcp*` commands.
+ * Command argument parsing and tab completions for `/mcp*` commands.
  */
-
-import type { RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
-import { parseRegisteredServerConfig, type McpConfig, type ServerConfig } from "./config.js";
 
 function stripResetFlag(name: string): { name: string; reset: boolean } {
   // WHY: Support standalone `--reset` as well as leading (`--reset <name>`) and trailing (`<name> --reset`)
@@ -92,39 +88,4 @@ export function serverNameCompletions(
   return completions.length > 0 ? completions : null;
 }
 
-export function collectRegisteredServers(
-  entries: readonly RegisteredMcpServer[],
-  fileServers: Record<string, ServerConfig>,
-  onError?: (err: unknown) => void,
-): Record<string, ServerConfig> {
-  const registered: Record<string, ServerConfig> = {};
-  for (const entry of entries) {
-    // Servers configured in mcp.json take precedence over extension-registered servers.
-    if (Object.prototype.hasOwnProperty.call(fileServers, entry.name)) {
-      continue;
-    }
-    try {
-      registered[entry.name] = parseRegisteredServerConfig(
-        entry.name,
-        entry.config,
-        entry.extensionPath || "<extension>",
-      );
-    } catch (err) {
-      onError?.(err);
-    }
-  }
-  return registered;
-}
-
-export function mergeWithRegisteredServers(
-  fileConfig: McpConfig,
-  registeredServers: Record<string, ServerConfig>,
-): McpConfig {
-  return {
-    settings: fileConfig.settings,
-    mcpServers: {
-      ...registeredServers,
-      ...fileConfig.mcpServers,
-    },
-  };
-}
+export { collectRegisteredServers, mergeWithRegisteredServers } from "./session-lifecycle.js";

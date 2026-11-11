@@ -82,8 +82,8 @@ ship with the next patch or feature release. A lifecycle regression can
 therefore reach users bundled with an unrelated fix.
 
 Run this checklist for PRs that touch `src/index.ts`,
-`src/register-commands.ts`, `src/register-tools.ts`, `src/connection-coordinator.ts`,
-`src/server-manager.ts`, `src/transport-factory.ts`, `src/stdio-process.ts`,
+`src/session-lifecycle.ts`, `src/register-commands.ts`, `src/register-tools.ts`, `src/connection-coordinator.ts`,
+`src/server-manager.ts`, `src/mcp-client.ts`, `src/transport-factory.ts`, `src/stdio-process.ts`,
 the OAuth/callback/lock modules (`oauth-*.ts`, `authorize-*.ts`,
 `oauth-state-store.ts`, `auth-lock.ts`, `callback-*.ts`), or `package.json`, and
 for any refactor that moves lifecycle code. Paste the checklist with its output
