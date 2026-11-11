@@ -183,7 +183,7 @@ type TransportMessageHandler = NonNullable<Transport["onmessage"]>;
 type TransportCloseHandler = NonNullable<Transport["onclose"]>;
 
 interface NotificationTurnTracker {
-  pending: number;
+  tail: Promise<void> | null;
   inMessage: boolean;
   inClose: boolean;
   reportError: (err: unknown) => void;
@@ -209,6 +209,36 @@ function invokeMessageSynchronously(
   }
 }
 
+/**
+ * Hold the turn queue open for one microtask so `Protocol._onnotification`'s internal
+ * `Promise.resolve().then(...)` handler completes before any subsequent non-notification or close.
+ */
+function enqueueTurnHold(tracker: NotificationTurnTracker): void {
+  const base = tracker.tail ?? Promise.resolve();
+  const hold = base.then(() => {
+    if (tracker.tail === hold) {
+      tracker.tail = null;
+    }
+  });
+  tracker.tail = hold;
+}
+
+function enqueueTurnStep(tracker: NotificationTurnTracker, step: () => void): void {
+  const base = tracker.tail ?? Promise.resolve();
+  const next = base.then(() => {
+    try {
+      step();
+    } catch (err) {
+      tracker.reportError(err);
+    } finally {
+      if (tracker.tail === next) {
+        tracker.tail = null;
+      }
+    }
+  });
+  tracker.tail = next;
+}
+
 function wrapOrderedMessageHandler(
   handler: TransportMessageHandler,
   tracker: NotificationTurnTracker,
@@ -219,25 +249,27 @@ function wrapOrderedMessageHandler(
       return;
     }
     if (isJsonRpcNotificationMessage(message)) {
-      tracker.pending += 1;
-      try {
-        invokeMessageSynchronously(handler, tracker, message, extra);
-      } finally {
-        void Promise.resolve().then(() => {
-          tracker.pending -= 1;
+      if (tracker.tail === null) {
+        try {
+          invokeMessageSynchronously(handler, tracker, message, extra);
+        } finally {
+          enqueueTurnHold(tracker);
+        }
+      } else {
+        enqueueTurnStep(tracker, () => {
+          invokeMessageSynchronously(handler, tracker, message, extra);
         });
+        enqueueTurnHold(tracker);
       }
       return;
     }
-    if (tracker.pending === 0) {
+    if (tracker.tail === null) {
       invokeMessageSynchronously(handler, tracker, message, extra);
       return;
     }
-    void Promise.resolve()
-      .then(() => {
-        invokeMessageSynchronously(handler, tracker, message, extra);
-      })
-      .catch(tracker.reportError);
+    enqueueTurnStep(tracker, () => {
+      invokeMessageSynchronously(handler, tracker, message, extra);
+    });
   };
 }
 
@@ -258,21 +290,20 @@ function wrapOrderedCloseHandler(
   tracker: NotificationTurnTracker,
 ): TransportCloseHandler {
   return () => {
-    if (tracker.inClose || tracker.pending === 0) {
+    if (tracker.inClose || tracker.tail === null) {
       invokeCloseSynchronously(handler, tracker);
       return;
     }
-    void Promise.resolve()
-      .then(() => {
-        invokeCloseSynchronously(handler, tracker);
-      })
-      .catch(tracker.reportError);
+    enqueueTurnStep(tracker, () => {
+      invokeCloseSynchronously(handler, tracker);
+    });
   };
 }
 
 /**
- * Preserve wire order when a JSON-RPC notification and a response/close share a synchronous
- * read batch (`StdioClientTransport.processReadBuffer()`, SSE chunks, or JSON batch responses).
+ * Preserve FIFO wire order when JSON-RPC notifications, responses/requests, and close events
+ * share a synchronous read batch (`StdioClientTransport.processReadBuffer()`, SSE chunks, or
+ * JSON batch responses).
  *
  * WHY: `Protocol._onnotification` defers notification dispatch onto `Promise.resolve().then(...)`
  * while `Protocol._onresponse` and `Protocol._onclose` clear `_progressHandlers` synchronously.
@@ -281,7 +312,7 @@ function wrapOrderedCloseHandler(
  */
 function instrumentTransportMessageOrder(transport: Transport): Transport {
   const tracker: NotificationTurnTracker = {
-    pending: 0,
+    tail: null,
     inMessage: false,
     inClose: false,
     reportError: (err: unknown) => {

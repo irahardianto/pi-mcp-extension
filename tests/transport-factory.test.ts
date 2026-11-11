@@ -343,5 +343,232 @@ describe("createTransport batch message ordering (#300)", () => {
     assert.equal(transport.onmessage, undefined);
     assert.equal(transport.onclose, undefined);
   });
+
+  it("preserves strict FIFO wire order across interleaved [notif1, resp1, notif2, resp2, close] batches at both raw and Protocol layers", async () => {
+    const transport = createTransport("srv", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    const rawEvents: string[] = [];
+    transport.onmessage = (msg) => {
+      if ("method" in msg && !("id" in msg)) {
+        const step = (msg.params as { progress?: number } | undefined)?.progress;
+        rawEvents.push(`raw:notif:${String(step)}`);
+      } else if ("id" in msg && "result" in msg) {
+        const res = msg.result as { content?: Array<{ text?: string }> };
+        if (res.content) {
+          rawEvents.push(`raw:resp:${res.content[0]?.text ?? ""}`);
+        }
+      }
+    };
+    transport.onclose = () => {
+      rawEvents.push("raw:close");
+    };
+
+    const pendingCalls: Array<{ id: string | number; token: string | number }> = [];
+    transport.start = async () => {};
+    transport.close = async () => {};
+    transport.send = async (message: JSONRPCMessage) => {
+      if (!("method" in message) || !("id" in message)) return;
+      if (message.method === "initialize") {
+        transport.onmessage?.({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "interleaved-srv", version: "1.0.0" },
+          },
+        });
+        return;
+      }
+      if (message.method === "tools/call") {
+        const token = (
+          message.params as { _meta?: { progressToken?: string | number } } | undefined
+        )?._meta?.progressToken;
+        pendingCalls.push({ id: message.id, token: token! });
+        if (pendingCalls.length === 2) {
+          const [first, second] = pendingCalls;
+          // Emit [notif1, resp1, notif2, resp2, close] synchronously in one read batch.
+          transport.onmessage?.({
+            jsonrpc: "2.0",
+            method: "notifications/progress",
+            params: { progressToken: first!.token, progress: 1, total: 1 },
+          });
+          transport.onmessage?.({
+            jsonrpc: "2.0",
+            id: first!.id,
+            result: { content: [{ type: "text", text: "done-1" }] },
+          });
+          transport.onmessage?.({
+            jsonrpc: "2.0",
+            method: "notifications/progress",
+            params: { progressToken: second!.token, progress: 2, total: 2 },
+          });
+          transport.onmessage?.({
+            jsonrpc: "2.0",
+            id: second!.id,
+            result: { content: [{ type: "text", text: "done-2" }] },
+          });
+          transport.onclose?.();
+        }
+      }
+    };
+
+    const clientErrors: Error[] = [];
+    const protocolEvents: string[] = [];
+    let closed = false;
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    client.onerror = (err) => clientErrors.push(err);
+    client.onclose = () => {
+      closed = true;
+    };
+    await client.connect(transport);
+
+    const [res1, res2] = await Promise.all([
+      client
+        .callTool({ name: "t1", arguments: {} }, undefined, {
+          onprogress: ({ progress }) => protocolEvents.push(`proto:notif:${progress}`),
+        })
+        .then((r) => {
+          const text = (r.content as Array<{ text: string }>)[0]!.text;
+          protocolEvents.push(`proto:resp:${text}`);
+          return text;
+        }),
+      client
+        .callTool({ name: "t2", arguments: {} }, undefined, {
+          onprogress: ({ progress }) => protocolEvents.push(`proto:notif:${progress}`),
+        })
+        .then((r) => {
+          const text = (r.content as Array<{ text: string }>)[0]!.text;
+          protocolEvents.push(`proto:resp:${text}`);
+          return text;
+        }),
+    ]);
+
+    // Both callTool promises resolved (rather than rejecting with ConnectionClosed), proving
+    // Protocol._onresponse ran for both before Protocol._onclose cleared _responseHandlers.
+    assert.equal(res1, "done-1");
+    assert.equal(res2, "done-2");
+    assert.equal(closed, true);
+    assert.deepEqual(rawEvents, [
+      "raw:notif:1",
+      "raw:resp:done-1",
+      "raw:notif:2",
+      "raw:resp:done-2",
+      "raw:close",
+    ]);
+    assert.deepEqual(protocolEvents, [
+      "proto:notif:1",
+      "proto:resp:done-1",
+      "proto:notif:2",
+      "proto:resp:done-2",
+    ]);
+    assert.deepEqual(clientErrors, []);
+  });
+
+  it("delivers coalesced SSE chunk notifications before the tools/call response over transport: sse", async () => {
+    const { createServer } = await import("node:http");
+    let sseStream: import("node:http").ServerResponse | undefined;
+    const httpServer = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/sse") {
+        sseStream = res;
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        res.write("event: endpoint\ndata: /messages\n\n");
+        return;
+      }
+      if (req.method === "POST" && req.url === "/messages") {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+          const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+            id?: number;
+            method?: string;
+            params?: { _meta?: { progressToken?: string | number } };
+          };
+          res.writeHead(202).end();
+          if (msg.method === "initialize") {
+            const initReply = JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "sse-batch", version: "1.0.0" },
+              },
+            });
+            sseStream?.write(`data: ${initReply}\n\n`);
+            return;
+          }
+          if (msg.method === "tools/call") {
+            const progressToken = msg.params?._meta?.progressToken;
+            const p1 = JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken, progress: 1, total: 2 },
+            });
+            const p2 = JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken, progress: 2, total: 2 },
+            });
+            const finalResult = JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: { content: [{ type: "text", text: "ok:sse" }] },
+            });
+            // Single write -> single TCP read chunk decoded synchronously by EventSource._parser.feed().
+            sseStream?.write(`data: ${p1}\n\ndata: ${p2}\n\ndata: ${finalResult}\n\n`);
+          }
+        });
+      }
+    });
+
+    await new Promise<void>((resolveListen) => {
+      httpServer.listen(0, "127.0.0.1", () => resolveListen());
+    });
+    const addr = httpServer.address();
+    assert.ok(addr && typeof addr === "object");
+
+    const transport = createTransport(
+      "sse-srv",
+      ServerConfigSchema.parse({
+        transport: "sse",
+        url: `http://127.0.0.1:${addr.port}/sse`,
+        lifecycle: "lazy",
+      }),
+    );
+    const clientErrors: Error[] = [];
+    const client = new Client({ name: "sse-client", version: "1.0.0" });
+    client.onerror = (err) => clientErrors.push(err);
+
+    try {
+      await client.connect(transport);
+      const seenProgress: number[] = [];
+      const result = await client.callTool(
+        { name: "report_progress", arguments: {} },
+        undefined,
+        {
+          onprogress: ({ progress }) => {
+            seenProgress.push(progress);
+          },
+          resetTimeoutOnProgress: true,
+        },
+      );
+      assert.deepEqual(seenProgress, [1, 2]);
+      assert.deepEqual(result.content, [{ type: "text", text: "ok:sse" }]);
+      assert.deepEqual(clientErrors, []);
+    } finally {
+      await client.close();
+      sseStream?.end();
+      await new Promise<void>((resolveClose) => httpServer.close(() => resolveClose()));
+    }
+  });
 });
 
