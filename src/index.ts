@@ -403,6 +403,19 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     return enqueueServerReconcile(ctx);
   });
 
+  // Keep active and outgoing tool order independent of connect timing, `/tree` transcript
+  // restoration, idle/mid-turn external `setActiveTools` reorderings (e.g. `tool_search` before
+  // continuation `sections.tools`, or idle shortcuts before `before_agent_start` snapshots
+  // `systemPromptOptions`), and first-appearance transcript replay (#278).
+  const normalizeActiveTools = (): void => {
+    bridge.orderActiveTools();
+  };
+  pi.on("session_tree", normalizeActiveTools);
+  pi.on("input", normalizeActiveTools);
+  pi.on("before_agent_start", normalizeActiveTools);
+  pi.on("tool_execution_end", normalizeActiveTools);
+  pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
+
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
     // WHY: invalidate before tearing down so an in-flight startup or queued reconcile
     // observes a dead session and bails, then drain both after teardown so shutdown never

@@ -22,6 +22,12 @@ import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
 import { convertResourceContent } from "./resource-bridge.js";
+import {
+  compareCodePoints,
+  orderOwnedEntries,
+  orderPayloadToolEntries,
+  sameToolList,
+} from "./tool-order.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -70,18 +76,6 @@ function isLosslessToolName(rawToolName: string): boolean {
   return /^[a-zA-Z0-9_]+$/.test(rawToolName);
 }
 
-/** Compare strings by Unicode code point, not by UTF-16 code unit. */
-function compareCodePoints(a: string, b: string): number {
-  const left = Array.from(a, (ch) => ch.codePointAt(0) ?? 0);
-  const right = Array.from(b, (ch) => ch.codePointAt(0) ?? 0);
-  const shared = Math.min(left.length, right.length);
-  for (let i = 0; i < shared; i++) {
-    const diff = (left[i] ?? 0) - (right[i] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return left.length - right.length;
-}
-
 /**
  * Order a server's tools so Pi-name assignment depends only on the tool set and never on
  * the order `tools/list` happened to return (#213): a lossless raw name wins the unhashed
@@ -99,10 +93,10 @@ function compareToolsForNameAssignment(a: McpToolDefinition, b: McpToolDefinitio
 
 /**
  * Order a server's tools for Pi-name assignment. The server's own `tools/list` order is kept —
- * so registration order, and the tool order Pi shows the model, only move where they must —
- * except that tools competing for the same unhashed identifier are emitted as one deterministic
- * group in the position of the group's first member. Which tool the server listed first is not
- * part of the MCP contract, so it must not decide who wins that identifier (#213).
+ * so registration order only moves where it must — except that tools competing for the same
+ * unhashed identifier are emitted as one deterministic group in the position of the group's
+ * first member. Which tool the server listed first is not part of the MCP contract, so it must
+ * not decide who wins that identifier (#213).
  */
 function orderToolsForNameAssignment(
   prefix: string,
@@ -324,12 +318,6 @@ function normalizeRefreshArgs(
   return { isCurrent, options };
 }
 
-/** True when two tool-name lists have the same length and the same entries in order. */
-function sameToolList(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) return false;
-  return left.every((name, index) => name === right[index]);
-}
-
 // ─── Tool Listing ─────────────────────────────────────────────────────────────
 
 export { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
@@ -428,6 +416,47 @@ export class ToolBridge {
     const names = this.serverToolNames.get(serverName) ?? new Set<string>();
     const active = new Set(this.pi.getActiveTools());
     return { discovered: names.size, active: [...names].filter((name) => active.has(name)).length };
+  }
+
+  /**
+   * Re-apply this bridge's deterministic tool order to Pi's active list when owned tools have
+   * been reordered externally, and do nothing when already ordered.
+   *
+   * WHY: `/tree` navigation (`session_tree`) restores active tools from the transcript's
+   * first-appearance order without re-running `refreshTools`, and another extension or tool
+   * (e.g. `tool_search`) may call `pi.setActiveTools` idle or mid-turn; re-normalizing on
+   * `session_tree`, `input`, `before_agent_start`, and `tool_execution_end` keeps `sections.tools`
+   * in the system prompt aligned with `orderPayloadTools` without re-activating inactive tools (#278).
+   */
+  orderActiveTools(): void {
+    const current = this.pi.getActiveTools();
+    const ordered = orderOwnedEntries(
+      current,
+      (name) => name,
+      (name) => this.toolOwners.has(name),
+    );
+    if (ordered === undefined) return;
+    this.pi.setActiveTools(ordered);
+  }
+
+  /**
+   * Order this bridge's tools in an outgoing provider payload the same way they are ordered in
+   * Pi's active list — across top-level `tools` (Anthropic, OpenAI Chat Completions & Responses,
+   * Mistral), AWS Bedrock Converse `toolConfig.tools`, Google/Vertex
+   * `config.tools[].functionDeclarations`, and `pi-messages` `context.messages[].toolsAdded` —
+   * and return the payload untouched when they already are. Only entries this bridge owns move,
+   * and only among the slots they already occupy: another extension's tool and Pi's reserved
+   * trailing declarations (`__pi_deferred_placeholder__`, `cachePoint`, non-function Gemini tool
+   * groups, non-system messages) keep their positions.
+   *
+   * WHY: request tool arrays are not built from the active list — Pi replays the transcript's
+   * tool declarations in first-appearance order and emits no delta for a pure reorder, so a
+   * server that connects after the first turn leaves its tools at the end, in connect order.
+   * Sorting the payload makes the declared tools a function of the tool set, so the prompt head
+   * stays stable across sessions and a server-side prefix cache keeps its KV entries (#278).
+   */
+  orderPayloadTools(payload: unknown): unknown {
+    return orderPayloadToolEntries(payload, (name) => this.toolOwners.has(name));
   }
 
   /** Deactivate all Pi tools belonging to a server (called on disconnect). */
@@ -799,7 +828,8 @@ export class ToolBridge {
   /**
    * Reconcile a server's active tools in Pi in one write: drop any previously owned Pi tool
    * names that are not in `desiredActive`, append any `desiredActive` names not yet active,
-   * and skip `pi.setActiveTools` altogether when the active set is unchanged.
+   * order the result, and skip `pi.setActiveTools` altogether when the active list already
+   * holds exactly that set in that order.
    */
   private _reconcileActiveTools(
     ownedPreviousNames: ReadonlySet<string>,
@@ -811,14 +841,30 @@ export class ToolBridge {
       (name) => !ownedPreviousNames.has(name) || desiredActive.has(name),
     );
     const newlyActive = [...desiredActive].filter((name) => !activeSet.has(name));
-    const unchangedBeforeLoop =
-      remaining.length === activeBefore.length && newlyActive.length === 0;
-    // WHY: Even when `desiredActive` leaves `activeBefore` unchanged, `pi.registerTool()`
-    // inside the loop may have auto-activated a newly registered hashed Pi name or a
-    // `--tools` allowlist entry; re-read `getActiveTools()` before skipping the write.
-    if (unchangedBeforeLoop && sameToolList(this.pi.getActiveTools(), activeBefore)) return;
+    const nextActive = this._orderActiveTools(new Set([...remaining, ...newlyActive]));
+    // WHY: `pi.registerTool()` inside the loop may have auto-activated a newly registered hashed
+    // Pi name or a `--tools` allowlist entry, and a resumed session restores the order it ended
+    // with — so compare against a fresh read and write whenever the set *or* the order differs.
+    if (sameToolList(this.pi.getActiveTools(), nextActive)) return;
 
-    this.pi.setActiveTools(Array.from(new Set([...remaining, ...newlyActive])));
+    this.pi.setActiveTools(nextActive);
+  }
+
+  /**
+   * Order the active set so this bridge's tools are a pure function of the tool set: they are
+   * sorted by Pi name among the positions they already occupy, while every entry another
+   * extension owns keeps its position.
+   *
+   * WHY: a server's tools are registered as its connection completes, and `desiredActive`
+   * follows `tools/list` order, which the MCP spec does not define. Without a fixed order the
+   * active list — and with it the system prompt's tool section and the tools declared to the
+   * provider — depends on eager-connect timing, so a server-side prefix cache keyed on the
+   * prompt head misses on every session start or resume (#278).
+   */
+  private _orderActiveTools(active: ReadonlySet<string>): string[] {
+    const names = [...active];
+    const ordered = orderOwnedEntries(names, (name) => name, (name) => this.toolOwners.has(name));
+    return ordered ?? names;
   }
 
   private _deactivateServerTools(serverName: string): void {

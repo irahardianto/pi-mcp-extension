@@ -1231,7 +1231,7 @@ describe("ToolBridge", () => {
     const bridge = new ToolBridge(settings, mockPi);
 
     await bridge.refreshTools("db", mockClient);
-    assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+    assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
     assert.equal(setActiveToolCalls, 1, "The first connect activates the whole discovered set");
 
     // Another extension or a user policy narrows the active set while the server stays ready.
@@ -1243,7 +1243,7 @@ describe("ToolBridge", () => {
 
     assert.deepEqual(
       activeTools,
-      ["mcp_db_read_data", "mcp_db_list_tables"],
+      ["mcp_db_list_tables", "mcp_db_read_data"],
       "A live refresh must not re-activate a tool another extension deactivated",
     );
     assert.equal(setActiveToolCalls, 2);
@@ -1327,7 +1327,7 @@ describe("ToolBridge", () => {
     const bridge = new ToolBridge(settings, mockPi);
 
     await bridge.refreshTools("db", mockClient);
-    assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+    assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
 
     serverTools = [readData];
     await bridge.refreshTools("db", mockClient);
@@ -1337,7 +1337,7 @@ describe("ToolBridge", () => {
     await bridge.refreshTools("db", mockClient);
     assert.deepEqual(
       activeTools,
-      ["mcp_db_read_data", "mcp_db_drop_table"],
+      ["mcp_db_drop_table", "mcp_db_read_data"],
       "A tool the bridge deactivated with the server comes back active",
     );
   });
@@ -1522,7 +1522,7 @@ describe("ToolBridge", () => {
     const bridge = new ToolBridge(settings, mockPi);
 
     await bridge.refreshTools("db", mockClient);
-    assert.deepEqual(activeTools, ["mcp_db_read_data", "mcp_db_drop_table"]);
+    assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
 
     // A reconnect is a fresh start: the previous restriction no longer holds.
     bridge.deactivateServer("db");
@@ -1530,9 +1530,543 @@ describe("ToolBridge", () => {
     await bridge.refreshTools("db", mockClient);
     assert.deepEqual(
       activeTools,
-      ["mcp_db_read_data", "mcp_db_drop_table"],
+      ["mcp_db_drop_table", "mcp_db_read_data"],
       "Reconnecting must activate every tool the server discovers",
     );
+  });
+
+  it("orders bridged tools deterministically regardless of sequential connect order", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const clientWith = (names: string[]) =>
+      ({
+        request: async () => ({
+          tools: names.map((name) => ({ name, inputSchema: { type: "object" } })),
+        }),
+      }) as unknown as Client;
+    const activeAfterConnects = async (
+      order: Array<[string, Client]>,
+    ): Promise<string[]> => {
+      let activeTools: string[] = [];
+      const bridge = new ToolBridge(settings, {
+        registerTool: () => {},
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => { activeTools = names; },
+      });
+      for (const [server, mockClient] of order) await bridge.refreshTools(server, mockClient);
+      return activeTools;
+    };
+
+    const alpha = (): Client => clientWith(["alpha_one", "alpha_two"]);
+    const beta = (): Client => clientWith(["beta_one", "beta_two"]);
+
+    const alphaFirst = await activeAfterConnects([["alpha", alpha()], ["beta", beta()]]);
+    const betaFirst = await activeAfterConnects([["beta", beta()], ["alpha", alpha()]]);
+
+    assert.deepEqual(
+      alphaFirst,
+      betaFirst,
+      "Concurrent eager connects must not change the tool order (#278)",
+    );
+    assert.deepEqual(alphaFirst, [
+      "mcp_alpha_alpha_one",
+      "mcp_alpha_alpha_two",
+      "mcp_beta_beta_one",
+      "mcp_beta_beta_two",
+    ]);
+  });
+
+  it("orders bridged tools deterministically when concurrent connects finish in either order", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const deferredClient = (names: string[]) => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const client = {
+        request: async () => {
+          await gate;
+          return {
+            tools: names.map((name) => ({ name, inputSchema: { type: "object" } })),
+          };
+        },
+      } as unknown as Client;
+      return { client, release };
+    };
+    const connectBoth = async (first: "alpha" | "beta"): Promise<string[]> => {
+      let activeTools: string[] = [];
+      const bridge = new ToolBridge(settings, {
+        registerTool: () => {},
+        getActiveTools: () => activeTools,
+        setActiveTools: (names: string[]) => { activeTools = names; },
+      });
+      const alpha = deferredClient(["one", "two"]);
+      const beta = deferredClient(["one", "two"]);
+      // Both refreshTools calls start together and wait on their in-flight tools/list requests.
+      const pending = Promise.all([
+        bridge.refreshTools("alpha", alpha.client),
+        bridge.refreshTools("beta", beta.client),
+      ]);
+      if (first === "alpha") {
+        alpha.release();
+        await Promise.resolve();
+        beta.release();
+      } else {
+        beta.release();
+        await Promise.resolve();
+        alpha.release();
+      }
+      await pending;
+      return activeTools;
+    };
+
+    const alphaFirst = await connectBoth("alpha");
+    const betaFirst = await connectBoth("beta");
+
+    assert.deepEqual(
+      alphaFirst,
+      betaFirst,
+      "Whichever eager connect finishes last, the active order is the same",
+    );
+    assert.deepEqual(alphaFirst, [
+      "mcp_alpha_one",
+      "mcp_alpha_two",
+      "mcp_beta_one",
+      "mcp_beta_two",
+    ]);
+  });
+
+  it("orders a server's tools by name regardless of tools/list order", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const activeWithListOrder = async (names: string[]): Promise<string[]> => {
+      let activeTools: string[] = [];
+      const bridge = new ToolBridge(settings, {
+        registerTool: () => {},
+        getActiveTools: () => activeTools,
+        setActiveTools: (next: string[]) => { activeTools = next; },
+      });
+      const mockClient = {
+        request: async () => ({
+          tools: names.map((name) => ({ name, inputSchema: { type: "object" } })),
+        }),
+      } as unknown as Client;
+      await bridge.refreshTools("alpha", mockClient);
+      return activeTools;
+    };
+
+    const ascending = await activeWithListOrder(["alpha_one", "alpha_two"]);
+    const descending = await activeWithListOrder(["alpha_two", "alpha_one"]);
+
+    assert.deepEqual(descending, ascending, "tools/list order is not part of the MCP contract");
+    assert.deepEqual(ascending, ["mcp_alpha_alpha_one", "mcp_alpha_alpha_two"]);
+  });
+
+  it("rewrites a stable order when another extension reorders the same set", async () => {
+    // The desired set is unchanged; only the order differs, and the bridge still normalises it.
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const mockClient = {
+      request: async () => ({
+        tools: [
+          { name: "read_data", inputSchema: { type: "object" } },
+          { name: "drop_table", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+    await bridge.refreshTools("db", mockClient);
+    assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
+
+    activeTools = ["mcp_db_read_data", "mcp_db_drop_table"];
+    await bridge.refreshTools("db", mockClient);
+
+    assert.deepEqual(activeTools, ["mcp_db_drop_table", "mcp_db_read_data"]);
+  });
+
+  it("orders this bridge's tools in an outgoing provider payload", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    let activeTools: string[] = [];
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    const foreign = { type: "function", function: { name: "bash" } };
+    const payload = {
+      model: "test-model",
+      tools: [
+        { type: "function", function: { name: "mcp_db_z_tool" } },
+        foreign,
+        { type: "function", function: { name: "mcp_db_a_tool" } },
+      ],
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      model: string;
+      tools: Array<{ type?: string; name?: string; function?: { name?: string } }>;
+    };
+    const names = ordered.tools.map((tool) => tool.function?.name ?? tool.name);
+
+    assert.deepEqual(
+      names,
+      ["mcp_db_a_tool", "bash", "mcp_db_z_tool"],
+      "Only this bridge's tools move, and only among the slots they already hold",
+    );
+    assert.equal(ordered.model, "test-model");
+    assert.equal(ordered.tools[1], foreign, "another extension's definition keeps its slot");
+    assert.equal(
+      (payload.tools[0] as { function: { name: string } }).function.name,
+      "mcp_db_z_tool",
+      "The caller's payload is not mutated",
+    );
+  });
+
+  it("keeps Pi's reserved trailing declaration and slot cache_control in place", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    let activeTools: string[] = [];
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    // Pi attaches `cache_control` to the last non-placeholder tool slot and appends
+    // `__pi_deferred_placeholder__` after it on Anthropic models with native tool changes.
+    // Reordering must keep the placeholder last AND keep `cache_control` anchored on slot 1
+    // so the reordered payload matches a session that started in sorted order.
+    const cacheControl = { type: "ephemeral" };
+    const placeholder = { name: "__pi_deferred_placeholder__", defer_loading: true };
+    const aWithCache = { name: "mcp_db_a_tool", cache_control: cacheControl };
+    const payload = {
+      tools: [{ name: "mcp_db_z_tool" }, aWithCache, placeholder],
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      tools: Array<{ name: string; cache_control?: unknown }>;
+    };
+
+    assert.deepEqual(ordered.tools, [
+      { name: "mcp_db_a_tool" },
+      { name: "mcp_db_z_tool", cache_control: cacheControl },
+      placeholder,
+    ]);
+    assert.equal("cache_control" in (ordered.tools[0] ?? {}), false);
+    assert.equal(ordered.tools[2], placeholder);
+    assert.deepEqual(
+      aWithCache,
+      { name: "mcp_db_a_tool", cache_control: cacheControl },
+      "The caller's tool definition is not mutated",
+    );
+  });
+
+  it("leaves an already ordered payload, and a payload without tools, untouched", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    // Anthropic-style definitions carry `name` at the top level.
+    const unordered = { tools: [{ name: "mcp_db_z_tool" }, { name: "bash" }, { name: "mcp_db_a_tool" }] };
+    const ordered = bridge.orderPayloadTools(unordered) as { tools: Array<{ name: string }> };
+    assert.deepEqual(ordered.tools.map((tool) => tool.name), ["mcp_db_a_tool", "bash", "mcp_db_z_tool"]);
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered payload is returned as is");
+
+    const withoutTools = { model: "test-model" };
+    assert.equal(bridge.orderPayloadTools(withoutTools), withoutTools);
+    assert.equal(bridge.orderPayloadTools(undefined), undefined);
+  });
+
+  it("orders Google/Vertex config.tools[].functionDeclarations and leaves non-function tool groups untouched", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    const googleSearchGroup = { googleSearch: {} };
+    const foreignRead = { name: "read", description: "Read file" };
+    const functionGroup = {
+      functionDeclarations: [
+        { name: "mcp_db_z_tool" },
+        foreignRead,
+        { name: "mcp_db_a_tool" },
+      ],
+    };
+    const payload = {
+      model: "gemini-2.5-pro",
+      contents: [],
+      config: {
+        systemInstruction: "sys",
+        tools: [googleSearchGroup, functionGroup],
+      },
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      model: string;
+      config: {
+        systemInstruction: string;
+        tools: Array<{ googleSearch?: Record<string, never>; functionDeclarations?: Array<{ name: string }> }>;
+      };
+    };
+
+    assert.equal(ordered.config.tools[0], googleSearchGroup, "non-function Gemini tool group keeps its reference");
+    assert.deepEqual(
+      ordered.config.tools[1]?.functionDeclarations?.map((decl) => decl.name),
+      ["mcp_db_a_tool", "read", "mcp_db_z_tool"],
+    );
+    assert.equal(ordered.config.tools[1]?.functionDeclarations?.[1], foreignRead);
+    assert.equal(
+      functionGroup.functionDeclarations[0]?.name,
+      "mcp_db_z_tool",
+      "The caller's Google payload is not mutated",
+    );
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered Google payload is returned as is");
+  });
+
+  it("orders AWS Bedrock Converse toolConfig.tools and keeps trailing cachePoint and toolChoice intact", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    const foreignBash = { toolSpec: { name: "bash" } };
+    const cachePoint = { cachePoint: { type: "default" } };
+    const toolChoice = { auto: {} };
+    const payload = {
+      modelId: "anthropic.claude-sonnet-4-6",
+      toolConfig: {
+        tools: [
+          { toolSpec: { name: "mcp_db_z_tool" } },
+          foreignBash,
+          { toolSpec: { name: "mcp_db_a_tool" } },
+          cachePoint,
+        ],
+        toolChoice,
+      },
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as {
+      modelId: string;
+      toolConfig: {
+        tools: Array<{ toolSpec?: { name: string }; cachePoint?: { type: string } }>;
+        toolChoice: unknown;
+      };
+    };
+
+    assert.deepEqual(ordered.toolConfig.tools, [
+      { toolSpec: { name: "mcp_db_a_tool" } },
+      foreignBash,
+      { toolSpec: { name: "mcp_db_z_tool" } },
+      cachePoint,
+    ]);
+    assert.equal(ordered.toolConfig.tools[1], foreignBash);
+    assert.equal(ordered.toolConfig.tools[3], cachePoint);
+    assert.equal(ordered.toolConfig.toolChoice, toolChoice);
+    assert.equal(
+      (payload.toolConfig.tools[0] as { toolSpec: { name: string } }).toolSpec.name,
+      "mcp_db_z_tool",
+      "The caller's Bedrock payload is not mutated",
+    );
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered Bedrock payload is returned as is");
+  });
+
+  it("orders pi-messages context.messages[].toolsAdded per system message while leaving non-system messages untouched", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    type PiMessagesEntry = {
+      role: string;
+      content: unknown;
+      toolsAdded?: Array<{ name: string; description: string; parameters: { type: string } }>;
+      toolsRemoved?: Array<{ name: string }>;
+      timestamp: number;
+    };
+    const foreignRead = { name: "read", description: "Read", parameters: { type: "object" } };
+    const userMsg: PiMessagesEntry = { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 };
+    const alreadyOrderedSystemMsg: PiMessagesEntry = {
+      role: "system",
+      content: "",
+      toolsAdded: [{ name: "mcp_db_a_tool", description: "A", parameters: { type: "object" } }],
+      toolsRemoved: [{ name: "mcp_db_z_tool" }],
+      timestamp: 2,
+    };
+    const options = { temperature: 0, cacheRetention: "long" };
+    const payload: { model: string; context: { messages: PiMessagesEntry[] }; options: typeof options } = {
+      model: "claude-sonnet-4-6",
+      context: {
+        messages: [
+          {
+            role: "system",
+            content: "base prompt",
+            toolsAdded: [
+              { name: "mcp_db_z_tool", description: "Z", parameters: { type: "object" } },
+              foreignRead,
+              { name: "mcp_db_a_tool", description: "A", parameters: { type: "object" } },
+            ],
+            timestamp: 0,
+          },
+          userMsg,
+          alreadyOrderedSystemMsg,
+        ],
+      },
+      options,
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as typeof payload;
+    assert.deepEqual(
+      ordered.context.messages[0]?.toolsAdded?.map((tool) => tool.name),
+      ["mcp_db_a_tool", "read", "mcp_db_z_tool"],
+    );
+    assert.equal(ordered.context.messages[0]?.toolsAdded?.[1], foreignRead);
+    assert.equal(ordered.context.messages[1], userMsg, "Non-system messages keep their reference");
+    assert.equal(
+      ordered.context.messages[2],
+      alreadyOrderedSystemMsg,
+      "System messages whose toolsAdded needs no reorder keep their reference",
+    );
+    assert.equal(ordered.options, options);
+    assert.equal(
+      payload.context.messages[0]?.toolsAdded?.[0]?.name,
+      "mcp_db_z_tool",
+      "The caller's pi-messages payload is not mutated",
+    );
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered pi-messages payload is returned as is");
+  });
+
+  it("re-orders active owned tools on orderActiveTools without re-activating inactive tools or writing when ordered", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    let activeTools: string[] = ["bash"];
+    let writes = 0;
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => {
+        writes += 1;
+        activeTools = names;
+      },
+    });
+    const clientFor = (name: string): Client =>
+      ({
+        request: async () => ({
+          tools: [{ name, inputSchema: { type: "object" } }],
+        }),
+      }) as unknown as Client;
+
+    await bridge.refreshTools("alpha", clientFor("a_tool"));
+    await bridge.refreshTools("beta", clientFor("b_tool"));
+    await bridge.refreshTools("gamma", clientFor("g_tool"));
+    assert.deepEqual(activeTools, ["bash", "mcp_alpha_a_tool", "mcp_beta_b_tool", "mcp_gamma_g_tool"]);
+
+    const writesAfterConnect = writes;
+    bridge.orderActiveTools();
+    assert.equal(writes, writesAfterConnect, "Already-ordered active list must not trigger setActiveTools");
+
+    // Simulate `/tree` restoring transcript first-appearance order after `beta` connected mid-session.
+    activeTools = ["bash", "mcp_alpha_a_tool", "mcp_gamma_g_tool", "mcp_beta_b_tool"];
+    bridge.orderActiveTools();
+    assert.deepEqual(activeTools, ["bash", "mcp_alpha_a_tool", "mcp_beta_b_tool", "mcp_gamma_g_tool"]);
+    assert.equal(writes, writesAfterConnect + 1);
+
+    // Simulate `/tree` navigating back to an earlier branch where `beta` was not active yet.
+    activeTools = ["mcp_gamma_g_tool", "bash", "mcp_alpha_a_tool"];
+    bridge.orderActiveTools();
+    assert.deepEqual(
+      activeTools,
+      ["mcp_alpha_a_tool", "bash", "mcp_gamma_g_tool"],
+      "Inactive server tools must stay inactive while active owned slots are ordered",
+    );
+  });
+
+  it("keeps other extensions' tools in their own positions", async () => {
+    let activeTools: string[] = ["bash", "read", "other_ext_tool"];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const mockClient = {
+      request: async () => ({
+        tools: [
+          { name: "z_tool", inputSchema: { type: "object" } },
+          { name: "a_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, mockPi);
+    await bridge.refreshTools("db", mockClient);
+
+    assert.deepEqual(activeTools, [
+      "bash",
+      "read",
+      "other_ext_tool",
+      "mcp_db_a_tool",
+      "mcp_db_z_tool",
+    ]);
   });
 
   it("undoes registerTool auto-activation when a live refresh leaves the desired active set unchanged", async () => {
