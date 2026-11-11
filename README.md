@@ -168,7 +168,7 @@ In project-level `.pi/mcp.json`, `settings` keys carry no defaults — only the 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `toolPrefix` | `string` | `"mcp"` | Prefix for registered tools: `<prefix>_<server>_<tool>`. Must match `^[a-zA-Z][a-zA-Z0-9_]*$`. |
-| `requestTimeoutMs` | `number` | `30000` | Default per-request timeout in milliseconds. For `tools/call` this is an inactivity deadline: every `notifications/progress` event from the server restarts it, so page-by-page work is not cut off mid-flight |
+| `requestTimeoutMs` | `number` | `30000` | Default per-request timeout in milliseconds. For `tools/call` this is an inactivity deadline: every `notifications/progress` event from the server restarts it, so page-by-page work is not cut off mid-flight. A server that reports progress indefinitely has no wall-clock cap — cancel the tool to stop it |
 | `maxRetries` | `number` | `5` | Max reconnection attempts (0–10) before giving up |
 
 ### Per-Server Config

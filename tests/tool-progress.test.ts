@@ -13,13 +13,17 @@ import { dirname, join } from "node:path";
 import { ServerManager } from "../src/server-manager.js";
 import { ToolBridge, type PiExtensionAPI } from "../src/tool-bridge.js";
 import type { McpConfig } from "../src/config.js";
+import { McpError } from "../src/errors.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MOCK_SERVER_PATH = join(__dirname, "mock-server.ts");
 
-// WHY: every step of the mock tool is slower than this on its own, so a call can only finish if
-// each progress notification restarts the SDK's inactivity timer (`resetTimeoutOnProgress`).
+// WHY: the mock's steps are 4x shorter than this deadline and the whole call is twice as long, so
+// a call can only finish if each progress notification restarts the SDK's inactivity timer
+// (`resetTimeoutOnProgress`) — and a scheduling hiccup between two steps cannot trip it.
 const REQUEST_TIMEOUT_MS = 400;
+const STEP_MS = 100;
+const STEPS = 8;
 
 interface RegisteredTool {
   name: string;
@@ -67,6 +71,7 @@ describe("MCP notifications/progress over stdio (#254)", () => {
   let manager: ServerManager;
   let tools: RegisteredTool[];
   let progressTool: RegisteredTool;
+  let silentTool: RegisteredTool;
 
   before(async () => {
     const mockPi = makeMockPi();
@@ -80,6 +85,9 @@ describe("MCP notifications/progress over stdio (#254)", () => {
     const tool = tools.find((t) => t.name.includes("report_progress"));
     assert.ok(tool, `mock server must expose report_progress, registered: ${tools.map((t) => t.name).join(", ")}`);
     progressTool = tool;
+    const silent = tools.find((t) => t.name.includes("silent_wait"));
+    assert.ok(silent, "mock server must expose silent_wait");
+    silentTool = silent;
   });
 
   after(async () => {
@@ -88,10 +96,10 @@ describe("MCP notifications/progress over stdio (#254)", () => {
 
   it("keeps an actively reporting tool alive past the request timeout", async () => {
     const updates: string[] = [];
-    // 4 × 200ms = 800ms of work against a 400ms request timeout.
+    // 8 × 100ms = 800ms of work against a 400ms request timeout.
     const result = await progressTool.execute(
       "call-live",
-      { steps: 4, stepMs: 200 },
+      { steps: STEPS, stepMs: STEP_MS },
       undefined,
       (update) => {
         updates.push(update.content[0]?.text ?? "");
@@ -99,21 +107,24 @@ describe("MCP notifications/progress over stdio (#254)", () => {
       {},
     );
 
-    assert.equal(result.content[0]?.text, "Completed 4 steps");
-    assert.deepEqual(updates, ["Progress 1/4", "Progress 2/4", "Progress 3/4", "Progress 4/4"]);
+    assert.equal(result.content[0]?.text, `Completed ${STEPS} steps`);
+    assert.deepEqual(
+      updates,
+      Array.from({ length: STEPS }, (_, index) => `Progress ${index + 1}/${STEPS}`),
+    );
   });
 
   it("asks for progress even when Pi passes no onUpdate callback", async () => {
     const startedAt = Date.now();
     const result = await progressTool.execute(
       "call-headless",
-      { steps: 4, stepMs: 200 },
+      { steps: STEPS, stepMs: STEP_MS },
       undefined,
       undefined,
       {},
     );
 
-    assert.equal(result.content[0]?.text, "Completed 4 steps");
+    assert.equal(result.content[0]?.text, `Completed ${STEPS} steps`);
     assert.ok(
       Date.now() - startedAt > REQUEST_TIMEOUT_MS,
       "the call must outlive the request timeout; a timeout error would mean no progress token",
@@ -133,5 +144,22 @@ describe("MCP notifications/progress over stdio (#254)", () => {
     );
 
     assert.deepEqual(updates, ["Deploying"], "one identical message for every tick renders once");
+  });
+
+  it("still times out a tool that reports no progress", async () => {
+    const startedAt = Date.now();
+    await assert.rejects(
+      // Longer than the request timeout, and this tool sends no notifications at all.
+      () => silentTool.execute("call-silent", { ms: 900 }, undefined, undefined, {}),
+      (err: unknown) => {
+        assert.ok(err instanceof McpError, `expected an McpError, got ${String(err)}`);
+        assert.equal(err.code, "timeout");
+        return true;
+      },
+    );
+    assert.ok(
+      Date.now() - startedAt < 900,
+      "the deadline must fire before the tool could have finished",
+    );
   });
 });

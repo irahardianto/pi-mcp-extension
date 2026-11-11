@@ -127,6 +127,17 @@ const TOOLS = [
             required: [],
           },
         },
+        {
+          name: "silent_wait",
+          description: "Sleep for the given time without reporting any progress",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ms: { type: "number", description: "How long to sleep in milliseconds" },
+            },
+            required: [],
+          },
+        },
       ]
     : []),
 ];
@@ -273,6 +284,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await emitProgressSteps(request.params._meta?.progressToken, steps, stepMs, message);
       return {
         content: [{ type: "text", text: `Completed ${steps} steps` }],
+        isError: false,
+      };
+    }
+
+    case "silent_wait": {
+      const ms = Number(args?.["ms"] ?? 1000);
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return {
+        content: [{ type: "text", text: `Waited ${ms}ms` }],
         isError: false,
       };
     }
