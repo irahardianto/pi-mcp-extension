@@ -134,7 +134,7 @@ The manual `/mcp:auth` flow accepts only HTTP redirect URLs using `localhost`, `
 
 ### OAuth Provider
 
-- **Files**: `src/oauth-provider.ts`, `src/oauth-state-store.ts`, `src/oauth-status.ts`, `src/auth-lock.ts`, `src/auth-lock-policy.ts`
+- **Files**: `src/oauth-provider.ts`, `src/oauth-policy.ts`, `src/oauth-state-store.ts`, `src/oauth-status.ts`, `src/auth-lock.ts`, `src/auth-lock-policy.ts`
 - **Implements**: `OAuthClientProvider` from MCP SDK
 - **Key Methods**:
   - `redirectUrl` - Returns the callback server URL
