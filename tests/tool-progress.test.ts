@@ -18,6 +18,10 @@ import { McpError } from "../src/errors.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MOCK_SERVER_PATH = join(__dirname, "mock-server.ts");
 
+// Connect and `tools/list` share the config timeout with `tools/call`, so the connection keeps the
+// production default: a cold CI runner needs headroom to spawn node, compile the mock through tsx,
+// and complete `initialize`. The call deadline the tests exercise is set explicitly afterwards.
+const CONNECT_TIMEOUT_MS = 30000;
 // WHY: the mock's steps are 4x shorter than this deadline and the whole call is twice as long, so
 // a call can only finish if each progress notification restarts the SDK's inactivity timer
 // (`resetTimeoutOnProgress`) — and a scheduling hiccup between two steps cannot trip it.
@@ -53,14 +57,14 @@ function makeMockPi(): { api: PiExtensionAPI; tools: RegisteredTool[] } {
 
 function makeConfig(): McpConfig {
   return {
-    settings: { toolPrefix: "mcp", requestTimeoutMs: REQUEST_TIMEOUT_MS, maxRetries: 0 },
+    settings: { toolPrefix: "mcp", requestTimeoutMs: CONNECT_TIMEOUT_MS, maxRetries: 0 },
     mcpServers: {
       test: {
         command: "node",
         args: ["--import", "tsx/esm", MOCK_SERVER_PATH],
         transport: "stdio",
         lifecycle: "lazy",
-        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+        requestTimeoutMs: CONNECT_TIMEOUT_MS,
         env: { MOCK_PROGRESS: "1" },
       },
     },
@@ -82,6 +86,10 @@ describe("MCP notifications/progress over stdio (#254)", () => {
       await bridge.refreshTools(name, client, options);
     });
     await manager.startServer("test", process.cwd());
+    const client = manager.getServer("test")?.client;
+    assert.ok(client, "mock server did not connect");
+    // Pin the per-server `tools/call` timeout (the connect above used CONNECT_TIMEOUT_MS).
+    await bridge.refreshTools("test", client, { requestTimeoutMs: REQUEST_TIMEOUT_MS });
     const tool = tools.find((t) => t.name.includes("report_progress"));
     assert.ok(tool, `mock server must expose report_progress, registered: ${tools.map((t) => t.name).join(", ")}`);
     progressTool = tool;
