@@ -3121,6 +3121,18 @@ describe("MCP progress notifications", () => {
       "Progress 4/10",
     );
     assert.equal(formatProgressText({ progress: 5, total: Number.NaN }), "Progress 5");
+    // WHY: the sanitizer appends `…` when it truncates, so a long blank message must be judged
+    // on its untruncated text — otherwise the fallback never fires and the row renders blank.
+    assert.equal(
+      formatProgressText({ progress: 6, total: 10, message: " ".repeat(300) }),
+      "Progress 6/10",
+    );
+  });
+
+  it("keeps the rendered line within the message budget after redaction", () => {
+    const text = formatProgressText({ progress: 1, message: `${"x".repeat(192)} token=v` });
+    assert.ok(text.length <= 200, `expected at most 200 characters, got ${text.length}`);
+    assert.ok(!text.includes(" token=v"), `the credential must still be masked: ${text}`);
   });
 });
 
