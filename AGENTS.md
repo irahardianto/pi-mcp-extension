@@ -49,7 +49,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 |---|---|
 | `src/index.ts` | Extension entry (default export); `session_start` / `mcp_servers_change` / `session_tree` / `input` / `before_agent_start` / `tool_execution_end` / `before_provider_request` / `session_shutdown`; file-level config provenance tracking; wires slash commands and management tools |
 | `src/register-commands.ts` | Pi `/mcp`, `/mcp:start`, `/mcp:stop`, `/mcp:auth`, and `/mcp:resources` slash-command registration (`registerCommands`), including the enriched `/mcp <name>` detail view |
-| `src/register-tools.ts` | Pi `mcp_status`, `mcp_connect`, `mcp_list_resources`, and `mcp_read_resource` tool registration (`registerManagementTools`), connection error formatting, and resource queries |
+| `src/register-tools.ts` | Pi `mcp_status`, `mcp_connect`, `mcp_list_resources`, and `mcp_read_resource` tool registration (`registerManagementTools`), connection error formatting (`formatMcpConnectError`), and resource queries |
 | `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, eager server starts, session teardown) |
 | `src/startup-auth.ts` | Abort-aware auth-queue turn waiter (`waitForQueueTurn`), startup authorization prompt (`promptStartupAuth`, `startupAuthNowOption`, `startupAuthLaterOption`), and error message formatting (`formatErrorMessage`) |
 | `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`, `parseResourceArguments`), server-name tab completions (`serverNameCompletions`), and extension-registered server config merging (`collectRegisteredServers`, `mergeWithRegisteredServers`) |

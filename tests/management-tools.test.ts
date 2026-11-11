@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
 import { acquireAuthLock, AuthLockError, AuthRequiredError, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
-import { formatMcpConnectError } from "../src/register-tools.js";
+import { formatMcpConnectError, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 for (const { name, error, options, expected } of [
@@ -78,6 +78,48 @@ for (const { name, error, options, expected } of [
     }), expected);
   });
 }
+
+it("propagates in-flight mcp_list_resources cancellation instead of recording a per-server error row", async () => {
+  const mockExt = createMockExtension();
+  let nextFailure: () => Error = () => new AuthCancelledError("docs");
+  const server = {
+    name: "docs",
+    state: "ready",
+    client: { getServerCapabilities: () => ({ resources: {} }) },
+  };
+  const deps = {
+    manager: {
+      getAllServers: () => [server],
+      resolveRequestTimeoutMs: () => 1000,
+    },
+    coordinator: {},
+    bridge: {},
+    resources: {
+      getCatalog: async () => {
+        throw nextFailure();
+      },
+    },
+    getProvenance: () => ({ origins: {}, extensionServers: [], projectConfigPath: "", projectConfigIncluded: false }),
+  } as unknown as ManagementToolDeps;
+
+  registerManagementTools(mockExt.api, deps);
+  const listResources = mockExt.tools.get("mcp_list_resources");
+
+  await assert.rejects(
+    listResources.execute("", { server: "docs" }),
+    (err: unknown) => err instanceof AuthCancelledError && err.message.includes("docs"),
+  );
+
+  const midFlight = new AbortController();
+  nextFailure = () => {
+    midFlight.abort();
+    return new Error("transport closed during abort");
+  };
+  await assert.rejects(
+    listResources.execute("", {}, midFlight.signal),
+    (err: unknown) => err instanceof AuthCancelledError && err.message.includes("docs"),
+  );
+});
 
 it("registers agent-visible status and connect tools without eagerly starting a lazy server", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-management-"));

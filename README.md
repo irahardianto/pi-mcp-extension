@@ -347,8 +347,9 @@ While a Pi UI is active, the extension never writes diagnostics to Pi's stderr (
 ```mermaid
 flowchart TD
     subgraph Pi["Pi Coding Agent (TUI / RPC, ExtensionAPI)"]
-        Entry["index.ts (entry & mcp_* agent tools)"]
-        Cmds["register-commands (/mcp, :start, :stop, :auth)"]
+        Entry["index.ts (entry & session lifecycle)"]
+        Cmds["register-commands (/mcp, :start, :stop, :auth, :resources)"]
+        Tools["register-tools (mcp_* agent tools)"]
         Config["config (Zod + JSONC)"]
         Coord["connection-coordinator (in-flight connects, authQueue, teardown)"]
         Mgr["server-manager (stopped -> starting -> ready lifecycle)"]
@@ -357,9 +358,11 @@ flowchart TD
         Transport["transport-factory & oauth-provider (MCP SDK)"]
 
         Entry --> Cmds
+        Entry --> Tools
         Entry --> Config
         Entry --> Coord
         Cmds --> Coord
+        Tools --> Coord
         Coord --> Mgr
         Mgr --> Bridge
         Bridge --> Schema
