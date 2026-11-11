@@ -274,12 +274,16 @@ const PROGRESS_MESSAGE_MAX_LENGTH = 200;
  * `message` is server-controlled and lands in Pi's UI stream, so it is sanitized (ANSI and
  * control sequences stripped, length bounded) and stripped of token-like substrings first.
  * A server that sends no usable text gets a numeric `Progress 3/10` line instead.
+ *
+ * WHY: sanitize before redacting, as `sanitizeLogText` does — the sanitizer deletes escape
+ * sequences, and an escape *inside* a credential (`\u001b[1mtoken\u001b[0m=sk-…`) hides the
+ * `key=value` shape from `redactSecrets`, which would then pass the token through verbatim.
  */
 export function formatProgressText(progress: Progress): string {
   const rawMessage = typeof progress.message === "string" ? progress.message : "";
-  const message = sanitizeTerminalText(redactSecrets(rawMessage), {
-    maxLength: PROGRESS_MESSAGE_MAX_LENGTH,
-  });
+  const message = redactSecrets(
+    sanitizeTerminalText(rawMessage, { maxLength: PROGRESS_MESSAGE_MAX_LENGTH }),
+  );
   if (message.trim().length > 0) return message;
   const total = Number.isFinite(progress.total) ? `/${progress.total}` : "";
   return `Progress ${progress.progress}${total}`;

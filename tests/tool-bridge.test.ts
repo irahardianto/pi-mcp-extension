@@ -3101,7 +3101,9 @@ describe("MCP progress notifications", () => {
     await executeWithUpdates(registeredTools[0]!, "call-2", updates);
     captured.onProgress?.({
       progress: 1,
-      message: "\u001b[31mDeploying\u001b[0m Authorization: Bearer sk-live-1234567890",
+      // WHY: the escape sits inside the credential (`token=` + ESC + `sk-…`), so redacting the raw
+      // text would miss the `key=value` shape the sanitizer only makes visible.
+      message: "\u001b[31mDeploying\u001b[0m \u001b[1mtoken\u001b[0m=sk-live-1234567890",
     });
 
     const text = updates[0]?.content[0]?.text ?? "";
