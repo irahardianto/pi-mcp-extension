@@ -1062,6 +1062,33 @@ describe("fuzz: ToolBridge deterministic active & payload ordering (#278)", () =
               .map((t) => t.toolSpec?.name),
             allOwnedSorted,
           );
+
+          const userMessage = { role: "user", content: "hello", timestamp: 1 };
+          const piMessagesPayload = {
+            model: "claude-sonnet-4-6",
+            context: {
+              messages: [
+                {
+                  role: "system",
+                  content: "sys",
+                  toolsAdded: scrambledPayloadNames.map((name) => ({ name })),
+                  timestamp: 0,
+                },
+                userMessage,
+              ],
+            },
+          };
+          const orderedPiMessages = runA.bridge.orderPayloadTools(piMessagesPayload) as {
+            context: { messages: [{ toolsAdded: Array<{ name: string }> }, unknown] };
+          };
+          assert.equal(runA.bridge.orderPayloadTools(orderedPiMessages), orderedPiMessages);
+          assert.equal(orderedPiMessages.context.messages[1], userMessage);
+          assert.deepEqual(
+            orderedPiMessages.context.messages[0].toolsAdded
+              .slice(1, 1 + allOwnedSorted.length)
+              .map((t) => t.name),
+            allOwnedSorted,
+          );
         },
       ),
       testOptions(80),

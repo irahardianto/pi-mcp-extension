@@ -52,23 +52,26 @@ flowchart TD
 ```
 
 - The **entry** loads config, constructs the collaborators, and registers
-  `session_start` / `mcp_servers_change` / `session_tree` / `before_agent_start` /
-  `before_provider_request` / `session_shutdown`, the `/mcp*` commands, and the
-  `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource` tools. It
-  registers them even when bootstrap config loading fails, so a later `session_start` in
-  another directory can still load a valid project config.
+  `session_start` / `mcp_servers_change` / `session_tree` / `input` / `before_agent_start` /
+  `tool_execution_end` / `before_provider_request` / `session_shutdown`, the `/mcp*`
+  commands, and the `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource`
+  tools. It registers them even when bootstrap config loading fails, so a later
+  `session_start` in another directory can still load a valid project config.
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
   server connects and disconnects. Each reconcile writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
-  tool left at its position; `orderActiveTools()` re-applies that order on `session_tree`
-  (when `/tree` restores active tools from transcript first-appearance order) and
-  `before_agent_start` (without re-activating inactive tools), and `orderPayloadTools()`
+  tool left at its position; `orderActiveTools()` re-applies that order without re-activating
+  inactive tools on `session_tree` (when `/tree` restores active tools from transcript
+  first-appearance order), `input` (before `_prepareRun` snapshots `systemPromptOptions`),
+  `before_agent_start`, and `tool_execution_end` (when a tool such as `tool_search` calls
+  `setActiveTools` mid-turn before continuation `sections.tools`), and `orderPayloadTools()`
   applies the same order in `before_provider_request` across top-level `tools`, AWS Bedrock
-  Converse `toolConfig.tools`, and Google/Vertex `config.tools[].functionDeclarations`
-  (keeping any slot-level `cache_control` breakpoint, trailing `cachePoint`, and non-function
-  Gemini tool groups in place) — Pi builds outgoing tool declarations from the transcript's
+  Converse `toolConfig.tools`, Google/Vertex `config.tools[].functionDeclarations`, and
+  `pi-messages` `context.messages[].toolsAdded` (keeping any slot-level `cache_control`
+  breakpoint, trailing `cachePoint`, non-function Gemini tool groups, and non-system
+  messages in place) — Pi builds outgoing tool declarations from the transcript's
   first-appearance order, which a pure reorder never updates. The order is therefore a
   function of the tool set rather than eager-connect timing (#278).
 - **ResourceBridge** lazily caches each server's `resources/list` + `resources/templates/list`

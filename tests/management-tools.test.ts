@@ -458,7 +458,7 @@ it("reports a tools/list timeout from mcp_connect as a timeout, not as tool disc
   }
 });
 
-it("wires session_tree, before_agent_start, and before_provider_request to keep active and declared tool order deterministic (#278)", async () => {
+it("wires session_tree, input, before_agent_start, tool_execution_end, and before_provider_request to keep active and declared tool order deterministic (#278)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-order-hooks-"));
   const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
   const tsxEsmLoader = import.meta.resolve("tsx/esm");
@@ -474,7 +474,9 @@ it("wires session_tree, before_agent_start, and before_provider_request to keep 
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
 
     assert.ok(events.has("session_tree"), "Must register session_tree handler");
+    assert.ok(events.has("input"), "Must register input handler");
     assert.ok(events.has("before_agent_start"), "Must register before_agent_start handler");
+    assert.ok(events.has("tool_execution_end"), "Must register tool_execution_end handler");
     assert.ok(events.has("before_provider_request"), "Must register before_provider_request handler");
 
     await events.get("session_start")({}, ctx);
@@ -490,11 +492,32 @@ it("wires session_tree, before_agent_start, and before_provider_request to keep 
     await events.get("session_tree")({}, ctx);
     assert.deepEqual(mockExt.activeTools, expectedActive);
 
-    // Simulate another extension scrambling active tool order before a turn starts;
-    // the hook must restore order and return `undefined` so it never overrides prompt options.
+    // Simulate an external shortcut/command scrambling active tools while idle: `input`
+    // normalizes before `_prepareRun` snapshots `systemPromptOptions.selectedTools`, and
+    // returns `undefined` so user input passes through untouched.
+    mockExt.activeTools = ["bash", "read", ...[...ownedSorted].reverse()];
+    const inputResult = await events.get("input")(
+      { type: "input", text: "hello", source: "interactive" },
+      ctx,
+    );
+    assert.equal(inputResult, undefined);
+    assert.deepEqual(mockExt.activeTools, expectedActive);
+
+    // Simulate another extension scrambling active tool order on a custom-message run (no `input`)
+    // or in an earlier `before_agent_start` handler; returns `undefined` so prompt options stay untouched.
     mockExt.activeTools = ["bash", "read", ...[...ownedSorted].reverse()];
     const beforeStartResult = await events.get("before_agent_start")({}, ctx);
     assert.equal(beforeStartResult, undefined);
+    assert.deepEqual(mockExt.activeTools, expectedActive);
+
+    // Simulate `tool_search` activating matched MCP tools in BM25 score order mid-run;
+    // `tool_execution_end` normalizes before `prepareNextTurnWithContext` builds `sections.tools`.
+    mockExt.activeTools = ["bash", "read", ...[...ownedSorted].reverse()];
+    const toolEndResult = await events.get("tool_execution_end")(
+      { type: "tool_execution_end", toolCallId: "call-1", toolName: "tool_search", result: {}, isError: false },
+      ctx,
+    );
+    assert.equal(toolEndResult, undefined);
     assert.deepEqual(mockExt.activeTools, expectedActive);
 
     const firstOwned = ownedSorted[0]!;
@@ -527,6 +550,29 @@ it("wires session_tree, before_agent_start, and before_provider_request to keep 
       { toolSpec: { name: lastOwned } },
       { cachePoint: { type: "default" } },
     ]);
+
+    const piMessagesPayload = {
+      model: "claude-sonnet-4-6",
+      context: {
+        messages: [
+          {
+            role: "system",
+            content: "sys",
+            toolsAdded: [{ name: lastOwned }, { name: "bash" }, { name: firstOwned }],
+            timestamp: 0,
+          },
+        ],
+      },
+      options: {},
+    };
+    const orderedPiMessages = (await events.get("before_provider_request")(
+      { payload: piMessagesPayload },
+      ctx,
+    )) as typeof piMessagesPayload;
+    assert.deepEqual(
+      orderedPiMessages.context.messages[0]?.toolsAdded.map((decl) => decl.name),
+      [firstOwned, "bash", lastOwned],
+    );
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });

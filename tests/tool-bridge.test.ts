@@ -1921,6 +1921,81 @@ describe("ToolBridge", () => {
     assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered Bedrock payload is returned as is");
   });
 
+  it("orders pi-messages context.messages[].toolsAdded per system message while leaving non-system messages untouched", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+    const bridge = new ToolBridge(settings, {
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    });
+    await bridge.refreshTools("db", {
+      request: async () => ({
+        tools: [
+          { name: "a_tool", inputSchema: { type: "object" } },
+          { name: "z_tool", inputSchema: { type: "object" } },
+        ],
+      }),
+    } as unknown as Client);
+
+    type PiMessagesEntry = {
+      role: string;
+      content: unknown;
+      toolsAdded?: Array<{ name: string; description: string; parameters: { type: string } }>;
+      toolsRemoved?: Array<{ name: string }>;
+      timestamp: number;
+    };
+    const foreignRead = { name: "read", description: "Read", parameters: { type: "object" } };
+    const userMsg: PiMessagesEntry = { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 };
+    const alreadyOrderedSystemMsg: PiMessagesEntry = {
+      role: "system",
+      content: "",
+      toolsAdded: [{ name: "mcp_db_a_tool", description: "A", parameters: { type: "object" } }],
+      toolsRemoved: [{ name: "mcp_db_z_tool" }],
+      timestamp: 2,
+    };
+    const options = { temperature: 0, cacheRetention: "long" };
+    const payload: { model: string; context: { messages: PiMessagesEntry[] }; options: typeof options } = {
+      model: "claude-sonnet-4-6",
+      context: {
+        messages: [
+          {
+            role: "system",
+            content: "base prompt",
+            toolsAdded: [
+              { name: "mcp_db_z_tool", description: "Z", parameters: { type: "object" } },
+              foreignRead,
+              { name: "mcp_db_a_tool", description: "A", parameters: { type: "object" } },
+            ],
+            timestamp: 0,
+          },
+          userMsg,
+          alreadyOrderedSystemMsg,
+        ],
+      },
+      options,
+    };
+
+    const ordered = bridge.orderPayloadTools(payload) as typeof payload;
+    assert.deepEqual(
+      ordered.context.messages[0]?.toolsAdded?.map((tool) => tool.name),
+      ["mcp_db_a_tool", "read", "mcp_db_z_tool"],
+    );
+    assert.equal(ordered.context.messages[0]?.toolsAdded?.[1], foreignRead);
+    assert.equal(ordered.context.messages[1], userMsg, "Non-system messages keep their reference");
+    assert.equal(
+      ordered.context.messages[2],
+      alreadyOrderedSystemMsg,
+      "System messages whose toolsAdded needs no reorder keep their reference",
+    );
+    assert.equal(ordered.options, options);
+    assert.equal(
+      payload.context.messages[0]?.toolsAdded?.[0]?.name,
+      "mcp_db_z_tool",
+      "The caller's pi-messages payload is not mutated",
+    );
+    assert.equal(bridge.orderPayloadTools(ordered), ordered, "An ordered pi-messages payload is returned as is");
+  });
+
   it("re-orders active owned tools on orderActiveTools without re-activating inactive tools or writing when ordered", async () => {
     const settings = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
     let activeTools: string[] = ["bash"];
