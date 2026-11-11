@@ -1,10 +1,12 @@
 /**
- * Pure connection failure classification and retry policy for pi-mcp.
+ * Pure connection and stream error classification and retry policy for pi-mcp.
  *
  * Owns:
  *   - Pure OAuth 401/403 connect and tool error detection (`isOAuthUnauthorizedError`)
  *   - Pure SDK request-timeout detection (`isSdkTimeoutError`) and cancellation detection
  *     (`isCancellationError`)
+ *   - Pure `client.onerror` stream/JSON-RPC error classification (`classifyClientError`,
+ *     `isNonFatalClientError`, `isNotificationHandlerError`)
  *   - Fixed retry backoff schedule (`RETRY_DELAYS_MS`)
  *   - Connect-failure classification into retry, auth-required, fast-fail, give-up, or cancelled (`classifyConnectFailure`)
  */

@@ -1140,6 +1140,22 @@ describe("resolveTransportPid", () => {
     assert.equal(resolveTransportPid(null, {}), null);
     assert.equal(resolveTransportPid(null, { pid: "not-a-pid" }), null);
   });
+
+  it("rejects zero, negative, NaN, and non-integer PIDs and falls through to valid positive sources", () => {
+    // WHY: POSIX kill(0, sig) signals the caller's entire process group and kill(-1, sig)
+    // signals every process of the current uid, so non-positive/non-integer candidates must
+    // never be returned as teardown targets or mask a valid positive fallback PID.
+    assert.equal(resolveTransportPid(0, null), null);
+    assert.equal(resolveTransportPid(-1, null), null);
+    assert.equal(resolveTransportPid(Number.NaN, null), null);
+    assert.equal(resolveTransportPid(12.5, null), null);
+
+    assert.equal(resolveTransportPid(0, { _process: { pid: 777 } }), 777);
+    assert.equal(resolveTransportPid(-1, { pid: 555 }), 555);
+    assert.equal(resolveTransportPid(Number.NaN, { _process: { pid: 0 }, pid: 888 }), 888);
+    assert.equal(resolveTransportPid(null, { _process: { pid: -5 }, pid: 0 }), null);
+    assert.equal(resolveTransportPid(null, { pid: 12.5 }), null);
+  });
 });
 
 describe("terminateStdioTree", () => {

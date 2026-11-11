@@ -1056,11 +1056,12 @@ await server.connect(new StdioServerTransport());
 
     // WHY: setImmediate, not timers — setTimeout is mocked, so only the real macrotask queue
     // can make progress through the transport rejection and teardown that precede the retry wait.
-    // The armed `retryTimer` is the marker, not the listener count: the connect race guard also
-    // holds an abort listener for the duration of each attempt.
+    // `_waitRetry` assigns `retryTimer` and attaches its `abort` listener synchronously in the
+    // same turn (after `connectClientWithTimeout` has already disposed its race-guard listener),
+    // so an armed `retryTimer` marks the exact point to assert the listener count directly.
     const drainUntilRetryPending = async (): Promise<boolean> => {
       for (let spin = 0; spin < 500; spin++) {
-        if (failingServer()?.retryTimer !== null && abortListenerCount() === 1) return true;
+        if (failingServer()?.retryTimer !== null) return true;
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
       return false;
