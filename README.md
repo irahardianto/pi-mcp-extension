@@ -347,24 +347,30 @@ While a Pi UI is active, the extension never writes diagnostics to Pi's stderr (
 ```mermaid
 flowchart TD
     subgraph Pi["Pi Coding Agent (TUI / RPC, ExtensionAPI)"]
-        Entry["index.ts (entry & session lifecycle)"]
+        Entry["index.ts (extension entry)"]
+        Life["session-lifecycle (bootstrap, reload, mcp_servers_change)"]
         Cmds["register-commands (/mcp, :start, :stop, :auth, :resources)"]
         Tools["register-tools (mcp_* agent tools)"]
         Config["config (Zod + JSONC)"]
         Coord["connection-coordinator (in-flight connects, authQueue, teardown)"]
         Mgr["server-manager (stopped -> starting -> ready lifecycle)"]
         Bridge["tool-bridge (MCP -> Pi tools)"]
+        Res["resource-bridge (MCP resources & catalog cache)"]
         Schema["schema-convert (JSON Schema -> TypeBox)"]
         Transport["transport-factory & oauth-provider (MCP SDK)"]
 
+        Entry --> Life
         Entry --> Cmds
         Entry --> Tools
-        Entry --> Config
-        Entry --> Coord
+        Life --> Config
+        Life --> Coord
         Cmds --> Coord
+        Cmds --> Res
         Tools --> Coord
+        Tools --> Res
         Coord --> Mgr
         Mgr --> Bridge
+        Mgr --> Res
         Bridge --> Schema
         Mgr --> Transport
     end
@@ -451,7 +457,7 @@ The test suite includes:
 - **Tool bridge, status diagnostics & debug log** (`tests/tool-bridge.test.ts`, `tests/tool-progress.test.ts`, `tests/management-tools.test.ts`, `tests/server-status.test.ts`, `tests/status-commands.test.ts`, `tests/completions.test.ts`, `tests/debug-log.test.ts`) — JSON Schema → TypeBox conversion (`allOf` object inference, `$ref` cycle protection, union `null` ordering), name sanitization, image content passthrough, `isError` filtering, activate/deactivate, `notifications/progress` forwarding (sanitizing, redaction, dedupe, and the timeout reset over a real stdio server), `mcp_status` / `mcp_connect`, `/mcp <name>` config provenance and failure hints, slash command completions, and redacted `PI_MCP_DEBUG=1` JSONL logging
 - **Resource bridge** (`tests/resource-bridge.test.ts`) — paginated `resources/list` / `resources/templates/list`, `-32601` degradation, catalog caching with `notifications/resources/list_changed` invalidation, stale in-flight discard, text/image/binary `resources/read` conversion, abort/timeout/401 mapping, `mcp_list_resources` / `mcp_read_resource`, and `/mcp:resources`
 - **Property-based fuzzing** (`tests/fuzz.test.ts`) — `fast-check` properties covering JSONC comment stripping, callback/redirect URL validation, `WWW-Authenticate` challenge parsing, JSON Schema → TypeBox conversion, tool naming, terminal/log secret sanitization, custom header merging, and read-batch transport message/close ordering
-- **Release flow & repository policy** (`tests/release.test.ts`, `tests/ruleset-audit.test.ts`, `tests/repo-policy.test.ts`) — Release PR orchestration and npm/git self-healing (`scripts/release.ts`), live GitHub ruleset drift auditing (`scripts/ruleset-audit.ts`), and CI/ESLint/Qlty policy invariants
+- **Release flow & repository policy** (`tests/release.test.ts`, `tests/ruleset-audit.test.ts`, `tests/repo-policy.test.ts`, `tests/esm-boundaries.test.ts`) — Release PR orchestration and npm/git self-healing (`scripts/release.ts`), live GitHub ruleset drift auditing (`scripts/ruleset-audit.ts`), CI/ESLint/Qlty policy invariants, and pure-module/leaf-import ESM boundary checks
 - **End-to-end integration** — Real mock MCP and OAuth servers over `stdio` and HTTP with tool discovery and execution
 
 ## Security

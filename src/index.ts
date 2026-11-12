@@ -35,7 +35,7 @@ import {
 export {
   startupAuthNowOption,
   startupAuthLaterOption,
-} from "./connection-coordinator.js";
+} from "./startup-auth.js";
 
 export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string; globalConfigPath?: string; authStorageDir?: string; browserOpen?: (url: string) => void | Promise<void>; callbackServer?: CallbackServer } = {}): Promise<void> {
   // ── 0. Opt-in diagnostic log ───────────────────────────────────────────────

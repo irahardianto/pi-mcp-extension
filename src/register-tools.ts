@@ -4,12 +4,9 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as Type from "typebox";
-import {
-  type ConnectionCoordinator,
-  formatErrorMessage,
-} from "./connection-coordinator.js";
-import { McpError, AuthCancelledError } from "./errors.js";
-import { AuthLockError, AuthRequiredError } from "./oauth-provider.js";
+import type { ConnectionCoordinator } from "./connection-coordinator.js";
+import { AuthCancelledError, AuthLockError, AuthRequiredError, McpError } from "./errors.js";
+import { formatErrorMessage } from "./startup-auth.js";
 import type {
   ResourceBridge,
   McpResourceDefinition,

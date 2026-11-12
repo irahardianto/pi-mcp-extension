@@ -23,7 +23,9 @@ import { hostname as osHostname } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { agentDir } from "./config.js";
-import { describeError, reportDiagnostic } from "./debug-log.js";
+import { describeError } from "./debug-log-format.js";
+import { reportDiagnostic } from "./debug-log.js";
+import { AuthLockError, AuthRequiredError } from "./errors.js";
 import {
   formatHolderDetails,
   HEARTBEAT_MS,
@@ -32,29 +34,7 @@ import {
   type LockRecord,
 } from "./auth-lock-policy.js";
 
-// ─── Errors ───────────────────────────────────────────────────────────────────
-
-export class AuthRequiredError extends Error {
-  constructor(
-    serverName: string,
-    message = `Authorization required for ${serverName}. Connect in an interactive Pi session or use /mcp:auth ${serverName}.`,
-  ) {
-    super(message);
-    this.name = "AuthRequiredError";
-  }
-}
-
-export class AuthLockError extends AuthRequiredError {
-  constructor(serverName: string, details?: string) {
-    const message = details
-      ? details.startsWith("Authorization lock") || details.startsWith("Another Pi process")
-        ? details
-        : `Another Pi process (${details}) is authorizing ${serverName}. Retry after it finishes.`
-      : `Another Pi process is authorizing ${serverName}. Retry after it finishes.`;
-    super(serverName, message);
-    this.name = "AuthLockError";
-  }
-}
+export { AuthLockError, AuthRequiredError };
 
 // ─── Dependency Injection Types ───────────────────────────────────────────────
 

@@ -12,8 +12,7 @@
  */
 
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
-import { McpError, AuthCancelledError } from "./errors.js";
-import { AuthRequiredError } from "./oauth-provider.js";
+import { McpError, AuthCancelledError, AuthRequiredError } from "./errors.js";
 import type { ServerConfig } from "./config.js";
 
 function isHttpStatusCodeUnauthorized(numericCode: number, error: unknown): boolean {

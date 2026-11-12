@@ -7,7 +7,8 @@
 
 import { unlink } from "node:fs/promises";
 import { acquireAuthLock, statePath, type AuthLockHandle } from "./auth-lock.js";
-import { canonicalServerUrl, loadState, saveState } from "./oauth-state-store.js";
+import { canonicalServerUrl } from "./oauth-policy.js";
+import { loadState, saveState } from "./oauth-state-store.js";
 
 /**
  * Best-effort invalidation of stored tokens on disk when a resource server

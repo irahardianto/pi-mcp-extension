@@ -14,12 +14,52 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { McpError } from "./errors.js";
-import {
-  canonicalServerUrl,
-  type StoredClientInfo,
-  type StoredState,
-  type StoredTokens,
+import type {
+  StoredClientInfo,
+  StoredState,
+  StoredTokens,
 } from "./oauth-state-store.js";
+
+// ─── URL Canonicalization & Origin-Binding Helpers ────────────────────────────
+
+export function canonicalServerUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    const path = u.pathname.length > 1 ? u.pathname.replace(/\/+$/, "") : u.pathname;
+    return `${u.origin}${path}${u.search}`;
+  } catch {
+    // WHY: new URL() throws TypeError per WHATWG URL spec on malformed or relative
+    // URL strings. Falling back to trimmed rawUrl allows graceful degradation for
+    // non-standard or unparseable URLs without crashing callers.
+    return rawUrl.trim();
+  }
+}
+
+export function urlsMatch(storedUrl: string, expectedUrl: string): boolean {
+  return canonicalServerUrl(storedUrl) === canonicalServerUrl(expectedUrl);
+}
+
+function isUrlPrefixCompatible(req: URL, cfg: URL): boolean {
+  if (req.origin !== cfg.origin) return false;
+  if (req.pathname.length < cfg.pathname.length) return false;
+  const reqPath = req.pathname.endsWith("/") ? req.pathname : `${req.pathname}/`;
+  const cfgPath = cfg.pathname.endsWith("/") ? cfg.pathname : `${cfg.pathname}/`;
+  return reqPath.startsWith(cfgPath);
+}
+
+export function isResourceCompatibleWithServerUrl(resource: string, expectedServerUrl: string): boolean {
+  if (urlsMatch(resource, expectedServerUrl)) return true;
+  try {
+    const req = new URL(canonicalServerUrl(expectedServerUrl));
+    const cfg = new URL(canonicalServerUrl(resource));
+    return isUrlPrefixCompatible(req, cfg);
+  } catch {
+    // WHY: new URL() throws TypeError per WHATWG URL spec if canonicalServerUrl produced
+    // an invalid or relative URL. If either URL cannot be parsed into an absolute URL,
+    // they cannot be origin/path-compatible, so returning false is the safe fallback.
+    return false;
+  }
+}
 
 // ─── Types & Constants ────────────────────────────────────────────────────────
 
