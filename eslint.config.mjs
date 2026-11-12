@@ -350,10 +350,144 @@ export const maxBooleanOperatorsRule = {
   },
 };
 
+/**
+ * Caps aggregate per-file cognitive complexity across `src/` modules, mirroring Qlty's
+ * `[smells.file_complexity]` (`threshold = 100`, which flags `count >= 100`, so `max: 99` passes
+ * `<= 99` and fails `>= 100`). Unlike `maxCognitiveComplexityRule`, Qlty's file total includes
+ * `<default export>` and module-level control flow while charging only `&&` / `||` logical operator
+ * runs (not `??` nullish coalescing).
+ */
+export const maxFileComplexityRule = {
+  meta: {
+    type: "suggestion",
+    schema: [
+      {
+        type: "object",
+        properties: { max: { type: "integer", minimum: 1 } },
+        additionalProperties: false,
+      },
+    ],
+    messages: {
+      tooComplex:
+        "File has aggregate cognitive complexity {{count}}, above the maximum of {{max}} (matching Qlty [smells.file_complexity] threshold = 100). Extract cohesive pure policy or helper modules in a planned refactor instead of growing a multi-concern file.",
+    },
+  },
+  create(context) {
+    const max = context.options[0]?.max ?? 99;
+    const frames = [];
+
+    function currentFrame() {
+      return frames[frames.length - 1];
+    }
+
+    function enterFunction(node) {
+      const parent = currentFrame();
+      frames.push({
+        node,
+        name: getFunctionName(node),
+        score: 0,
+        depth: parent && !parent.isFileRoot ? parent.depth + 1 : (parent?.depth ?? 0),
+        isFileRoot: false,
+      });
+    }
+
+    function exitFunction() {
+      const frame = frames.pop();
+      if (!frame) return;
+      const parent = currentFrame();
+      if (parent) {
+        parent.score += frame.score;
+      }
+    }
+
+    function enterControlFlow(node) {
+      const frame = currentFrame();
+      if (!frame) return;
+      if (isElseIfStatement(node)) {
+        frame.score += 1;
+        return;
+      }
+      frame.score += 1 + frame.depth;
+      if (node.type === "WhileStatement" || node.type === "DoWhileStatement") {
+        frame.score += 1;
+      }
+      if (node.type === "IfStatement" && hasFinalElseClause(node)) {
+        frame.score += 1;
+      }
+      frame.depth += 1;
+    }
+
+    function exitControlFlow(node) {
+      const frame = currentFrame();
+      if (!frame || isElseIfStatement(node)) return;
+      frame.depth -= 1;
+    }
+
+    function enterJump() {
+      const frame = currentFrame();
+      if (!frame) return;
+      frame.score += 1;
+    }
+
+    const visitors = {
+      Program(node) {
+        frames.push({
+          node,
+          name: "<file>",
+          score: 0,
+          depth: 0,
+          isFileRoot: true,
+        });
+      },
+      "Program:exit"(node) {
+        const root = frames.pop();
+        if (!root || root.score <= max) return;
+        context.report({
+          node,
+          messageId: "tooComplex",
+          data: {
+            count: String(root.score),
+            max: String(max),
+          },
+        });
+      },
+      "FunctionDeclaration:exit": exitFunction,
+      "FunctionExpression:exit": exitFunction,
+      "ArrowFunctionExpression:exit": exitFunction,
+      ContinueStatement: enterJump,
+      BreakStatement: enterJump,
+      LogicalExpression(node) {
+        const frame = currentFrame();
+        if (!frame || !isBooleanOperator(node) || isSameOperatorSequenceMember(node)) return;
+        frame.score += 1;
+      },
+      CallExpression(node) {
+        const frame = currentFrame();
+        if (!frame || frame.isFileRoot) return;
+        if (calledName(node.callee) === frame.name) {
+          frame.score += 1;
+        }
+      },
+    };
+
+    for (const type of COGNITIVE_FUNCTION_NODES) {
+      visitors[type] = enterFunction;
+    }
+
+    for (const type of COGNITIVE_CONTROL_NODES) {
+      visitors[type] = enterControlFlow;
+      visitors[`${type}:exit`] = exitControlFlow;
+    }
+
+    return visitors;
+  },
+};
+
 const piMcpPlugin = {
   rules: {
     "max-return-statements": maxReturnStatementsRule,
     "max-cognitive-complexity": maxCognitiveComplexityRule,
+    "max-file-complexity": maxFileComplexityRule,
     "max-boolean-operators": maxBooleanOperatorsRule,
   },
 };
@@ -448,6 +582,7 @@ export default tseslint.config(
       "no-console": ["error", { allow: ["error"] }],
       "pi-mcp/max-return-statements": ["error", { max: 4 }],
       "pi-mcp/max-cognitive-complexity": ["error", { max: 15 }],
+      "pi-mcp/max-file-complexity": ["error", { max: 99 }],
       complexity: ["error", { max: 15 }],
     },
   },
