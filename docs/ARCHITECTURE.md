@@ -449,9 +449,9 @@ Behavior:
   bootstrap and on every `mcp_servers_change`; a same-named `mcp.json` entry takes
   precedence.
 - **Provenance.** `loadConfigWithOrigins()` returns the merged config plus the winning
-  file origin per server (`global` or `project`); the entry merges in the registered
-  extension server names (`withExtensionServers`) and keeps that record for the current
-  session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
+  file origin per server (`global` or `project`); `SessionLifecycle` merges in the
+  registered extension server names (`withExtensionServers`) and keeps that record for
+  the current session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
   skipped project config renders as `Project config: not loaded (<path>)` instead of
   silently missing servers. `loadConfig()` remains the thin wrapper that returns only
   the merged config.
