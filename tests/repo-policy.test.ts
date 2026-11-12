@@ -557,6 +557,12 @@ describe("coverage and Qlty maintainability policy", () => {
           code: "function makeDeps(open) { return { open: (p) => open(p), now: () => Date.now() }; }",
           options: [{ max: 1 }],
         },
+        {
+          // WHY: a non-arrow `function` callback rebinds `this`, so `this.run(...)` inside it is
+          // not direct recursion of outer method `run` (Qlty scores 2 for `if` at depth 1).
+          code: "class Service { run(xs) { xs.forEach(function (x) { if (x) this.run([]); }); } }",
+          options: [{ max: 2 }],
+        },
       ],
       invalid: [
         {
@@ -644,6 +650,26 @@ describe("coverage and Qlty maintainability policy", () => {
             {
               message:
                 "Function 'recur' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function walkClosure(xs) { xs.forEach((x) => { if (Array.isArray(x)) walkClosure(x); }); }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'walkClosure' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "class Service { recurClosure(xs) { xs.forEach((x) => { if (x) this.recurClosure([]); }); } }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'recurClosure' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
             },
           ],
         },
@@ -832,6 +858,16 @@ describe("coverage and Qlty maintainability policy", () => {
       /pi-mcp\/max-file-complexity/,
       "AGENTS.md must name the pi-mcp/max-file-complexity rule",
     );
+    assert.match(
+      agents,
+      /augmented assignment \(`\+=`, `-=`, `\|\|=`, `&&=`, `\?\?=`/,
+      "AGENTS.md must document augmented assignment scoring in cognitive complexity",
+    );
+    assert.doesNotMatch(
+      agents,
+      /extra 1 for `while` \/ `do-while` loop conditions/,
+      "AGENTS.md must not retain the stale while/do-while loop-condition point claim",
+    );
     const contributing = readRepoFile("CONTRIBUTING.md");
     assert.match(
       contributing,
@@ -906,6 +942,12 @@ describe("coverage and Qlty maintainability policy", () => {
           code: "function walk(n, a, b) { while (a && b) { if (n > 0) return walk(n - 1); n -= 1; break; } return 0; }",
           options: [{ max: 6 }],
           errors: [{ message: message(7, 6) }],
+        },
+        {
+          // Closure-wrapped recursion rolls into the file total just like Qlty (`if` at depth 1 = 2 + recursion = 3).
+          code: "function walkTree(xs) { xs.forEach((x) => { if (Array.isArray(x)) walkTree(x); }); }",
+          options: [{ max: 2 }],
+          errors: [{ message: message(3, 2) }],
         },
         {
           // `if ... else if ... else` and `+=` / `-=` match Qlty's cognitive complexity (`readStructuredValue` / `authorize`).

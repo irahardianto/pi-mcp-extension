@@ -99,7 +99,14 @@ function isSameOperatorSequenceMember(node) {
   return parent?.type === "LogicalExpression" && parent.operator === node.operator;
 }
 
-function isDirectRecursiveCall(callee, frame) {
+function definesOwnThisBinding(fnNode) {
+  return (
+    fnNode.type !== "ArrowFunctionExpression" ||
+    unwrapTypeExpressions(fnNode)?.type === "PropertyDefinition"
+  );
+}
+
+function isDirectRecursiveCall(callee, frame, allowThis) {
   const fnNode = frame.node;
   // WHY: Only lexical bindings (`function walk`, `const walk = ...`, `walk = ...`) and `this.m()`
   // member calls are direct recursion in Qlty. Object-literal property keys (`{ open: (p) => open(p) }`)
@@ -116,9 +123,25 @@ function isDirectRecursiveCall(callee, frame) {
     }
     return false;
   }
-  if (callee?.type === "MemberExpression" && callee.object?.type === "ThisExpression") {
+  if (allowThis && callee?.type === "MemberExpression" && callee.object?.type === "ThisExpression") {
     if (callee.property?.type === "Identifier") return callee.property.name === frame.name;
     if (callee.property?.type === "PrivateIdentifier") return `#${callee.property.name}` === frame.name;
+  }
+  return false;
+}
+
+function isRecursiveCallInFrames(callee, frames) {
+  // WHY: Qlty also counts recursion into an enclosing active function from inside an inline
+  // closure (`xs.forEach((x) => walk(x))` or `xs.forEach((x) => this.m(x))`), while a non-arrow
+  // `function` or class-field arrow boundary rebinds `this` and stops `this.*` matching beyond it.
+  let allowThis = true;
+  for (let i = frames.length - 1; i >= 0; i -= 1) {
+    const frame = frames[i];
+    if (frame.isFileRoot) break;
+    if (isDirectRecursiveCall(callee, frame, allowThis)) return true;
+    if (definesOwnThisBinding(frame.node)) {
+      allowThis = false;
+    }
   }
   return false;
 }
@@ -202,7 +225,7 @@ function createCognitiveComplexityVisitors({ frames, countNullishOperators, onRo
     CallExpression(node) {
       const frame = currentFrame();
       if (!frame || frame.isFileRoot) return;
-      if (isDirectRecursiveCall(node.callee, frame)) {
+      if (isRecursiveCallInFrames(node.callee, frames)) {
         frame.score += 1;
       }
     },
