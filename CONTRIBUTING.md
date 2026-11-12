@@ -53,7 +53,14 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
   complexity (`pi-mcp/max-cognitive-complexity`), `<= 4` return statements, and
   `<= 4` control-flow nesting levels. Qlty's `function_complexity`,
   `return_statements`, and `nested_control_flow` smells use the same thresholds;
-  keep `qlty smells --all` clean when you touch `src/`.
+  keep `qlty smells --all` clean when you touch `src/`. Top-level anonymous
+  callbacks are covered too: only a `<default export>` is exempt. Qlty's
+  `file_complexity` smell is capped at `100` per `src/` module (Qlty reports
+  `count >= threshold`), so a module scoring `100` or more needs a planned
+  `refactor:` extraction rather than an opportunistic split inside a
+  `fix:` / `feat:` change. That ceiling is review-time: `npm run lint` has no
+  equivalent rule and no CI job runs `qlty smells`, so `tests/repo-policy.test.ts`
+  pins the value and reviewers hold the line.
 - `npm run lint` also caps boolean expressions at `<= 3` `&&` / `||` operators on
   `src/**/*.ts` and `scripts/**/*.ts` (`pi-mcp/max-boolean-operators`), matching
   Qlty's `boolean_logic` smell (threshold 4), and caps function/method parameter

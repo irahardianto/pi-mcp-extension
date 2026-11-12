@@ -147,10 +147,12 @@ export const maxCognitiveComplexityRule = {
         return;
       }
       // WHY: Qlty attributes a nested closure's complexity to its enclosing function and does not
-      // report anonymous/default-exported functions at all; skip them here too so `npm run lint`
-      // and `qlty:function-complexity` agree, instead of failing the extension entry point that
-      // Qlty never flags.
-      if (frame.name === "<anonymous>" || frame.name === "<default export>") return;
+      // report default-exported functions at all; skip the latter here too so `npm run lint` and
+      // `qlty:function-complexity` agree on the extension entry point that Qlty never flags.
+      // A root-level `<anonymous>` frame is different: it has no enclosing named function, so the
+      // roll-up above never sees it, and skipping it would silently exempt every top-level
+      // callback (`z.preprocess((raw) => ...)`, `.superRefine((cfg, ctx) => ...)`) from the gate.
+      if (frame.name === "<default export>") return;
       if (frame.score > max) {
         context.report({
           node: frame.node,

@@ -260,6 +260,24 @@ describe("coverage and Qlty maintainability policy", () => {
     }
   });
 
+  it("configures [smells.file_complexity] with threshold 100 in .qlty/qlty.toml", () => {
+    // WHY: strip `#` comment lines before matching. The section's own WHY block quotes
+    // `threshold = 100`, so a raw text match would keep passing after the real key was deleted or
+    // changed to any 3-digit value — the guard has to read the config, not the prose.
+    const qltyToml = readRepoFile(".qlty/qlty.toml")
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
+    // WHY: Qlty reports `count >= threshold`, so 100 is the ceiling: it sits above the largest
+    // analysed `src/` module (server-manager.ts, 90) so a fix/feat PR never needs an opportunistic
+    // split, while the previous 1,000 let multi-concern modules accumulate unchecked.
+    assert.match(
+      qltyToml,
+      /\[smells\.file_complexity\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*100(?!\d)/,
+      ".qlty/qlty.toml must configure [smells.file_complexity] with enabled = true and threshold = 100",
+    );
+  });
+
   it("includes CI, Qlty Maintainability, and Code Coverage badges in README.md", () => {
     const readme = readRepoFile("README.md");
     assert.ok(readme.includes("actions/workflows/ci.yml/badge.svg?branch=main"), "README.md must include CI status badge");
@@ -469,9 +487,22 @@ describe("coverage and Qlty maintainability policy", () => {
     const excludes = /exclude_patterns\s*=\s*\[([\s\S]*?)\]/.exec(qltyToml)?.[1] ?? "";
     assert.match(excludes, /"\.semgrep\/\*\*"/, ".qlty/qlty.toml must exclude .semgrep/** fixtures from analysis");
     assert.match(excludes, /"\*\.mjs"/, ".qlty/qlty.toml must exclude *.mjs build-time config from analysis");
+    // WHY: the calibrated ceilings and the docs' "src/ only" scope depend on this exclusion.
+    // Dropping `scripts/**` would pull `scripts/release.ts` (~1,030 lines, complexity 203) into the
+    // analysed set, where `[smells.file_complexity]` would report it immediately.
+    assert.match(
+      excludes,
+      /"scripts\/\*\*"/,
+      ".qlty/qlty.toml must keep excluding scripts/** so the file/function ceilings stay scoped to src/",
+    );
+    assert.match(
+      excludes,
+      /"tests\/\*\*"/,
+      ".qlty/qlty.toml must keep excluding tests/** so test fixtures do not drive the src/ ceilings",
+    );
   });
 
-  it("enforces Qlty-aligned cognitive complexity on branches, nesting, closures, and recursion", async () => {
+  it("enforces Qlty-aligned cognitive complexity on branches, nesting, closures, recursion, and top-level anonymous callbacks", async () => {
     const { RuleTester } = await import("eslint");
     // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
     const { maxCognitiveComplexityRule } = (await import("../eslint.config.mjs")) as {
@@ -500,8 +531,27 @@ describe("coverage and Qlty maintainability policy", () => {
           code: "export default function () { if (a) {} if (b) {} if (c) {} if (d) {} }",
           options: [{ max: 1 }],
         },
+        {
+          // WHY: a top-level anonymous callback has no enclosing named function frame, so it is
+          // reported on its own frame only when it actually exceeds the limit.
+          code: "const schema = wrap((a) => { if (a) {} });",
+          options: [{ max: 1 }],
+        },
       ],
       invalid: [
+        {
+          // WHY: top-level anonymous callbacks (`z.preprocess((raw) => ...)`,
+          // `.superRefine((cfg, ctx) => ...)`) have no enclosing named function, so they used to
+          // be dropped entirely by the `<anonymous>` skip.
+          code: "const schema = wrap((a) => { if (a === 1) {} if (a === 2) {} if (a === 3) {} if (a === 4) {} });",
+          options: [{ max: 3 }],
+          errors: [
+            {
+              message:
+                "Function '<anonymous>' has cognitive complexity 4, above the maximum of 3. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
         {
           code:
             "function tooComplex(a) {" +
@@ -710,11 +760,23 @@ describe("coverage and Qlty maintainability policy", () => {
       /pi-mcp\/max-cognitive-complexity/,
       "AGENTS.md must name the pi-mcp/max-cognitive-complexity rule",
     );
+    // WHY: assert the affirmative claim (rule name + `<default export>` exemption in the same
+    // sentence), not a bare phrase that a negated sentence would also satisfy.
+    assert.match(
+      agents,
+      /`pi-mcp\/max-cognitive-complexity` still reports a \*\*top-level\*\* anonymous callback[\s\S]{0,500}?only `<default export>` stays exempt/,
+      "AGENTS.md must state that pi-mcp/max-cognitive-complexity reports top-level anonymous callbacks and exempts only <default export>",
+    );
     const contributing = readRepoFile("CONTRIBUTING.md");
     assert.match(
       contributing,
       /npm run lint` enforces Qlty-aligned structural complexity limits on\s+`src\/\*\*\/\*\.ts`/,
       "CONTRIBUTING.md must note that npm run lint enforces structural complexity limits on src/**/*.ts",
+    );
+    assert.match(
+      contributing,
+      /Top-level anonymous\s+callbacks are covered too: only a `<default export>` is exempt\./,
+      "CONTRIBUTING.md must state that top-level anonymous callbacks are covered and only <default export> is exempt",
     );
   });
 
