@@ -495,6 +495,22 @@ describe("debug log", () => {
       assert.equal(describeError(new TypeError("nope")).kind, "TypeError");
       assert.equal(describeError("plain").kind, "unknown");
     });
+
+    it("never throws on null-prototype objects or throwing message/toString getters", () => {
+      const nullProto = describeError(Object.create(null));
+      assert.equal(nullProto.kind, "unknown");
+      assert.ok(nullProto.message.length > 0);
+
+      const hostileErr = new Error("initial");
+      Object.defineProperty(hostileErr, "message", {
+        get() {
+          throw new Error("getter exploded");
+        },
+      });
+      const describedHostile = describeError(hostileErr);
+      assert.equal(describedHostile.kind, "Error");
+      assert.ok(describedHostile.message.length > 0);
+    });
   });
 
   describe("buildLogEntry / formatLogLine", () => {
