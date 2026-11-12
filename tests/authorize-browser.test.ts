@@ -88,6 +88,64 @@ describe("authorize-browser", () => {
   });
 
   describe("openBrowser", () => {
+    it("rejects unsafe or malformed URLs before invoking the OS browser opener", async () => {
+      const inputs = [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "data:text/html,<script>alert(1)</script>",
+        "http://evil.example.com/authorize",
+        "not a url",
+        "--help",
+        "-a Calculator",
+      ];
+      let spawnCount = 0;
+      for (const input of inputs) {
+        await assert.rejects(
+          openBrowser(input, {
+            serverName: "server-1",
+            spawnProcess: () => {
+              spawnCount++;
+              return new FakeBrowserChild();
+            },
+          }),
+          (err: unknown) => {
+            assert.ok(err instanceof McpError);
+            assert.equal(err.code, "protocol");
+            assert.equal(err.server, "server-1");
+            assert.equal(
+              err.message,
+              "Refusing to open unsafe authorization URL: only HTTPS (or loopback HTTP) URLs are allowed",
+            );
+            return true;
+          },
+        );
+      }
+      assert.equal(spawnCount, 0);
+    });
+
+    it("canonicalizes valid HTTPS and loopback HTTP URLs before opening", async () => {
+      const inputs = [
+        "https://auth.example.com/a b",
+        "http://127.0.0.1:8080/authorize",
+        "http://localhost:8080/authorize",
+        "http://[::1]:8080/authorize",
+      ];
+      for (const input of inputs) {
+        const child = new FakeBrowserChild();
+        let openedUrl = "";
+        await openBrowser(input, {
+          platform: "darwin",
+          spawnProcess: (_command, args) => {
+            openedUrl = args[0] ?? "";
+            queueMicrotask(() => child.emit("spawn"));
+            return child;
+          },
+        });
+        assert.equal(openedUrl, new URL(input).toString());
+        assert.equal(child.unreferenced, true);
+      }
+    });
+
     it("spawns detached with stdio ignore and windowsHide, unrefs on spawn, and resolves", async () => {
       const child = new FakeBrowserChild();
       let capturedCommand = "";
