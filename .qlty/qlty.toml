@@ -34,9 +34,9 @@ default = true
 # under the gate, while a module scoring 100 or more is genuine multi-concern accumulation that
 # belongs in a planned `refactor:` extraction. The analysed set is `src/` only: `exclude_patterns`
 # above drops `scripts/**` and `tests/**`, so `scripts/release.ts` is outside this ceiling.
-# Unlike `function_complexity` and `boolean_logic`, no ESLint rule mirrors this smell and no CI job
-# runs `qlty smells`, so the value is a review-time ceiling: `tests/repo-policy.test.ts` pins the
-# number and the Qlty dashboard reports the score, but the PR gate will not block on it.
+# Mirrored by `pi-mcp/max-file-complexity` (`max: 99`) in `npm run lint` (`eslint.config.mjs`),
+# which is the blocking PR gate (`<= 99` passes both ESLint and Qlty; `>= 100` fails both), while
+# `tests/repo-policy.test.ts` pins both configs and the Qlty dashboard reports the score.
 enabled = true
 threshold = 100
 
@@ -47,13 +47,14 @@ threshold = 100
 enabled = true
 threshold = 5
 
-# WHY: `threshold = 15` flags functions at or above 15, matching ESLint's
-# `complexity: ["error", { max: 15 }]` and `pi-mcp/max-cognitive-complexity` (see AGENTS.md →
-# Function complexity & decomposition). The ESLint rule is the blocking gate; this smell is the
-# source of truth for the metric on the Qlty dashboard.
+# WHY: Qlty's `threshold` is the minimum offending score (`count >= threshold`), whereas ESLint's
+# `complexity` and `pi-mcp/max-cognitive-complexity` rules (`max: 15`) flag `count > max`. Setting
+# `threshold = 16` aligns both gates so functions at `<= 15` pass both ESLint and Qlty and `>= 16`
+# fail both (see AGENTS.md → Function complexity & decomposition). The ESLint rule is the blocking
+# gate; this smell is the source of truth for the metric on the Qlty dashboard.
 [smells.function_complexity]
 enabled = true
-threshold = 15
+threshold = 16
 
 # WHY: `threshold = 4` is Qlty's minimum offending `&&` / `||` operator count, so `<= 3` operators
 # pass and `>= 4` are reported as `Complex binary expression` (verified against this Qlty build).
