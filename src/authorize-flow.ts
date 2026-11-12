@@ -1,11 +1,9 @@
-import { spawn } from "node:child_process";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import {
   CallbackServer,
   callbackServerConfigFromRedirectUrl,
 } from "./callback-server.js";
-import { isSafeAuthorizationUrl } from "./callback-url.js";
 import {
   discoverManualAuthChallenge,
   createHeadersFetch,
@@ -19,16 +17,22 @@ import {
   type AuthLockHandle,
 } from "./oauth-provider.js";
 import { McpError, AuthCancelledError } from "./errors.js";
-import { sanitizeTerminalText } from "./terminal-text.js";
 import { describeError, reportDiagnostic } from "./debug-log.js";
 import {
-  authPasteOption,
-  waitForOAuthCallback,
-} from "./authorize-dialog.js";
+  createAuthorizationBrowserLauncher,
+  openBrowser,
+  reopenAuthorizationBrowser,
+} from "./authorize-browser.js";
+import { waitForOAuthCallback } from "./authorize-dialog.js";
 import type { ServerConfig } from "./config.js";
 import type { ServerManager } from "./server-manager.js";
 
 export { AuthCancelledError } from "./errors.js";
+export {
+  browserOpenCommand,
+  openBrowser,
+  type BrowserOpenCommand,
+} from "./authorize-browser.js";
 export {
   authCancelOption,
   authPasteOption,
@@ -36,51 +40,6 @@ export {
   waitForOAuthCallback,
   type OAuthPasteOptions,
 } from "./authorize-dialog.js";
-
-export interface BrowserOpenCommand {
-  command: string;
-  args: string[];
-}
-
-export function browserOpenCommand(url: string): BrowserOpenCommand {
-  if (process.platform === "darwin") {
-    return { command: "open", args: [url] };
-  }
-  if (process.platform === "win32") {
-    return { command: "rundll32", args: ["url.dll,FileProtocolHandler", url] };
-  }
-  return { command: "xdg-open", args: [url] };
-}
-
-/**
- * Open a URL in the user's default browser.
- * Works on macOS, Linux, and Windows.
- */
-export function openBrowser(url: string): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const { command, args } = browserOpenCommand(url);
-    const child = spawn(command, args, {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    });
-
-    child.once("error", (err) => {
-      reportDiagnostic({
-        level: "error",
-        event: "auth.browser_open_failed",
-        message: `Failed to open browser: ${sanitizeTerminalText(err.message)}`,
-      });
-      reject(err);
-    });
-
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
-}
-
 
 export interface AuthorizeDeps {
   manager: ServerManager;
@@ -126,15 +85,6 @@ interface StartCallbackServerParams {
   ctx: ExtensionContext;
   signal: AbortSignal;
   isLockLost: () => boolean;
-}
-
-interface BrowserLauncherParams {
-  serverName: string;
-  port: number;
-  ctx: ExtensionContext;
-  browserOpener: (url: string) => void | Promise<void>;
-  isInactive: () => boolean;
-  onUrlRecorded: (url: URL) => void;
 }
 
 interface InteractiveAuthProviderParams {
@@ -289,37 +239,6 @@ async function startAuthorizationCallbackServer(params: StartCallbackServerParam
   return port;
 }
 
-/**
- * Build the `onAuthRequired` hook: refuse unsafe URLs, remember the last URL for
- * "Retry", open the browser, and tell the user how to finish on a remote host.
- */
-function createAuthorizationBrowserLauncher(params: BrowserLauncherParams): (url: URL) => Promise<void> {
-  const { serverName, port, ctx, browserOpener, isInactive, onUrlRecorded } = params;
-  return async (url: URL): Promise<void> => {
-    if (!isSafeAuthorizationUrl(url)) {
-      throw new McpError(
-        `Refusing to open unsafe authorization URL for "${serverName}": only HTTPS (or loopback HTTP) URLs are allowed`,
-        serverName,
-        "protocol",
-      );
-    }
-    onUrlRecorded(new URL(url.toString()));
-    if (isInactive()) return;
-    try {
-      await browserOpener(url.toString());
-      ctx.ui.notify(
-        `pi-mcp: Authorize ${serverName}: ${url.toString()} (On SSH, forward the callback with ssh -L ${port}:127.0.0.1:${port}, or choose "${authPasteOption}".)`,
-        "info",
-      );
-    } catch (err) {
-      ctx.ui.notify(
-        `pi-mcp: Failed to open browser for ${serverName} (${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}). Open ${url.toString()} manually or choose "${authPasteOption}".`,
-        "error",
-      );
-    }
-  };
-}
-
 /** Create the interactive-mode OAuth provider wired to the run's lock and signal. */
 function createInteractiveAuthProvider(params: InteractiveAuthProviderParams): McpOAuthProvider {
   const { serverName, config, serverUrl, redirectUrl, deps, signal, unlock, onAuthRequired } = params;
@@ -451,24 +370,6 @@ async function runInitialSdkAuth(
     reportCorruptOAuthState(serverName, err);
     return auth(authProvider, authOptions);
   }
-}
-
-/**
- * Re-open the last authorization URL when the user retries from the dialog.
- */
-function reopenAuthorizationBrowser(
-  launchAuthorizationBrowser: (url: URL) => Promise<void>,
-  state: AuthorizeRunState,
-  serverName: string,
-): Promise<void> {
-  if (!state.latestAuthorizationUrl) {
-    throw new McpError(
-      `Authorization URL is not available for ${serverName}`,
-      serverName,
-      "protocol",
-    );
-  }
-  return launchAuthorizationBrowser(state.latestAuthorizationUrl);
 }
 
 /**
@@ -667,7 +568,12 @@ export async function authorize(
         customFetch,
         callbackPromise,
         oauthState,
-        reopenBrowser: () => reopenAuthorizationBrowser(launchAuthorizationBrowser, state, serverName),
+        reopenBrowser: () =>
+          reopenAuthorizationBrowser(
+            launchAuthorizationBrowser,
+            () => state.latestAuthorizationUrl,
+            serverName,
+          ),
         onPasteResolved: cancel,
         assertActive,
       });
