@@ -260,6 +260,28 @@ describe("coverage and Qlty maintainability policy", () => {
     }
   });
 
+  it("calibrates [smells.file_complexity] to a 100-point ceiling in .qlty/qlty.toml", () => {
+    const qltyToml = readRepoFile(".qlty/qlty.toml");
+    const fileComplexity = /\[smells\.file_complexity\]([\s\S]*?)(?=\n\[|$)/.exec(qltyToml)?.[1] ?? "";
+    assert.match(
+      fileComplexity,
+      /enabled\s*=\s*true/,
+      ".qlty/qlty.toml must enable [smells.file_complexity]",
+    );
+    // WHY: Qlty reports `count >= threshold`. `100` sits above the largest cohesive module
+    // (server-manager.ts, 90) so a fix/feat PR never needs an opportunistic split, while a
+    // 1,000-point ceiling (the previous value) let multi-concern modules accumulate unchecked.
+    assert.match(
+      fileComplexity,
+      /threshold\s*=\s*100(?!\d)/,
+      ".qlty/qlty.toml must cap [smells.file_complexity] at threshold = 100",
+    );
+    assert.ok(
+      !/threshold\s*=\s*\d{4,}/.test(fileComplexity),
+      ".qlty/qlty.toml must not leave [smells.file_complexity] effectively unbounded",
+    );
+  });
+
   it("includes CI, Qlty Maintainability, and Code Coverage badges in README.md", () => {
     const readme = readRepoFile("README.md");
     assert.ok(readme.includes("actions/workflows/ci.yml/badge.svg?branch=main"), "README.md must include CI status badge");
@@ -471,7 +493,7 @@ describe("coverage and Qlty maintainability policy", () => {
     assert.match(excludes, /"\*\.mjs"/, ".qlty/qlty.toml must exclude *.mjs build-time config from analysis");
   });
 
-  it("enforces Qlty-aligned cognitive complexity on branches, nesting, closures, and recursion", async () => {
+  it("enforces Qlty-aligned cognitive complexity on branches, nesting, closures, recursion, and top-level anonymous callbacks", async () => {
     const { RuleTester } = await import("eslint");
     // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
     const { maxCognitiveComplexityRule } = (await import("../eslint.config.mjs")) as {
@@ -500,8 +522,27 @@ describe("coverage and Qlty maintainability policy", () => {
           code: "export default function () { if (a) {} if (b) {} if (c) {} if (d) {} }",
           options: [{ max: 1 }],
         },
+        {
+          // WHY: a top-level anonymous callback has no enclosing named function frame, so it is
+          // reported on its own frame only when it actually exceeds the limit.
+          code: "const schema = wrap((a) => { if (a) {} });",
+          options: [{ max: 1 }],
+        },
       ],
       invalid: [
+        {
+          // WHY: top-level anonymous callbacks (`z.preprocess((raw) => ...)`,
+          // `.superRefine((cfg, ctx) => ...)`) have no enclosing named function, so they used to
+          // be dropped entirely by the `<anonymous>` skip.
+          code: "const schema = wrap((a) => { if (a === 1) {} if (a === 2) {} if (a === 3) {} if (a === 4) {} });",
+          options: [{ max: 3 }],
+          errors: [
+            {
+              message:
+                "Function '<anonymous>' has cognitive complexity 4, above the maximum of 3. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
         {
           code:
             "function tooComplex(a) {" +
@@ -710,11 +751,21 @@ describe("coverage and Qlty maintainability policy", () => {
       /pi-mcp\/max-cognitive-complexity/,
       "AGENTS.md must name the pi-mcp/max-cognitive-complexity rule",
     );
+    assert.match(
+      agents,
+      /top-level\**\s*anonymous callback/,
+      "AGENTS.md must document that top-level anonymous callbacks are subject to pi-mcp/max-cognitive-complexity",
+    );
     const contributing = readRepoFile("CONTRIBUTING.md");
     assert.match(
       contributing,
       /npm run lint` enforces Qlty-aligned structural complexity limits on\s+`src\/\*\*\/\*\.ts`/,
       "CONTRIBUTING.md must note that npm run lint enforces structural complexity limits on src/**/*.ts",
+    );
+    assert.match(
+      contributing,
+      /Top-level anonymous\s+callbacks/,
+      "CONTRIBUTING.md must note that top-level anonymous callbacks are covered by the complexity gate",
     );
   });
 
