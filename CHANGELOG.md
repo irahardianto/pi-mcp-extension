@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Trailing MCP `notifications/progress` updates are no longer dropped when a notification and its `tools/call` response (or stream close) arrive in the same read batch (#300). `@modelcontextprotocol/sdk`'s `Protocol._onnotification` defers notification dispatch onto a microtask while `Protocol._onresponse` and `Protocol._onclose` clear `_progressHandlers` synchronously, so whenever `StdioClientTransport.processReadBuffer()`, an SSE chunk, or a JSON batch response delivered `[notifications/progress, result]` in one synchronous loop, the response deleted the progress handler before the notification microtask ran — dropping the final progress update and emitting `Received a progress notification for an unknown token`. `createTransport` now instruments `onmessage`, `onclose`, and `close()` in place to queue subsequent frames and close events in strict FIFO wire order behind any in-flight notification microtask (including re-entrant dispatches), isolate throwing `onerror` listeners and unstringifiable thrown values from wedging the queue, deduplicate `onclose` / concurrent `close()` dispatches across turns, and drain queued steps before `close()` settles while keeping ordinary notification-free turns synchronous.
+
 ## [1.15.0] - 2026-11-11
 
 ### Added

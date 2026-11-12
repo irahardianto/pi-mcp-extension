@@ -141,7 +141,12 @@ While `ready`, three independent recovery paths exist:
   (`startHealthCheck()` in `src/mcp-client.ts` owns only the schedule; the manager supplies
   `isReady()` and the recovery callback).
 - an unexpected transport close (`client.onclose`) or a fatal stream error triggers
-  `_recover()`; deliberate closes abort the signal first and are ignored. `client.onerror` is
+  `_recover()`; deliberate closes abort the signal first and are ignored. Transports built
+  by `createTransport()` preserve FIFO wire order across read-batch notifications,
+  responses/requests, and close events, deduplicate `onclose` / concurrent `close()`
+  dispatches, and drain queued turns before `close()` settles so trailing
+  `notifications/progress` updates are never dropped ahead of a coalesced response or
+  stream close (#300). `client.onerror` is
   routed by the pure `classifyClientError()` (`src/connect-policy.ts`), which drops benign
   unknown-ID/token diagnostics and the SDK's POST-only SSE probe, logs uncaught
   notification-handler errors without reconnecting, and recovers everything else.

@@ -391,18 +391,37 @@ export function sanitizeLogFields(fields: LogFields | undefined): Record<string,
   return out;
 }
 
+function safeErrorText(read: () => string, fallback: string): string {
+  try {
+    return read();
+  } catch {
+    // WHY: Null-prototype objects (`Object.create(null)`) and hostile `message` / `toString`
+    // getters throw `TypeError`; diagnostic error classification must never throw.
+    return fallback;
+  }
+}
+
 /**
  * Describe an error for a log field: a stable kind plus a sanitized message.
  * Never logs the raw error object (it may carry tokens in its properties).
  */
 export function describeError(err: unknown): { kind: string; message: string } {
   if (err instanceof McpError) {
-    return { kind: err.code, message: sanitizeLogText(err.message) };
+    return {
+      kind: err.code,
+      message: sanitizeLogText(safeErrorText(() => String(err.message), "[unreadable error message]")),
+    };
   }
   if (err instanceof Error) {
-    return { kind: err.name || "error", message: sanitizeLogText(err.message) };
+    return {
+      kind: safeErrorText(() => err.name || "error", "error"),
+      message: sanitizeLogText(safeErrorText(() => String(err.message), "[unreadable error message]")),
+    };
   }
-  return { kind: "unknown", message: sanitizeLogText(String(err)) };
+  return {
+    kind: "unknown",
+    message: sanitizeLogText(safeErrorText(() => String(err), "[unstringifiable value]")),
+  };
 }
 
 // ─── Log Entry ────────────────────────────────────────────────────────────────
