@@ -184,7 +184,6 @@ type TransportCloseHandler = NonNullable<Transport["onclose"]>;
 
 interface NotificationTurnTracker {
   tail: Promise<void> | null;
-  closePending: boolean;
   reportError: (err: unknown) => void;
 }
 
@@ -261,12 +260,22 @@ async function drainTurnQueue(tracker: NotificationTurnTracker): Promise<void> {
   }
 }
 
+function normalizeDeferredError(err: unknown): Error {
+  try {
+    return err instanceof Error ? err : new Error(String(err));
+  } catch {
+    // WHY: `String(Object.create(null))` and throwing `toString` getters throw `TypeError`;
+    // normalization must never reject `tracker.tail` and wedge subsequent turns.
+    return new Error("[unstringifiable value thrown]");
+  }
+}
+
 function reportDeferredHandlerError(
   serverName: string,
   transport: Transport,
   err: unknown,
 ): void {
-  const normalized = err instanceof Error ? err : new Error(String(err));
+  const normalized = normalizeDeferredError(err);
   try {
     transport.onerror?.(normalized);
   } catch (onErrorErr) {
@@ -314,36 +323,28 @@ function wrapOrderedMessageHandler(
   };
 }
 
-function enqueueDeferredClose(
-  handler: TransportCloseHandler,
-  tracker: NotificationTurnTracker,
-): void {
-  if (tracker.closePending) return;
-  tracker.closePending = true;
-  enqueueTurnStep(tracker, () => {
-    try {
-      handler();
-    } finally {
-      tracker.closePending = false;
-    }
-  });
-}
-
 function wrapOrderedCloseHandler(
   handler: TransportCloseHandler,
   tracker: NotificationTurnTracker,
   isSuperseded: () => boolean,
 ): TransportCloseHandler {
+  // WHY: `Protocol._onclose()` clears `client.transport` without clearing `transport.onclose`,
+  // while `StreamableHTTPClientTransport.close()` and `SSEClientTransport.close()` invoke
+  // `this.onclose?.()`. Latch per top-level handler registration so both same-turn and cross-tick
+  // `onclose` + `transport.close()` combinations fire `onclose` at most once.
+  let closeDispatched = false;
   return () => {
     if (isSuperseded()) {
       handler();
       return;
     }
+    if (closeDispatched) return;
+    closeDispatched = true;
     if (tracker.tail === null) {
-      if (!tracker.closePending) handler();
+      handler();
       return;
     }
-    enqueueDeferredClose(handler, tracker);
+    enqueueTurnStep(tracker, handler);
   };
 }
 
@@ -366,7 +367,7 @@ function bindOrderedHandlerProperty<K extends "onmessage" | "onclose">(
         return;
       }
       if (next === ordered) return;
-      const wrapped = wrap(next, () => ordered !== undefined && ordered !== wrapped);
+      const wrapped = wrap(next, () => ordered !== wrapped);
       ordered = wrapped;
     },
   });
@@ -408,7 +409,6 @@ function wrapOrderedTransportClose(
 function instrumentTransportMessageOrder(serverName: string, transport: Transport): Transport {
   const tracker: NotificationTurnTracker = {
     tail: null,
-    closePending: false,
     reportError: (err: unknown) => {
       reportDeferredHandlerError(serverName, transport, err);
     },

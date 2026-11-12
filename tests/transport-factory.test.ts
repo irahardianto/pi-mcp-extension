@@ -919,6 +919,104 @@ describe("createTransport batch message ordering (#300)", () => {
     assert.equal(closedCount2, 1);
     assert.equal(client2.transport, undefined);
     await call2;
+
+    // 3. Cross-tick direct `transport.close()` after `transport.onclose()` already drained
+    // `Protocol._onclose()` (which clears `client.transport` but leaves `transport.onclose` bound).
+    const t3 = makeHttpTransport();
+    let closedCount3 = 0;
+    const progress3: number[] = [];
+    const client3 = new Client({ name: "c3", version: "1.0.0" });
+    client3.onclose = () => {
+      closedCount3 += 1;
+    };
+    await client3.connect(t3);
+    const call3 = client3
+      .callTool({ name: "slow", arguments: {} }, undefined, {
+        onprogress: ({ progress }) => progress3.push(progress),
+      })
+      .catch((err: unknown) => err);
+
+    t3.onmessage?.({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 1, progress: 1, total: 1 },
+    });
+    t3.onclose?.();
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+    await t3.close();
+    t3.onclose?.();
+    assert.deepEqual(progress3, [1]);
+    assert.equal(closedCount3, 1);
+    await call3;
+  });
+
+  it("survives null-prototype throws in deferred handlers and onerror, and keeps chained order if cleared mid-drain", async () => {
+    // 1. Null-prototype (`Object.create(null)`) thrown by both a deferred handler and `transport.onerror`
+    // must never reject `tracker.tail` or strand subsequent messages.
+    const transport = createTransport("srv-null-proto", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    const delivered: number[] = [];
+    let onErrorCount = 0;
+    transport.onerror = () => {
+      onErrorCount += 1;
+      throw Object.create(null);
+    };
+    transport.onmessage = (msg) => {
+      if ("id" in msg && typeof msg.id === "number") {
+        if (msg.id === 1) {
+          throw Object.create(null);
+        }
+        delivered.push(msg.id);
+      }
+    };
+
+    transport.onmessage({ jsonrpc: "2.0", method: "notifications/progress", params: {} });
+    transport.onmessage({ jsonrpc: "2.0", id: 1, result: {} });
+    transport.onmessage({ jsonrpc: "2.0", id: 2, result: {} });
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+    assert.equal(onErrorCount, 1);
+    assert.deepEqual(delivered, [2]);
+
+    // 2. Clearing `transport.onmessage = undefined` while a chained `[notif1, notif2, resp]` batch
+    // is mid-drain must not un-supersede the inner hook and re-enqueue it behind `resp`.
+    const chainedTransport = createTransport("srv-clear-mid-drain", {
+      transport: "stdio",
+      command: process.execPath,
+      args: [],
+      lifecycle: "lazy",
+    });
+    const formatFrameTag = (msg: JSONRPCMessage): string =>
+      "params" in msg && msg.params
+        ? `notif:${String((msg.params as { n: number }).n)}`
+        : `resp:${String("id" in msg ? msg.id : "?")}`;
+    const trace: string[] = [];
+    chainedTransport.onmessage = (msg) => {
+      trace.push(`inner:${formatFrameTag(msg)}`);
+    };
+    const prevOnMessage = chainedTransport.onmessage;
+    chainedTransport.onmessage = (msg, extra) => {
+      prevOnMessage?.(msg, extra);
+      trace.push(`outer:${formatFrameTag(msg)}`);
+    };
+
+    chainedTransport.onmessage({ jsonrpc: "2.0", method: "notifications/progress", params: { n: 1 } });
+    chainedTransport.onmessage({ jsonrpc: "2.0", method: "notifications/progress", params: { n: 2 } });
+    chainedTransport.onmessage({ jsonrpc: "2.0", id: 99, result: {} });
+    chainedTransport.onmessage = undefined;
+
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+    assert.deepEqual(trace, [
+      "inner:notif:1",
+      "outer:notif:1",
+      "inner:notif:2",
+      "outer:notif:2",
+      "inner:resp:99",
+      "outer:resp:99",
+    ]);
   });
 
   it("delivers single-write coalesced notifications and response from a real spawned stdio child process", async () => {

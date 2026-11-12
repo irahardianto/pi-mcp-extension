@@ -1718,19 +1718,20 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
 
 describe("fuzz: createTransport batch message ordering (#300)", () => {
   it("preserves strict FIFO wire order across arbitrary notification/response batches, handler/onerror throws, and concurrent closes", async () => {
+    const throwModeArb = fc.constantFrom("none" as const, "error" as const, "null-proto" as const);
     const frameArb = fc.record({
       kind: fc.constantFrom("notif" as const, "resp" as const),
-      throwHandler: fc.boolean(),
+      throwMode: throwModeArb,
     });
     const waveArb = fc.array(frameArb, { minLength: 1, maxLength: 8 });
 
     await fc.assert(
       fc.asyncProperty(
         fc.array(waveArb, { minLength: 1, maxLength: 3 }),
-        fc.boolean(),
-        fc.boolean(),
+        throwModeArb,
+        fc.constantFrom("none" as const, "same-turn" as const, "cross-tick" as const),
         fc.integer({ min: 1, max: 3 }),
-        async (waves, onErrorThrows, preCloseEvent, concurrentCloses) => {
+        async (waves, onErrorThrowMode, preCloseMode, concurrentCloses) => {
           const transport = createTransport(
             "fuzz-http",
             ServerConfigSchema.parse({
@@ -1744,17 +1745,24 @@ describe("fuzz: createTransport batch message ordering (#300)", () => {
           const expected: string[] = [];
           let closeCount = 0;
 
+          const raiseConfigured = (mode: "error" | "null-proto", label: string): never => {
+            if (mode === "null-proto") {
+              throw Object.create(null);
+            }
+            throw new Error(label);
+          };
+
           transport.onerror = () => {
-            if (onErrorThrows) {
-              throw new Error("fuzz onerror listener boom");
+            if (onErrorThrowMode !== "none") {
+              raiseConfigured(onErrorThrowMode, "fuzz onerror listener boom");
             }
           };
 
           transport.onmessage = (msg) => {
             if ("method" in msg && !("id" in msg)) {
-              const params = msg.params as { seq: number; fail: boolean };
-              if (params.fail) {
-                throw new Error(`notif-${params.seq}-boom`);
+              const params = msg.params as { seq: number; fail: "none" | "error" | "null-proto" };
+              if (params.fail !== "none") {
+                raiseConfigured(params.fail, `notif-${params.seq}-boom`);
               }
               // Mirror `Protocol._onnotification`: notification side effects run one microtask later.
               void Promise.resolve().then(() => {
@@ -1763,18 +1771,16 @@ describe("fuzz: createTransport batch message ordering (#300)", () => {
               return;
             }
             if ("id" in msg && "result" in msg && typeof msg.id === "number") {
-              const res = msg.result as { fail: boolean };
-              if (res.fail) {
-                throw new Error(`resp-${msg.id}-boom`);
+              const res = msg.result as { fail: "none" | "error" | "null-proto" };
+              if (res.fail !== "none") {
+                raiseConfigured(res.fail, `resp-${msg.id}-boom`);
               }
               // Mirror `Protocol._onresponse`: response side effects run synchronously.
               observed.push(`msg:${msg.id}`);
             }
           };
 
-          let attachedTransport: typeof transport | undefined = transport;
           transport.onclose = () => {
-            attachedTransport = undefined;
             closeCount += 1;
             observed.push("close");
           };
@@ -1784,7 +1790,7 @@ describe("fuzz: createTransport batch message ordering (#300)", () => {
             const wave = waves[w]!;
             for (const frame of wave) {
               seq += 1;
-              if (!frame.throwHandler) {
+              if (frame.throwMode === "none") {
                 expected.push(`msg:${seq}`);
               }
               try {
@@ -1792,19 +1798,19 @@ describe("fuzz: createTransport batch message ordering (#300)", () => {
                   transport.onmessage({
                     jsonrpc: "2.0",
                     method: "notifications/progress",
-                    params: { seq, fail: frame.throwHandler },
+                    params: { seq, fail: frame.throwMode },
                   });
                 } else {
                   transport.onmessage({
                     jsonrpc: "2.0",
                     id: seq,
-                    result: { fail: frame.throwHandler },
+                    result: { fail: frame.throwMode },
                   });
                 }
               } catch (syncErr) {
                 // Mirror `StdioClientTransport.processReadBuffer()` catching synchronous throws.
                 try {
-                  transport.onerror?.(syncErr instanceof Error ? syncErr : new Error(String(syncErr)));
+                  transport.onerror?.(syncErr instanceof Error ? syncErr : new Error("sync-non-error"));
                 } catch {
                   // WHY: fuzz harness isolates simulated caller-side synchronous catch forwarding.
                 }
@@ -1815,12 +1821,15 @@ describe("fuzz: createTransport batch message ordering (#300)", () => {
             }
           }
 
-          if (preCloseEvent) {
+          if (preCloseMode !== "none") {
             transport.onclose();
+            if (preCloseMode === "cross-tick") {
+              await new Promise((resolveTick) => setImmediate(resolveTick));
+            }
           }
           await Promise.all(
             Array.from({ length: concurrentCloses }, async () => {
-              await attachedTransport?.close();
+              await transport.close();
             }),
           );
 
