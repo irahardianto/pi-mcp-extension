@@ -51,7 +51,8 @@ import {
   discoverManualAuthChallenge,
 } from "../src/auth-challenge.js";
 import { McpError } from "../src/errors.js";
-import { redactSecrets } from "../src/debug-log-format.js";
+import { redactSecrets } from "../src/secret-redaction.js";
+import { sanitizeTerminalText } from "../src/terminal-text.js";
 import { parseResourceArguments } from "../src/commands.js";
 import { convertResourceContents } from "../src/resource-bridge.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
@@ -1537,6 +1538,25 @@ describe("fuzz: redactSecrets", () => {
         );
         assert.equal(redacted, expected, `Unexpected redaction for ${JSON.stringify(text)}`);
       }),
+      testOptions(),
+    );
+  });
+
+  it("stays idempotent after post-redaction length capping across arbitrary cut points", () => {
+    fc.assert(
+      fc.property(
+        fc.oneof(arbitraryString, fc.oneof(...credentialCarriers).map((entry) => entry.text)),
+        fc.integer({ min: 1, max: 80 }),
+        (raw, maxLength) => {
+          const sanitized = sanitizeTerminalText(raw);
+          const capped = sanitizeTerminalText(redactSecrets(sanitized), { maxLength });
+          assert.equal(
+            redactSecrets(capped),
+            capped,
+            `Post-truncation redaction was not idempotent at maxLength=${String(maxLength)} for ${JSON.stringify(raw)} -> ${JSON.stringify(capped)}`,
+          );
+        },
+      ),
       testOptions(),
     );
   });

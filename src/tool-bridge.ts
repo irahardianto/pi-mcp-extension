@@ -17,7 +17,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, type Progress } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { McpError, AuthCancelledError } from "./errors.js";
-import { redactSecrets } from "./debug-log.js";
+import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import type { Settings } from "./config.js";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";

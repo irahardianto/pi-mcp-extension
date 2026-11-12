@@ -19,8 +19,9 @@ import { McpError, AuthCancelledError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } from "./oauth-provider.js";
 import type { ToolRefreshOptions } from "./tool-bridge.js";
+import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
-import { describeError, redactSecrets, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
+import { describeError, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
 import {
   ensurePidTerminated,
   instrumentStdioTransport,
