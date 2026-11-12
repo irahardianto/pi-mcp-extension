@@ -487,6 +487,19 @@ describe("coverage and Qlty maintainability policy", () => {
     const excludes = /exclude_patterns\s*=\s*\[([\s\S]*?)\]/.exec(qltyToml)?.[1] ?? "";
     assert.match(excludes, /"\.semgrep\/\*\*"/, ".qlty/qlty.toml must exclude .semgrep/** fixtures from analysis");
     assert.match(excludes, /"\*\.mjs"/, ".qlty/qlty.toml must exclude *.mjs build-time config from analysis");
+    // WHY: the calibrated ceilings and the docs' "src/ only" scope depend on this exclusion.
+    // Dropping `scripts/**` would pull `scripts/release.ts` (~1,030 lines, complexity 203) into the
+    // analysed set, where `[smells.file_complexity]` would report it immediately.
+    assert.match(
+      excludes,
+      /"scripts\/\*\*"/,
+      ".qlty/qlty.toml must keep excluding scripts/** so the file/function ceilings stay scoped to src/",
+    );
+    assert.match(
+      excludes,
+      /"tests\/\*\*"/,
+      ".qlty/qlty.toml must keep excluding tests/** so test fixtures do not drive the src/ ceilings",
+    );
   });
 
   it("enforces Qlty-aligned cognitive complexity on branches, nesting, closures, recursion, and top-level anonymous callbacks", async () => {
@@ -747,10 +760,12 @@ describe("coverage and Qlty maintainability policy", () => {
       /pi-mcp\/max-cognitive-complexity/,
       "AGENTS.md must name the pi-mcp/max-cognitive-complexity rule",
     );
+    // WHY: assert the affirmative claim (rule name + `<default export>` exemption in the same
+    // sentence), not a bare phrase that a negated sentence would also satisfy.
     assert.match(
       agents,
-      /\*\*top-level\*\* anonymous callback/,
-      "AGENTS.md must document that top-level anonymous callbacks are subject to pi-mcp/max-cognitive-complexity",
+      /`pi-mcp\/max-cognitive-complexity` still reports a \*\*top-level\*\* anonymous callback[\s\S]{0,500}?only `<default export>` stays exempt/,
+      "AGENTS.md must state that pi-mcp/max-cognitive-complexity reports top-level anonymous callbacks and exempts only <default export>",
     );
     const contributing = readRepoFile("CONTRIBUTING.md");
     assert.match(
@@ -760,8 +775,8 @@ describe("coverage and Qlty maintainability policy", () => {
     );
     assert.match(
       contributing,
-      /Top-level anonymous\s+callbacks are covered/,
-      "CONTRIBUTING.md must note that top-level anonymous callbacks are covered by the complexity gate",
+      /Top-level anonymous\s+callbacks are covered too: only a `<default export>` is exempt\./,
+      "CONTRIBUTING.md must state that top-level anonymous callbacks are covered and only <default export> is exempt",
     );
   });
 

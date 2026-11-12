@@ -34,6 +34,9 @@ default = true
 # under the gate, while a module scoring 100 or more is genuine multi-concern accumulation that
 # belongs in a planned `refactor:` extraction. The analysed set is `src/` only: `exclude_patterns`
 # above drops `scripts/**` and `tests/**`, so `scripts/release.ts` is outside this ceiling.
+# Unlike `function_complexity` and `boolean_logic`, no ESLint rule mirrors this smell and no CI job
+# runs `qlty smells`, so the value is a review-time ceiling: `tests/repo-policy.test.ts` pins the
+# number and the Qlty dashboard reports the score, but the PR gate will not block on it.
 enabled = true
 threshold = 100
 

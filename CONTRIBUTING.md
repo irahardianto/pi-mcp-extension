@@ -58,7 +58,9 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
   `file_complexity` smell is capped at `100` per `src/` module (Qlty reports
   `count >= threshold`), so a module scoring `100` or more needs a planned
   `refactor:` extraction rather than an opportunistic split inside a
-  `fix:` / `feat:` change.
+  `fix:` / `feat:` change. That ceiling is review-time: `npm run lint` has no
+  equivalent rule and no CI job runs `qlty smells`, so `tests/repo-policy.test.ts`
+  pins the value and reviewers hold the line.
 - `npm run lint` also caps boolean expressions at `<= 3` `&&` / `||` operators on
   `src/**/*.ts` and `scripts/**/*.ts` (`pi-mcp/max-boolean-operators`), matching
   Qlty's `boolean_logic` smell (threshold 4), and caps function/method parameter
