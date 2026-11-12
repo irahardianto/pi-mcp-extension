@@ -260,25 +260,21 @@ describe("coverage and Qlty maintainability policy", () => {
     }
   });
 
-  it("calibrates [smells.file_complexity] to a 100-point ceiling in .qlty/qlty.toml", () => {
-    const qltyToml = readRepoFile(".qlty/qlty.toml");
-    const fileComplexity = /\[smells\.file_complexity\]([\s\S]*?)(?=\n\[|$)/.exec(qltyToml)?.[1] ?? "";
+  it("configures [smells.file_complexity] with threshold 100 in .qlty/qlty.toml", () => {
+    // WHY: strip `#` comment lines before matching. The section's own WHY block quotes
+    // `threshold = 100`, so a raw text match would keep passing after the real key was deleted or
+    // changed to any 3-digit value — the guard has to read the config, not the prose.
+    const qltyToml = readRepoFile(".qlty/qlty.toml")
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
+    // WHY: Qlty reports `count >= threshold`, so 100 is the ceiling: it sits above the largest
+    // analysed `src/` module (server-manager.ts, 90) so a fix/feat PR never needs an opportunistic
+    // split, while the previous 1,000 let multi-concern modules accumulate unchecked.
     assert.match(
-      fileComplexity,
-      /enabled\s*=\s*true/,
-      ".qlty/qlty.toml must enable [smells.file_complexity]",
-    );
-    // WHY: Qlty reports `count >= threshold`. `100` sits above the largest cohesive module
-    // (server-manager.ts, 90) so a fix/feat PR never needs an opportunistic split, while a
-    // 1,000-point ceiling (the previous value) let multi-concern modules accumulate unchecked.
-    assert.match(
-      fileComplexity,
-      /threshold\s*=\s*100(?!\d)/,
-      ".qlty/qlty.toml must cap [smells.file_complexity] at threshold = 100",
-    );
-    assert.ok(
-      !/threshold\s*=\s*\d{4,}/.test(fileComplexity),
-      ".qlty/qlty.toml must not leave [smells.file_complexity] effectively unbounded",
+      qltyToml,
+      /\[smells\.file_complexity\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*100(?!\d)/,
+      ".qlty/qlty.toml must configure [smells.file_complexity] with enabled = true and threshold = 100",
     );
   });
 
@@ -753,7 +749,7 @@ describe("coverage and Qlty maintainability policy", () => {
     );
     assert.match(
       agents,
-      /top-level\**\s*anonymous callback/,
+      /\*\*top-level\*\* anonymous callback/,
       "AGENTS.md must document that top-level anonymous callbacks are subject to pi-mcp/max-cognitive-complexity",
     );
     const contributing = readRepoFile("CONTRIBUTING.md");
@@ -764,7 +760,7 @@ describe("coverage and Qlty maintainability policy", () => {
     );
     assert.match(
       contributing,
-      /Top-level anonymous\s+callbacks/,
+      /Top-level anonymous\s+callbacks are covered/,
       "CONTRIBUTING.md must note that top-level anonymous callbacks are covered by the complexity gate",
     );
   });

@@ -27,11 +27,13 @@ default = true
 # WHY: This smell reports a per-file aggregate complexity score (`High total complexity (count = N)`),
 # not a line count — the two differ by roughly an order of magnitude.
 # `threshold = 100` is a calibrated ceiling rather than a target: the smell reports `count >= threshold`,
-# and the largest module after the #280 extractions is `server-manager.ts` (90), followed by
+# and the largest analysed module after the #280 extractions is `server-manager.ts` (90), followed by
 # `connection-coordinator.ts` (86) and `auth-lock.ts` (76) — cohesive `LCOM <= 1` state machines.
-# Those ten points of headroom mean a `fix:` / `feat:` PR on cohesive code never has to perform an
-# opportunistic split just to get under the gate, while a module drifting past 100 is genuine
-# multi-concern accumulation that belongs in a planned `refactor:` extraction.
+# That leaves nine points of headroom before a module trips the smell (the next report is at 100),
+# so a `fix:` / `feat:` PR on cohesive code never has to perform an opportunistic split just to get
+# under the gate, while a module scoring 100 or more is genuine multi-concern accumulation that
+# belongs in a planned `refactor:` extraction. The analysed set is `src/` only: `exclude_patterns`
+# above drops `scripts/**` and `tests/**`, so `scripts/release.ts` is outside this ceiling.
 enabled = true
 threshold = 100
 
