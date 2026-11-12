@@ -1,18 +1,24 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
-function getEnclosingIdentifierName(node) {
+function unwrapTypeExpressions(node) {
   let curr = node;
   let parent = curr.parent;
   while (
     parent &&
     (parent.type === "TSAsExpression" ||
       parent.type === "TSTypeAssertion" ||
-      parent.type === "TSNonNullExpression")
+      parent.type === "TSNonNullExpression" ||
+      parent.type === "TSSatisfiesExpression")
   ) {
     curr = parent;
     parent = curr.parent;
   }
+  return parent;
+}
+
+function getEnclosingIdentifierName(node) {
+  const parent = unwrapTypeExpressions(node);
   if (!parent) return undefined;
   if (parent.type === "VariableDeclarator" && parent.id?.type === "Identifier") {
     return parent.id.name;
@@ -84,25 +90,142 @@ function hasFinalElseClause(node) {
   return node.alternate !== null && node.alternate !== undefined && node.alternate.type !== "IfStatement";
 }
 
+function isBooleanOperator(node) {
+  return node?.type === "LogicalExpression" && (node.operator === "&&" || node.operator === "||");
+}
+
 function isSameOperatorSequenceMember(node) {
   const parent = node.parent;
   return parent?.type === "LogicalExpression" && parent.operator === node.operator;
 }
 
-function calledName(callee) {
-  if (callee?.type === "Identifier") return callee.name;
-  if (callee?.type === "MemberExpression" && callee.property?.type === "Identifier") {
-    return callee.property.name;
+function isDirectRecursiveCall(callee, frame) {
+  const fnNode = frame.node;
+  // WHY: Only lexical bindings (`function walk`, `const walk = ...`, `walk = ...`) and `this.m()`
+  // member calls are direct recursion in Qlty. Object-literal property keys (`{ open: (p) => open(p) }`)
+  // are not lexical bindings in scope, and arbitrary `obj.now()` (`Date.now()`, `process.kill()`)
+  // calls are delegations rather than self-calls.
+  if (callee?.type === "Identifier") {
+    if (fnNode.id?.name === callee.name) return true;
+    const parent = unwrapTypeExpressions(fnNode);
+    if (parent?.type === "VariableDeclarator" && parent.id?.type === "Identifier") {
+      return parent.id.name === callee.name;
+    }
+    if (parent?.type === "AssignmentExpression" && parent.left?.type === "Identifier") {
+      return parent.left.name === callee.name;
+    }
+    return false;
   }
-  return undefined;
+  if (callee?.type === "MemberExpression" && callee.object?.type === "ThisExpression") {
+    if (callee.property?.type === "Identifier") return callee.property.name === frame.name;
+    if (callee.property?.type === "PrivateIdentifier") return `#${callee.property.name}` === frame.name;
+  }
+  return false;
+}
+
+function createCognitiveComplexityVisitors({ frames, countNullishOperators, onRootFunctionExit }) {
+  function currentFrame() {
+    return frames[frames.length - 1];
+  }
+
+  function enterFunction(node) {
+    const parent = currentFrame();
+    frames.push({
+      node,
+      name: getFunctionName(node),
+      score: 0,
+      depth: parent && !parent.isFileRoot ? parent.depth + 1 : (parent?.depth ?? 0),
+      isFileRoot: false,
+    });
+  }
+
+  function exitFunction() {
+    const frame = frames.pop();
+    if (!frame) return;
+    const parent = currentFrame();
+    if (parent) {
+      parent.score += frame.score;
+      return;
+    }
+    onRootFunctionExit?.(frame);
+  }
+
+  function enterControlFlow(node) {
+    const frame = currentFrame();
+    if (!frame) return;
+    if (isElseIfStatement(node)) {
+      // WHY: `else if` adds +1 without deepening nesting beyond the outer `IfStatement`, and if
+      // that `else if` itself carries a trailing `else { ... }`, the final `else` adds +1 too.
+      frame.score += hasFinalElseClause(node) ? 2 : 1;
+      return;
+    }
+    frame.score += 1 + frame.depth;
+    if (node.type === "IfStatement" && hasFinalElseClause(node)) {
+      frame.score += 1;
+    }
+    frame.depth += 1;
+  }
+
+  function exitControlFlow(node) {
+    const frame = currentFrame();
+    if (!frame || isElseIfStatement(node)) return;
+    frame.depth -= 1;
+  }
+
+  function enterJump() {
+    const frame = currentFrame();
+    if (!frame) return;
+    frame.score += 1;
+  }
+
+  const visitors = {
+    "FunctionDeclaration:exit": exitFunction,
+    "FunctionExpression:exit": exitFunction,
+    "ArrowFunctionExpression:exit": exitFunction,
+    ContinueStatement: enterJump,
+    BreakStatement: enterJump,
+    AssignmentExpression(node) {
+      // WHY: Qlty's Tree-sitter cognitive-complexity metric counts `augmented_assignment_expression`
+      // (`+=`, `-=`, `||=`, `&&=`, `??=`, etc.) as +1 each.
+      const frame = currentFrame();
+      if (frame && node.operator !== "=") {
+        frame.score += 1;
+      }
+    },
+    LogicalExpression(node) {
+      const frame = currentFrame();
+      if (!frame || (!countNullishOperators && !isBooleanOperator(node)) || isSameOperatorSequenceMember(node)) {
+        return;
+      }
+      frame.score += 1;
+    },
+    CallExpression(node) {
+      const frame = currentFrame();
+      if (!frame || frame.isFileRoot) return;
+      if (isDirectRecursiveCall(node.callee, frame)) {
+        frame.score += 1;
+      }
+    },
+  };
+
+  for (const type of COGNITIVE_FUNCTION_NODES) {
+    visitors[type] = enterFunction;
+  }
+
+  for (const type of COGNITIVE_CONTROL_NODES) {
+    visitors[type] = enterControlFlow;
+    visitors[`${type}:exit`] = exitControlFlow;
+  }
+
+  return visitors;
 }
 
 /**
  * Cognitive complexity in the style Qlty's `function_complexity` smell reports: control-flow
  * structures cost `1 + nestingDepth`, `else`/`else if` branches add 1 without deepening nesting,
- * `while` / `do-while` loop conditions add an extra 1, `continue` and `break` add 1 each,
- * each contiguous run of identical `&&` / `||` / `??` operators adds 1, and direct recursion adds
- * 1. Nested closures deepen nesting and roll their own complexity up into the enclosing function,
+ * `continue`, `break`, and augmented assignments (`+=`, `-=`, `||=`, etc.) add 1 each, each
+ * contiguous run of identical `&&` / `||` / `??` operators adds 1, and direct recursion adds 1.
+ * Nested closures deepen nesting and roll their own complexity up into the enclosing function,
  * so a helper that only exists to dodge the limit does not hide the complexity.
  */
 export const maxCognitiveComplexityRule = {
@@ -123,109 +246,30 @@ export const maxCognitiveComplexityRule = {
   create(context) {
     const max = context.options[0]?.max ?? 15;
     const frames = [];
-
-    function currentFrame() {
-      return frames[frames.length - 1];
-    }
-
-    function enterFunction(node) {
-      const parent = currentFrame();
-      frames.push({
-        node,
-        name: getFunctionName(node),
-        score: 0,
-        depth: parent ? parent.depth + 1 : 0,
-      });
-    }
-
-    function exitFunction() {
-      const frame = frames.pop();
-      if (!frame) return;
-      const parent = currentFrame();
-      if (parent) {
-        parent.score += frame.score;
-        return;
-      }
-      // WHY: Qlty attributes a nested closure's complexity to its enclosing function and does not
-      // report default-exported functions at all; skip the latter here too so `npm run lint` and
-      // `qlty:function-complexity` agree on the extension entry point that Qlty never flags.
-      // A root-level `<anonymous>` frame is different: it has no enclosing named function, so the
-      // roll-up above never sees it, and skipping it would silently exempt every top-level
-      // callback (`z.preprocess((raw) => ...)`, `.superRefine((cfg, ctx) => ...)`) from the gate.
-      if (frame.name === "<default export>") return;
-      if (frame.score > max) {
-        context.report({
-          node: frame.node,
-          messageId: "tooComplex",
-          data: {
-            name: frame.name,
-            count: String(frame.score),
-            max: String(max),
-          },
-        });
-      }
-    }
-
-    function enterControlFlow(node) {
-      const frame = currentFrame();
-      if (!frame) return;
-      if (isElseIfStatement(node)) {
-        frame.score += 1;
-        return;
-      }
-      frame.score += 1 + frame.depth;
-      // WHY: Qlty charges an extra point for the loop condition of while/do-while.
-      if (node.type === "WhileStatement" || node.type === "DoWhileStatement") {
-        frame.score += 1;
-      }
-      if (node.type === "IfStatement" && hasFinalElseClause(node)) {
-        frame.score += 1;
-      }
-      frame.depth += 1;
-    }
-
-    function enterJump() {
-      const frame = currentFrame();
-      if (!frame) return;
-      frame.score += 1;
-    }
-
-    function exitControlFlow(node) {
-      const frame = currentFrame();
-      if (!frame || isElseIfStatement(node)) return;
-      frame.depth -= 1;
-    }
-
-    const visitors = {
-      "FunctionDeclaration:exit": exitFunction,
-      "FunctionExpression:exit": exitFunction,
-      "ArrowFunctionExpression:exit": exitFunction,
-      ContinueStatement: enterJump,
-      BreakStatement: enterJump,
-      LogicalExpression(node) {
-        const frame = currentFrame();
-        if (!frame || isSameOperatorSequenceMember(node)) return;
-        frame.score += 1;
-      },
-      CallExpression(node) {
-        const frame = currentFrame();
-        if (!frame) return;
-        if (calledName(node.callee) === frame.name) {
-          frame.score += 1;
+    return createCognitiveComplexityVisitors({
+      frames,
+      countNullishOperators: true,
+      onRootFunctionExit(frame) {
+        // WHY: Qlty attributes a nested closure's complexity to its enclosing function and does not
+        // report default-exported functions at all; skip the latter here too so `npm run lint` and
+        // `qlty:function-complexity` agree on the extension entry point that Qlty never flags.
+        // A root-level `<anonymous>` frame is different: it has no enclosing named function, so the
+        // roll-up above never sees it, and skipping it would silently exempt every top-level
+        // callback (`z.preprocess((raw) => ...)`, `.superRefine((cfg, ctx) => ...)`) from the gate.
+        if (frame.name === "<default export>") return;
+        if (frame.score > max) {
+          context.report({
+            node: frame.node,
+            messageId: "tooComplex",
+            data: {
+              name: frame.name,
+              count: String(frame.score),
+              max: String(max),
+            },
+          });
         }
       },
-    };
-
-    for (const type of COGNITIVE_FUNCTION_NODES) {
-      visitors[type] = enterFunction;
-    }
-
-    for (const type of COGNITIVE_CONTROL_NODES) {
-      visitors[type] = enterControlFlow;
-      visitors[`${type}:exit`] = exitControlFlow;
-    }
-
-    return visitors;
+    });
   },
 };
 
@@ -294,10 +338,6 @@ export const maxReturnStatementsRule = {
     };
   },
 };
-
-function isBooleanOperator(node) {
-  return node?.type === "LogicalExpression" && (node.operator === "&&" || node.operator === "||");
-}
 
 /**
  * Total `&&` / `||` operators inside a boolean expression tree. Only logical subtrees are
@@ -375,110 +415,31 @@ export const maxFileComplexityRule = {
   create(context) {
     const max = context.options[0]?.max ?? 99;
     const frames = [];
-
-    function currentFrame() {
-      return frames[frames.length - 1];
-    }
-
-    function enterFunction(node) {
-      const parent = currentFrame();
+    const visitors = createCognitiveComplexityVisitors({
+      frames,
+      countNullishOperators: false,
+    });
+    visitors.Program = (node) => {
       frames.push({
         node,
-        name: getFunctionName(node),
+        name: "<file>",
         score: 0,
-        depth: parent && !parent.isFileRoot ? parent.depth + 1 : (parent?.depth ?? 0),
-        isFileRoot: false,
+        depth: 0,
+        isFileRoot: true,
       });
-    }
-
-    function exitFunction() {
-      const frame = frames.pop();
-      if (!frame) return;
-      const parent = currentFrame();
-      if (parent) {
-        parent.score += frame.score;
-      }
-    }
-
-    function enterControlFlow(node) {
-      const frame = currentFrame();
-      if (!frame) return;
-      if (isElseIfStatement(node)) {
-        frame.score += 1;
-        return;
-      }
-      frame.score += 1 + frame.depth;
-      if (node.type === "WhileStatement" || node.type === "DoWhileStatement") {
-        frame.score += 1;
-      }
-      if (node.type === "IfStatement" && hasFinalElseClause(node)) {
-        frame.score += 1;
-      }
-      frame.depth += 1;
-    }
-
-    function exitControlFlow(node) {
-      const frame = currentFrame();
-      if (!frame || isElseIfStatement(node)) return;
-      frame.depth -= 1;
-    }
-
-    function enterJump() {
-      const frame = currentFrame();
-      if (!frame) return;
-      frame.score += 1;
-    }
-
-    const visitors = {
-      Program(node) {
-        frames.push({
-          node,
-          name: "<file>",
-          score: 0,
-          depth: 0,
-          isFileRoot: true,
-        });
-      },
-      "Program:exit"(node) {
-        const root = frames.pop();
-        if (!root || root.score <= max) return;
-        context.report({
-          node,
-          messageId: "tooComplex",
-          data: {
-            count: String(root.score),
-            max: String(max),
-          },
-        });
-      },
-      "FunctionDeclaration:exit": exitFunction,
-      "FunctionExpression:exit": exitFunction,
-      "ArrowFunctionExpression:exit": exitFunction,
-      ContinueStatement: enterJump,
-      BreakStatement: enterJump,
-      LogicalExpression(node) {
-        const frame = currentFrame();
-        if (!frame || !isBooleanOperator(node) || isSameOperatorSequenceMember(node)) return;
-        frame.score += 1;
-      },
-      CallExpression(node) {
-        const frame = currentFrame();
-        if (!frame || frame.isFileRoot) return;
-        if (calledName(node.callee) === frame.name) {
-          frame.score += 1;
-        }
-      },
     };
-
-    for (const type of COGNITIVE_FUNCTION_NODES) {
-      visitors[type] = enterFunction;
-    }
-
-    for (const type of COGNITIVE_CONTROL_NODES) {
-      visitors[type] = enterControlFlow;
-      visitors[`${type}:exit`] = exitControlFlow;
-    }
-
+    visitors["Program:exit"] = (node) => {
+      const root = frames.pop();
+      if (!root || root.score <= max) return;
+      context.report({
+        node,
+        messageId: "tooComplex",
+        data: {
+          count: String(root.score),
+          max: String(max),
+        },
+      });
+    };
     return visitors;
   },
 };

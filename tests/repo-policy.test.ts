@@ -551,6 +551,12 @@ describe("coverage and Qlty maintainability policy", () => {
           code: "const schema = wrap((a) => { if (a) {} });",
           options: [{ max: 1 }],
         },
+        {
+          // WHY: object-literal adapter methods (`open: (p) => open(p)`) and non-`this` member
+          // calls (`now: () => Date.now()`) delegate rather than recurse (Qlty scores 0).
+          code: "function makeDeps(open) { return { open: (p) => open(p), now: () => Date.now() }; }",
+          options: [{ max: 1 }],
+        },
       ],
       invalid: [
         {
@@ -622,12 +628,52 @@ describe("coverage and Qlty maintainability policy", () => {
           ],
         },
         {
+          code: "const walkArrow = (n) => { if (n > 0) { return walkArrow(n - 1); } return 0; };",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'walkArrow' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "class Service { recur(n) { if (n > 0) { return this.recur(n - 1); } return 0; } }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'recur' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
           code: "class Service { run(a) { if (a) {} else { if (a) {} } } }",
           options: [{ max: 3 }],
           errors: [
             {
               message:
                 "Function 'run' has cognitive complexity 4, above the maximum of 3. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function elseIfElse(a, b) { if (a) {} else if (b) {} else {} }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'elseIfElse' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function withAugmented(a) { let x = 0; x += 1; x -= a; return x; }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'withAugmented' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
             },
           ],
         },
@@ -652,7 +698,7 @@ describe("coverage and Qlty maintainability policy", () => {
           ],
         },
         {
-          code: "function withWhile() { while (true) { break; } }",
+          code: "function withWhile(n) { let i = 0; while (i < n) { i += 1; break; } }",
           options: [{ max: 2 }],
           errors: [
             {
@@ -662,7 +708,7 @@ describe("coverage and Qlty maintainability policy", () => {
           ],
         },
         {
-          code: "function withDoWhile() { do { break; } while (true); }",
+          code: "function withDoWhile(n) { let i = 0; do { i += 1; break; } while (i < n); }",
           options: [{ max: 2 }],
           errors: [
             {
@@ -826,6 +872,13 @@ describe("coverage and Qlty maintainability policy", () => {
           code: "export default function (a) { if (a) return 1; return 0; }",
           options: [{ max: 1 }],
         },
+        {
+          // Object-literal adapter methods delegating to imports/globals do not add fake recursion.
+          code:
+            "function makeDeps(open) { return { open: (p) => open(p), now: () => Date.now(), kill: (p) => process.kill(p) }; }" +
+            " function check(a) { if (a) return 1; return 0; }",
+          options: [{ max: 1 }],
+        },
       ],
       invalid: [
         {
@@ -849,10 +902,16 @@ describe("coverage and Qlty maintainability policy", () => {
           errors: [{ message: message(3, 2) }],
         },
         {
-          // Logical `&&` / `||` runs, recursion, and while/break loops count toward file total.
-          code: "function walk(n, a, b) { while (a && b) { if (n > 0) return walk(n - 1); break; } return 0; }",
-          options: [{ max: 5 }],
-          errors: [{ message: message(7, 5) }],
+          // Logical `&&` / `||` runs, recursion, augmented assignments, and while/break loops count toward file total.
+          code: "function walk(n, a, b) { while (a && b) { if (n > 0) return walk(n - 1); n -= 1; break; } return 0; }",
+          options: [{ max: 6 }],
+          errors: [{ message: message(7, 6) }],
+        },
+        {
+          // `if ... else if ... else` and `+=` / `-=` match Qlty's cognitive complexity (`readStructuredValue` / `authorize`).
+          code: "function scan(a, b) { let depth = 0; if (a) { depth += 1; } else if (b) { depth -= 1; } else { return 0; } return depth; }",
+          options: [{ max: 4 }],
+          errors: [{ message: message(5, 4) }],
         },
       ],
     });
