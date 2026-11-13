@@ -2327,6 +2327,8 @@ describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct"
     const exact = overrides.find(([pattern]) => pattern === toolName);
     if (exact) return exact[1];
     const matching = overrides.find(([pattern]) => {
+      // A key without `*` is an exact name and only matches itself (handled above).
+      if (!pattern.includes("*")) return false;
       if (pattern === "*") return true;
       const core = pattern.replaceAll("*", "");
       if (pattern.startsWith("*") && pattern.endsWith("*")) return toolName.includes(core);
@@ -2419,7 +2421,7 @@ describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct"
           assert.equal(tool.exposure, expectedExposure(rawName, serverExposure, entries));
         }
       }),
-      testOptions(40),
+      testOptions(),
     );
   });
 });
