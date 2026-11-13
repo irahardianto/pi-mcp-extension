@@ -43,3 +43,25 @@ export class AuthCancelledError extends Error {
   }
 }
 
+export class AuthRequiredError extends Error {
+  constructor(
+    serverName: string,
+    message = `Authorization required for ${serverName}. Connect in an interactive Pi session or use /mcp:auth ${serverName}.`,
+  ) {
+    super(message);
+    this.name = "AuthRequiredError";
+  }
+}
+
+export class AuthLockError extends AuthRequiredError {
+  constructor(serverName: string, details?: string) {
+    const message = details
+      ? details.startsWith("Authorization lock") || details.startsWith("Another Pi process")
+        ? details
+        : `Another Pi process (${details}) is authorizing ${serverName}. Retry after it finishes.`
+      : `Another Pi process is authorizing ${serverName}. Retry after it finishes.`;
+    super(serverName, message);
+    this.name = "AuthLockError";
+  }
+}
+

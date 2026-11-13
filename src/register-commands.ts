@@ -12,15 +12,13 @@ import {
   parseResourceArguments,
   serverNameCompletions,
 } from "./commands.js";
-import {
-  type ConnectionCoordinator,
-  formatErrorMessage,
-} from "./connection-coordinator.js";
-import { sanitizeLogText } from "./debug-log.js";
+import type { ConnectionCoordinator } from "./connection-coordinator.js";
+import { sanitizeLogText } from "./debug-log-format.js";
 import { AuthCancelledError } from "./errors.js";
 import type { ManagedServer, ServerManager } from "./server-manager.js";
 import { lookupServerSource, type ConfigProvenance } from "./server-provenance.js";
 import { collectServerStatus, formatServerDetail } from "./server-status.js";
+import { formatErrorMessage } from "./startup-auth.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import type { ToolBridge } from "./tool-bridge.js";
 import type { PiResourceContent, ResourceBridge, ResourceCatalog } from "./resource-bridge.js";

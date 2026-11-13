@@ -10,8 +10,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { McpConfig, ServerConfig } from "./config.js";
 import type { ManagedServer, ServerManager } from "./server-manager.js";
 import type { ToolBridge } from "./tool-bridge.js";
-import { McpError, AuthCancelledError } from "./errors.js";
-import { AuthRequiredError } from "./oauth-provider.js";
+import { McpError, AuthCancelledError, AuthRequiredError } from "./errors.js";
 import {
   formatErrorMessage,
   promptStartupAuth,

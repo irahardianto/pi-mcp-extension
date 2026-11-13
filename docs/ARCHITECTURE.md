@@ -8,11 +8,11 @@ branch, and the invariants called out in [AGENTS.md](../AGENTS.md) are cited whe
 apply.
 
 The extension has no build step: Pi loads the entry module as TypeScript directly. The
-entry wires five collaborators — a **connection coordinator**, a **server manager**, a
-**tool bridge**, a **resource bridge**, and an **OAuth provider** — around the Pi
-`ExtensionAPI`. Configuration, credentials, and child processes are the only places that
-touch the filesystem, the network, the clock, or PIDs; policy and transforms stay as
-pure functions.
+entry wires six collaborators — a **session lifecycle**, a **connection coordinator**, a
+**server manager**, a **tool bridge**, a **resource bridge**, and an **OAuth provider** —
+around the Pi `ExtensionAPI`. Configuration, credentials, and child processes are the only
+places that touch the filesystem, the network, the clock, or PIDs; policy and transforms
+stay as pure functions.
 
 ---
 
@@ -23,6 +23,7 @@ flowchart TD
     Pi["Pi coding agent<br/>(TUI / RPC, ExtensionAPI)"]
 
     subgraph Entry["Extension entry (default export)"]
+        Life["SessionLifecycle<br/>bootstrap, trust-gated reload, mcp_servers_change"]
         Coord["ConnectionCoordinator<br/>in-flight connects, authQueue, startup prompts, teardown"]
         Bridge["ToolBridge<br/>discovery, naming, activation"]
         Res["ResourceBridge<br/>paginated catalog cache, resources/read"]
@@ -39,6 +40,10 @@ flowchart TD
     Servers["MCP servers"]
 
     Pi <-->|session events and tools| Entry
+    Life --> Coord
+    Life --> Mgr
+    Life --> Bridge
+    Life --> Res
     Coord --> Mgr
     Mgr --> Tp
     Mgr --> Bridge
@@ -51,12 +56,17 @@ flowchart TD
     Bridge <--> Registry
 ```
 
-- The **entry** loads config, constructs the collaborators, and registers
+- The **entry** runs untrusted-safe bootstrap config loading (`loadBootstrapConfigState()`),
+  constructs the collaborators, and registers
   `session_start` / `mcp_servers_change` / `session_tree` / `input` / `before_agent_start` /
   `tool_execution_end` / `before_provider_request` / `session_shutdown`, the `/mcp*`
   commands, and the `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource`
   tools. It registers them even when bootstrap config loading fails, so a later
   `session_start` in another directory can still load a valid project config.
+- **SessionLifecycle** owns the epoch-guarded state machine and serialized reconcile queue
+  for `session_start`, `mcp_servers_change`, and `session_shutdown`, merging global and
+  trusted project `mcp.json` files with dynamically registered extension servers and tracking
+  per-server config provenance.
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
@@ -182,14 +192,17 @@ behave identically.
 
 ## 3. Session events
 
-`session_start` runs once per session switch and distinguishes a first start from a
-reload by comparing the freshly loaded config against the in-memory one.
+`SessionLifecycle` handles `session_start`, `mcp_servers_change`, and `session_shutdown`
+under a monotonically increasing `sessionEpoch` and serialized `reconcileQueue`,
+distinguishing a first start from a reload by comparing the freshly loaded config against
+the in-memory one.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Pi as Pi
     participant Entry as Extension entry
+    participant Life as SessionLifecycle
     participant Cfg as Config loader
     participant Coord as Coordinator
     participant Mgr as ServerManager
@@ -198,47 +211,50 @@ sequenceDiagram
 
     Note over Pi,CB: Phase A — session_start (first start or reload)
     Pi->>Entry: session_start(ctx)
-    Entry->>Coord: setActiveContext(ctx)
-    Entry->>Cfg: loadConfig(cwd, globalPath, includeProjectConfig = isProjectTrusted())
-    Cfg-->>Entry: merged McpConfig or McpError
+    Entry->>Life: handleSessionStart(ctx)
+    Life->>Coord: setActiveContext(ctx)
+    Life->>Cfg: loadConfigWithOrigins(cwd, globalPath, includeProjectConfig = isProjectTrusted())
+    Cfg-->>Life: merged McpConfig + origins or McpError
     alt config invalid
-        Entry->>Coord: teardown(ctx)
-        Entry->>Bridge: updateSettings(default settings)
-        Entry->>Mgr: rebuildServers(empty defaults)
-        Entry->>Coord: startEagerServers(eager, ctx)
+        Life->>Coord: teardown(ctx)
+        Life->>Bridge: updateSettings(default settings)
+        Life->>Mgr: rebuildServers(empty defaults)
+        Life->>Coord: startEagerServers(eager, ctx)
     else config changed
-        Entry->>Coord: teardown(ctx)
-        Entry->>Bridge: updateSettings(settings)
-        Entry->>Mgr: rebuildServers(new config)
-        Entry->>Coord: startEagerServers(eager, ctx)
+        Life->>Coord: teardown(ctx)
+        Life->>Bridge: updateSettings(settings)
+        Life->>Mgr: rebuildServers(new config)
+        Life->>Coord: startEagerServers(eager, ctx)
     else config identical
-        Entry->>Mgr: updateCwd(ctx.cwd)
-        Entry->>Coord: syncStatus(ctx)
-        Entry->>Coord: startEagerServers(eager, ctx)
+        Life->>Mgr: updateCwd(ctx.cwd)
+        Life->>Coord: syncStatus(ctx)
+        Life->>Coord: startEagerServers(eager, ctx)
     end
 
     Note over Pi,CB: Phase B — mcp_servers_change (dynamic registration)
-    Pi->>Entry: mcp_servers_change(servers)
-    Entry->>Coord: setActiveContext(ctx)
-    Entry->>Entry: collectRegisteredServers(entries, fileConfig)
+    Pi->>Entry: mcp_servers_change(event, ctx)
+    Entry->>Life: handleServersChange(event, ctx)
+    Life->>Coord: setActiveContext(ctx)
+    Life->>Life: collectRegisteredServers(entries, fileConfig)
     loop removed or changed servers
-        Entry->>Coord: cancelServer(name)
-        Entry->>Bridge: removeServer(name)
-        Entry->>Mgr: removeServer(name)
+        Life->>Coord: cancelServer(name)
+        Life->>Bridge: removeServer(name)
+        Life->>Mgr: removeServer(name)
     end
     loop newly added servers
-        Entry->>Mgr: setServer(name, cfg)
+        Life->>Mgr: setServer(name, cfg)
     end
-    Entry->>Coord: startEagerServers(addedEager, ctx)
+    Life->>Coord: startEagerServers(addedEager, ctx)
 
     Note over Pi,CB: Phase C — session_shutdown
     Pi->>Entry: session_shutdown(ctx)
-    Entry->>Coord: teardown(ctx, removeServers = false)
+    Entry->>Life: handleSessionShutdown(ctx)
+    Life->>Coord: teardown(ctx, removeServers = false)
     Coord->>Coord: abort startup prompts and in-flight attempts
     Coord->>CB: stop()
     Coord->>Bridge: deactivateServer(name) per server
     Coord->>Mgr: shutdownAll()
-    Entry->>Coord: setActiveContext(undefined)
+    Life->>Coord: setActiveContext(undefined)
 ```
 
 Key behaviors:
@@ -252,8 +268,10 @@ Key behaviors:
 - **Config identical** still refreshes roots: `ServerManager.updateCwd()` notifies ready
   servers whose `cwd` changed (root URIs are `pathToFileURL(cwd).href`) and re-syncs the
   status footer.
-- **`mcp_servers_change`** reconciles dynamically registered servers: removed/changed
-  ones are cancelled and dropped; new ones are added and started eagerly if configured.
+- **`mcp_servers_change`** reconciles dynamically registered servers on a serialized queue
+  that re-reads the live registry so rapid register/unregister bursts collapse into the
+  latest state: removed/changed ones (including superseded in-flight eager starts) are
+  cancelled and dropped; new ones are added and started eagerly if configured.
 - **Teardown** (`coordinator.teardown`) aborts startup prompts, aborts and awaits in-flight
   connect attempts, stops the callback server, deactivates (session reload) or removes
   (config change) each server's tools, and calls `shutdownAll()`. `session_shutdown`
@@ -431,9 +449,9 @@ Behavior:
   bootstrap and on every `mcp_servers_change`; a same-named `mcp.json` entry takes
   precedence.
 - **Provenance.** `loadConfigWithOrigins()` returns the merged config plus the winning
-  file origin per server (`global` or `project`); the entry merges in the registered
-  extension server names (`withExtensionServers`) and keeps that record for the current
-  session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
+  file origin per server (`global` or `project`); `SessionLifecycle` merges in the
+  registered extension server names (`withExtensionServers`) and keeps that record for
+  the current session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
   skipped project config renders as `Project config: not loaded (<path>)` instead of
   silently missing servers. `loadConfig()` remains the thin wrapper that returns only
   the merged config.

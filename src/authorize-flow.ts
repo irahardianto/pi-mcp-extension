@@ -1,23 +1,18 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
-import {
-  CallbackServer,
-  callbackServerConfigFromRedirectUrl,
-} from "./callback-server.js";
+import { CallbackServer } from "./callback-server.js";
+import { callbackServerConfigFromRedirectUrl } from "./callback-url.js";
 import {
   discoverManualAuthChallenge,
   createHeadersFetch,
   stripAuthorizationHeader,
   type ManualAuthChallenge,
 } from "./auth-challenge.js";
-import {
-  McpOAuthProvider,
-  acquireAuthLock,
-  AuthLockError,
-  type AuthLockHandle,
-} from "./oauth-provider.js";
-import { McpError, AuthCancelledError } from "./errors.js";
-import { describeError, reportDiagnostic } from "./debug-log.js";
+import { acquireAuthLock, type AuthLockHandle } from "./auth-lock.js";
+import { McpOAuthProvider } from "./oauth-provider.js";
+import { McpError, AuthCancelledError, AuthLockError } from "./errors.js";
+import { describeError } from "./debug-log-format.js";
+import { reportDiagnostic } from "./debug-log.js";
 import {
   createAuthorizationBrowserLauncher,
   openBrowser,

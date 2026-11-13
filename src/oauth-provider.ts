@@ -13,11 +13,9 @@
 
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthClientMetadata, OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { McpError } from "./errors.js";
+import { AuthLockError, AuthRequiredError, McpError } from "./errors.js";
 import {
   acquireAuthLock,
-  AuthLockError,
-  AuthRequiredError,
   type AcquireAuthLockOptions,
   type AuthLockHandle,
 } from "./auth-lock.js";
@@ -50,7 +48,8 @@ import {
   type StoredState,
   type StoredTokens,
 } from "./oauth-state-store.js";
-import { describeError, reportDiagnostic } from "./debug-log.js";
+import { describeError } from "./debug-log-format.js";
+import { reportDiagnostic } from "./debug-log.js";
 
 export { acquireAuthLock, AuthLockError, AuthRequiredError, type AcquireAuthLockOptions, type AuthLockHandle };
 export { DEFAULT_CALLBACK_PORT, DEFAULT_REDIRECT_URL, type AuthConfig, type InvalidationScope };
