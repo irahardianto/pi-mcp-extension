@@ -140,23 +140,90 @@ describe("authorize-browser", () => {
     it("canonicalizes valid HTTPS and loopback HTTP URLs before opening", async () => {
       const inputs = [
         "https://auth.example.com/a b",
+        "  \thttps://auth.example.com/authorize?state=trimmed\n  ",
         "http://127.0.0.1:8080/authorize",
         "http://localhost:8080/authorize",
         "http://[::1]:8080/authorize",
       ];
-      for (const input of inputs) {
-        const child = new FakeBrowserChild();
-        let openedUrl = "";
-        await openBrowser(input, {
-          platform: "darwin",
-          spawnProcess: (_command, args) => {
-            openedUrl = args[0] ?? "";
-            queueMicrotask(() => child.emit("spawn"));
-            return child;
+      for (const platform of ["darwin", "win32", "linux"] as const) {
+        for (const input of inputs) {
+          const child = new FakeBrowserChild();
+          let openedArgs: readonly string[] = [];
+          await openBrowser(input, {
+            platform,
+            spawnProcess: (_command, args) => {
+              openedArgs = args;
+              queueMicrotask(() => child.emit("spawn"));
+              return child;
+            },
+          });
+          assert.equal(openedArgs.at(-1), new URL(input).toString());
+          assert.equal(child.unreferenced, true);
+        }
+      }
+    });
+
+    it("emits zero DebugLog lines and leaks no query secrets when rejecting via openBrowser or its authorize-flow re-export (#309)", async () => {
+      const lines: string[] = [];
+      const prevLogger = getDebugLog();
+      const prevUiActive = isUiActive();
+      const logger = new DebugLog("/virtual/logs/pi-mcp.log", {
+        now: () => new Date("2026-01-01T00:00:00.000Z"),
+        fs: {
+          mkdir: async () => undefined,
+          appendFile: async (_filePath, data) => {
+            lines.push(data);
           },
-        });
-        assert.equal(openedUrl, new URL(input).toString());
-        assert.equal(child.unreferenced, true);
+          stat: async () => ({ size: 0 }),
+          rename: async () => undefined,
+          chmod: async () => undefined,
+        },
+      });
+      setDebugLog(logger);
+      setDiagnosticUi({ notify: () => {} }, true);
+
+      try {
+        let spawned = false;
+        const secretUrl =
+          "http://evil.example.com/authorize?state=secret-state-token&code_challenge=pkce-secret";
+        const badInputs: unknown[] = [
+          secretUrl,
+          "",
+          null,
+          undefined,
+          {
+            toString(): string {
+              throw new Error("toString must never run");
+            },
+          },
+        ];
+
+        for (const badInput of badInputs) {
+          await assert.rejects(
+            () =>
+              reExportedOpenBrowser(badInput as string, {
+                spawnProcess: () => {
+                  spawned = true;
+                  return new FakeBrowserChild();
+                },
+              }),
+            (err: unknown) => {
+              assert.ok(err instanceof McpError);
+              assert.equal(err.code, "protocol");
+              assert.equal(err.server, "<oauth>");
+              assert.equal(err.message.includes("secret-state-token"), false);
+              assert.equal(err.message.includes("pkce-secret"), false);
+              return true;
+            },
+          );
+        }
+
+        await logger.flush();
+        assert.equal(spawned, false);
+        assert.deepEqual(lines, []);
+      } finally {
+        setDebugLog(prevLogger);
+        setDiagnosticUi(null, prevUiActive);
       }
     });
 

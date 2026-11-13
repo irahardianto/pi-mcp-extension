@@ -58,6 +58,20 @@ import { parseResourceArguments } from "../src/commands.js";
 import { convertResourceContents } from "../src/resource-bridge.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
 import { sanitizeServerInstructions } from "../src/server-status.js";
+import { EventEmitter } from "node:events";
+import {
+  browserOpenCommand,
+  openBrowser,
+  type BrowserChildProcess,
+  type BrowserSpawnOptions,
+} from "../src/authorize-browser.js";
+import {
+  DebugLog,
+  getDebugLog,
+  isUiActive,
+  setDebugLog,
+  setDiagnosticUi,
+} from "../src/debug-log.js";
 import { createTransport } from "../src/transport-factory.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
@@ -2006,4 +2020,291 @@ describe("fuzz: describeError", () => {
     );
   });
 });
+
+// ─── Suite 19: openBrowser & browserOpenCommand (#309) ────────────────────────
+
+describe("fuzz: openBrowser & browserOpenCommand", () => {
+  class FuzzBrowserChild extends EventEmitter implements BrowserChildProcess {
+    unreferenced = false;
+
+    unref(): void {
+      this.unreferenced = true;
+    }
+  }
+
+  const EXPECTED_UNSAFE_URL_MESSAGE =
+    "Refusing to open unsafe authorization URL: only HTTPS (or loopback HTTP) URLs are allowed";
+
+  const arbitraryAsciiPad = fc.array(
+    fc.constantFrom(" ", "\t", "\r", "\n"),
+    { maxLength: 4 },
+  ).map((chars) => chars.join(""));
+
+  const arbitrarySafeOrigin = fc.oneof(
+    fc.domain().map((host) => `https://${host}`),
+    fc
+      .tuple(
+        fc.constantFrom("localhost", "127.0.0.1", "[::1]"),
+        fc.option(fc.integer({ min: 1, max: 65535 }), { nil: undefined }),
+      )
+      .map(([host, port]) => (port === undefined ? `http://${host}` : `http://${host}:${port}`)),
+  );
+
+  const arbitraryPathAndQuery = fc
+    .tuple(
+      fc.stringMatching(/^[A-Za-z0-9/_~.-]{0,24}$/),
+      fc.array(fc.constantFrom(" ", "$(id)", "`whoami`", ";", "|", "&", '"', "'", "é"), {
+        maxLength: 5,
+      }),
+    )
+    .map(([base, extras]) => `/${base}?q=${extras.join("")}`);
+
+  const arbitraryValidUrlString = fc
+    .tuple(arbitraryAsciiPad, arbitrarySafeOrigin, arbitraryPathAndQuery, arbitraryAsciiPad)
+    .map(([lead, origin, tail, trail]) => `${lead}${origin}${tail}${trail}`);
+
+  type BrowserCandidateSpec =
+    | { kind: "string"; value: string }
+    | { kind: "non-string-primitive"; value: null | undefined | number | boolean | symbol }
+    | { kind: "url-instance"; href: string }
+    | { kind: "null-proto" }
+    | { kind: "revoked-proxy" }
+    | { kind: "stateful-toString"; first: string; second: string; throwOnFirst: boolean };
+
+  const arbitraryCandidateSpec: fc.Arbitrary<BrowserCandidateSpec> = fc.oneof(
+    arbitraryString.map((value): BrowserCandidateSpec => ({ kind: "string", value })),
+    arbitraryValidUrlString.map((value): BrowserCandidateSpec => ({ kind: "string", value })),
+    fc
+      .tuple(
+        fc.constantFrom("javascript:", "file:", "data:", "blob:", "vbscript:", "custom-app:", "-"),
+        fc.string({ maxLength: 32 }),
+      )
+      .map(([prefix, rest]): BrowserCandidateSpec => ({ kind: "string", value: `${prefix}${rest}` })),
+    fc
+      .domain()
+      .filter((d) => !["localhost", "127.0.0.1", "::1", "[::1]"].includes(d))
+      .map((domain): BrowserCandidateSpec => ({ kind: "string", value: `http://${domain}/authorize` })),
+    fc
+      .oneof(
+        fc.constant(null),
+        fc.constant(undefined),
+        fc.integer(),
+        fc.boolean(),
+        fc.constant(Symbol.for("pi-mcp-url")),
+      )
+      .map((value): BrowserCandidateSpec => ({ kind: "non-string-primitive", value })),
+    arbitrarySafeOrigin.map((origin): BrowserCandidateSpec => ({
+      kind: "url-instance",
+      href: `${origin}/authorize`,
+    })),
+    fc.constant<BrowserCandidateSpec>({ kind: "null-proto" }),
+    fc.constant<BrowserCandidateSpec>({ kind: "revoked-proxy" }),
+    fc
+      .tuple(arbitrarySafeOrigin, fc.string({ maxLength: 24 }), fc.boolean())
+      .map(([origin, suffix, throwOnFirst]): BrowserCandidateSpec => ({
+        kind: "stateful-toString",
+        first: `${origin}/authorize`,
+        second: `file:///tmp/${suffix}`,
+        throwOnFirst,
+      })),
+  );
+
+  function materializeCandidate(spec: BrowserCandidateSpec): {
+    candidate: unknown;
+    getCoercionCalls: () => number;
+  } {
+    let coercionCalls = 0;
+    switch (spec.kind) {
+      case "string":
+        return { candidate: spec.value, getCoercionCalls: () => coercionCalls };
+      case "non-string-primitive":
+        return { candidate: spec.value, getCoercionCalls: () => coercionCalls };
+      case "url-instance":
+        return { candidate: new URL(spec.href), getCoercionCalls: () => coercionCalls };
+      case "null-proto":
+        return { candidate: Object.create(null), getCoercionCalls: () => coercionCalls };
+      case "revoked-proxy": {
+        const { proxy, revoke } = Proxy.revocable({ url: "x" }, {});
+        revoke();
+        return { candidate: proxy, getCoercionCalls: () => coercionCalls };
+      }
+      case "stateful-toString": {
+        const obj = {
+          toString(): string {
+            coercionCalls += 1;
+            if (spec.throwOnFirst) {
+              throw new TypeError("hostile toString coercion");
+            }
+            return coercionCalls === 1 ? spec.first : spec.second;
+          },
+        };
+        return { candidate: obj, getCoercionCalls: () => coercionCalls };
+      }
+    }
+  }
+
+  it("never throws synchronously and spawns iff input is a string primitive passing isSafeAuthorizationUrl", async () => {
+    const arbitraryPlatform = fc.option(
+      fc.constantFrom<NodeJS.Platform>("darwin", "win32", "linux", "freebsd"),
+      { nil: undefined },
+    );
+    const arbitraryServerName = fc.option(fc.stringMatching(/^[a-z0-9_-]{1,16}$/), {
+      nil: undefined,
+    });
+
+    await fc.assert(
+      fc.asyncProperty(
+        arbitraryCandidateSpec,
+        arbitraryPlatform,
+        arbitraryServerName,
+        async (spec, platform, serverName) => {
+          const { candidate, getCoercionCalls } = materializeCandidate(spec);
+          const expectedSafe =
+            typeof candidate === "string" && isSafeAuthorizationUrl(candidate);
+
+          let spawnCount = 0;
+          let capturedCommand = "";
+          let capturedArgs: readonly string[] = [];
+          let capturedOptions: BrowserSpawnOptions | undefined;
+          const child = new FuzzBrowserChild();
+
+          const returnedPromise = openBrowser(candidate as string, {
+            platform,
+            serverName,
+            spawnProcess: (command, args, options) => {
+              spawnCount += 1;
+              capturedCommand = command;
+              capturedArgs = args;
+              capturedOptions = options;
+              queueMicrotask(() => child.emit("spawn"));
+              return child;
+            },
+          });
+
+          assert.ok(returnedPromise instanceof Promise, "openBrowser must always return a Promise");
+          assert.equal(getCoercionCalls(), 0, "non-string coercion must never run");
+
+          if (expectedSafe) {
+            await returnedPromise;
+            const canonical = new URL(candidate).toString();
+            const expectedCmd = browserOpenCommand(canonical, platform);
+            assert.equal(spawnCount, 1);
+            assert.equal(capturedCommand, expectedCmd.command);
+            assert.deepEqual(capturedArgs, expectedCmd.args);
+            assert.deepEqual(capturedOptions, {
+              detached: true,
+              stdio: "ignore",
+              windowsHide: true,
+            });
+            assert.equal("shell" in (capturedOptions ?? {}), false);
+            assert.equal(child.unreferenced, true);
+          } else {
+            await assert.rejects(returnedPromise, (err: unknown) => {
+              assert.ok(err instanceof McpError);
+              assert.equal(err.code, "protocol");
+              assert.equal(err.server, serverName ?? "<oauth>");
+              assert.equal(err.message, EXPECTED_UNSAFE_URL_MESSAGE);
+              return true;
+            });
+            assert.equal(spawnCount, 0);
+            assert.equal(getCoercionCalls(), 0);
+          }
+        },
+      ),
+      testOptions(),
+    );
+  });
+
+  it("canonicalizes valid HTTPS and loopback HTTP URLs into flag-safe, whitespace-free argv across platforms", async () => {
+    const arbitraryPlatform = fc.constantFrom<NodeJS.Platform>("darwin", "win32", "linux", "freebsd");
+
+    await fc.assert(
+      fc.asyncProperty(arbitraryValidUrlString, arbitraryPlatform, async (rawUrl, platform) => {
+        let openedArgs: readonly string[] = [];
+        const child = new FuzzBrowserChild();
+
+        await openBrowser(rawUrl, {
+          platform,
+          spawnProcess: (_cmd, args) => {
+            openedArgs = args;
+            queueMicrotask(() => child.emit("spawn"));
+            return child;
+          },
+        });
+
+        const openedHref = openedArgs.at(-1);
+        assert.ok(typeof openedHref === "string");
+        assert.notEqual(openedHref[0], "-", "canonicalized href must never start with '-'");
+        assert.ok(
+          !/[\s\x00-\x1f\x7f-\x9f]/.test(openedHref),
+          `canonicalized href must contain no whitespace or control chars: ${JSON.stringify(openedHref)}`,
+        );
+        assert.equal(openedHref, new URL(rawUrl).toString());
+        assert.equal(isSafeAuthorizationUrl(openedHref), true);
+        const reparsed = new URL(openedHref);
+        assert.ok(reparsed.protocol === "https:" || reparsed.protocol === "http:");
+      }),
+      testOptions(),
+    );
+  });
+
+  it("never leaks secret query tokens into rejected error messages or DebugLog entries", async () => {
+    const secretToken = fc.stringMatching(/^[A-Za-z0-9_-]{12,32}$/);
+    const unsafePrefix = fc.constantFrom(
+      "file:///tmp/auth",
+      "javascript:void(0)//",
+      "data:text/plain,",
+      "http://192.0.2.10:8080/authorize",
+    );
+
+    const lines: string[] = [];
+    const prevLogger = getDebugLog();
+    const prevUiActive = isUiActive();
+    const logger = new DebugLog("/virtual/logs/pi-mcp.log", {
+      now: () => new Date("2026-01-01T00:00:00.000Z"),
+      fs: {
+        mkdir: async () => undefined,
+        appendFile: async (_filePath, data) => {
+          lines.push(data);
+        },
+        stat: async () => ({ size: 0 }),
+        rename: async () => undefined,
+        chmod: async () => undefined,
+      },
+    });
+    setDebugLog(logger);
+    setDiagnosticUi({ notify: () => {} }, true);
+
+    try {
+      await fc.assert(
+        fc.asyncProperty(unsafePrefix, secretToken, async (prefix, secret) => {
+          const unsafeWithSecrets = `${prefix}?state=${secret}&code_challenge=${secret}&client_secret=${secret}`;
+          let spawned = false;
+          await assert.rejects(
+            openBrowser(unsafeWithSecrets, {
+              spawnProcess: () => {
+                spawned = true;
+                return new FuzzBrowserChild();
+              },
+            }),
+            (err: unknown) => {
+              assert.ok(err instanceof McpError);
+              assert.equal(err.code, "protocol");
+              assert.equal(err.message.includes(secret), false);
+              return true;
+            },
+          );
+          assert.equal(spawned, false);
+        }),
+        testOptions(100),
+      );
+      await logger.flush();
+      assert.deepEqual(lines, []);
+    } finally {
+      setDebugLog(prevLogger);
+      setDiagnosticUi(null, prevUiActive);
+    }
+  });
+});
+
 
