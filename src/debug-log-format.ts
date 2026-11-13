@@ -113,7 +113,7 @@ function safeErrorText(read: () => string, fallback: string): string {
 }
 
 function sanitizedErrorKind(read: () => string): string {
-  const kind = sanitizeLogText(safeErrorText(read, "error"), DEBUG_LOG_MAX_SERVER_LENGTH);
+  const kind = sanitizeLogText(safeErrorText(read, "error"), DEBUG_LOG_MAX_SERVER_LENGTH).trim();
   return kind || "error";
 }
 

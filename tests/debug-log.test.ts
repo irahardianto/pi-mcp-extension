@@ -513,7 +513,7 @@ describe("debug log", () => {
     });
 
     it("coerces non-string error kinds, sanitizes names, and tolerates revoked proxies", () => {
-      const names: unknown[] = [Object.create(null), 123, ""];
+      const names: unknown[] = [Object.create(null), 123, "", undefined, null, "   ", "\u001b[31m\r\n"];
       for (const name of names) {
         const err = Object.assign(new Error("boom"), { name });
         const described = describeError(err);
@@ -531,13 +531,15 @@ describe("debug log", () => {
       const escaped = new Error("boom");
       escaped.name = "Bearer sk-secret-token\u001b[31m\n";
       const described = describeError(escaped);
+      assert.equal(described.kind, "Bearer [REDACTED]");
       assert.equal(described.kind.includes("sk-secret-token"), false);
       assert.equal(described.kind.includes("\u001b"), false);
       assert.equal(described.kind.includes("\n"), false);
 
-      const mcp = new McpError("boom", "github", "auth");
-      Object.assign(mcp, { code: 123 });
-      assert.equal(describeError(mcp).kind, "123");
+      for (const code of [123, Object.create(null), "", undefined, null, "\u001b[31m\n"] as unknown[]) {
+        const mcp = Object.assign(new McpError("boom", "github", "auth"), { code });
+        assert.equal(describeError(mcp).kind, code === 123 ? "123" : "error");
+      }
 
       const { proxy, revoke } = Proxy.revocable(new Error("boom"), {});
       revoke();
