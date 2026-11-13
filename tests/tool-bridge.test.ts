@@ -1360,6 +1360,8 @@ describe("ToolBridge", () => {
     );
     assert.deepEqual(activeTools, ["mcp_db_search_users"]);
     assert.deepEqual(bridge.getToolActivity("db"), { discovered: 3, active: 1, expected: 1 });
+    assert.deepEqual(bridge.getInactiveDirectTools("db"), []);
+    assert.deepEqual(bridge.getInactiveDirectTools("unknown"), []);
     const byName = new Map(registered.map((tool) => [tool.name, tool]));
     assert.equal(byName.get("mcp_db_get_status")?.defaultActive, false);
     assert.equal(byName.get("mcp_db_delete_user")?.defaultActive, false);
@@ -1411,10 +1413,21 @@ describe("ToolBridge", () => {
     assert.deepEqual(activeTools, ["mcp_db_echo", "mcp_db_search"]);
     assert.deepEqual(bridge.getToolActivity("db"), { discovered: 2, active: 2, expected: 1 });
 
+    // The verification helper reports the missing direct tool by name, even though the totals
+    // still add up (active 1 = expected 1: a loaded deferred tool replaced it).
+    activeTools = ["mcp_db_search"];
+    assert.deepEqual(
+      bridge.getInactiveDirectTools("db"),
+      ["mcp_db_echo"],
+      "a tool_search-loaded deferred tool must not hide an inactive direct tool behind the counts",
+    );
+    assert.deepEqual(bridge.getToolActivity("db"), { discovered: 2, active: 1, expected: 1 });
+
     // A reconnect after a stop re-derives the active set from exposure alone.
     bridge.deactivateServer("db");
     await bridge.refreshTools("db", listingClient(toolNames), exposure);
     assert.deepEqual(activeTools, ["mcp_db_echo"]);
+    assert.deepEqual(bridge.getInactiveDirectTools("db"), []);
   });
 
   it("keeps externally deactivated tools inactive across a live tools/list_changed refresh", async () => {

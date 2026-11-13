@@ -58,7 +58,6 @@ import { parseResourceArguments } from "../src/commands.js";
 import { convertResourceContents } from "../src/resource-bridge.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
 import { sanitizeServerInstructions } from "../src/server-status.js";
-import { resolveToolExposure } from "../src/tool-exposure.js";
 import { EventEmitter } from "node:events";
 import {
   browserOpenCommand,
@@ -2308,75 +2307,118 @@ describe("fuzz: openBrowser & browserOpenCommand", () => {
   });
 });
 
-// ─── Suite 6c: ToolBridge exposure activation (#257) ─────────────────────────
+// ─── Suite 6d: ToolBridge exposure activation (#257) ─────────────────────────
 
 describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct", () => {
   const exposures = ["codemode", "deferred", "direct", "hidden"] as const;
+  type Exposure = (typeof exposures)[number];
 
-  it("derives the active set from exposure alone, for any tool set and override map", async () => {
-    const toolNamesArb = fc.uniqueArray(fc.stringMatching(/^[a-z][a-z_]{1,7}$/), {
+  /**
+   * Reference resolution, computed independently of `src/tool-exposure.ts`. The generated
+   * patterns are limited to an exact name, `name*`, `*name`, `*name*`, and `*`, so the oracle
+   * is plain string work instead of a second copy of the matcher under test — a precondition of
+   * the property actually catching a precedence bug (exact-before-pattern, declaration order).
+   */
+  function expectedExposure(
+    toolName: string,
+    serverExposure: Exposure | undefined,
+    overrides: ReadonlyArray<readonly [string, Exposure]>,
+  ): Exposure {
+    const exact = overrides.find(([pattern]) => pattern === toolName);
+    if (exact) return exact[1];
+    const matching = overrides.find(([pattern]) => {
+      if (pattern === "*") return true;
+      const core = pattern.replaceAll("*", "");
+      if (pattern.startsWith("*") && pattern.endsWith("*")) return toolName.includes(core);
+      if (pattern.endsWith("*")) return toolName.startsWith(core);
+      return toolName.endsWith(core);
+    });
+    return matching ? matching[1] : serverExposure ?? "direct";
+  }
+
+  function graphArb() {
+    const toolNames = fc.uniqueArray(fc.stringMatching(/^[a-z][a-z_]{1,7}$/), {
       minLength: 1,
       maxLength: 5,
     });
-    const overridesArb = fc.uniqueArray(
-      fc.tuple(fc.stringMatching(/^[a-z][a-z_]{0,4}\*?$/), fc.constantFrom(...exposures)),
-      { selector: ([pattern]) => pattern, maxLength: 3 },
-    );
+    const patterns = fc
+      .tuple(fc.stringMatching(/^[a-z][a-z_]{0,5}$/), fc.constantFrom("exact", "prefix", "suffix", "contains", "all"))
+      .map(([core, shape]) => {
+        if (shape === "prefix") return `${core}*`;
+        if (shape === "suffix") return `*${core}`;
+        if (shape === "contains") return `*${core}*`;
+        if (shape === "all") return "*";
+        return core;
+      });
+    const overrides = fc.uniqueArray(fc.tuple(patterns, fc.constantFrom(...exposures)), {
+      selector: ([pattern]) => pattern,
+      maxLength: 3,
+    });
+    return fc.record({
+      toolNames,
+      serverExposure: fc.option(fc.constantFrom(...exposures), { nil: undefined }),
+      overrides,
+      // Every run also draws a guaranteed exact-vs-pattern collision: a `*<tool>*` pattern
+      // declared BEFORE the tool's own key, with a different exposure. The exact key must win
+      // whatever its position, so a matcher that scans patterns first fails the property.
+      collision: fc.tuple(fc.constantFrom(...exposures), fc.constantFrom(...exposures)),
+    });
+  }
 
+  it("derives the active set from exposure alone, for any tool set and override map", async () => {
     await fc.assert(
-      fc.asyncProperty(
-        toolNamesArb,
-        fc.option(fc.constantFrom(...exposures), { nil: undefined }),
-        overridesArb,
-        async (toolNames, serverExposure, overrideEntries) => {
-          const toolExposure = Object.fromEntries(overrideEntries);
-          const config = {
-            ...(serverExposure === undefined ? {} : { exposure: serverExposure }),
-            toolExposure,
-          };
-          const registered = new Map<string, ToolDefinition>();
-          let active: string[] = [];
-          const bridge = new ToolBridge(
-            { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
-            {
-              registerTool: (t: unknown) => {
-                const tool = t as ToolDefinition;
-                registered.set(tool.name, tool);
-              },
-              getActiveTools: () => [...active],
-              setActiveTools: (names: string[]) => {
-                active = [...names];
-              },
+      fc.asyncProperty(graphArb(), async ({ toolNames, serverExposure, overrides, collision }) => {
+        const firstTool = toolNames[0]!; // the arbitrary guarantees at least one tool
+        const collisionEntries = [
+          [`*${firstTool}*`, collision[0]],
+          [firstTool, collision[1]],
+        ] as const;
+        const entries = [...collisionEntries, ...overrides];
+        const config = {
+          ...(serverExposure === undefined ? {} : { exposure: serverExposure }),
+          toolExposure: Object.fromEntries(entries),
+        };
+        const registered = new Map<string, ToolDefinition>();
+        let active: string[] = [];
+        const bridge = new ToolBridge(
+          { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+          {
+            registerTool: (t: unknown) => {
+              const tool = t as ToolDefinition;
+              registered.set(tool.name, tool);
             },
-          );
-          const client = {
-            request: async () => ({
-              tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
-            }),
-          } as unknown as Client;
+            getActiveTools: () => [...active],
+            setActiveTools: (names: string[]) => {
+              active = [...names];
+            },
+          },
+        );
+        const client = {
+          request: async () => ({
+            tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+          }),
+        } as unknown as Client;
 
-          await bridge.refreshTools("alpha", client, config);
+        await bridge.refreshTools("alpha", client, config);
 
-          const expectedActive = toolNames
-            .filter((name) => resolveToolExposure(config, name) === "direct")
-            .map((name) => buildToolName("mcp", "alpha", name))
-            .sort();
-          assert.deepEqual([...active].sort(), expectedActive);
-          assert.deepEqual(bridge.getToolActivity("alpha"), {
-            discovered: toolNames.length,
-            active: expectedActive.length,
-            expected: expectedActive.length,
-          });
+        const expectedActive = toolNames
+          .filter((name) => expectedExposure(name, serverExposure, entries) === "direct")
+          .map((name) => buildToolName("mcp", "alpha", name))
+          .sort();
+        assert.deepEqual([...active].sort(), expectedActive);
+        assert.deepEqual(bridge.getInactiveDirectTools("alpha"), []);
+        assert.deepEqual(bridge.getToolActivity("alpha"), {
+          discovered: toolNames.length,
+          active: expectedActive.length,
+          expected: expectedActive.length,
+        });
 
-          for (const [piName, tool] of registered) {
-            const rawName = toolNames.find(
-              (name) => buildToolName("mcp", "alpha", name) === piName,
-            );
-            assert.ok(rawName, `${piName} must map back to a raw tool name`);
-            assert.equal(tool.exposure, resolveToolExposure(config, rawName));
-          }
-        },
-      ),
+        for (const [piName, tool] of registered) {
+          const rawName = toolNames.find((name) => buildToolName("mcp", "alpha", name) === piName);
+          assert.ok(rawName, `${piName} must map back to a raw tool name`);
+          assert.equal(tool.exposure, expectedExposure(rawName, serverExposure, entries));
+        }
+      }),
       testOptions(40),
     );
   });

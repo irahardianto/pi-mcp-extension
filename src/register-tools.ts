@@ -88,7 +88,8 @@ export function formatMcpConnectError(err: unknown, options: McpConnectErrorOpti
 /**
  * Success text for `mcp_connect`. A server whose exposure keeps every tool out of the model
  * never becomes active by design, so saying "tools discovered and active" there would read
- * as a silent failure (#257).
+ * as a silent failure — but Pi's `tool_search` can still have loaded some of them, so the
+ * message states that count instead of implying nothing runs (#257).
  */
 export function formatConnectSuccess(name: string, activity: ToolActivity): string {
   if (activity.expected > 0) {
@@ -97,7 +98,8 @@ export function formatConnectSuccess(name: string, activity: ToolActivity): stri
   if (activity.discovered === 0) {
     return `MCP server ${name} ready; it advertises no tools.`;
   }
-  return `MCP server ${name} ready; all ${activity.discovered} tools are configured as deferred, codemode, or hidden.`;
+  const loaded = activity.active > 0 ? ` (${activity.active} loaded through tool_search or codemode)` : "";
+  return `MCP server ${name} ready; no tool is configured as direct — all ${activity.discovered} are deferred, codemode, or hidden${loaded}.`;
 }
 
 export function registerManagementTools(
@@ -138,14 +140,16 @@ export function registerManagementTools(
         });
         throw new Error(message);
       }
-      const activity = bridge.getToolActivity(name);
-      // WHY: compare against the tools whose exposure is `direct`, not every discovered one.
-      // A server configured with `exposure: "hidden"` plus a few `toolExposure` overrides, or
-      // one whose tools are all deferred to `tool_search`, is working as configured — the old
-      // discovered-vs-active check reported it as a failure (#257).
-      if (activity.active < activity.expected) {
+      // WHY: check the tools whose exposure is `direct` by name, not every discovered one. A
+      // server configured with `exposure: "hidden"` plus a few `toolExposure` overrides, or one
+      // whose tools are all deferred to `tool_search`, is working as configured — the old
+      // discovered-vs-active check reported it as a failure (#257) — while a `direct` tool another
+      // extension removed is still a failure. Totals cannot decide it: `active` also counts
+      // non-direct tools `tool_search` loaded, and those would mask a missing direct tool.
+      if (bridge.getInactiveDirectTools(name).length > 0) {
         throw new Error("MCP server connected, but some tools configured as direct are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered, active, and expected counts.");
       }
+      const activity = bridge.getToolActivity(name);
       const instructions = getServerInstructions(manager.getServer(name));
       const ready = formatConnectSuccess(name, activity);
       const text = instructions === undefined ? ready : `${ready}\nInstructions: ${instructions}`;

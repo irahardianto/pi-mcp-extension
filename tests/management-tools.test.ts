@@ -128,7 +128,12 @@ it("formats a successful mcp_connect message that reflects the configured exposu
   );
   assert.equal(
     formatConnectSuccess("svc", { discovered: 6, active: 0, expected: 0 }),
-    "MCP server svc ready; all 6 tools are configured as deferred, codemode, or hidden.",
+    "MCP server svc ready; no tool is configured as direct — all 6 are deferred, codemode, or hidden.",
+  );
+  // A tool_search-loaded tool must not leave the message claiming nothing is callable.
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 6, active: 2, expected: 0 }),
+    "MCP server svc ready; no tool is configured as direct — all 6 are deferred, codemode, or hidden (2 loaded through tool_search or codemode).",
   );
   assert.equal(
     formatConnectSuccess("svc", { discovered: 0, active: 0, expected: 0 }),
@@ -171,6 +176,16 @@ it("reports mcp_connect success when exposure keeps most tools out of the model 
     // The mock server advertises six tools; four stay hidden or deferred by configuration.
     const rows = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.deepEqual(rows[0].tools, { discovered: 6, active: 2, expected: 2 });
+
+    // A tool_search-loaded deferred tool must not mask a direct tool another extension removed:
+    // `active` (2) still equals `expected` (2), so only a per-name check catches it.
+    mockExt.activeTools = ["mcp_partial_add", "mcp_partial_get_cwd"];
+    await assert.rejects(
+      tools.get("mcp_connect").execute("", { name: "partial" }, undefined, undefined, ctx),
+      /configured as direct are inactive/,
+      "an activated deferred tool must not mask an inactive direct tool",
+    );
+    assert.deepEqual(mockExt.activeTools, ["mcp_partial_add", "mcp_partial_get_cwd"]);
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });

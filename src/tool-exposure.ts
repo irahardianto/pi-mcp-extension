@@ -3,7 +3,8 @@
  *
  * A server entry may declare how each of its tools reaches the model: `direct` (declared
  * to the model and active), `deferred` (inactive until `tool_search` loads it), `codemode`
- * (callable from codemode scripts only), or `hidden` (registered but unreachable). Pi
+ * (callable from codemode scripts, also loadable by `tool_search`), or `hidden` (registered
+ * but unreachable). Pi
  * resolves one tool's exposure from its `toolExposure` entry first — an exact name, then
  * the first matching `*` pattern in declaration order — and falls back to the server's
  * `exposure`.

@@ -145,7 +145,8 @@ const ServerConfigObjectSchema = z.object({
    *
    * `direct` — registered and activated, so the model sees the declaration.
    * `deferred` — registered inactive; `tool_search` can load it on demand.
-   * `codemode` — registered inactive; callable from codemode scripts only.
+   * `codemode` — registered inactive; callable from codemode scripts, and loadable by
+   *   `tool_search` (which then declares it).
    * `hidden` — registered but not exposed to the model at all.
    *
    * Default: `"direct"` (unlike Pi's own `codemode`, so an existing config keeps every

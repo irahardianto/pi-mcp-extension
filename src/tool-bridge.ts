@@ -306,6 +306,21 @@ export class ToolBridge {
   }
 
   /**
+   * Direct tools this bridge owns that Pi does not currently have active.
+   *
+   * WHY: verified per name, never by subtracting the `active` and `expected` totals — `active`
+   * also counts non-direct tools Pi's `tool_search` loaded, so with `direct` 2 / `deferred` 1 an
+   * activated deferred tool masks a direct tool another extension removed (2 === 2) and
+   * `mcp_connect` would report success while a configured tool is unreachable (#257).
+   */
+  getInactiveDirectTools(serverName: string): string[] {
+    const direct = this.directToolNames.get(serverName);
+    if (!direct) return [];
+    const active = new Set(this.pi.getActiveTools());
+    return [...direct].filter((name) => !active.has(name));
+  }
+
+  /**
    * Re-apply this bridge's deterministic tool order to Pi's active list when owned tools have
    * been reordered externally, and do nothing when already ordered.
    *
