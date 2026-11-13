@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- Validate and canonicalize OAuth authorization URLs at the public OS browser-launch boundary, preventing unsafe schemes and malformed inputs from reaching system openers (#309).
+
 ## [1.15.2] - 2026-11-13
 
 ### Fixed

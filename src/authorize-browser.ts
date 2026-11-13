@@ -40,6 +40,7 @@ export type BrowserSpawn = (
 export interface OpenBrowserDeps {
   platform?: NodeJS.Platform | undefined;
   spawnProcess?: BrowserSpawn | undefined;
+  serverName?: string | undefined;
 }
 
 export interface BrowserLauncherContext {
@@ -73,8 +74,21 @@ export function browserOpenCommand(
  * Works on macOS, Linux, and Windows.
  */
 export function openBrowser(url: string, deps?: OpenBrowserDeps): Promise<void> {
+  // WHY: This public entry point must enforce the URL policy independently of its callers,
+  // and require a string primitive so a non-string object with a stateful `toString()`
+  // cannot pass validation and mutate before `new URL(url)`.
+  if (typeof url !== "string" || !isSafeAuthorizationUrl(url)) {
+    return Promise.reject(
+      new McpError(
+        "Refusing to open unsafe authorization URL: only HTTPS (or loopback HTTP) URLs are allowed",
+        deps?.serverName ?? "<oauth>",
+        "protocol",
+      ),
+    );
+  }
+  const safeHref = new URL(url).toString();
   const spawnProcess: BrowserSpawn = deps?.spawnProcess ?? spawn;
-  const { command, args } = browserOpenCommand(url, deps?.platform);
+  const { command, args } = browserOpenCommand(safeHref, deps?.platform);
   return new Promise<void>((resolve, reject) => {
     const child = spawnProcess(command, args, {
       detached: true,
