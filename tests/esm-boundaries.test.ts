@@ -2,9 +2,11 @@
  * Architectural ESM dependency-graph and leaf-import boundary tests (`src/*.ts`):
  * 1. Every `src/*.ts` file is explicitly partitioned into either `PURE_MODULES` or `RUNTIME_MODULES`,
  *    and pure policy/transform modules never transitively runtime-import `RUNTIME_MODULES`, bare or
- *    `node:` Node I/O built-ins, or computed dynamic imports.
- * 2. Internal `src/*.ts` imports and compat re-exports always point directly at the canonical defining leaf module
- *    (never through barrel re-exports, wildcard `export *`, or multi-hop re-export chains).
+ *    `node:` Node I/O built-ins, unapproved external runtime packages, non-canonical relative paths,
+ *    or computed dynamic imports.
+ * 2. Internal `src/*.ts` imports and compat re-exports use canonical flat `./<module>.js` specifiers
+ *    pointing directly at the defining leaf module (never through barrel re-exports, wildcard `export *`,
+ *    two-step namespace re-exports, or multi-hop re-export chains).
  * 3. Preserved compatibility re-exports maintain exact referential identity (`===`) with their leaf definitions.
  */
 
@@ -43,6 +45,9 @@ const RUNTIME_MODULES = [
   "authorize-dialog.ts",
   "authorize-flow.ts",
   "callback-server.ts",
+  // WHY: commands.ts argument parsers are pure, but the module retains backwards-compatible
+  // runtime re-exports (`collectRegisteredServers`, `mergeWithRegisteredServers`) from
+  // `session-lifecycle.ts`, so evaluating `commands.ts` loads runtime lifecycle code.
   "commands.ts",
   "config.ts",
   "connection-coordinator.ts",
@@ -61,11 +66,23 @@ const RUNTIME_MODULES = [
   "startup-auth.ts",
   "stdio-process.ts",
   "tool-bridge.ts",
+  // WHY: tool-content.ts transforms are pure at call time, but it imports `convertResourceContent`
+  // from `resource-bridge.ts` (kept whole per #280), which pulls `debug-log.ts` (`node:fs/promises`).
   "tool-content.ts",
   "tool-discovery.ts",
   "transport-factory.ts",
   "transport-order.ts",
 ] as const;
+
+// WHY: Pure modules may only runtime-import zero-I/O schema/type builders (`zod`, `typebox`)
+// and the `UnauthorizedError` class constructor (`@modelcontextprotocol/sdk/client/auth.js`)
+// for `instanceof` classification in `connect-policy.ts`. Transport, client, and process SDK
+// subpaths (`.../stdio.js`, `.../streamableHttp.js`, etc.) are rejected.
+const ALLOWED_PURE_EXTERNAL_RUNTIME_SPECIFIERS = new Set([
+  "zod",
+  "typebox",
+  "@modelcontextprotocol/sdk/client/auth.js",
+]);
 
 const BARE_NODE_BUILTINS = new Set(
   builtinModules.map((mod) => (mod.startsWith("node:") ? mod.slice(5) : mod)),
@@ -73,21 +90,39 @@ const BARE_NODE_BUILTINS = new Set(
 
 function normalizeNodeBuiltin(specifier: string): string | null {
   if (specifier.startsWith("node:")) return specifier;
-  return BARE_NODE_BUILTINS.has(specifier) ? `node:${specifier}` : null;
+  const root = specifier.split("/")[0] ?? "";
+  return BARE_NODE_BUILTINS.has(specifier) || BARE_NODE_BUILTINS.has(root)
+    ? `node:${specifier}`
+    : null;
 }
 
+function isRelativeSpecifier(specifier: string): boolean {
+  return (
+    specifier === "." ||
+    specifier === ".." ||
+    specifier.startsWith("./") ||
+    specifier.startsWith("../")
+  );
+}
+
+const CANONICAL_FLAT_RELATIVE_SPECIFIER = /^\.\/[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.js$/;
+
 function toTsFilename(specifier: string): string | null {
-  if (!specifier.startsWith("./") || !specifier.endsWith(".js")) return null;
+  if (!CANONICAL_FLAT_RELATIVE_SPECIFIER.test(specifier)) return null;
   return `${specifier.slice(2, -3)}.ts`;
 }
 
 interface ModuleGraphEntry {
   runtimeRelativeDeps: Set<string>;
   nodeBuiltinRuntimeDeps: Set<string>;
+  externalRuntimeDeps: Set<string>;
+  invalidRelativeSpecifiers: Set<string>;
   hasComputedDynamicImport: boolean;
   wildcardReExports: Set<string>;
   /** Exported name -> source `.ts` file for bindings re-exported from another `./*.js` module. */
   reExportedFrom: Map<string, string>;
+  /** Runtime value re-exports (`exportedName -> { targetFile, origName }`). */
+  runtimeReExports: Map<string, { targetFile: string; origName: string }>;
   /** Specifiers imported or re-exported from `./*.js`. */
   relativeBindings: Array<{
     targetFile: string;
@@ -101,11 +136,38 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
 
   const runtimeRelativeDeps = new Set<string>();
   const nodeBuiltinRuntimeDeps = new Set<string>();
+  const externalRuntimeDeps = new Set<string>();
+  const invalidRelativeSpecifiers = new Set<string>();
   let hasComputedDynamicImport = false;
   const wildcardReExports = new Set<string>();
-  const localImportedFrom = new Map<string, { targetFile: string; importedName: string }>();
+  const localImportedFrom = new Map<
+    string,
+    { targetFile: string; importedName: string; isTypeOnly: boolean }
+  >();
   const reExportedFrom = new Map<string, string>();
+  const runtimeReExports = new Map<string, { targetFile: string; origName: string }>();
   const relativeBindings: ModuleGraphEntry["relativeBindings"] = [];
+
+  function classifySpecifier(spec: string, isRuntime: boolean): string | null {
+    const builtin = normalizeNodeBuiltin(spec);
+    if (builtin) {
+      if (isRuntime) nodeBuiltinRuntimeDeps.add(builtin);
+      return null;
+    }
+    if (isRelativeSpecifier(spec)) {
+      const targetTs = toTsFilename(spec);
+      if (!targetTs) {
+        invalidRelativeSpecifiers.add(spec);
+        return null;
+      }
+      if (isRuntime) runtimeRelativeDeps.add(targetTs);
+      return targetTs;
+    }
+    if (isRuntime) {
+      externalRuntimeDeps.add(spec);
+    }
+    return null;
+  }
 
   for (const stmt of sf.statements) {
     if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier)) {
@@ -127,18 +189,14 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
         }
       }
 
-      const builtin = normalizeNodeBuiltin(spec);
-      if (builtin && hasRuntimeBinding) {
-        nodeBuiltinRuntimeDeps.add(builtin);
-      }
-
-      const targetTs = toTsFilename(spec);
+      const targetTs = classifySpecifier(spec, hasRuntimeBinding);
       if (targetTs) {
-        if (hasRuntimeBinding) {
-          runtimeRelativeDeps.add(targetTs);
-        }
         if (clause?.name) {
-          localImportedFrom.set(clause.name.text, { targetFile: targetTs, importedName: "default" });
+          localImportedFrom.set(clause.name.text, {
+            targetFile: targetTs,
+            importedName: "default",
+            isTypeOnly: isStmtTypeOnly,
+          });
           relativeBindings.push({
             targetFile: targetTs,
             importedName: "default",
@@ -147,6 +205,11 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
         }
         if (clause?.namedBindings) {
           if (ts.isNamespaceImport(clause.namedBindings)) {
+            localImportedFrom.set(clause.namedBindings.name.text, {
+              targetFile: targetTs,
+              importedName: "*",
+              isTypeOnly: isStmtTypeOnly,
+            });
             relativeBindings.push({
               targetFile: targetTs,
               importedName: "*",
@@ -155,7 +218,11 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
           } else if (ts.isNamedImports(clause.namedBindings)) {
             for (const el of clause.namedBindings.elements) {
               const importedName = (el.propertyName ?? el.name).text;
-              localImportedFrom.set(el.name.text, { targetFile: targetTs, importedName });
+              localImportedFrom.set(el.name.text, {
+                targetFile: targetTs,
+                importedName,
+                isTypeOnly: isStmtTypeOnly || el.isTypeOnly,
+              });
               relativeBindings.push({
                 targetFile: targetTs,
                 importedName,
@@ -169,17 +236,16 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
       const isStmtTypeOnly = stmt.isTypeOnly;
       if (stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)) {
         const spec = stmt.moduleSpecifier.text;
-        const builtin = normalizeNodeBuiltin(spec);
-        if (builtin && !isStmtTypeOnly) {
-          nodeBuiltinRuntimeDeps.add(builtin);
+        const isWildcardOrNs = !stmt.exportClause || ts.isNamespaceExport(stmt.exportClause);
+        let hasRuntimeExport = !isStmtTypeOnly && isWildcardOrNs;
+        if (!isStmtTypeOnly && stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
+          hasRuntimeExport = stmt.exportClause.elements.some((el) => !el.isTypeOnly);
         }
-        const targetTs = toTsFilename(spec);
+
+        const targetTs = classifySpecifier(spec, hasRuntimeExport);
         if (targetTs) {
-          if (!stmt.exportClause || ts.isNamespaceExport(stmt.exportClause)) {
+          if (isWildcardOrNs) {
             wildcardReExports.add(targetTs);
-            if (!isStmtTypeOnly) {
-              runtimeRelativeDeps.add(targetTs);
-            }
             if (stmt.exportClause && ts.isNamespaceExport(stmt.exportClause)) {
               reExportedFrom.set(stmt.exportClause.name.text, targetTs);
             }
@@ -188,23 +254,19 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
               importedName: "*",
               kind: "re-export",
             });
-          } else if (ts.isNamedExports(stmt.exportClause)) {
-            let hasRuntimeExport = false;
+          } else if (stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
             for (const el of stmt.exportClause.elements) {
               const origName = (el.propertyName ?? el.name).text;
               const exportedName = el.name.text;
               reExportedFrom.set(exportedName, targetTs);
+              if (!isStmtTypeOnly && !el.isTypeOnly) {
+                runtimeReExports.set(exportedName, { targetFile: targetTs, origName });
+              }
               relativeBindings.push({
                 targetFile: targetTs,
                 importedName: origName,
                 kind: "re-export",
               });
-              if (!isStmtTypeOnly && !el.isTypeOnly) {
-                hasRuntimeExport = true;
-              }
-            }
-            if (hasRuntimeExport) {
-              runtimeRelativeDeps.add(targetTs);
             }
           }
         }
@@ -215,6 +277,12 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
           const origin = localImportedFrom.get(localName);
           if (origin) {
             reExportedFrom.set(exportedName, origin.targetFile);
+            if (!isStmtTypeOnly && !el.isTypeOnly && !origin.isTypeOnly) {
+              runtimeReExports.set(exportedName, {
+                targetFile: origin.targetFile,
+                origName: origin.importedName,
+              });
+            }
           }
         }
       }
@@ -230,14 +298,8 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
     if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const firstArg = node.arguments[0];
       if (firstArg && ts.isStringLiteralLike(firstArg)) {
-        const spec = firstArg.text;
-        const builtin = normalizeNodeBuiltin(spec);
-        if (builtin) {
-          nodeBuiltinRuntimeDeps.add(builtin);
-        }
-        const targetTs = toTsFilename(spec);
+        const targetTs = classifySpecifier(firstArg.text, true);
         if (targetTs) {
-          runtimeRelativeDeps.add(targetTs);
           relativeBindings.push({
             targetFile: targetTs,
             importedName: "*",
@@ -256,9 +318,12 @@ function parseModuleSource(file: string, code: string): ModuleGraphEntry {
   return {
     runtimeRelativeDeps,
     nodeBuiltinRuntimeDeps,
+    externalRuntimeDeps,
+    invalidRelativeSpecifiers,
     hasComputedDynamicImport,
     wildcardReExports,
     reExportedFrom,
+    runtimeReExports,
     relativeBindings,
   };
 }
@@ -308,12 +373,26 @@ function findPureModuleViolations(
         );
       }
 
+      for (const badRel of entry.invalidRelativeSpecifiers) {
+        violations.push(
+          `pure module ${pureFile} uses non-canonical relative specifier "${badRel}" via ${current.chain.join(" -> ")}`,
+        );
+      }
+
       for (const builtin of entry.nodeBuiltinRuntimeDeps) {
         // Only deterministic SHA-256 hashing (`node:crypto`) in tool-names.ts is permitted in pure modules.
         const allowedCrypto = current.file === "tool-names.ts" && builtin === "node:crypto";
         if (!allowedCrypto) {
           violations.push(
             `pure module ${pureFile} transitively imports Node built-in "${builtin}" via ${current.chain.join(" -> ")}`,
+          );
+        }
+      }
+
+      for (const ext of entry.externalRuntimeDeps) {
+        if (!ALLOWED_PURE_EXTERNAL_RUNTIME_SPECIFIERS.has(ext)) {
+          violations.push(
+            `pure module ${pureFile} transitively runtime-imports unapproved external specifier "${ext}" via ${current.chain.join(" -> ")}`,
           );
         }
       }
@@ -338,6 +417,12 @@ function findLeafImportViolations(graph: ReadonlyMap<string, ModuleGraphEntry>):
   const violations: string[] = [];
 
   for (const [file, entry] of graph) {
+    for (const badRel of entry.invalidRelativeSpecifiers) {
+      violations.push(
+        `src/${file} uses non-canonical relative specifier "${badRel}" (expected flat "./<module>.js")`,
+      );
+    }
+
     for (const wildcardTarget of entry.wildcardReExports) {
       violations.push(
         `src/${file} uses wildcard barrel re-export from "./${wildcardTarget.replace(/\.ts$/, ".js")}"`,
@@ -401,25 +486,34 @@ describe("ESM dependency boundaries and leaf imports", () => {
     assert.deepEqual(findLeafImportViolations(graph), []);
   });
 
-  it("catches bare Node built-ins, non-pure relative deps, wildcard re-exports, dynamic imports, and barrel imports", () => {
+  it("catches bare Node built-ins, parent/nested relative paths, unapproved SDK imports, wildcard/2-step namespace re-exports, dynamic imports, and barrel imports", () => {
     const synthetic = new Map<string, ModuleGraphEntry>([
       ["leaf.ts", parseModuleSource("leaf.ts", "export class LeafError extends Error {}")],
       [
         "barrel.ts",
         parseModuleSource("barrel.ts", 'export { LeafError } from "./leaf.js"; export const local = 1;'),
       ],
+      [
+        "barrel-two-step-ns.ts",
+        parseModuleSource("barrel-two-step-ns.ts", 'import * as leafNs from "./leaf.js"; export { leafNs };'),
+      ],
       ["runtime-io.ts", parseModuleSource("runtime-io.ts", "export async function fetchThing() {}")],
       ["pure-bare-fs.ts", parseModuleSource("pure-bare-fs.ts", 'import { readFile } from "fs/promises"; export { readFile };')],
+      ["pure-parent-rel.ts", parseModuleSource("pure-parent-rel.ts", 'import { fetchThing } from "../src/runtime-io.js"; export { fetchThing };')],
+      ["pure-sdk-stdio.ts", parseModuleSource("pure-sdk-stdio.ts", 'import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"; export { StdioClientTransport };')],
       ["pure-nonpure-dep.ts", parseModuleSource("pure-nonpure-dep.ts", 'import { fetchThing } from "./runtime-io.js"; export { fetchThing };')],
       ["pure-star-reexport.ts", parseModuleSource("pure-star-reexport.ts", 'export * from "./runtime-io.js";')],
       ["pure-dyn-http.ts", parseModuleSource("pure-dyn-http.ts", 'export const load = () => import("http");')],
       ["pure-dyn-computed.ts", parseModuleSource("pure-dyn-computed.ts", "export const load = (p: string) => import(p);")],
       ["consumer-named.ts", parseModuleSource("consumer-named.ts", 'import { LeafError } from "./barrel.js"; export { LeafError };')],
       ["consumer-ns.ts", parseModuleSource("consumer-ns.ts", 'import * as barrel from "./barrel.js"; export { barrel };')],
+      ["consumer-two-step-ns.ts", parseModuleSource("consumer-two-step-ns.ts", 'import { leafNs } from "./barrel-two-step-ns.js"; export { leafNs };')],
     ]);
 
     const pureChecks = [
       ["pure-bare-fs.ts", /Node built-in "node:fs\/promises"/],
+      ["pure-parent-rel.ts", /non-canonical relative specifier "\.\.\/src\/runtime-io\.js"/],
+      ["pure-sdk-stdio.ts", /unapproved external specifier "@modelcontextprotocol\/sdk\/client\/stdio\.js"/],
       ["pure-nonpure-dep.ts", /non-pure module "runtime-io\.ts"/],
       ["pure-star-reexport.ts", /non-pure module "runtime-io\.ts"/],
       ["pure-dyn-http.ts", /Node built-in "node:http"/],
@@ -435,6 +529,11 @@ describe("ESM dependency boundaries and leaf imports", () => {
     }
 
     const leafViolations = findLeafImportViolations(synthetic);
+    assert.ok(
+      leafViolations.some((v) =>
+        v.includes('src/pure-parent-rel.ts uses non-canonical relative specifier "../src/runtime-io.js"'),
+      ),
+    );
     assert.ok(leafViolations.some((v) => v.includes('src/pure-star-reexport.ts uses wildcard barrel re-export')));
     assert.ok(
       leafViolations.some((v) =>
@@ -442,9 +541,35 @@ describe("ESM dependency boundaries and leaf imports", () => {
       ),
     );
     assert.ok(leafViolations.some((v) => v.includes('src/consumer-ns.ts (import) namespace-imports barrel "./barrel.js"')));
+    assert.ok(
+      leafViolations.some((v) =>
+        v.includes('src/consumer-two-step-ns.ts (import) pulls "leafNs" from barrel "./barrel-two-step-ns.js" instead of leaf "./leaf.js"'),
+      ),
+    );
   });
 
   it("preserves referential identity (===) across all backwards-compatible re-exports", async () => {
+    let dynamicCheckedCount = 0;
+    for (const [file, entry] of graph) {
+      if (entry.runtimeReExports.size === 0) continue;
+      const reExportMod = (await import(`../src/${file.replace(/\.ts$/, ".js")}`)) as Record<string, unknown>;
+      for (const [exportedName, { targetFile, origName }] of entry.runtimeReExports) {
+        const leafMod = (await import(`../src/${targetFile.replace(/\.ts$/, ".js")}`)) as Record<string, unknown>;
+        assert.notEqual(
+          reExportMod[exportedName],
+          undefined,
+          `Expected src/${file}#${exportedName} to be defined at runtime`,
+        );
+        assert.equal(
+          reExportMod[exportedName],
+          origName === "*" ? leafMod : leafMod[origName],
+          `Expected src/${file}#${exportedName} === src/${targetFile}#${origName}`,
+        );
+        dynamicCheckedCount += 1;
+      }
+    }
+    assert.equal(dynamicCheckedCount, 44, "Expected all 44 runtime compatibility re-exports to be verified");
+
     const errors = await import("../src/errors.js");
     const authLock = await import("../src/auth-lock.js");
     const authorizeBrowser = await import("../src/authorize-browser.js");
