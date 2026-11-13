@@ -29,8 +29,8 @@ import type { ToolBridge } from "./tool-bridge.js";
 import type { ResourceBridge } from "./resource-bridge.js";
 import type { ConnectionCoordinator } from "./connection-coordinator.js";
 import { formatErrorMessage } from "./startup-auth.js";
+import { describeError } from "./debug-log-format.js";
 import {
-  describeError,
   getDebugLog,
   reportDiagnostic,
   setDiagnosticUi,

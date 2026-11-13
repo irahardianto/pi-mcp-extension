@@ -37,7 +37,6 @@ export {
   DEBUG_LOG_MAX_TEXT_LENGTH,
   describeError,
   formatLogLine,
-  redactSecrets,
   SAFE_FIELD_NAMES,
   sanitizeLogFields,
   sanitizeLogText,
@@ -47,6 +46,7 @@ export {
   type LogFields,
   type LogFieldValue,
 } from "./debug-log-format.js";
+export { redactSecrets } from "./secret-redaction.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 

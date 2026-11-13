@@ -51,6 +51,7 @@ import {
   discoverManualAuthChallenge,
 } from "../src/auth-challenge.js";
 import { McpError } from "../src/errors.js";
+import { buildLogEntry, describeError, formatLogLine } from "../src/debug-log-format.js";
 import { redactSecrets } from "../src/secret-redaction.js";
 import { sanitizeTerminalText } from "../src/terminal-text.js";
 import { parseResourceArguments } from "../src/commands.js";
@@ -1865,3 +1866,144 @@ describe("fuzz: createTransport batch message ordering (#300)", () => {
     );
   });
 });
+
+// ─── Suite 18: describeError / buildLogEntry / formatLogLine (#305) ───────────
+
+describe("fuzz: describeError", () => {
+  const arbitraryHostileField = fc.oneof(
+    arbitraryString,
+    fc.anything(),
+    fc.constant(undefined),
+    fc.constant(null),
+    fc.integer(),
+    fc.boolean(),
+    fc.constant(Symbol.for("pi-mcp-fuzz")),
+    fc.string().map((key) => {
+      const obj = Object.create(null) as Record<string, unknown>;
+      obj[key] = 1;
+      return obj;
+    }),
+  );
+
+  type HostileSpec =
+    | { tag: "any"; value: unknown }
+    | { tag: "revoked-proxy"; message: string }
+    | { tag: "error"; nameVal: unknown; msgVal: unknown; throwGetter: boolean }
+    | { tag: "mcp-error"; codeVal: unknown; msgVal: unknown; throwGetter: boolean };
+
+  const arbitraryHostileSpec: fc.Arbitrary<HostileSpec> = fc.oneof(
+    fc.anything().map((value): HostileSpec => ({ tag: "any", value })),
+    fc.string().map((message): HostileSpec => ({ tag: "revoked-proxy", message })),
+    fc
+      .tuple(arbitraryHostileField, arbitraryHostileField, fc.boolean())
+      .map(([nameVal, msgVal, throwGetter]): HostileSpec => ({
+        tag: "error",
+        nameVal,
+        msgVal,
+        throwGetter,
+      })),
+    fc
+      .tuple(arbitraryHostileField, arbitraryHostileField, fc.boolean())
+      .map(([codeVal, msgVal, throwGetter]): HostileSpec => ({
+        tag: "mcp-error",
+        codeVal,
+        msgVal,
+        throwGetter,
+      })),
+  );
+
+  function materializeHostileValue(spec: HostileSpec): unknown {
+    switch (spec.tag) {
+      case "any":
+        return spec.value;
+      case "revoked-proxy": {
+        const { proxy, revoke } = Proxy.revocable(new Error(spec.message), {});
+        revoke();
+        return proxy;
+      }
+      case "error": {
+        const err = new Error("initial");
+        if (spec.throwGetter) {
+          Object.defineProperty(err, "name", {
+            get() {
+              throw new TypeError("hostile name getter");
+            },
+          });
+        } else {
+          Object.assign(err, { name: spec.nameVal, message: spec.msgVal });
+        }
+        return err;
+      }
+      case "mcp-error": {
+        const err = new McpError("initial", "srv", "protocol");
+        if (spec.throwGetter) {
+          Object.defineProperty(err, "code", {
+            get() {
+              throw new TypeError("hostile code getter");
+            },
+          });
+        } else {
+          Object.assign(err, { code: spec.codeVal, message: spec.msgVal });
+        }
+        return err;
+      }
+    }
+  }
+
+  it("never throws on hostile JS values and always produces single-line JSONL via buildLogEntry", () => {
+    const fixedTs = new Date("2026-01-01T00:00:00.000Z");
+
+    fc.assert(
+      fc.property(arbitraryHostileSpec, (spec) => {
+        const thrown = materializeHostileValue(spec);
+        const { kind, message } = describeError(thrown);
+        assert.equal(typeof kind, "string");
+        assert.equal(typeof message, "string");
+        assert.ok(kind.length > 0, "kind must never be empty");
+        assert.equal(kind, kind.trim(), "kind must be trimmed");
+        assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(kind), `kind contains control chars: ${JSON.stringify(kind)}`);
+        assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(message), `message contains control chars: ${JSON.stringify(message)}`);
+
+        const entry = buildLogEntry({
+          ts: fixedTs,
+          level: "error",
+          event: "transport.onerror_error",
+          server: "fuzz-srv",
+          message,
+          fields: { kind },
+        });
+        const line = formatLogLine(entry);
+        assert.ok(line.endsWith("\n"));
+        assert.equal(line.indexOf("\n"), line.length - 1);
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        assert.equal(parsed["kind"], kind);
+        assert.equal(parsed["message"], message);
+      }),
+      testOptions(),
+    );
+  });
+
+  it("redacts secrets and strips escapes in mutated Error.name and McpError.code", () => {
+    const secretToken = fc.stringMatching(/^[A-Za-z0-9_-]{12,32}$/);
+    const ansiNoise = fc.constantFrom("\x1b[31m", "\x1b]0;title\x07", "\r\n", "\x00");
+
+    fc.assert(
+      fc.property(secretToken, ansiNoise, fc.boolean(), (secret, noise, useMcpError) => {
+        const carrier = `Bearer ${secret}${noise}Suffix`;
+        const err = useMcpError
+          ? Object.assign(new McpError(`token=${secret}`, "srv", "auth"), { code: carrier })
+          : Object.assign(new Error(`token=${secret}`), { name: carrier });
+
+        const { kind, message } = describeError(err);
+        assert.equal(kind.includes(secret), false, `Secret leaked in kind: ${kind}`);
+        assert.equal(message.includes(secret), false, `Secret leaked in message: ${message}`);
+        assert.ok(kind.includes("[REDACTED]"));
+        assert.ok(message.includes("[REDACTED]"));
+        assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(kind));
+        assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(message));
+      }),
+      testOptions(),
+    );
+  });
+});
+

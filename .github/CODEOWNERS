@@ -37,6 +37,7 @@
 /src/auth-challenge.ts @irahardianto
 /src/startup-auth.ts @irahardianto
 /src/connect-policy.ts @irahardianto
+/src/errors.ts @irahardianto
 
 # Loopback OAuth callback listener and URL validation
 /src/callback-*.ts @irahardianto

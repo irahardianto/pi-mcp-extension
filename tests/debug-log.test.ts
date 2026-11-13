@@ -511,6 +511,69 @@ describe("debug log", () => {
       assert.equal(describedHostile.kind, "Error");
       assert.ok(describedHostile.message.length > 0);
     });
+
+    it("coerces non-string error kinds, sanitizes names, and tolerates revoked proxies", () => {
+      const names: unknown[] = [Object.create(null), 123, "", undefined, null, "   ", "\u001b[31m\r\n"];
+      for (const name of names) {
+        const err = Object.assign(new Error("boom"), { name });
+        const described = describeError(err);
+        assert.equal(typeof described.kind, "string");
+        assert.equal(typeof described.message, "string");
+        assert.equal(described.kind, name === 123 ? "123" : "error");
+      }
+
+      const hostile = new Error("boom");
+      Object.defineProperty(hostile, "name", {
+        get() { throw Object.create(null); },
+      });
+      assert.equal(describeError(hostile).kind, "error");
+
+      const escaped = new Error("boom");
+      escaped.name = "Bearer sk-secret-token\u001b[31m\n";
+      const described = describeError(escaped);
+      assert.equal(described.kind, "Bearer [REDACTED]");
+      assert.equal(described.kind.includes("sk-secret-token"), false);
+      assert.equal(described.kind.includes("\u001b"), false);
+      assert.equal(described.kind.includes("\n"), false);
+
+      for (const code of [123, Object.create(null), "", undefined, null, "\u001b[31m\n"] as unknown[]) {
+        const mcp = Object.assign(new McpError("boom", "github", "auth"), { code });
+        assert.equal(describeError(mcp).kind, code === 123 ? "123" : "error");
+      }
+
+      const { proxy, revoke } = Proxy.revocable(new Error("boom"), {});
+      revoke();
+      assert.deepEqual(describeError(proxy), {
+        kind: "unknown",
+        message: "[unreadable error]",
+      });
+    });
+
+    it("writes valid JSONL diagnostics for an Error with an uncoercible name", async () => {
+      const fake = new FakeFs();
+      const logger = makeLogger(fake);
+      setDebugLog(logger);
+      setDiagnosticUi({ notify: () => {} }, true);
+      try {
+        const err = Object.assign(new Error("boom"), { name: Object.create(null) });
+        const { kind } = describeError(err);
+        assert.doesNotThrow(() => reportDiagnostic({
+          level: "info",
+          event: "transport.onerror_error",
+          message: "test",
+          fields: { kind },
+        }));
+        await logger.flush();
+        const raw = fake.files.get(join("/logs", DEBUG_LOG_FILE_NAME))?.content;
+        assert.ok(raw);
+        const entry = JSON.parse(raw.trim()) as { kind: string; message: string };
+        assert.equal(entry.kind, "error");
+        assert.equal(entry.message, "test");
+      } finally {
+        setDebugLog(null);
+        setDiagnosticUi(null, false);
+      }
+    });
   });
 
   describe("buildLogEntry / formatLogLine", () => {
