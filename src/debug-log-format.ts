@@ -112,21 +112,36 @@ function safeErrorText(read: () => string, fallback: string): string {
   }
 }
 
+function sanitizedErrorKind(read: () => string): string {
+  const kind = sanitizeLogText(safeErrorText(read, "error"), DEBUG_LOG_MAX_SERVER_LENGTH).trim();
+  return kind || "error";
+}
+
 /**
  * Describe an error for a log field: a stable kind plus a sanitized message.
  * Never logs the raw error object (it may carry tokens in its properties).
  */
 export function describeError(err: unknown): { kind: string; message: string } {
-  if (err instanceof McpError) {
+  let classification: "mcp" | "error" | "unknown" = "unknown";
+  try {
+    // WHY: A revoked Proxy can throw even during instanceof classification.
+    if (err instanceof McpError) classification = "mcp";
+    else if (err instanceof Error) classification = "error";
+  } catch {
+    return { kind: "unknown", message: "[unreadable error]" };
+  }
+  if (classification === "mcp") {
+    const error = err as McpError;
     return {
-      kind: err.code,
-      message: sanitizeLogText(safeErrorText(() => String(err.message), "[unreadable error message]")),
+      kind: sanitizedErrorKind(() => String(error.code || "error")),
+      message: sanitizeLogText(safeErrorText(() => String(error.message), "[unreadable error message]")),
     };
   }
-  if (err instanceof Error) {
+  if (classification === "error") {
+    const error = err as Error;
     return {
-      kind: safeErrorText(() => err.name || "error", "error"),
-      message: sanitizeLogText(safeErrorText(() => String(err.message), "[unreadable error message]")),
+      kind: sanitizedErrorKind(() => String(error.name || "error")),
+      message: sanitizeLogText(safeErrorText(() => String(error.message), "[unreadable error message]")),
     };
   }
   return {
