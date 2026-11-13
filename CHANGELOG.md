@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.15.2] - 2026-11-13
+
 ### Fixed
 - Coerce, sanitize, and bound diagnostic error kinds, including hostile or non-string `Error.name` values and revoked proxies (#305).
 
