@@ -107,6 +107,10 @@ export class ConnectionCoordinator {
     this.activeCtx = ctx;
   }
 
+  getActiveContext(): ExtensionContext | undefined {
+    return this.activeCtx;
+  }
+
   hasConnectAttempt(serverName: string): boolean {
     return this.connectAttempts.has(serverName);
   }

@@ -29,6 +29,7 @@ import { authorize as runAuthorize } from "./authorize-flow.js";
 import {
   DebugLog,
   isDebugLogEnabled,
+  reportDiagnostic,
   setDebugLog,
 } from "./debug-log.js";
 
@@ -50,7 +51,11 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
 
   // ── 2. Initialize bridge components ──────────────────────────────────────
   const manager = new ServerManager(initialState.config, paths.authStorageDir);
-  const bridge = new ToolBridge(initialState.config.settings, pi);
+  const bridge = new ToolBridge(
+    initialState.config.settings,
+    pi,
+    initialState.config.autoEnableCodemode,
+  );
   const resources = new ResourceBridge();
   const callbackServer = paths.callbackServer ?? new CallbackServer();
   const coordinator: ConnectionCoordinator = new ConnectionCoordinator({
@@ -88,6 +93,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         requestTimeoutMs,
         exposure: server?.config.exposure,
         toolExposure: server?.config.toolExposure,
+        description: server?.config.description,
       },
     );
   });
@@ -119,12 +125,29 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
   };
   bridge.setAuthErrorCallback(handleAuthError);
+  let warnedUnreachable = false;
+  bridge.setDiscoveryWarningCallback((warning) => {
+    if (warnedUnreachable) return;
+    warnedUnreachable = true;
+    reportDiagnostic({
+      level: "info",
+      event: "tools.discovery_unreachable",
+      message: warning,
+    });
+    const ctx = coordinator.getActiveContext();
+    if (ctx?.hasUI) {
+      ctx.ui.notify(`pi-mcp: ${warning}`, "warning");
+    }
+  });
   // WHY: a resources/* request can be the first call to hit an expired token, so it needs
   // the same re-authorization path as tools/call.
   resources.setAuthErrorCallback(handleAuthError);
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
-  pi.on("session_start", (_event, ctx: ExtensionContext) => lifecycle.handleSessionStart(ctx));
+  pi.on("session_start", (_event, ctx: ExtensionContext) => {
+    warnedUnreachable = false;
+    return lifecycle.handleSessionStart(ctx);
+  });
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
   pi.on("mcp_servers_change", (event, ctx: ExtensionContext) =>
     lifecycle.handleServersChange(event, ctx),

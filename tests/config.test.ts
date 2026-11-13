@@ -1104,6 +1104,45 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
     });
   });
 
+  it("parses and merges top-level autoEnableCodemode and per-server description", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        autoEnableCodemode: true,
+        mcpServers: {
+          docs: { command: "node", description: "Global docs server" },
+        },
+      });
+      assert.equal((await loadBoth(dir)).config.autoEnableCodemode, true);
+      assert.equal((await loadBoth(dir)).config.mcpServers["docs"]?.description, "Global docs server");
+
+      await writeMcpJson(dir, { autoEnableCodemode: false });
+      assert.equal(
+        (await loadBoth(dir)).config.autoEnableCodemode,
+        false,
+        "project autoEnableCodemode must override global",
+      );
+
+      await writeGlobalConfig(dir, { autoEnableCodemode: "nope" });
+      await assert.rejects(() => loadBoth(dir), expectConfigError("autoEnableCodemode"));
+
+      await writeGlobalConfig(dir, { mcpServers: { docs: { command: "node", description: 42 } } });
+      await assert.rejects(() => loadBoth(dir), expectConfigError("mcpServers.docs.description"));
+    });
+  });
+
+  it("parses exposure, toolExposure, codemode-deferred alias, and description in parseRegisteredServerConfig", () => {
+    const parsed = parseRegisteredServerConfig("ext-docs", {
+      url: "https://mcp.example.com/mcp",
+      description: "Extension docs",
+      exposure: "codemode-deferred",
+      toolExposure: { ping: "direct" },
+    });
+    assert.equal(parsed.lifecycle, "eager");
+    assert.equal(parsed.description, "Extension docs");
+    assert.equal(parsed.exposure, "codemode");
+    assert.deepEqual(parsed.toolExposure, { ping: "direct" });
+  });
+
   it("rejects a project override for a server no config defines, even when non-override keys are present", async () => {
     await withTempDir(async (dir) => {
       await writeGlobalConfig(dir, { mcpServers: { known: { command: "node" } } });

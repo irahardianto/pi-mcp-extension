@@ -763,3 +763,130 @@ it("wires session_tree, input, before_agent_start, tool_execution_end, and befor
   }
 });
 
+it("extension lifecycle activates reaching discovery tools, warns once when unreachable, and hides stopped/removed server tools (#257)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-exposure-e2e-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const notifications: Array<{ message: string; level: string | undefined }> = [];
+  const noopExecute = async () => ({ content: [{ type: "text", text: "ok" }] as [{ type: "text"; text: string }] });
+  const mockExt = createMockExtension({
+    activeTools: ["read"],
+    tools: [
+      { name: "read", description: "Read", execute: noopExecute },
+      { name: "codemode", description: "Codemode", reachesTools: true, execute: noopExecute },
+      { name: "tool_search", description: "Search", reachesTools: true, execute: noopExecute },
+    ],
+  });
+  const ctx = createMockContext({
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => {
+        notifications.push({ message, level });
+      },
+    },
+  });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          mock: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            env: {
+              MOCK_INSTRUCTIONS: "Prefer search_docs before fetch_doc; cite URIs.",
+            },
+            lifecycle: "eager",
+            description: "Mock reference server",
+            exposure: "codemode",
+            toolExposure: { echo: "direct", add: "deferred" },
+          },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "absent-global.json"),
+    });
+    await mockExt.events.get("session_start")({}, ctx);
+
+    // Both codemode and tool_search are auto-activated in deterministic order, and only echo is direct
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search", "mcp_mock_echo"]);
+    const addTool = mockExt.tools.get("mcp_mock_add");
+    const echoTool = mockExt.tools.get("mcp_mock_echo");
+    assert.equal(addTool.exposure, "deferred");
+    assert.equal(echoTool.exposure, "direct");
+    assert.deepEqual(addTool.namespace, {
+      name: "mcp_mock",
+      aliases: ["mock", "mcp__mock"],
+      description: "Mock reference server",
+      instructions: "Prefer search_docs before fetch_doc; cite URIs.",
+    });
+
+    // Simulate tool_search loading `add` while a policy deactivates `echo` -> /mcp mock surfaces masked state
+    mockExt.activeTools = ["read", "codemode", "tool_search", "mcp_mock_add"];
+    notifications.length = 0;
+    await mockExt.commands.get("mcp").handler("mock", ctx);
+    assert.match(
+      notifications.at(-1)?.message ?? "",
+      /^Tools: 1\/6 active \(1 configured direct, 1 direct inactive\)$/m,
+    );
+
+    // /mcp:stop hides every registered tool of the stopped server
+    await mockExt.commands.get("mcp:stop").handler("mock", ctx);
+    assert.equal(mockExt.tools.get("mcp_mock_echo").exposure, "hidden");
+    assert.equal(mockExt.tools.get("mcp_mock_add").exposure, "hidden");
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+
+    // Reloading with autoEnableCodemode: false and neither discovery tool active warns once per session
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        autoEnableCodemode: false,
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          mock: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "eager",
+            exposure: "codemode",
+          },
+        },
+      }),
+    );
+    mockExt.activeTools = ["read"];
+    notifications.length = 0;
+    await mockExt.events.get("session_start")({}, ctx);
+    const warnings = notifications.filter((n) => n.level === "warning");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!.message, /\(autoEnableCodemode is false\)/);
+
+    // Dynamic extension server registration and removal also hides unregistered tools
+    const extEntry = {
+      name: "dyn",
+      config: {
+        command: "node",
+        args: ["--import", tsxEsmLoader, mock],
+        exposure: "deferred",
+      },
+      extensionPath: "/ext/dyn.ts",
+    } as never;
+    mockExt.mcpServers.push(extEntry);
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    assert.ok(mockExt.activeTools.includes("tool_search"));
+    assert.equal(mockExt.tools.get("mcp_dyn_echo").exposure, "deferred");
+
+    mockExt.mcpServers.length = 0;
+    await mockExt.events.get("mcp_servers_change")({ servers: [] }, ctx);
+    assert.equal(mockExt.tools.get("mcp_dyn_echo").exposure, "hidden");
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+

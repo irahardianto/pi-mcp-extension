@@ -88,13 +88,16 @@
     // overrides it per raw MCP tool name ("*" matches any characters, an exact
     // name wins, then the first matching pattern in declaration order).
     // Omitted exposure means "direct" here — every discovered tool is active.
-    // Other values: "deferred" (inactive until Pi's tool_search loads it),
-    // "codemode" (callable from codemode scripts only), and "hidden" (registered
-    // but never exposed to the model).
+    // Other values: "deferred" (inactive until Pi's tool_search loads it, auto-
+    // activating tool_search), "codemode" (callable from codemode scripts via
+    // searchTools() and loadable by tool_search, auto-activating codemode unless
+    // top-level "autoEnableCodemode": false is set), and "hidden" (registered
+    // inactive and never exposed to the model, tool_search, or codemode).
 
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
+      "description": "GitHub repository and pull-request read tools",
       "exposure": "hidden",
       "toolExposure": {
         "get_*": "direct",

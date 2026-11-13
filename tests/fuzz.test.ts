@@ -2418,7 +2418,26 @@ describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct"
         for (const [piName, tool] of registered) {
           const rawName = toolNames.find((name) => buildToolName("mcp", "alpha", name) === piName);
           assert.ok(rawName, `${piName} must map back to a raw tool name`);
-          assert.equal(tool.exposure, expectedExposure(rawName, serverExposure, entries));
+          const resolved = expectedExposure(rawName, serverExposure, entries);
+          assert.equal(tool.exposure, resolved === "codemode" ? "deferred" : resolved);
+          assert.equal(tool.namespace?.name, "mcp_alpha");
+        }
+
+        // Disconnecting hides every registered tool from tool_search / codemode, and reconnecting
+        // restores each tool's resolved Pi exposure and active set.
+        bridge.deactivateServer("alpha");
+        assert.deepEqual(active, []);
+        for (const tool of registered.values()) {
+          assert.equal(tool.exposure, "hidden");
+          assert.equal(tool.defaultActive, false);
+        }
+
+        await bridge.refreshTools("alpha", client, config);
+        assert.deepEqual([...active].sort(), expectedActive);
+        for (const [piName, tool] of registered) {
+          const rawName = toolNames.find((name) => buildToolName("mcp", "alpha", name) === piName)!;
+          const resolved = expectedExposure(rawName, serverExposure, entries);
+          assert.equal(tool.exposure, resolved === "codemode" ? "deferred" : resolved);
         }
       }),
       testOptions(),

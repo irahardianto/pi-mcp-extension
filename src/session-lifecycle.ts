@@ -35,6 +35,7 @@ import {
   reportDiagnostic,
   setDiagnosticUi,
 } from "./debug-log.js";
+import { collectConfiguredExposures } from "./tool-exposure.js";
 
 export const DEFAULT_SETTINGS = {
   toolPrefix: "mcp",
@@ -121,6 +122,9 @@ export function mergeWithRegisteredServers(
       ...registeredServers,
       ...fileConfig.mcpServers,
     },
+    ...(fileConfig.autoEnableCodemode === undefined
+      ? {}
+      : { autoEnableCodemode: fileConfig.autoEnableCodemode }),
   };
 }
 
@@ -437,6 +441,9 @@ export class SessionLifecycle {
         );
       }
       if (this.inFlightEagerBatch.length > 0) {
+        this.deps.bridge.ensureDiscoveryTools(
+          collectConfiguredExposures(this.inFlightEagerBatch.map(([, cfg]) => cfg)),
+        );
         await this.deps.coordinator.startEagerServers(this.inFlightEagerBatch, ctx);
       }
     } finally {
@@ -503,6 +510,7 @@ export class SessionLifecycle {
       nextConfig,
     );
     this.deps.bridge.updateSettings(nextConfig.settings);
+    this.deps.bridge.setAutoEnableCodemode(nextConfig.autoEnableCodemode);
     this.deps.manager.rebuildServers(nextConfig);
     return Object.keys(nextExtensionServers).length > 0
       ? filterEagerServers(nextConfig.mcpServers)
@@ -538,6 +546,7 @@ export class SessionLifecycle {
       nextExtensionServers,
       rebuild ? sessionConfig : this.config,
     );
+    this.deps.bridge.setAutoEnableCodemode(sessionConfig.autoEnableCodemode);
     if (rebuild) {
       this.deps.bridge.updateSettings(sessionConfig.settings);
       this.deps.manager.rebuildServers(sessionConfig);

@@ -5,10 +5,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  CODEMODE_TOOL_NAME,
   DEFAULT_EXPOSURE,
   MCP_EXPOSURES,
+  TOOL_SEARCH_TOOL_NAME,
+  buildServerToolNamespace,
+  collectConfiguredExposures,
+  mergeRawToolExposures,
   normalizeExposureAlias,
+  reconcileLiveRefreshState,
+  resolveDiscoveryActivation,
   resolveToolExposure,
+  shouldActivateLiveTool,
+  toPiToolExposure,
 } from "../src/tool-exposure.js";
 
 describe("resolveToolExposure", () => {
@@ -90,7 +99,7 @@ describe("resolveToolExposure", () => {
   });
 });
 
-describe("normalizeExposureAlias", () => {
+describe("normalizeExposureAlias & toPiToolExposure", () => {
   it("maps Pi's retired codemode-deferred alias onto codemode", () => {
     assert.equal(normalizeExposureAlias("codemode-deferred"), "codemode");
     for (const exposure of MCP_EXPOSURES) {
@@ -104,4 +113,188 @@ describe("normalizeExposureAlias", () => {
     assert.equal(normalizeExposureAlias("bogus"), "bogus");
     assert.equal(normalizeExposureAlias("constructor"), "constructor");
   });
+
+  it("maps MCP codemode onto Pi deferred so codemode descriptions stay out of the prompt (#257)", () => {
+    assert.equal(toPiToolExposure("codemode"), "deferred");
+    assert.equal(toPiToolExposure("deferred"), "deferred");
+    assert.equal(toPiToolExposure("direct"), "direct");
+    assert.equal(toPiToolExposure("hidden"), "hidden");
+  });
 });
+
+describe("shouldActivateLiveTool & reconcileLiveRefreshState", () => {
+  it("enforces hidden, activates new direct tools, honors live exposure crossings, and preserves state otherwise", () => {
+    for (const prevActive of [undefined, true, false]) {
+      for (const prevExposure of [undefined, "direct", "deferred", "codemode", "hidden"] as const) {
+        assert.equal(shouldActivateLiveTool(prevActive, prevExposure, "hidden"), false);
+      }
+    }
+    assert.equal(shouldActivateLiveTool(undefined, undefined, "direct"), true);
+    assert.equal(shouldActivateLiveTool(undefined, undefined, "deferred"), false);
+    assert.equal(shouldActivateLiveTool(undefined, undefined, "codemode"), false);
+
+    // Live narrowing/widening across direct <-> indirect
+    assert.equal(shouldActivateLiveTool(true, "direct", "deferred"), false);
+    assert.equal(shouldActivateLiveTool(true, "direct", "codemode"), false);
+    assert.equal(shouldActivateLiveTool(false, "deferred", "direct"), true);
+    assert.equal(shouldActivateLiveTool(false, "codemode", "direct"), true);
+
+    // Unchanged direct (#214) and indirect-to-indirect (#257) preserve Pi's active state
+    assert.equal(shouldActivateLiveTool(false, "direct", "direct"), false);
+    assert.equal(shouldActivateLiveTool(true, "direct", "direct"), true);
+    assert.equal(shouldActivateLiveTool(true, "deferred", "codemode"), true);
+    assert.equal(shouldActivateLiveTool(false, "codemode", "deferred"), false);
+  });
+
+  it("tracks dropped tools, restores or updates them on re-advertisement, and prunes stale exposures", () => {
+    const step1 = reconcileLiveRefreshState({
+      currentRawNames: new Map([["mcp_s_keep", "keep"]]),
+      currentExposures: new Map([["keep", "direct"]]),
+      previousStateByRawName: new Map([
+        ["keep", true],
+        ["dropped_loaded", true],
+      ]),
+      previousExposures: new Map([
+        ["keep", "direct"],
+        ["dropped_loaded", "deferred"],
+      ]),
+      previousDropped: undefined,
+    });
+    assert.deepEqual([...step1.desiredActive], ["mcp_s_keep"]);
+    assert.deepEqual([...(step1.dropped ?? [])], [["dropped_loaded", true]]);
+
+    const exposuresAfterStep1 = mergeRawToolExposures(
+      new Map([
+        ["keep", "direct"],
+        ["dropped_loaded", "deferred"],
+        ["stale_forgotten", "codemode"],
+      ]),
+      new Map([["keep", "direct"]]),
+      step1.dropped,
+    );
+    assert.deepEqual(
+      [...exposuresAfterStep1],
+      [
+        ["keep", "direct"],
+        ["dropped_loaded", "deferred"],
+      ],
+    );
+
+    const step2 = reconcileLiveRefreshState({
+      currentRawNames: new Map([
+        ["mcp_s_keep", "keep"],
+        ["mcp_s_dropped_loaded", "dropped_loaded"],
+      ]),
+      currentExposures: new Map([
+        ["keep", "deferred"],
+        ["dropped_loaded", "deferred"],
+      ]),
+      previousStateByRawName: new Map([["keep", true]]),
+      previousExposures: exposuresAfterStep1,
+      previousDropped: step1.dropped,
+    });
+    assert.deepEqual(
+      [...step2.desiredActive],
+      ["mcp_s_dropped_loaded"],
+      "narrowed keep becomes inactive while re-advertised deferred tool restores loaded state",
+    );
+    assert.equal(step2.dropped, undefined);
+  });
+});
+
+describe("buildServerToolNamespace", () => {
+  it("builds namespace aliases, sanitizes escapes before redacting secrets, and bounds field lengths", () => {
+    const ns = buildServerToolNamespace({
+      prefix: "mcp",
+      serverName: "my-docs",
+      description: `  Docs \u001b[31mapi_key\u001b[0m=sk-secret-123456 ${"x".repeat(300)}  `,
+      instructions: `Use search first; Authorization: Bearer super-secret-token ${"y".repeat(600)}`,
+    });
+    assert.equal(ns.name, "mcp_my_docs");
+    assert.deepEqual(ns.aliases, ["my-docs", "mcp__my_docs"]);
+    assert.ok(ns.description);
+    assert.ok(!ns.description.includes("sk-secret-123456"));
+    assert.ok(!ns.description.includes("\u001b"));
+    assert.ok(ns.description.includes("[REDACTED]"));
+    assert.ok(ns.description.length <= 250);
+    assert.ok(ns.instructions);
+    assert.ok(!ns.instructions.includes("super-secret-token"));
+    assert.ok(ns.instructions.length <= 500);
+  });
+
+  it("omits empty metadata and deduplicates aliases that equal the primary namespace name", () => {
+    const ns = buildServerToolNamespace({
+      prefix: "mcp_",
+      serverName: "mcp__plain",
+      description: "   \u001b[0m  ",
+      instructions: undefined,
+    });
+    assert.equal(ns.name, "mcp__mcp__plain");
+    assert.equal("description" in ns, false);
+    assert.equal("instructions" in ns, false);
+  });
+});
+
+describe("collectConfiguredExposures & resolveDiscoveryActivation", () => {
+  const reachingCodemode = { name: CODEMODE_TOOL_NAME, reachesTools: true };
+  const reachingToolSearch = { name: TOOL_SEARCH_TOOL_NAME, reachesTools: true };
+
+  it("collects default and overridden exposures across server configs", () => {
+    const exposures = collectConfiguredExposures([
+      {},
+      { exposure: "hidden", toolExposure: { search: "deferred", run: "codemode" } },
+    ]);
+    assert.deepEqual([...exposures].sort(), ["codemode", "deferred", "direct", "hidden"]);
+  });
+
+  it("activates codemode and tool_search in deterministic order and ignores non-reaching impostors", () => {
+    assert.deepEqual(
+      resolveDiscoveryActivation({
+        exposures: ["direct", "hidden"],
+        allTools: [reachingCodemode, reachingToolSearch],
+        activeTools: [],
+      }),
+      { activate: [] },
+    );
+
+    const both = resolveDiscoveryActivation({
+      exposures: ["deferred", "codemode"],
+      allTools: [reachingToolSearch, reachingCodemode],
+      activeTools: ["read"],
+    });
+    assert.deepEqual(both, { activate: ["codemode", "tool_search"] });
+
+    // An extension tool named `codemode` or `tool_search` without `reachesTools` must never activate
+    const impostor = resolveDiscoveryActivation({
+      exposures: ["codemode", "deferred"],
+      allTools: [
+        { name: CODEMODE_TOOL_NAME, reachesTools: false },
+        { name: TOOL_SEARCH_TOOL_NAME },
+      ],
+      activeTools: ["read"],
+    });
+    assert.deepEqual(impostor.activate, []);
+    assert.match(impostor.unreachableWarning ?? "", /neither is active;/);
+  });
+
+  it("honors autoEnableCodemode: false, warning only when neither reaching tool is active", () => {
+    const blocked = resolveDiscoveryActivation({
+      exposures: ["codemode"],
+      allTools: [reachingCodemode, reachingToolSearch],
+      activeTools: ["read"],
+      autoEnableCodemode: false,
+    });
+    assert.deepEqual(blocked.activate, []);
+    assert.match(blocked.unreachableWarning ?? "", /\(autoEnableCodemode is false\)/);
+
+    const savedByToolSearch = resolveDiscoveryActivation({
+      exposures: ["codemode"],
+      allTools: [reachingCodemode, reachingToolSearch],
+      activeTools: ["read", TOOL_SEARCH_TOOL_NAME],
+      autoEnableCodemode: false,
+    });
+    assert.equal(savedByToolSearch.unreachableWarning, undefined);
+    assert.deepEqual(savedByToolSearch, { activate: [] });
+  });
+});
+

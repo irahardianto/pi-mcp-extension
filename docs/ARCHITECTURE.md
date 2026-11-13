@@ -70,12 +70,17 @@ flowchart TD
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
-  server connects and disconnects. Each tool is registered with the exposure resolved from
-  the server entry's `exposure` / `toolExposure` (exact raw-name key, then the first `*`
-  pattern in declaration order, then the server default `direct`), and only `direct` tools
-  enter the active set — `deferred` / `codemode` stay registered and inactive for Pi's
-  `tool_search` or codemode to load, `hidden` ones are registered but never exposed, and a
-  reconnect after a stop re-derives the set from exposure alone (#257). Each reconcile
+  server connects and disconnects. Each tool's exposure is resolved from the server entry's
+  `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact raw-name key, then the first `*`
+  pattern in declaration order, then the server default `direct`) and attached to a sanitized
+  per-server `ToolNamespace` (`description` + MCP handshake `instructions`). Only `direct`
+  tools enter the active set; `deferred` and `codemode` both register on Pi as `deferred` so
+  `codemode`'s own tool description never mutates mid-session with inlined MCP schemas, while
+  reaching `codemode` (when `autoEnableCodemode !== false`) and `tool_search` tools are
+  automatically activated ahead of eager server starts and on tool refreshes (`ensureDiscoveryTools()`).
+  `hidden` tools are registered inactive and never exposed, stopping/removing/withdrawing a
+  tool re-registers it as `hidden` and guards `execute` against stale calls, and a reconnect
+  after a stop re-derives the set from exposure alone (#257). Each reconcile
   writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
   tool left at its position; `orderActiveTools()` re-applies that order without re-activating
@@ -145,12 +150,12 @@ what to do:
 While `ready`, three independent recovery paths exist:
 
 - `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-registers the
-  server's tools, deactivates ones the server no longer advertises (remembering whether Pi
-  had each active), and activates only tools the server did not expose before whose
-  exposure is `direct` — the
-  active/inactive state of tools Pi already knew about is left alone, because another
-  extension or a user policy may have removed them, and a tool that reappears is restored to
-  the state it left in;
+  server's current tools, hides and deactivates tools the server no longer advertises
+  (remembering whether Pi had each active), activates newly discovered `direct` tools and
+  existing tools promoted into `direct`, deactivates tools narrowed out of `direct` or set
+  `hidden`, and preserves the active/inactive state of tools whose exposure class did not
+  cross `direct` (such as policies that deactivated a `direct` tool or `tool_search` loading
+  a `deferred` tool), restoring a re-advertised tool when compatible with its current exposure;
   `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,

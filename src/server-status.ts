@@ -42,6 +42,8 @@ export interface ServerStatusSnapshot {
   recentOutput: string;
   /** Sanitized initialize-handshake guidance, only while the server is ready. */
   instructions?: string | undefined;
+  /** Configured `direct` tools currently absent from Pi's active set while ready. */
+  inactiveDirectTools?: number | undefined;
 }
 
 export interface ServerStatusRow {
@@ -60,6 +62,8 @@ export interface CollectServerStatusParams {
   tools: ToolActivity;
   source: ServerConfigSource | undefined;
   recentOutput?: string | undefined;
+  /** Configured `direct` tools absent from Pi's active set while ready. */
+  inactiveDirectTools?: number | undefined;
   /** Reads stored OAuth state for a server; injected so tests avoid disk I/O. */
   readAuthStatus: (serverName: string) => Promise<StoredAuthStatus | null>;
 }
@@ -119,16 +123,22 @@ function isDefined(value: string | undefined): value is string {
 /**
  * `(N configured direct)` suffix for the `Tools:` line when exposure keeps some tools out of
  * the active set by design — without it a server configured with `exposure: "hidden"` and a
- * few overridden tools renders `3/12 active` and reads as a broken server (#257).
+ * few overridden tools renders `3/12 active` and reads as a broken server (#257). When a
+ * loaded deferred tool masks an inactive direct tool (`2/3 active (2 configured direct)`),
+ * also state how many configured `direct` tools are currently inactive.
  */
-function formatExposureNote(tools: ToolActivity): string {
+function formatExposureNote(tools: ToolActivity, inactiveDirectTools = 0): string {
   if (tools.expected === tools.discovered) return "";
+  if (inactiveDirectTools > 0) {
+    return ` (${tools.expected} configured direct, ${inactiveDirectTools} direct inactive)`;
+  }
   return ` (${tools.expected} configured direct)`;
 }
 
 /** `/mcp <name>` detail view: config provenance, tool counts, credentials, and next steps. */
 export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: ConfigProvenance): string {
   const instructions = sanitizeServerInstructions(snapshot.instructions);
+  const exposureNote = formatExposureNote(snapshot.tools, snapshot.inactiveDirectTools);
   const lines: Array<string | undefined> = [
     `Server: ${sanitizeTerminalText(snapshot.name)}`,
     `State:  ${snapshot.state}`,
@@ -136,7 +146,7 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
     `Transport: ${snapshot.transport}`,
     `Lifecycle: ${snapshot.lifecycle}`,
     `Source: ${formatServerSource(snapshot.source)}`,
-    `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active${formatExposureNote(snapshot.tools)}`,
+    `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active${exposureNote}`,
     instructions === undefined ? undefined : `Instructions: ${instructions}`,
     snapshot.auth === undefined ? undefined : `OAuth: ${snapshot.auth}`,
     formatProjectConfigNote(provenance),
@@ -221,5 +231,6 @@ export async function collectServerStatus(params: CollectServerStatusParams): Pr
     lastError: server.lastError,
     recentOutput: params.recentOutput ?? "",
     ...(instructions === undefined ? {} : { instructions }),
+    ...(params.inactiveDirectTools ? { inactiveDirectTools: params.inactiveDirectTools } : {}),
   };
 }

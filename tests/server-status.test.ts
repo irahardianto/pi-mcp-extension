@@ -219,6 +219,18 @@ describe("formatServerDetail", () => {
     );
 
     assert.match(detail, /^Tools: 3\/24 active \(3 configured direct\)$/m);
+
+    const masked = formatServerDetail(
+      snapshot({
+        state: "ready",
+        tools: { discovered: 3, active: 2, expected: 2 },
+        inactiveDirectTools: 1,
+        recentOutput: "listening",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+
+    assert.match(masked, /^Tools: 2\/3 active \(2 configured direct, 1 direct inactive\)$/m);
   });
 
   it("adds OAuth, last error, hint, and the skipped-project note for a failed untrusted server", () => {
