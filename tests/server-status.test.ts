@@ -73,7 +73,7 @@ function snapshot(overrides: Partial<ServerStatusSnapshot> = {}): ServerStatusSn
     lifecycle: "lazy",
     retryCount: 0,
     source: "global",
-    tools: { discovered: 0, active: 0 },
+    tools: { discovered: 0, active: 0, expected: 0 },
     auth: undefined,
     lastError: null,
     recentOutput: "(no stderr output from srv)",
@@ -188,7 +188,7 @@ describe("formatServerDetail", () => {
         transport: "streamable-http",
         lifecycle: "eager",
         source: "project",
-        tools: { discovered: 4, active: 3 },
+        tools: { discovered: 4, active: 3, expected: 4 },
         recentOutput: "listening",
       }),
       withExtensionServers(provenanceInput(), []),
@@ -208,13 +208,26 @@ describe("formatServerDetail", () => {
     assert.doesNotMatch(detail, /^Hint:/m);
   });
 
+  it("names the configured direct tools when exposure keeps the rest out of the active set", () => {
+    const detail = formatServerDetail(
+      snapshot({
+        state: "ready",
+        tools: { discovered: 24, active: 3, expected: 3 },
+        recentOutput: "listening",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+
+    assert.match(detail, /^Tools: 3\/24 active \(3 configured direct\)$/m);
+  });
+
   it("adds OAuth, last error, hint, and the skipped-project note for a failed untrusted server", () => {
     const detail = formatServerDetail(
       snapshot({
         state: "stopped",
         retryCount: 5,
         source: "global",
-        tools: { discovered: 2, active: 0 },
+        tools: { discovered: 2, active: 0, expected: 2 },
         auth: "credentials stored",
         lastError: new McpError("Connection timed out after 30000ms", "srv", "timeout"),
         recentOutput: "(no stderr output from srv)",
@@ -235,7 +248,7 @@ describe("collectServerStatus", () => {
     client.getInstructions = () => raw;
     return collectServerStatus({
       server: managedServer({ state, client }),
-      tools: { discovered: 1, active: 1 },
+      tools: { discovered: 1, active: 1, expected: 1 },
       source: "global",
       readAuthStatus: async () => null,
     });
@@ -303,7 +316,7 @@ describe("collectServerStatus", () => {
     let probes = 0;
     const status = await collectServerStatus({
       server: managedServer(),
-      tools: { discovered: 1, active: 1 },
+      tools: { discovered: 1, active: 1, expected: 1 },
       source: "extension",
       recentOutput: "out",
       readAuthStatus: async () => {
@@ -326,14 +339,14 @@ describe("collectServerStatus", () => {
     });
     const withTokens = await collectServerStatus({
       server,
-      tools: { discovered: 0, active: 0 },
+      tools: { discovered: 0, active: 0, expected: 0 },
       source: "global",
       recentOutput: "",
       readAuthStatus: async () => ({ hasTokens: true }),
     });
     const withoutState = await collectServerStatus({
       server,
-      tools: { discovered: 0, active: 0 },
+      tools: { discovered: 0, active: 0, expected: 0 },
       source: "global",
       readAuthStatus: async () => null,
     });
@@ -351,7 +364,7 @@ describe("collectServerStatus", () => {
 
     const status = await withoutStderr(() => collectServerStatus({
       server,
-      tools: { discovered: 0, active: 0 },
+      tools: { discovered: 0, active: 0, expected: 0 },
       source: "project",
       recentOutput: "",
       readAuthStatus: async () => {
@@ -370,7 +383,7 @@ describe("toStatusRow", () => {
         name: "srv",
         lifecycle: "eager",
         state: "ready",
-        tools: { discovered: 3, active: 2 },
+        tools: { discovered: 3, active: 2, expected: 3 },
         lastError: null,
         source: "project",
       }),
@@ -380,7 +393,7 @@ describe("toStatusRow", () => {
       name: "srv",
       lifecycle: "eager",
       state: "ready",
-      tools: { discovered: 3, active: 2 },
+      tools: { discovered: 3, active: 2, expected: 3 },
       auth: "not configured",
       error: undefined,
       source: "project",

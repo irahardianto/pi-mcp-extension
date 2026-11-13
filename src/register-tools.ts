@@ -21,7 +21,7 @@ import {
   toStatusRow,
   type ServerStatusRow,
 } from "./server-status.js";
-import type { ToolBridge } from "./tool-bridge.js";
+import type { ToolActivity, ToolBridge } from "./tool-bridge.js";
 
 export interface ManagementToolDeps {
   manager: ServerManager;
@@ -85,6 +85,21 @@ export function formatMcpConnectError(err: unknown, options: McpConnectErrorOpti
   return formatMcpAuthError(err, options.hasUI) ?? formatMcpConnectFailureMessage(err);
 }
 
+/**
+ * Success text for `mcp_connect`. A server whose exposure keeps every tool out of the model
+ * never becomes active by design, so saying "tools discovered and active" there would read
+ * as a silent failure (#257).
+ */
+export function formatConnectSuccess(name: string, activity: ToolActivity): string {
+  if (activity.expected > 0) {
+    return `MCP server ${name} ready; tools discovered and active.`;
+  }
+  if (activity.discovered === 0) {
+    return `MCP server ${name} ready; it advertises no tools.`;
+  }
+  return `MCP server ${name} ready; all ${activity.discovered} tools are configured as deferred, codemode, or hidden.`;
+}
+
 export function registerManagementTools(
   pi: ExtensionAPI,
   deps: ManagementToolDeps,
@@ -124,11 +139,15 @@ export function registerManagementTools(
         throw new Error(message);
       }
       const activity = bridge.getToolActivity(name);
-      if (activity.active !== activity.discovered) {
-        throw new Error("MCP server connected, but some discovered tools are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered and active counts.");
+      // WHY: compare against the tools whose exposure is `direct`, not every discovered one.
+      // A server configured with `exposure: "hidden"` plus a few `toolExposure` overrides, or
+      // one whose tools are all deferred to `tool_search`, is working as configured — the old
+      // discovered-vs-active check reported it as a failure (#257).
+      if (activity.active < activity.expected) {
+        throw new Error("MCP server connected, but some tools configured as direct are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered, active, and expected counts.");
       }
       const instructions = getServerInstructions(manager.getServer(name));
-      const ready = `MCP server ${name} ready; tools discovered and active.`;
+      const ready = formatConnectSuccess(name, activity);
       const text = instructions === undefined ? ready : `${ready}\nInstructions: ${instructions}`;
       return { content: [{ type: "text", text }], details: {} };
     },

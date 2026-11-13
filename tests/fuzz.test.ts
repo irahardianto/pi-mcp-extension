@@ -58,6 +58,7 @@ import { parseResourceArguments } from "../src/commands.js";
 import { convertResourceContents } from "../src/resource-bridge.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
 import { sanitizeServerInstructions } from "../src/server-status.js";
+import { resolveToolExposure } from "../src/tool-exposure.js";
 import { EventEmitter } from "node:events";
 import {
   browserOpenCommand,
@@ -2307,4 +2308,76 @@ describe("fuzz: openBrowser & browserOpenCommand", () => {
   });
 });
 
+// ─── Suite 6c: ToolBridge exposure activation (#257) ─────────────────────────
 
+describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct", () => {
+  const exposures = ["codemode", "deferred", "direct", "hidden"] as const;
+
+  it("derives the active set from exposure alone, for any tool set and override map", async () => {
+    const toolNamesArb = fc.uniqueArray(fc.stringMatching(/^[a-z][a-z_]{1,7}$/), {
+      minLength: 1,
+      maxLength: 5,
+    });
+    const overridesArb = fc.uniqueArray(
+      fc.tuple(fc.stringMatching(/^[a-z][a-z_]{0,4}\*?$/), fc.constantFrom(...exposures)),
+      { selector: ([pattern]) => pattern, maxLength: 3 },
+    );
+
+    await fc.assert(
+      fc.asyncProperty(
+        toolNamesArb,
+        fc.option(fc.constantFrom(...exposures), { nil: undefined }),
+        overridesArb,
+        async (toolNames, serverExposure, overrideEntries) => {
+          const toolExposure = Object.fromEntries(overrideEntries);
+          const config = {
+            ...(serverExposure === undefined ? {} : { exposure: serverExposure }),
+            toolExposure,
+          };
+          const registered = new Map<string, ToolDefinition>();
+          let active: string[] = [];
+          const bridge = new ToolBridge(
+            { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+            {
+              registerTool: (t: unknown) => {
+                const tool = t as ToolDefinition;
+                registered.set(tool.name, tool);
+              },
+              getActiveTools: () => [...active],
+              setActiveTools: (names: string[]) => {
+                active = [...names];
+              },
+            },
+          );
+          const client = {
+            request: async () => ({
+              tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+            }),
+          } as unknown as Client;
+
+          await bridge.refreshTools("alpha", client, config);
+
+          const expectedActive = toolNames
+            .filter((name) => resolveToolExposure(config, name) === "direct")
+            .map((name) => buildToolName("mcp", "alpha", name))
+            .sort();
+          assert.deepEqual([...active].sort(), expectedActive);
+          assert.deepEqual(bridge.getToolActivity("alpha"), {
+            discovered: toolNames.length,
+            active: expectedActive.length,
+            expected: expectedActive.length,
+          });
+
+          for (const [piName, tool] of registered) {
+            const rawName = toolNames.find(
+              (name) => buildToolName("mcp", "alpha", name) === piName,
+            );
+            assert.ok(rawName, `${piName} must map back to a raw tool name`);
+            assert.equal(tool.exposure, resolveToolExposure(config, rawName));
+          }
+        },
+      ),
+      testOptions(40),
+    );
+  });
+});

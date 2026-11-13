@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
 import { acquireAuthLock, AuthLockError, AuthRequiredError, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
-import { formatMcpConnectError, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
+import { formatMcpConnectError, formatConnectSuccess, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 for (const { name, error, options, expected } of [
@@ -121,6 +121,62 @@ it("propagates in-flight mcp_list_resources cancellation instead of recording a 
   );
 });
 
+it("formats a successful mcp_connect message that reflects the configured exposure", () => {
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 6, active: 3, expected: 3 }),
+    "MCP server svc ready; tools discovered and active.",
+  );
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 6, active: 0, expected: 0 }),
+    "MCP server svc ready; all 6 tools are configured as deferred, codemode, or hidden.",
+  );
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 0, active: 0, expected: 0 }),
+    "MCP server svc ready; it advertises no tools.",
+  );
+});
+
+it("reports mcp_connect success when exposure keeps most tools out of the model (#257)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-exposure-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const mockExt = createMockExtension();
+  const tools = mockExt.tools;
+  const events = mockExt.events;
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
+      settings: { maxRetries: 0 },
+      mcpServers: {
+        partial: {
+          command: "node",
+          args: ["--import", tsxEsmLoader, mock],
+          lifecycle: "lazy",
+          exposure: "hidden",
+          toolExposure: { "get_*": "direct", add: "deferred" },
+        },
+      },
+    }));
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await events.get("session_start")({}, ctx);
+
+    const result = await tools.get("mcp_connect").execute("", { name: "partial" }, undefined, undefined, ctx);
+    assert.match(result.content[0].text, /ready; tools discovered and active/);
+    assert.deepEqual(
+      [...mockExt.activeTools].sort(),
+      ["mcp_partial_get_cwd", "mcp_partial_get_status"],
+      "only the tools configured as direct may be active",
+    );
+    // The mock server advertises six tools; four stay hidden or deferred by configuration.
+    const rows = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.deepEqual(rows[0].tools, { discovered: 6, active: 2, expected: 2 });
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it("registers agent-visible status and connect tools without eagerly starting a lazy server", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-management-"));
   const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
@@ -171,25 +227,25 @@ it("registers agent-visible status and connect tools without eagerly starting a 
     assert.ok(commands.has("mcp:start") && commands.has("mcp:stop") && commands.has("mcp:auth"));
     const discovered = active.length;
     const connectedStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
-    assert.deepEqual(connectedStatus[0].tools, { discovered, active: discovered });
+    assert.deepEqual(connectedStatus[0].tools, { discovered, active: discovered, expected: discovered });
     // Another extension may apply an intentional tool restriction after discovery.
     mockExt.activeTools = mockExt.activeTools.slice(1);
     await assert.rejects(
       tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
-      /connected, but some discovered tools are inactive/,
+      /connected, but some tools configured as direct are inactive/,
     );
     active = mockExt.activeTools;
     assert.equal(active.length, discovered - 1, "Connect must not override another extension's restriction");
     mockExt.activeTools = [];
     await assert.rejects(
       tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
-      /connected, but some discovered tools are inactive/,
+      /connected, but some tools configured as direct are inactive/,
     );
     active = mockExt.activeTools;
     assert.deepEqual(active, []);
     const inactiveStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(inactiveStatus[0].state, "ready", "Transport readiness and tool activation are separate states");
-    assert.deepEqual(inactiveStatus[0].tools, { discovered, active: 0 });
+    assert.deepEqual(inactiveStatus[0].tools, { discovered, active: 0, expected: discovered });
     await events.get("session_shutdown")({}, ctx);
     active = mockExt.activeTools;
     assert.equal(active.length, 0);

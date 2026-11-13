@@ -76,6 +76,9 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       options?.requestTimeoutMs ??
       server?.config.requestTimeoutMs ??
       lifecycle.getConfig().settings.requestTimeoutMs;
+    // WHY: exposure lives on the server entry, and the manager's refresh options carry only
+    // timeouts — resolve it here so a config reload that changes `exposure` / `toolExposure`
+    // takes effect on the next discovery instead of being frozen at construction.
     await bridge.refreshTools(
       serverName,
       client,
@@ -83,6 +86,8 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       {
         ...options,
         requestTimeoutMs,
+        exposure: server?.config.exposure,
+        toolExposure: server?.config.toolExposure,
       },
     );
   });

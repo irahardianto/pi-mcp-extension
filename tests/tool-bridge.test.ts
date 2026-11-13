@@ -1263,6 +1263,17 @@ describe("orderToolsForNameAssignment and resolveUniqueToolName", () => {
 
 // ── Tool Bridge ───────────────────────────────────────────────────────────────
 
+/** A `tools/list` client exposing the given raw tool names; the array is read on every request. */
+function listingClient(toolNames: string[]): Client {
+  return {
+    request: async () => ({
+      tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+    }),
+  } as unknown as Client;
+}
+
+const BRIDGE_SETTINGS = { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 };
+
 describe("ToolBridge", () => {
   it("registers tools and activates them", async () => {
     const registeredTools: TestToolDefinition[] = [];
@@ -1318,10 +1329,92 @@ describe("ToolBridge", () => {
     // Tools should be activated
     assert.ok(activeTools.includes("mcp_myserver_echo"));
     assert.ok(activeTools.includes("mcp_myserver_count"));
-    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 2 });
+    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 2, expected: 2 });
     activeTools = ["mcp_myserver_echo", "unrelated_tool"];
-    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 1 });
-    assert.deepEqual(bridge.getToolActivity("unknown"), { discovered: 0, active: 0 });
+    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 1, expected: 2 });
+    assert.deepEqual(bridge.getToolActivity("unknown"), { discovered: 0, active: 0, expected: 0 });
+  });
+
+  it("registers every tool with its resolved exposure and activates only direct ones", async () => {
+    const registered: TestToolDefinition[] = [];
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: (t: unknown) => registered.push(t as TestToolDefinition),
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, mockPi);
+
+    await bridge.refreshTools("db", listingClient(["search_users", "delete_user", "get_status"]), {
+      exposure: "hidden",
+      toolExposure: { "search_*": "direct", get_status: "deferred" },
+    });
+
+    assert.deepEqual(
+      Object.fromEntries(registered.map((tool) => [tool.name, tool.exposure])),
+      {
+        mcp_db_delete_user: "hidden",
+        mcp_db_get_status: "deferred",
+        mcp_db_search_users: "direct",
+      },
+    );
+    assert.deepEqual(activeTools, ["mcp_db_search_users"]);
+    assert.deepEqual(bridge.getToolActivity("db"), { discovered: 3, active: 1, expected: 1 });
+    const byName = new Map(registered.map((tool) => [tool.name, tool]));
+    assert.equal(byName.get("mcp_db_get_status")?.defaultActive, false);
+    assert.equal(byName.get("mcp_db_delete_user")?.defaultActive, false);
+    assert.equal(
+      byName.get("mcp_db_search_users")?.defaultActive,
+      undefined,
+      "a direct tool keeps Pi's default activation",
+    );
+  });
+
+  it("never activates a newly discovered non-direct tool on a live refresh", async () => {
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, mockPi);
+    const toolNames = ["echo"];
+    const exposure = { exposure: "hidden", toolExposure: { echo: "direct" } } as const;
+
+    await bridge.refreshTools("db", listingClient(toolNames), exposure);
+    assert.deepEqual(activeTools, ["mcp_db_echo"]);
+
+    toolNames.push("search");
+    await bridge.refreshTools("db", listingClient(toolNames), exposure);
+    assert.deepEqual(activeTools, ["mcp_db_echo"], "a new deferred tool must not be activated");
+    assert.deepEqual(bridge.getToolActivity("db"), { discovered: 2, active: 1, expected: 1 });
+  });
+
+  it("preserves a deferred tool that tool_search activated, until the server reconnects", async () => {
+    const toolNames = ["echo", "search"];
+    let activeTools: string[] = [];
+    const mockPi = {
+      registerTool: () => {},
+      getActiveTools: () => activeTools,
+      setActiveTools: (names: string[]) => { activeTools = names; },
+    };
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, mockPi);
+    const exposure = { exposure: "hidden", toolExposure: { echo: "direct" } } as const;
+
+    await bridge.refreshTools("db", listingClient(toolNames), exposure);
+    assert.deepEqual(activeTools, ["mcp_db_echo"]);
+
+    // Pi's `tool_search` loads the deferred tool into the active set; a later refresh must
+    // neither drop it nor turn its activation into a permanent exemption.
+    activeTools = [...activeTools, "mcp_db_search"];
+    await bridge.refreshTools("db", listingClient(toolNames), exposure);
+    assert.deepEqual(activeTools, ["mcp_db_echo", "mcp_db_search"]);
+    assert.deepEqual(bridge.getToolActivity("db"), { discovered: 2, active: 2, expected: 1 });
+
+    // A reconnect after a stop re-derives the active set from exposure alone.
+    bridge.deactivateServer("db");
+    await bridge.refreshTools("db", listingClient(toolNames), exposure);
+    assert.deepEqual(activeTools, ["mcp_db_echo"]);
   });
 
   it("keeps externally deactivated tools inactive across a live tools/list_changed refresh", async () => {
@@ -2276,7 +2369,7 @@ describe("ToolBridge", () => {
     assert.ok(!activeTools.includes("mcp_myserver_echo"));
     assert.ok(!activeTools.includes("mcp_myserver_count"));
     assert.ok(activeTools.includes("other_tool"));
-    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 0 });
+    assert.deepEqual(bridge.getToolActivity("myserver"), { discovered: 2, active: 0, expected: 0 });
   });
 
   it("re-registers tools on repeated refresh to capture new client", async () => {

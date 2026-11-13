@@ -34,6 +34,7 @@ const PURE_MODULES = [
   "secret-redaction.ts",
   "server-provenance.ts",
   "terminal-text.ts",
+  "tool-exposure.ts",
   "tool-names.ts",
   "tool-order.ts",
 ] as const;

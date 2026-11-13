@@ -20,6 +20,7 @@ import {
   type ServerConfigSource,
 } from "./server-provenance.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
+import type { ToolActivity } from "./tool-bridge.js";
 
 /** Stored-credentials summary as far as a status view needs it. */
 export interface StoredAuthStatus {
@@ -33,7 +34,7 @@ export interface ServerStatusSnapshot {
   lifecycle: ServerConfig["lifecycle"];
   retryCount: number;
   source: ServerConfigSource | undefined;
-  tools: { discovered: number; active: number };
+  tools: ToolActivity;
   /** OAuth credential summary, or undefined when the server has no `auth` config. */
   auth: string | undefined;
   lastError: Error | null;
@@ -47,7 +48,7 @@ export interface ServerStatusRow {
   name: string;
   lifecycle: string;
   state: string;
-  tools: { discovered: number; active: number };
+  tools: ToolActivity;
   auth: string;
   error: string | undefined;
   source: ServerConfigSource | "unknown";
@@ -56,7 +57,7 @@ export interface ServerStatusRow {
 
 export interface CollectServerStatusParams {
   server: ManagedServer;
-  tools: { discovered: number; active: number };
+  tools: ToolActivity;
   source: ServerConfigSource | undefined;
   recentOutput?: string | undefined;
   /** Reads stored OAuth state for a server; injected so tests avoid disk I/O. */
@@ -115,6 +116,16 @@ function isDefined(value: string | undefined): value is string {
   return value !== undefined;
 }
 
+/**
+ * `(N configured direct)` suffix for the `Tools:` line when exposure keeps some tools out of
+ * the active set by design — without it a server configured with `exposure: "hidden"` and a
+ * few overridden tools renders `3/12 active` and reads as a broken server (#257).
+ */
+function formatExposureNote(tools: ToolActivity): string {
+  if (tools.expected === tools.discovered) return "";
+  return ` (${tools.expected} configured direct)`;
+}
+
 /** `/mcp <name>` detail view: config provenance, tool counts, credentials, and next steps. */
 export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: ConfigProvenance): string {
   const instructions = sanitizeServerInstructions(snapshot.instructions);
@@ -125,7 +136,7 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
     `Transport: ${snapshot.transport}`,
     `Lifecycle: ${snapshot.lifecycle}`,
     `Source: ${formatServerSource(snapshot.source)}`,
-    `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active`,
+    `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active${formatExposureNote(snapshot.tools)}`,
     instructions === undefined ? undefined : `Instructions: ${instructions}`,
     snapshot.auth === undefined ? undefined : `OAuth: ${snapshot.auth}`,
     formatProjectConfigNote(provenance),

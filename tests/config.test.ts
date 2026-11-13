@@ -1006,14 +1006,14 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
     });
   });
 
-  it("accepts Pi-native exposure keys in a project override and applies lifecycle", async () => {
+  it("honors Pi-native exposure keys from a project override", async () => {
     await withTempDir(async (dir) => {
       await writeGlobalConfig(dir, {
         mcpServers: { docs: { url: "https://mcp.example.com/mcp", lifecycle: "eager" } },
       });
       await writeMcpJson(dir, {
         mcpServers: {
-          docs: { lifecycle: "lazy", exposure: "hidden", toolExposure: { search: "hidden" } },
+          docs: { lifecycle: "lazy", exposure: "hidden", toolExposure: { search: "deferred" } },
         },
       });
 
@@ -1024,6 +1024,83 @@ describe("Issue #215: Pi 1.3.0 config interoperability", () => {
       assert.equal(docs.url, "https://mcp.example.com/mcp");
       assert.equal(docs.transport, "streamable-http");
       assert.equal(docs.lifecycle, "lazy");
+      assert.equal(docs.exposure, "hidden", "a project override must reach the tool bridge");
+      assert.deepEqual(docs.toolExposure, { search: "deferred" });
+    });
+  });
+
+  it("parses exposure and toolExposure on a global server entry", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          github: {
+            command: "npx",
+            args: ["-y", "@modelcontextprotocol/server-github"],
+            exposure: "hidden",
+            toolExposure: { "get_*": "direct", "list_*": "direct", "search_*": "deferred" },
+          },
+        },
+      });
+
+      const loaded = await loadBoth(dir);
+      const github = loaded.config.mcpServers["github"];
+
+      assert.ok(github);
+      assert.equal(github.exposure, "hidden");
+      assert.deepEqual(github.toolExposure, {
+        "get_*": "direct",
+        "list_*": "direct",
+        "search_*": "deferred",
+      });
+    });
+  });
+
+  it("normalizes Pi's codemode-deferred exposure alias at the server and tool level", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        mcpServers: {
+          docs: {
+            url: "https://mcp.example.com/mcp",
+            exposure: "codemode-deferred",
+            toolExposure: { search: "codemode-deferred", "get_*": "codemode" },
+          },
+        },
+      });
+
+      const docs = (await loadBoth(dir)).config.mcpServers["docs"];
+      assert.ok(docs);
+      assert.equal(docs.exposure, "codemode");
+      assert.deepEqual(docs.toolExposure, { search: "codemode", "get_*": "codemode" });
+    });
+  });
+
+  it("rejects an unknown exposure value at load time", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        mcpServers: { docs: { command: "node", exposure: "lazy-ish" } },
+      });
+      await assert.rejects(() => loadBoth(dir), expectConfigError("mcpServers.docs.exposure"));
+    });
+  });
+
+  it("rejects a toolExposure that is not a tool-to-exposure map", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        mcpServers: { docs: { command: "node", toolExposure: ["search"] } },
+      });
+      await assert.rejects(() => loadBoth(dir), expectConfigError("mcpServers.docs.toolExposure"));
+    });
+  });
+
+  it("rejects an unknown per-tool exposure value at load time", async () => {
+    await withTempDir(async (dir) => {
+      await writeGlobalConfig(dir, {
+        mcpServers: { docs: { command: "node", toolExposure: { search: "sometimes" } } },
+      });
+      await assert.rejects(
+        () => loadBoth(dir),
+        expectConfigError("mcpServers.docs.toolExposure.search"),
+      );
     });
   });
 

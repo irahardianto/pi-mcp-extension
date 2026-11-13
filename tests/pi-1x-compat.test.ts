@@ -455,6 +455,31 @@ describe("config-compat pure alias normalizers and project override merger", () 
     });
   });
 
+  it("normalizes Pi's retired codemode-deferred exposure alias without mutating the input", () => {
+    const frozen = Object.freeze({
+      command: "node",
+      exposure: "codemode-deferred",
+      toolExposure: Object.freeze({ search: "codemode-deferred", "get_*": "direct" }),
+    });
+    assert.deepEqual(normalizeServerConfigAliases(frozen), {
+      command: "node",
+      exposure: "codemode",
+      toolExposure: { search: "codemode", "get_*": "direct" },
+    });
+    assert.equal(frozen.exposure, "codemode-deferred", "the raw config must stay untouched");
+    assert.deepEqual(frozen.toolExposure, { search: "codemode-deferred", "get_*": "direct" });
+
+    // A non-object `toolExposure` and unknown values reach the schema untouched so it can report them.
+    assert.deepEqual(normalizeServerConfigAliases({ command: "node", toolExposure: ["bad"] }), {
+      command: "node",
+      toolExposure: ["bad"],
+    });
+    assert.deepEqual(normalizeServerConfigAliases({ command: "node", exposure: "sometimes" }), {
+      command: "node",
+      exposure: "sometimes",
+    });
+  });
+
   it("applies extension-registered server lifecycle defaults via withRegisteredServerLifecycle", () => {
     assert.equal(withRegisteredServerLifecycle(null), null);
     const explicitLazy = { command: "node", lifecycle: "lazy" };

@@ -25,6 +25,7 @@ import {
 } from "./config-compat.js";
 import { McpError } from "./errors.js";
 import { stripJsonComments } from "./jsonc.js";
+import { MCP_EXPOSURES } from "./tool-exposure.js";
 
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
@@ -139,6 +140,27 @@ const ServerConfigObjectSchema = z.object({
    * `lifecycle: "lazy"`). Default: `true`.
    */
   enabled: z.boolean().optional(),
+  /**
+   * Pi 1.3.0 tool exposure for every tool this server advertises.
+   *
+   * `direct` — registered and activated, so the model sees the declaration.
+   * `deferred` — registered inactive; `tool_search` can load it on demand.
+   * `codemode` — registered inactive; callable from codemode scripts only.
+   * `hidden` — registered but not exposed to the model at all.
+   *
+   * Default: `"direct"` (unlike Pi's own `codemode`, so an existing config keeps every
+   * discovered tool active).
+   */
+  exposure: z.enum(MCP_EXPOSURES).optional(),
+  /**
+   * Pi 1.3.0 per-tool exposure overrides, keyed by the raw MCP tool name (`tools/list`
+   * name, not the Pi tool identifier) or a `*` wildcard pattern. An exact key wins, then
+   * the first matching pattern in declaration order, then `exposure`.
+   *
+   * The canonical way to expose only a few tools of a large server:
+   * `{ "exposure": "hidden", "toolExposure": { "search_*": "direct" } }`.
+   */
+  toolExposure: z.record(z.string(), z.enum(MCP_EXPOSURES)).optional(),
   /** Per-request timeout in ms. Overrides global setting. Default: 30000. */
   requestTimeoutMs: z.number().positive().optional(),
   /**

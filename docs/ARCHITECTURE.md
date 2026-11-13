@@ -70,7 +70,13 @@ flowchart TD
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
-  server connects and disconnects. Each reconcile writes the active set once, with the
+  server connects and disconnects. Each tool is registered with the exposure resolved from
+  the server entry's `exposure` / `toolExposure` (exact raw-name key, then the first `*`
+  pattern in declaration order, then the server default `direct`), and only `direct` tools
+  enter the active set — `deferred` / `codemode` stay registered and inactive for Pi's
+  `tool_search` or codemode to load, `hidden` ones are registered but never exposed, and a
+  reconnect after a stop re-derives the set from exposure alone (#257). Each reconcile
+  writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
   tool left at its position; `orderActiveTools()` re-applies that order without re-activating
   inactive tools on `session_tree` (when `/tree` restores active tools from transcript
@@ -140,7 +146,8 @@ While `ready`, three independent recovery paths exist:
 
 - `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-registers the
   server's tools, deactivates ones the server no longer advertises (remembering whether Pi
-  had each active), and activates only tools the server did not expose before — the
+  had each active), and activates only tools the server did not expose before whose
+  exposure is `direct` — the
   active/inactive state of tools Pi already knew about is left alone, because another
   extension or a user policy may have removed them, and a tool that reappears is restored to
   the state it left in;
@@ -428,8 +435,9 @@ Behavior:
   Pi's `/mcp` writes it (`{ "internal-tools": { "enabled": false } }`). The override is
   applied to the **raw** global entry before validation, so the global `command`/`url`,
   headers, and OAuth config are kept and the project only changes `enabled`,
-  `lifecycle`, `exposure`, or `toolExposure` (`exposure` / `toolExposure` are Pi-native
-  and ignored here). An override with any other key, or for a name no global file
+  `lifecycle`, `exposure`, or `toolExposure` (the two Pi-native exposure keys are honored
+  by the tool bridge, so a project can narrow what the agent sees without restating the
+  global credentials). An override with any other key, or for a name no global file
   defines, is a config error naming the file and the server.
 - **Pi 1.x aliases** are normalized before validation: `type` → `transport`, `"http"` →
   `"streamable-http"`, `oauth` → `auth`, `timeout` (seconds) → `requestTimeoutMs`, and
@@ -438,7 +446,10 @@ Behavior:
   `streamable-http` when `url` is set), `lifecycle` is `lazy` (eager for
   extension-registered servers unless `enabled: false`), `toolPrefix` is `mcp`,
   `requestTimeoutMs` is `30000`, and `maxRetries` is `5`.
-- **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `auth` is
+- **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `exposure`
+  and every `toolExposure` value must be `direct`, `deferred`, `codemode`, or `hidden`
+  (Pi's retired `codemode-deferred` alias is normalized to `codemode` before validation, on
+  the server value and on every per-tool value); `auth` is
   rejected on `stdio`; `auth.provider` (Pi's `/login` provider token, which this
   extension cannot forward) is rejected instead of being silently downgraded to OAuth;
   `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated
