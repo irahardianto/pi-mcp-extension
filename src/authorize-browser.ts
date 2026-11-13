@@ -74,8 +74,10 @@ export function browserOpenCommand(
  * Works on macOS, Linux, and Windows.
  */
 export function openBrowser(url: string, deps?: OpenBrowserDeps): Promise<void> {
-  // WHY: This public entry point must enforce the URL policy independently of its callers.
-  if (!isSafeAuthorizationUrl(url)) {
+  // WHY: This public entry point must enforce the URL policy independently of its callers,
+  // and require a string primitive so a non-string object with a stateful `toString()`
+  // cannot pass validation and mutate before `new URL(url)`.
+  if (typeof url !== "string" || !isSafeAuthorizationUrl(url)) {
     return Promise.reject(
       new McpError(
         "Refusing to open unsafe authorization URL: only HTTPS (or loopback HTTP) URLs are allowed",

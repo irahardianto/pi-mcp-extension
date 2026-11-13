@@ -120,6 +120,20 @@ describe("authorize-browser", () => {
           },
         );
       }
+      let toStringCalls = 0;
+      const statefulUrl = {
+        toString() {
+          toStringCalls += 1;
+          return toStringCalls === 1 ? "https://auth.example.com/authorize" : "file:///etc/passwd";
+        },
+      };
+      await assert.rejects(openBrowser(statefulUrl as unknown as string), (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, "protocol");
+        assert.equal(err.server, "<oauth>");
+        return true;
+      });
+      assert.equal(toStringCalls, 0);
       assert.equal(spawnCount, 0);
     });
 
