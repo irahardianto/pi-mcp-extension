@@ -477,12 +477,26 @@ describe("coverage and Qlty maintainability policy", () => {
       /files:\s*\["src\/\*\*\/\*\.ts"\],[^\n]*\n(?:.*\n)*?\s*"pi-mcp\/max-cognitive-complexity"/,
       "eslint.config.mjs must scope pi-mcp/max-cognitive-complexity to src/**/*.ts",
     );
+    assert.match(
+      eslintConfig,
+      /"pi-mcp\/max-file-complexity":\s*\[\s*"error",\s*\{\s*max:\s*99\s*\}\s*\]/,
+      "eslint.config.mjs must configure pi-mcp/max-file-complexity with max: 99 as error",
+    );
+    assert.match(
+      eslintConfig,
+      /files:\s*\["src\/\*\*\/\*\.ts"\],[^\n]*\n(?:.*\n)*?\s*"pi-mcp\/max-file-complexity"/,
+      "eslint.config.mjs must scope pi-mcp/max-file-complexity to src/**/*.ts",
+    );
 
     const qltyToml = readRepoFile(".qlty/qlty.toml");
+    const strippedQltyToml = qltyToml
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
     assert.match(
-      qltyToml,
-      /\[smells\.function_complexity\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*15/,
-      ".qlty/qlty.toml must configure [smells.function_complexity] with enabled = true and threshold = 15",
+      strippedQltyToml,
+      /\[smells\.function_complexity\]\s*\nenabled\s*=\s*true\s*\nthreshold\s*=\s*16(?!\d)/,
+      ".qlty/qlty.toml must configure [smells.function_complexity] with enabled = true and threshold = 16",
     );
     const excludes = /exclude_patterns\s*=\s*\[([\s\S]*?)\]/.exec(qltyToml)?.[1] ?? "";
     assert.match(excludes, /"\.semgrep\/\*\*"/, ".qlty/qlty.toml must exclude .semgrep/** fixtures from analysis");
@@ -536,6 +550,18 @@ describe("coverage and Qlty maintainability policy", () => {
           // reported on its own frame only when it actually exceeds the limit.
           code: "const schema = wrap((a) => { if (a) {} });",
           options: [{ max: 1 }],
+        },
+        {
+          // WHY: object-literal adapter methods (`open: (p) => open(p)`) and non-`this` member
+          // calls (`now: () => Date.now()`) delegate rather than recurse (Qlty scores 0).
+          code: "function makeDeps(open) { return { open: (p) => open(p), now: () => Date.now() }; }",
+          options: [{ max: 1 }],
+        },
+        {
+          // WHY: a non-arrow `function` callback rebinds `this`, so `this.run(...)` inside it is
+          // not direct recursion of outer method `run` (Qlty scores 2 for `if` at depth 1).
+          code: "class Service { run(xs) { xs.forEach(function (x) { if (x) this.run([]); }); } }",
+          options: [{ max: 2 }],
         },
       ],
       invalid: [
@@ -608,12 +634,72 @@ describe("coverage and Qlty maintainability policy", () => {
           ],
         },
         {
+          code: "const walkArrow = (n) => { if (n > 0) { return walkArrow(n - 1); } return 0; };",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'walkArrow' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "class Service { recur(n) { if (n > 0) { return this.recur(n - 1); } return 0; } }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'recur' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function walkClosure(xs) { xs.forEach((x) => { if (Array.isArray(x)) walkClosure(x); }); }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'walkClosure' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "class Service { recurClosure(xs) { xs.forEach((x) => { if (x) this.recurClosure([]); }); } }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'recurClosure' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
           code: "class Service { run(a) { if (a) {} else { if (a) {} } } }",
           options: [{ max: 3 }],
           errors: [
             {
               message:
                 "Function 'run' has cognitive complexity 4, above the maximum of 3. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function elseIfElse(a, b) { if (a) {} else if (b) {} else {} }",
+          options: [{ max: 2 }],
+          errors: [
+            {
+              message:
+                "Function 'elseIfElse' has cognitive complexity 3, above the maximum of 2. Extract nested branches, loops, and inline callbacks into named helper functions.",
+            },
+          ],
+        },
+        {
+          code: "function withAugmented(a) { let x = 0; x += 1; x -= a; return x; }",
+          options: [{ max: 1 }],
+          errors: [
+            {
+              message:
+                "Function 'withAugmented' has cognitive complexity 2, above the maximum of 1. Extract nested branches, loops, and inline callbacks into named helper functions.",
             },
           ],
         },
@@ -638,7 +724,7 @@ describe("coverage and Qlty maintainability policy", () => {
           ],
         },
         {
-          code: "function withWhile() { while (true) { break; } }",
+          code: "function withWhile(n) { let i = 0; while (i < n) { i += 1; break; } }",
           options: [{ max: 2 }],
           errors: [
             {
@@ -648,7 +734,7 @@ describe("coverage and Qlty maintainability policy", () => {
           ],
         },
         {
-          code: "function withDoWhile() { do { break; } while (true); }",
+          code: "function withDoWhile(n) { let i = 0; do { i += 1; break; } while (i < n); }",
           options: [{ max: 2 }],
           errors: [
             {
@@ -767,6 +853,21 @@ describe("coverage and Qlty maintainability policy", () => {
       /`pi-mcp\/max-cognitive-complexity` still reports a \*\*top-level\*\* anonymous callback[\s\S]{0,500}?only `<default export>` stays exempt/,
       "AGENTS.md must state that pi-mcp/max-cognitive-complexity reports top-level anonymous callbacks and exempts only <default export>",
     );
+    assert.match(
+      agents,
+      /pi-mcp\/max-file-complexity/,
+      "AGENTS.md must name the pi-mcp/max-file-complexity rule",
+    );
+    assert.match(
+      agents,
+      /augmented assignment \(`\+=`, `-=`, `\|\|=`, `&&=`, `\?\?=`/,
+      "AGENTS.md must document augmented assignment scoring in cognitive complexity",
+    );
+    assert.doesNotMatch(
+      agents,
+      /extra 1 for `while` \/ `do-while` loop conditions/,
+      "AGENTS.md must not retain the stale while/do-while loop-condition point claim",
+    );
     const contributing = readRepoFile("CONTRIBUTING.md");
     assert.match(
       contributing,
@@ -778,6 +879,84 @@ describe("coverage and Qlty maintainability policy", () => {
       /Top-level anonymous\s+callbacks are covered too: only a `<default export>` is exempt\./,
       "CONTRIBUTING.md must state that top-level anonymous callbacks are covered and only <default export> is exempt",
     );
+    assert.match(
+      contributing,
+      /pi-mcp\/max-file-complexity/,
+      "CONTRIBUTING.md must name the pi-mcp/max-file-complexity rule",
+    );
+  });
+
+  it("enforces Qlty-aligned aggregate per-file complexity via pi-mcp/max-file-complexity", async () => {
+    const { RuleTester } = await import("eslint");
+    // @ts-expect-error -- WHY: eslint.config.mjs is a pure JS flat config module without ambient type declarations.
+    const { maxFileComplexityRule } = (await import("../eslint.config.mjs")) as {
+      maxFileComplexityRule: import("eslint").Rule.RuleModule;
+    };
+    const message = (count: number, max: number): string =>
+      `File has aggregate cognitive complexity ${String(count)}, above the maximum of ${String(max)} (matching Qlty [smells.file_complexity] threshold = 100). Extract cohesive pure policy or helper modules in a planned refactor instead of growing a multi-concern file.`;
+    const ruleTester = new RuleTester();
+    ruleTester.run("pi-mcp/max-file-complexity", maxFileComplexityRule, {
+      valid: [
+        {
+          // Two functions scoring 2 each = 4 <= 4; nullish `??` chains do not inflate file complexity.
+          code:
+            "function f1(a, b, c) { if (a) return b ?? c ?? 0; if (b) return 1; return 2; }" +
+            " function f2(d, e) { if (d) return 1; if (e) return 2; return 0; }",
+          options: [{ max: 4 }],
+        },
+        {
+          code: "export default function (a) { if (a) return 1; return 0; }",
+          options: [{ max: 1 }],
+        },
+        {
+          // Object-literal adapter methods delegating to imports/globals do not add fake recursion.
+          code:
+            "function makeDeps(open) { return { open: (p) => open(p), now: () => Date.now(), kill: (p) => process.kill(p) }; }" +
+            " function check(a) { if (a) return 1; return 0; }",
+          options: [{ max: 1 }],
+        },
+      ],
+      invalid: [
+        {
+          // Each function individually is tiny (score 2 <= 15), but aggregate file score is 4 > 3.
+          code:
+            "function f1(a, b) { if (a) {} if (b) {} }" +
+            " function f2(c, d) { if (c) {} if (d) {} }",
+          options: [{ max: 3 }],
+          errors: [{ message: message(4, 3) }],
+        },
+        {
+          // Unlike per-function cognitive complexity, Qlty's file_complexity includes <default export>.
+          code: "export default function (a, b) { if (a) {} if (b) {} }",
+          options: [{ max: 1 }],
+          errors: [{ message: message(2, 1) }],
+        },
+        {
+          // Top-level anonymous callbacks and nested closures roll into the file total.
+          code: "const schema = wrap((a, b) => { if (a) { if (b) {} } });",
+          options: [{ max: 2 }],
+          errors: [{ message: message(3, 2) }],
+        },
+        {
+          // Logical `&&` / `||` runs, recursion, augmented assignments, and while/break loops count toward file total.
+          code: "function walk(n, a, b) { while (a && b) { if (n > 0) return walk(n - 1); n -= 1; break; } return 0; }",
+          options: [{ max: 6 }],
+          errors: [{ message: message(7, 6) }],
+        },
+        {
+          // Closure-wrapped recursion rolls into the file total just like Qlty (`if` at depth 1 = 2 + recursion = 3).
+          code: "function walkTree(xs) { xs.forEach((x) => { if (Array.isArray(x)) walkTree(x); }); }",
+          options: [{ max: 2 }],
+          errors: [{ message: message(3, 2) }],
+        },
+        {
+          // `if ... else if ... else` and `+=` / `-=` match Qlty's cognitive complexity (`readStructuredValue` / `authorize`).
+          code: "function scan(a, b) { let depth = 0; if (a) { depth += 1; } else if (b) { depth -= 1; } else { return 0; } return depth; }",
+          options: [{ max: 4 }],
+          errors: [{ message: message(5, 4) }],
+        },
+      ],
+    });
   });
 
   it("keeps typescript within typescript-eslint's supported peer range and ignores >= 7.0.0 in dependabot.yml", () => {

@@ -50,17 +50,17 @@ and Windows; skip only POSIX-only behavior and only on the affected platform.
   See [`AGENTS.md`](./AGENTS.md#testing--bug-fix-workflow) for the full policy.
 - `npm run lint` enforces Qlty-aligned structural complexity limits on
   `src/**/*.ts`: `<= 15` cyclomatic complexity (`complexity`), `<= 15` cognitive
-  complexity (`pi-mcp/max-cognitive-complexity`), `<= 4` return statements, and
-  `<= 4` control-flow nesting levels. Qlty's `function_complexity`,
-  `return_statements`, and `nested_control_flow` smells use the same thresholds;
-  keep `qlty smells --all` clean when you touch `src/`. Top-level anonymous
-  callbacks are covered too: only a `<default export>` is exempt. Qlty's
-  `file_complexity` smell is capped at `100` per `src/` module (Qlty reports
-  `count >= threshold`), so a module scoring `100` or more needs a planned
-  `refactor:` extraction rather than an opportunistic split inside a
-  `fix:` / `feat:` change. That ceiling is review-time: `npm run lint` has no
-  equivalent rule and no CI job runs `qlty smells`, so `tests/repo-policy.test.ts`
-  pins the value and reviewers hold the line.
+  complexity (`pi-mcp/max-cognitive-complexity`), `<= 99` aggregate per-file
+  cognitive complexity (`pi-mcp/max-file-complexity`), `<= 4` return statements,
+  and `<= 4` control-flow nesting levels. Qlty's `function_complexity`
+  (threshold 16), `file_complexity` (threshold 100), `return_statements`, and
+  `nested_control_flow` (threshold 5) smells flag the exact same boundary
+  (`count >= threshold`); keep `qlty smells --all` clean when you touch `src/`.
+  Top-level anonymous callbacks are covered too: only a `<default export>` is exempt.
+  A module scoring `100` or more on `file_complexity` (`> 99` in
+  `pi-mcp/max-file-complexity`) needs a planned `refactor:` extraction rather
+  than an opportunistic split inside a `fix:` / `feat:` change, and
+  `tests/repo-policy.test.ts` pins both ESLint and Qlty thresholds.
 - `npm run lint` also caps boolean expressions at `<= 3` `&&` / `||` operators on
   `src/**/*.ts` and `scripts/**/*.ts` (`pi-mcp/max-boolean-operators`), matching
   Qlty's `boolean_logic` smell (threshold 4), and caps function/method parameter
@@ -90,7 +90,7 @@ therefore reach users bundled with an unrelated fix.
 
 Run this checklist for PRs that touch `src/index.ts`,
 `src/session-lifecycle.ts`, `src/register-commands.ts`, `src/register-tools.ts`, `src/connection-coordinator.ts`,
-`src/server-manager.ts`, `src/mcp-client.ts`, `src/transport-factory.ts`, `src/stdio-process.ts`,
+`src/server-manager.ts`, `src/mcp-client.ts`, `src/transport-factory.ts`, `src/transport-order.ts`, `src/stdio-process.ts`,
 the OAuth/callback/lock modules (`oauth-*.ts`, `authorize-*.ts`,
 `oauth-state-store.ts`, `auth-lock.ts`, `callback-*.ts`), or `package.json`, and
 for any refactor that moves lifecycle code. Paste the checklist with its output
