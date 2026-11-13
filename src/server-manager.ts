@@ -15,13 +15,14 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { McpError, AuthCancelledError } from "./errors.js";
+import { AuthCancelledError, AuthRequiredError, McpError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
-import { AuthRequiredError, getAuthStatus, resetAuth, invalidateStoredTokens } from "./oauth-provider.js";
+import { getAuthStatus, invalidateStoredTokens, resetAuth } from "./oauth-status.js";
 import type { ToolRefreshOptions } from "./tool-bridge.js";
 import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
-import { describeError, reportDiagnostic, sanitizeLogText } from "./debug-log.js";
+import { describeError, sanitizeLogText } from "./debug-log-format.js";
+import { reportDiagnostic } from "./debug-log.js";
 import {
   ensurePidTerminated,
   instrumentStdioTransport,
