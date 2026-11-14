@@ -15,7 +15,7 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, type Progress } from "@modelcontextprotocol/sdk/types.js";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition, ToolNamespace } from "@earendil-works/pi-coding-agent";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
@@ -24,14 +24,17 @@ import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
 import {
+  buildMcpResultSchema,
   buildToolAnnotations,
-  buildToolCallContent,
+  buildToolCallOutcome,
   buildToolDescription,
-  toolErrorText,
+  supportsToolErrorResult,
   type ToolCallOutcome,
   type ToolCallResponse,
 } from "./tool-content.js";
 import {
+  collectReboundToolDefinitions,
+  mergePeerServerNames,
   orderToolsForNameAssignment,
   resolveUniqueToolName,
 } from "./tool-names.js";
@@ -40,29 +43,66 @@ import {
   orderPayloadToolEntries,
   sameToolList,
 } from "./tool-order.js";
+import {
+  assessRegisteredServerExposures,
+  buildServerToolNamespace,
+  collectConnectedExposures,
+  mergeRawToolExposures,
+  reconcileLiveRefreshState,
+  resolveDiscoveryActivation,
+  resolveToolExposure,
+  toPiToolExposure,
+  type McpExposure,
+  type RegisteredToolSummary,
+} from "./tool-exposure.js";
 
 export { buildToolName } from "./tool-names.js";
 export { convertMcpContent } from "./tool-content.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-/** Subset of Pi's ExtensionAPI used by the bridge. */
-export type PiExtensionAPI = Pick<ExtensionAPI, "registerTool" | "getActiveTools" | "setActiveTools">;
+/** Subset of Pi's ExtensionAPI used by the bridge (`getAllTools` is optional for minimal test mocks). */
+export type PiExtensionAPI = Pick<
+  ExtensionAPI,
+  "registerTool" | "getActiveTools" | "setActiveTools"
+> & {
+  getAllTools?: (() => readonly RegisteredToolSummary[]) | undefined;
+};
 
 export type ToolRefreshOptions = {
   requestTimeoutMs?: number | undefined;
   signal?: AbortSignal | undefined;
+  /** Server-level tool exposure (Pi 1.3.0 `exposure`). Default: `direct`. */
+  exposure?: McpExposure | undefined;
+  /** Per-tool exposure overrides, keyed by the raw MCP tool name (`tools/list` name). */
+  toolExposure?: Readonly<Record<string, McpExposure>> | undefined;
+  /** Optional configured server summary (Pi 1.3.0 `description`), forwarded on `namespace`. */
+  description?: string | undefined;
+  /** Optional configured peer server names for deterministic `ToolNamespace` disambiguation. */
+  peerServerNames?: Iterable<string> | undefined;
 };
+
+/**
+ * Tool counts for one server: everything registered (`discovered`), everything Pi has
+ * active (`active`), and the tools whose exposure makes this bridge activate them
+ * (`expected`).
+ */
+export interface ToolActivity {
+  discovered: number;
+  active: number;
+  expected: number;
+}
 
 // ─── Tool Call Execution ──────────────────────────────────────────────────────
 
 /** Pi's partial-result callback — the `onUpdate` argument of a tool's `execute`. */
 export type ToolUpdateCallback = (update: ToolCallOutcome) => void;
 
-/** Per-call streaming and cancellation options for one `tools/call`. */
+/** Per-call streaming, cancellation, and error-envelope options for one `tools/call`. */
 interface ToolCallOptions {
   signal: AbortSignal | undefined;
   onUpdate: ToolUpdateCallback | undefined;
+  supportsErrorResult: boolean;
 }
 
 /** Character budget for one progress line; Pi renders the latest line while the tool runs. */
@@ -168,6 +208,26 @@ function normalizeRefreshArgs(
   return { isCurrent, options };
 }
 
+interface ToolCallTarget {
+  serverName: string;
+  piName: string;
+  toolName: string;
+  client: Client;
+}
+
+interface RegisterToolParams {
+  piName: string;
+  serverName: string;
+  tool: McpToolDefinition;
+  client: Client;
+  exposure: McpExposure;
+  namespace: ToolNamespace;
+}
+
+function readClientInstructions(client: Client): string | undefined {
+  return typeof client.getInstructions === "function" ? client.getInstructions() : undefined;
+}
+
 // ─── Tool Listing ─────────────────────────────────────────────────────────────
 
 export { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
@@ -180,11 +240,14 @@ export { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
  */
 export class ToolBridge {
   private settings: Settings;
+  private autoEnableCodemode: boolean;
   private readonly pi: PiExtensionAPI;
   /** Tracks which Pi tool names belong to which MCP server. */
   private readonly serverToolNames = new Map<string, Set<string>>();
   /** Tracks which MCP server owns each registered Pi tool name. */
   private readonly toolOwners = new Map<string, string>();
+  /** Latest `ToolDefinition` registered for each owned Pi tool name, used to hide stopped tools. */
+  private readonly registeredDefinitions = new Map<string, ToolDefinition>();
   /**
    * Servers whose tools this bridge has activated and not deactivated since.
    * A server that is still in this set may have had individual tools removed from Pi's
@@ -204,20 +267,72 @@ export class ToolBridge {
    * name or a new tool recycles a dropped tool's Pi name.
    */
   private readonly rawToolNames = new Map<string, Map<string, string>>();
+  /** Per server, the resolved MCP exposure of each raw tool name on the active connection. */
+  private readonly rawToolExposures = new Map<string, Map<string, McpExposure>>();
+  /** Per server, the distinct resolved MCP exposures of currently advertised tools while active. */
+  private readonly activeServerExposures = new Map<string, ReadonlySet<McpExposure>>();
+  /** Servers whose indirect (`codemode` / `deferred`) tools were all dropped by Pi's `--tools` / `--exclude-tools`. */
+  private readonly indirectFilteredServers = new Set<string>();
+  /**
+   * Per server, the Pi names whose configured exposure is `direct` — the tools this bridge
+   * registers active. Deferred, codemode-only, and hidden tools are registered too, but
+   * they are never activated here (Pi's `tool_search` may load a deferred one later).
+   */
+  private readonly directToolNames = new Map<string, Set<string>>();
   /** Monotonic per-server generation counter to discard out-of-order refreshTools responses. */
   private readonly refreshGenerations = new Map<string, number>();
   /** Per-server request timeout overrides resolved during refreshTools. */
   private readonly serverTimeouts = new Map<string, number>();
   private onAuthError?: ((serverName: string, error: unknown) => Promise<void> | void) | undefined;
+  private onDiscoveryWarning?: ((message: string) => void) | undefined;
 
-  constructor(settings: Settings, pi: PiExtensionAPI) {
+  constructor(settings: Settings, pi: PiExtensionAPI, autoEnableCodemode = true) {
     this.settings = settings;
     this.pi = pi;
+    this.autoEnableCodemode = autoEnableCodemode !== false;
   }
 
   /** Register callback invoked when a mid-session tools/list or tools/call fails with 401/403. */
   setAuthErrorCallback(cb: (serverName: string, error: unknown) => Promise<void> | void): void {
     this.onAuthError = cb;
+  }
+
+  /** Register callback invoked when indirect MCP tools have neither reaching discovery tool active. */
+  setDiscoveryWarningCallback(cb: (message: string) => void): void {
+    this.onDiscoveryWarning = cb;
+  }
+
+  /** Update Pi 1.3.0 `autoEnableCodemode` (`undefined` resets to the default `true`). */
+  setAutoEnableCodemode(autoEnableCodemode: boolean | undefined): void {
+    this.autoEnableCodemode = autoEnableCodemode !== false;
+  }
+
+  /** Current configured tool prefix (e.g. `"mcp"`). */
+  getToolPrefix(): string {
+    return this.settings.toolPrefix;
+  }
+
+  /** Whether `serverName` currently has live discovered tools registered on this bridge. */
+  isServerActive(serverName: string): boolean {
+    return this.activeServers.has(serverName);
+  }
+
+  /** Distinct resolved MCP exposures of `serverName`'s currently advertised tools while connected. */
+  getServerExposures(serverName: string): Set<McpExposure> {
+    return new Set(this.activeServerExposures.get(serverName));
+  }
+
+  /**
+   * Whether `serverName` registered indirect (`codemode` / `deferred`) tools on its latest refresh
+   * that Pi's `--tools` / `--exclude-tools` filter removed from `pi.getAllTools()`.
+   */
+  hasAllIndirectToolsFiltered(serverName: string): boolean {
+    return this.indirectFilteredServers.has(serverName);
+  }
+
+  /** Distinct resolved MCP exposures across all currently connected servers. */
+  getConnectedExposures(): Set<McpExposure> {
+    return collectConnectedExposures(this.activeServerExposures.values());
   }
 
   /** Update bridge settings when session config is reloaded on session_start. */
@@ -229,6 +344,19 @@ export class ToolBridge {
         this.serverTimeouts.delete(serverName);
       }
     }
+  }
+
+  /**
+   * Activate Pi's reaching discovery tools (`codemode` / `tool_search`) in deterministic order
+   * ahead of concurrent eager connects when configured exposures require them (#257).
+   */
+  ensureDiscoveryTools(exposures: Iterable<McpExposure>): void {
+    const activeBefore = this.pi.getActiveTools();
+    const toActivate = this._resolveDiscoveryTools(exposures, activeBefore);
+    if (toActivate.length === 0) return;
+    const nextActive = this._orderActiveTools(new Set([...activeBefore, ...toActivate]));
+    if (sameToolList(this.pi.getActiveTools(), nextActive)) return;
+    this.pi.setActiveTools(nextActive);
   }
 
   /**
@@ -258,14 +386,40 @@ export class ToolBridge {
     // WHY: Discard stale tools/list responses if a newer refreshTools(),
     // deactivateServer(), or removeServerTools() occurred while listAllTools() was in flight.
     if (this.refreshGenerations.get(serverName) !== gen || !isCurrent()) return;
-    this._reconcileTools(serverName, tools, client);
+    this._reconcileTools(serverName, tools, client, options);
   }
 
-  /** Report discovery separately from the tools currently exposed by Pi. */
-  getToolActivity(serverName: string): { discovered: number; active: number } {
+  /**
+   * Report discovery separately from the tools currently exposed by Pi.
+   *
+   * `discovered` counts every registered tool, including ones exposure keeps out of the
+   * model. `expected` counts the tools whose resolved exposure is `direct` — the ones this
+   * bridge activates — so `active < expected` means a policy or another extension removed
+   * tools rather than the user configuring a smaller exposure on purpose (#257).
+   */
+  getToolActivity(serverName: string): ToolActivity {
     const names = this.serverToolNames.get(serverName) ?? new Set<string>();
     const active = new Set(this.pi.getActiveTools());
-    return { discovered: names.size, active: [...names].filter((name) => active.has(name)).length };
+    return {
+      discovered: names.size,
+      active: [...names].filter((name) => active.has(name)).length,
+      expected: this.directToolNames.get(serverName)?.size ?? 0,
+    };
+  }
+
+  /**
+   * Direct tools this bridge owns that Pi does not currently have active.
+   *
+   * WHY: verified per name, never by subtracting the `active` and `expected` totals — `active`
+   * also counts non-direct tools Pi's `tool_search` loaded, so with `direct` 2 / `deferred` 1 an
+   * activated deferred tool masks a direct tool another extension removed (2 === 2) and
+   * `mcp_connect` would report success while a configured tool is unreachable (#257).
+   */
+  getInactiveDirectTools(serverName: string): string[] {
+    const direct = this.directToolNames.get(serverName);
+    if (!direct) return [];
+    const active = new Set(this.pi.getActiveTools());
+    return [...direct].filter((name) => !active.has(name));
   }
 
   /**
@@ -313,11 +467,24 @@ export class ToolBridge {
   deactivateServer(serverName: string): void {
     this._bumpRefreshGeneration(serverName);
     this.activeServers.delete(serverName);
+    this.activeServerExposures.delete(serverName);
+    this.indirectFilteredServers.delete(serverName);
     // WHY: stopping the server turns every tool off, so what each one "left in" belongs to a
     // connection that no longer exists; a fresh connect rediscovers the state from scratch.
     this.droppedToolState.delete(serverName);
     this.rawToolNames.delete(serverName);
-    this._deactivateServerTools(serverName);
+    this.rawToolExposures.delete(serverName);
+    // WHY: Snapshot `activeTools` before `_hideOwnedServerTools` calls `pi.registerTool(hidden)`.
+    // Pi's `_refreshToolRegistry()` re-adds every declarable `--tools` match across all servers on
+    // each `registerTool`, which would resurrect another server's externally deactivated `direct`
+    // tool if `_deactivateServerTools` read `getActiveTools()` afterward (#257).
+    const activeBefore = [...this.pi.getActiveTools()];
+    // WHY: Pi has no `unregisterTool`, and `tool_search` / `codemode` read `_toolRegistry`
+    // (`AgentSession._getCallableTools`) rather than `activeTools` — re-registering owned tools
+    // with `exposure: "hidden"` before reconciling `activeTools` stops both from discovering,
+    // loading, or calling a disconnected server's stale `Client` (#257).
+    this._hideOwnedServerTools(serverName, false);
+    this._deactivateServerTools(serverName, activeBefore);
   }
 
   /** Remove all tracking data for a server (called when config changes remove a server). */
@@ -330,9 +497,15 @@ export class ToolBridge {
     this._bumpRefreshGeneration(serverName);
     this.serverTimeouts.delete(serverName);
     this.activeServers.delete(serverName);
+    this.activeServerExposures.delete(serverName);
+    this.indirectFilteredServers.delete(serverName);
     this.droppedToolState.delete(serverName);
     this.rawToolNames.delete(serverName);
-    this._deactivateServerTools(serverName);
+    this.rawToolExposures.delete(serverName);
+    this.directToolNames.delete(serverName);
+    const activeBefore = [...this.pi.getActiveTools()];
+    this._hideOwnedServerTools(serverName, true);
+    this._deactivateServerTools(serverName, activeBefore);
     const existing = this.serverToolNames.get(serverName);
     if (existing) {
       for (const toolName of existing) {
@@ -400,10 +573,43 @@ export class ToolBridge {
   }
 
   /**
-   * Register the freshly discovered tools, release ownership of any Pi names the
-   * server no longer uses, and reconcile Pi's active tool set.
+   * Re-sync `ToolDefinition.namespace` on active servers when `mcp_servers_change` adds or
+   * removes a peer whose sanitized name collides (`my-srv` vs `my_srv`), without network I/O.
    */
-  private _reconcileTools(serverName: string, tools: McpToolDefinition[], client: Client): void {
+  syncServerNamespaces(peerServerNames: Iterable<string>): void {
+    const activeBefore = [...this.pi.getActiveTools()];
+    if (!this._rebindActiveNamespaces(peerServerNames)) return;
+    if (!sameToolList(this.pi.getActiveTools(), activeBefore)) {
+      this.pi.setActiveTools(activeBefore);
+    }
+  }
+
+  private _rebindActiveNamespaces(peerServerNames: Iterable<string>): boolean {
+    const rebound = collectReboundToolDefinitions({
+      prefix: this.settings.toolPrefix,
+      activeServers: this.activeServers,
+      serverToolNames: this.serverToolNames,
+      toolOwners: this.toolOwners,
+      definitions: this.registeredDefinitions,
+      peerServerNames,
+    });
+    for (const definition of rebound) {
+      this.registeredDefinitions.set(definition.name, definition);
+      this.pi.registerTool(definition);
+    }
+    return rebound.length > 0;
+  }
+
+  /**
+   * Register the freshly discovered tools, hide and release ownership of any Pi names the
+   * server no longer uses, and reconcile Pi's active tool set (including discovery tools).
+   */
+  private _reconcileTools(
+    serverName: string,
+    tools: McpToolDefinition[],
+    client: Client,
+    options: ToolRefreshOptions | undefined,
+  ): void {
     const registeredForServer = this.serverToolNames.get(serverName) ?? new Set<string>();
     const ownedPreviousNames = this._ownedTools(serverName, registeredForServer);
     // WHY: Copy before calling `this._registerTool` — Pi's `registerTool()` runs
@@ -414,9 +620,24 @@ export class ToolBridge {
     const previousStateByRawName = isLiveRefresh
       ? this._snapshotActiveStateByRawName(serverName, ownedPreviousNames, new Set(activeBefore))
       : undefined;
+    const peerServerNames = mergePeerServerNames(
+      serverName,
+      this.activeServers,
+      options?.peerServerNames,
+    );
+    const namespace = buildServerToolNamespace({
+      prefix: this.settings.toolPrefix,
+      serverName,
+      description: options?.description,
+      instructions: readClientInstructions(client),
+      peerServerNames,
+    });
 
     const currentToolNames = new Set<string>();
     const currentRawNames = new Map<string, string>();
+    const currentExposures = new Map<string, McpExposure>();
+    const piExposures = new Map<string, McpExposure>();
+    const directToolNames = new Set<string>();
     // WHY: `tools/list` order carries no meaning (a server may reorder it freely), so colliding
     // names are assigned over a deterministic order of the tool set — otherwise the exact-match
     // tool could lose the unhashed name to a lossy one and a later refresh would swap which MCP
@@ -429,70 +650,183 @@ export class ToolBridge {
         seenInBatch: currentToolNames,
         toolOwners: this.toolOwners,
       });
+      const toolExposure = resolveToolExposure(options, tool.name);
       currentToolNames.add(piName);
       currentRawNames.set(piName, tool.name);
+      currentExposures.set(tool.name, toolExposure);
+      piExposures.set(piName, toolExposure);
       this.toolOwners.set(piName, serverName);
+      if (toolExposure === "direct") {
+        directToolNames.add(piName);
+      }
       // Always re-register — on reconnect the client reference changes and
       // Pi's registerTool overwrites by name, so this is idempotent.
-      this._registerTool(piName, serverName, tool, client);
+      this._registerTool({
+        piName,
+        serverName,
+        tool,
+        client,
+        exposure: toolExposure,
+        namespace,
+      });
     }
 
-    for (const existingName of ownedPreviousNames) {
-      if (!currentToolNames.has(existingName)) {
-        this.toolOwners.delete(existingName);
-      }
-    }
+    this._releaseWithdrawnTools(ownedPreviousNames, currentToolNames);
+    const serverExposures = this._assessServerExposures(serverName, piExposures);
 
     // WHY: `pi.setActiveTools` is shared with every other extension and the user, so an already
     // connected server's tool set may have been narrowed on purpose. A live `tools/list_changed`
     // therefore preserves each raw tool's active/inactive state (including across collision
-    // re-settlement and drop/re-advertisement), while a first connect or a reconnect after
-    // `deactivateServer` activates the whole discovered set (#214).
+    // re-settlement and drop/re-advertisement) unless exposure itself crossed `direct` or became
+    // `hidden`, while a first connect or a reconnect activates configured `direct` tools (#214, #257).
     const desiredActive = previousStateByRawName
-      ? this._resolveLiveDesiredActive(serverName, currentRawNames, previousStateByRawName)
-      : currentToolNames;
+      ? this._resolveLiveDesiredActive(
+          serverName,
+          currentRawNames,
+          currentExposures,
+          previousStateByRawName,
+        )
+      : directToolNames;
 
+    this.rawToolExposures.set(
+      serverName,
+      mergeRawToolExposures(
+        this.rawToolExposures.get(serverName),
+        currentExposures,
+        this.droppedToolState.get(serverName),
+      ),
+    );
     this.serverToolNames.set(serverName, currentToolNames);
     this.rawToolNames.set(serverName, currentRawNames);
+    this.directToolNames.set(serverName, directToolNames);
+    this.activeServerExposures.set(serverName, serverExposures);
     this.activeServers.add(serverName);
-    this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore);
+    this._rebindActiveNamespaces(peerServerNames);
+    const discoveryToActivate = this._resolveDiscoveryTools(serverExposures, activeBefore);
+    this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore, discoveryToActivate);
   }
 
-  private _registerTool(
-    piName: string,
+  private _assessServerExposures(
     serverName: string,
-    tool: McpToolDefinition,
-    client: Client,
-  ): void {
+    piExposures: ReadonlyMap<string, McpExposure>,
+  ): Set<McpExposure> {
+    const assessment = assessRegisteredServerExposures({
+      serverName,
+      toolPrefix: this.settings.toolPrefix,
+      piExposures,
+      allTools: this.pi.getAllTools?.(),
+    });
+    if (assessment.allIndirectFiltered) {
+      this.indirectFilteredServers.add(serverName);
+    } else {
+      this.indirectFilteredServers.delete(serverName);
+    }
+    if (assessment.filteredWarning !== undefined) {
+      this.onDiscoveryWarning?.(assessment.filteredWarning);
+    }
+    return assessment.exposures;
+  }
+
+  private _registerTool(registration: RegisterToolParams): void {
+    const { piName, serverName, tool, client, exposure, namespace } = registration;
     const annotations = tool.annotations;
     const description = buildToolDescription(tool, annotations);
     const toolAnnotations = buildToolAnnotations(annotations);
+    const target: ToolCallTarget = { serverName, piName, toolName: tool.name, client };
     const runTool = (
       params: unknown,
       signal: AbortSignal | undefined,
       onUpdate: ToolUpdateCallback | undefined,
-    ) => this._executeToolCall(serverName, tool.name, client, params, { signal, onUpdate });
+      supportsErrorResult: boolean,
+    ) => this._executeToolCall(target, params, { signal, onUpdate, supportsErrorResult });
     // WHY: `execute` runs with `this` bound to the registered-tool literal rather than the
     // bridge, so the rethrow helper is reached through a captured closure.
     const rethrowToolCallError = (err: unknown): Promise<never> =>
       this._rethrowToolCallError(serverName, err);
 
-    this.pi.registerTool({
+    const definition: ToolDefinition = {
       name: piName,
       label: annotations?.title ?? tool.name,
       description,
       promptSnippet: description.slice(0, 120),
       parameters: convertJsonSchemaToTypebox(tool.inputSchema),
+      outputSchema: buildMcpResultSchema(tool.outputSchema),
+      exposure: toPiToolExposure(exposure),
+      namespace,
+      // WHY: explicit belt-and-suspenders alongside `exposure` — older Pi 1.x runtimes do not
+      // inspect `exposure`, and when a `--tools` allowlist explicitly matches `<prefix>_*`,
+      // `_reconcileActiveTools` still keeps non-`direct` tools inactive until `tool_search` loads
+      // them (note: Pi 1.3.0's `isMcpToolName()` only auto-exempts `mcp__*`, so `--tools` callers
+      // must include `<prefix>_*` for single-underscore MCP tools to stay registered).
+      ...(exposure === "direct" ? {} : { defaultActive: false }),
       ...(toolAnnotations ? { annotations: toolAnnotations } : {}),
 
-      async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+      async execute(_toolCallId, params, signal, onUpdate, ctx) {
         try {
-          return await runTool(params, signal, onUpdate);
+          return await runTool(params, signal, onUpdate, supportsToolErrorResult(ctx));
         } catch (err) {
           return await rethrowToolCallError(err);
         }
       },
+    };
+    this.registeredDefinitions.set(piName, definition);
+    this.pi.registerTool(definition);
+  }
+
+  private _hideTool(piName: string, forgetDefinition: boolean): void {
+    const existing = this.registeredDefinitions.get(piName);
+    if (!existing) return;
+    if (existing.exposure !== "hidden") {
+      const hidden: ToolDefinition = {
+        ...existing,
+        exposure: "hidden",
+        defaultActive: false,
+      };
+      this.pi.registerTool(hidden);
+      if (!forgetDefinition) {
+        this.registeredDefinitions.set(piName, hidden);
+      }
+    }
+    if (forgetDefinition) {
+      this.registeredDefinitions.delete(piName);
+    }
+  }
+
+  private _hideOwnedServerTools(serverName: string, forgetDefinitions: boolean): void {
+    const serverTools = this.serverToolNames.get(serverName);
+    if (!serverTools) return;
+    for (const toolName of this._ownedTools(serverName, serverTools)) {
+      this._hideTool(toolName, forgetDefinitions);
+    }
+  }
+
+  private _releaseWithdrawnTools(
+    ownedPreviousNames: ReadonlySet<string>,
+    currentToolNames: ReadonlySet<string>,
+  ): void {
+    for (const existingName of ownedPreviousNames) {
+      if (!currentToolNames.has(existingName)) {
+        this._hideTool(existingName, true);
+        this.toolOwners.delete(existingName);
+      }
+    }
+  }
+
+  private _resolveDiscoveryTools(
+    exposures: Iterable<McpExposure>,
+    activeTools: readonly string[],
+  ): string[] {
+    if (typeof this.pi.getAllTools !== "function") return [];
+    const plan = resolveDiscoveryActivation({
+      exposures,
+      allTools: this.pi.getAllTools(),
+      activeTools,
+      autoEnableCodemode: this.autoEnableCodemode,
     });
+    if (plan.unreachableWarning !== undefined) {
+      this.onDiscoveryWarning?.(plan.unreachableWarning);
+    }
+    return plan.activate;
   }
 
   /**
@@ -517,28 +851,47 @@ export class ToolBridge {
     );
   }
 
+  private _assertToolCallable(target: ToolCallTarget): void {
+    if (!this.activeServers.has(target.serverName)) {
+      throw new McpError(
+        `MCP server "${target.serverName}" is not connected`,
+        target.serverName,
+        "connection",
+      );
+    }
+    const currentRaw = this.rawToolNames.get(target.serverName)?.get(target.piName);
+    const isHidden = this.registeredDefinitions.get(target.piName)?.exposure === "hidden";
+    if (this.toolOwners.get(target.piName) !== target.serverName || currentRaw !== target.toolName || isHidden) {
+      throw new McpError(
+        `Tool "${target.toolName}" is no longer available on MCP server "${target.serverName}"`,
+        target.serverName,
+        "tool",
+      );
+    }
+  }
+
   /**
-   * Run one `tools/call`: dispatch through the SDK client, convert the result
-   * into Pi content blocks, and surface `isError` as `McpError(..., "tool")`.
+   * Run one `tools/call`: guard against disconnected/withdrawn/hidden tools, dispatch through
+   * the SDK client, and convert the MCP response into Pi's tool outcome (preserving structured
+   * `isError` envelopes on Pi 1.3.0+ and throwing `McpError("tool")` on older runtimes).
    */
   private async _executeToolCall(
-    serverName: string,
-    toolName: string,
-    client: Client,
+    target: ToolCallTarget,
     params: unknown,
     options: ToolCallOptions,
   ): Promise<ToolCallOutcome> {
+    this._assertToolCallable(target);
     if (options.signal?.aborted) {
-      throw new McpError("Tool execution cancelled", serverName, "protocol");
+      throw new McpError("Tool execution cancelled", target.serverName, "protocol");
     }
 
     let result: ToolCallResponse;
     try {
       result = await callToolWithClient(
-        client,
-        toolName,
+        target.client,
+        target.toolName,
         params,
-        this.serverTimeouts.get(serverName) ?? this.settings.requestTimeoutMs,
+        this.serverTimeouts.get(target.serverName) ?? this.settings.requestTimeoutMs,
         options,
       );
     } catch (err) {
@@ -546,18 +899,11 @@ export class ToolBridge {
       // cancellation has to be recognised here — otherwise a caller cancellation is reported
       // as a server timeout, and blamed on the server (#209).
       if (isCancellationError(err, options.signal)) {
-        throw new McpError("Tool execution cancelled", serverName, "protocol");
+        throw new McpError("Tool execution cancelled", target.serverName, "protocol");
       }
       throw err;
     }
-    const content = buildToolCallContent(result);
-
-    // Tool execution errors (isError: true) — distinct from protocol errors
-    if (result.isError) {
-      throw new McpError(toolErrorText(content) || "Tool reported an error", serverName, "tool");
-    }
-
-    return { content, details: {} };
+    return buildToolCallOutcome(result, target.serverName, options.supportsErrorResult);
   }
 
   /** Filter a set of Pi tool names to those still owned by `serverName`. */
@@ -593,73 +939,47 @@ export class ToolBridge {
   /**
    * Compute which Pi tool names in `currentRawNames` should be active after a live refresh,
    * and update the server's dropped-tool memory.
-   *
-   * A tool present in the previous snapshot keeps the active/inactive state Pi currently
-   * reports for it (even if a colliding sibling shifted its Pi name). A tool absent from the
-   * previous snapshot restores the state it left in when dropped on this connection, or
-   * activates as newly discovered.
    */
   private _resolveLiveDesiredActive(
     serverName: string,
     currentRawNames: ReadonlyMap<string, string>,
+    currentExposures: ReadonlyMap<string, McpExposure>,
     previousStateByRawName: ReadonlyMap<string, boolean>,
   ): Set<string> {
-    const dropped = this.droppedToolState.get(serverName);
-    const desiredActive = new Set<string>();
-    const seenRawNames = new Set<string>();
-    for (const [piName, rawName] of currentRawNames) {
-      seenRawNames.add(rawName);
-      const shouldActivate =
-        previousStateByRawName.get(rawName) ?? dropped?.get(rawName) ?? true;
-      if (shouldActivate) {
-        desiredActive.add(piName);
-      }
-    }
-    this._updateDroppedTools(serverName, previousStateByRawName, seenRawNames);
-    return desiredActive;
-  }
-
-  /**
-   * Record the active state of tools dropped in this live refresh and forget tools that are
-   * currently advertised.
-   */
-  private _updateDroppedTools(
-    serverName: string,
-    previousStateByRawName: ReadonlyMap<string, boolean>,
-    currentRawNames: ReadonlySet<string>,
-  ): void {
-    const dropped = this.droppedToolState.get(serverName) ?? new Map<string, boolean>();
-    for (const [rawName, wasActive] of previousStateByRawName) {
-      if (!currentRawNames.has(rawName)) {
-        dropped.set(rawName, wasActive);
-      }
-    }
-    for (const rawName of currentRawNames) {
-      dropped.delete(rawName);
-    }
-    if (dropped.size > 0) {
+    const { desiredActive, dropped } = reconcileLiveRefreshState({
+      currentRawNames,
+      currentExposures,
+      previousStateByRawName,
+      previousExposures: this.rawToolExposures.get(serverName),
+      previousDropped: this.droppedToolState.get(serverName),
+    });
+    if (dropped) {
       this.droppedToolState.set(serverName, dropped);
     } else {
       this.droppedToolState.delete(serverName);
     }
+    return desiredActive;
   }
 
   /**
    * Reconcile a server's active tools in Pi in one write: drop any previously owned Pi tool
-   * names that are not in `desiredActive`, append any `desiredActive` names not yet active,
-   * order the result, and skip `pi.setActiveTools` altogether when the active list already
-   * holds exactly that set in that order.
+   * names that are not in `desiredActive`, append any `desiredActive` or discovery tool names
+   * not yet active, order the result, and skip `pi.setActiveTools` altogether when the active
+   * list already holds exactly that set in that order.
    */
   private _reconcileActiveTools(
     ownedPreviousNames: ReadonlySet<string>,
     desiredActive: ReadonlySet<string>,
     activeBefore: readonly string[],
+    discoveryToActivate: readonly string[] = [],
   ): void {
     const activeSet = new Set(activeBefore);
     const remaining = activeBefore.filter(
       (name) => !ownedPreviousNames.has(name) || desiredActive.has(name),
     );
-    const newlyActive = [...desiredActive].filter((name) => !activeSet.has(name));
+    const newlyActive = [...desiredActive, ...discoveryToActivate].filter(
+      (name) => !activeSet.has(name),
+    );
     const nextActive = this._orderActiveTools(new Set([...remaining, ...newlyActive]));
     // WHY: `pi.registerTool()` inside the loop may have auto-activated a newly registered hashed
     // Pi name or a `--tools` allowlist entry, and a resumed session restores the order it ended
@@ -686,13 +1006,13 @@ export class ToolBridge {
     return ordered ?? names;
   }
 
-  private _deactivateServerTools(serverName: string): void {
+  private _deactivateServerTools(serverName: string, activeBefore: readonly string[]): void {
     const serverTools = this.serverToolNames.get(serverName);
     if (!serverTools || serverTools.size === 0) return;
 
     const ownedByServer = this._ownedTools(serverName, serverTools);
     if (ownedByServer.size === 0) return;
 
-    this._reconcileActiveTools(ownedByServer, new Set(), this.pi.getActiveTools());
+    this._reconcileActiveTools(ownedByServer, new Set(), activeBefore);
   }
 }

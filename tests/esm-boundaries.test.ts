@@ -27,6 +27,7 @@ const PURE_MODULES = [
   "debug-log-format.ts",
   "errors.ts",
   "jsonc.ts",
+  "mcp-servers-prompt.ts",
   "oauth-policy.ts",
   "schema-allof.ts",
   "schema-convert.ts",
@@ -34,6 +35,7 @@ const PURE_MODULES = [
   "secret-redaction.ts",
   "server-provenance.ts",
   "terminal-text.ts",
+  "tool-exposure.ts",
   "tool-names.ts",
   "tool-order.ts",
 ] as const;

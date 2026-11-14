@@ -20,6 +20,7 @@ import {
   type ServerConfigSource,
 } from "./server-provenance.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
+import type { ToolActivity } from "./tool-bridge.js";
 
 /** Stored-credentials summary as far as a status view needs it. */
 export interface StoredAuthStatus {
@@ -33,7 +34,7 @@ export interface ServerStatusSnapshot {
   lifecycle: ServerConfig["lifecycle"];
   retryCount: number;
   source: ServerConfigSource | undefined;
-  tools: { discovered: number; active: number };
+  tools: ToolActivity;
   /** OAuth credential summary, or undefined when the server has no `auth` config. */
   auth: string | undefined;
   lastError: Error | null;
@@ -41,13 +42,24 @@ export interface ServerStatusSnapshot {
   recentOutput: string;
   /** Sanitized initialize-handshake guidance, only while the server is ready. */
   instructions?: string | undefined;
+  /** Configured `direct` tools currently absent from Pi's active set while ready. */
+  inactiveDirectTools?: number | undefined;
+  /** Whether Pi's `--tools` / `--exclude-tools` filter removed all indirect tools while ready. */
+  indirectToolsFiltered?: boolean | undefined;
+}
+
+export interface ServerStatusTools extends ToolActivity {
+  /** Configured `direct` tools absent from Pi's active set while ready (omitted when 0). */
+  inactiveDirect?: number | undefined;
+  /** Present (`true`) when Pi's `--tools` / `--exclude-tools` filter removed all indirect tools while ready. */
+  indirectFiltered?: true | undefined;
 }
 
 export interface ServerStatusRow {
   name: string;
   lifecycle: string;
   state: string;
-  tools: { discovered: number; active: number };
+  tools: ServerStatusTools;
   auth: string;
   error: string | undefined;
   source: ServerConfigSource | "unknown";
@@ -56,9 +68,13 @@ export interface ServerStatusRow {
 
 export interface CollectServerStatusParams {
   server: ManagedServer;
-  tools: { discovered: number; active: number };
+  tools: ToolActivity;
   source: ServerConfigSource | undefined;
   recentOutput?: string | undefined;
+  /** Configured `direct` tools absent from Pi's active set while ready. */
+  inactiveDirectTools?: number | undefined;
+  /** Whether Pi's `--tools` / `--exclude-tools` filter removed all indirect tools while ready. */
+  indirectToolsFiltered?: boolean | undefined;
   /** Reads stored OAuth state for a server; injected so tests avoid disk I/O. */
   readAuthStatus: (serverName: string) => Promise<StoredAuthStatus | null>;
 }
@@ -115,9 +131,36 @@ function isDefined(value: string | undefined): value is string {
   return value !== undefined;
 }
 
+/**
+ * `(N configured direct)` suffix for the `Tools:` line when exposure keeps some tools out of
+ * the active set by design — without it a server configured with `exposure: "hidden"` and a
+ * few overridden tools renders `3/12 active` and reads as a broken server (#257). Also surfaces
+ * inactive configured `direct` tools and indirect tools dropped by `--tools` / `--exclude-tools`.
+ */
+function formatExposureNote(
+  tools: ToolActivity,
+  inactiveDirectTools = 0,
+  indirectToolsFiltered = false,
+): string {
+  if (tools.expected === tools.discovered) return "";
+  const parts = [`${tools.expected} configured direct`];
+  if (inactiveDirectTools > 0) {
+    parts.push(`${inactiveDirectTools} direct inactive`);
+  }
+  if (indirectToolsFiltered) {
+    parts.push("indirect filtered by --tools / --exclude-tools");
+  }
+  return ` (${parts.join(", ")})`;
+}
+
 /** `/mcp <name>` detail view: config provenance, tool counts, credentials, and next steps. */
 export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: ConfigProvenance): string {
   const instructions = sanitizeServerInstructions(snapshot.instructions);
+  const exposureNote = formatExposureNote(
+    snapshot.tools,
+    snapshot.inactiveDirectTools,
+    snapshot.indirectToolsFiltered,
+  );
   const lines: Array<string | undefined> = [
     `Server: ${sanitizeTerminalText(snapshot.name)}`,
     `State:  ${snapshot.state}`,
@@ -125,7 +168,7 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
     `Transport: ${snapshot.transport}`,
     `Lifecycle: ${snapshot.lifecycle}`,
     `Source: ${formatServerSource(snapshot.source)}`,
-    `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active`,
+    `Tools: ${snapshot.tools.active}/${snapshot.tools.discovered} active${exposureNote}`,
     instructions === undefined ? undefined : `Instructions: ${instructions}`,
     snapshot.auth === undefined ? undefined : `OAuth: ${snapshot.auth}`,
     formatProjectConfigNote(provenance),
@@ -137,6 +180,16 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
   return `${lines.filter(isDefined).join("\n")}\n\nRecent output:\n${snapshot.recentOutput}`;
 }
 
+function toStatusTools(snapshot: ServerStatusSnapshot): ServerStatusTools {
+  return {
+    ...snapshot.tools,
+    ...((snapshot.inactiveDirectTools ?? 0) > 0
+      ? { inactiveDirect: snapshot.inactiveDirectTools }
+      : {}),
+    ...(snapshot.indirectToolsFiltered ? { indirectFiltered: true } : {}),
+  };
+}
+
 /** `mcp_status` row for one server. */
 export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
   const instructions = sanitizeServerInstructions(snapshot.instructions);
@@ -144,7 +197,7 @@ export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
     name: snapshot.name,
     lifecycle: snapshot.lifecycle,
     state: snapshot.state,
-    tools: snapshot.tools,
+    tools: toStatusTools(snapshot),
     auth: snapshot.auth ?? "not configured",
     error: formatStatusError(snapshot.lastError),
     source: formatServerSource(snapshot.source),
@@ -197,7 +250,10 @@ export function getServerInstructions(server: ManagedServer | undefined): string
 
 export async function collectServerStatus(params: CollectServerStatusParams): Promise<ServerStatusSnapshot> {
   const { server } = params;
+  const ready = server.state === "ready";
   const instructions = getServerInstructions(server);
+  const inactiveDirectTools =
+    ready && (params.inactiveDirectTools ?? 0) > 0 ? params.inactiveDirectTools : undefined;
   return {
     name: server.name,
     state: server.state,
@@ -210,5 +266,7 @@ export async function collectServerStatus(params: CollectServerStatusParams): Pr
     lastError: server.lastError,
     recentOutput: params.recentOutput ?? "",
     ...(instructions === undefined ? {} : { instructions }),
+    ...(inactiveDirectTools === undefined ? {} : { inactiveDirectTools }),
+    ...(ready && params.indirectToolsFiltered ? { indirectToolsFiltered: true } : {}),
   };
 }

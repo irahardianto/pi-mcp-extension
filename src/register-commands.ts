@@ -42,6 +42,8 @@ async function buildServerDetail(server: ManagedServer, deps: RegisterCommandsDe
     tools: deps.bridge.getToolActivity(serverName),
     source: lookupServerSource(provenance, serverName),
     recentOutput: manager.getServerLogs(serverName),
+    inactiveDirectTools: deps.bridge.getInactiveDirectTools(serverName).length,
+    indirectToolsFiltered: deps.bridge.hasAllIndirectToolsFiltered(serverName),
     readAuthStatus: (name) => manager.getServerAuthStatus(name),
   });
   return formatServerDetail(snapshot, provenance);

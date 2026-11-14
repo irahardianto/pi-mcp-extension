@@ -25,6 +25,7 @@ import {
 } from "./config-compat.js";
 import { McpError } from "./errors.js";
 import { stripJsonComments } from "./jsonc.js";
+import { MCP_EXPOSURES } from "./tool-exposure.js";
 
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
@@ -139,6 +140,33 @@ const ServerConfigObjectSchema = z.object({
    * `lifecycle: "lazy"`). Default: `true`.
    */
   enabled: z.boolean().optional(),
+  /**
+   * Pi 1.3.0 tool exposure for every tool this server advertises.
+   *
+   * `direct` — registered and activated, so the model sees the declaration.
+   * `deferred` — registered inactive; `tool_search` can load it on demand.
+   * `codemode` — registered inactive; callable from codemode scripts, and loadable by
+   *   `tool_search` (which then declares it).
+   * `hidden` — registered but not exposed to the model at all.
+   *
+   * Default: `"direct"` (unlike Pi's own `codemode`, so an existing config keeps every
+   * discovered tool active).
+   */
+  exposure: z.enum(MCP_EXPOSURES).optional(),
+  /**
+   * Pi 1.3.0 per-tool exposure overrides, keyed by the raw MCP tool name (`tools/list`
+   * name, not the Pi tool identifier) or a `*` wildcard pattern. An exact key wins, then
+   * the first matching pattern in declaration order, then `exposure`.
+   *
+   * The canonical way to expose only a few tools of a large server:
+   * `{ "exposure": "hidden", "toolExposure": { "search_*": "direct" } }`.
+   */
+  toolExposure: z.record(z.string(), z.enum(MCP_EXPOSURES)).optional(),
+  /**
+   * Short summary of what the server offers (Pi 1.3.0 `description`). Forwarded on the tool
+   * `namespace` for `tool_search` ranking and codemode's `describeNamespace()`.
+   */
+  description: z.string().optional(),
   /** Per-request timeout in ms. Overrides global setting. Default: 30000. */
   requestTimeoutMs: z.number().positive().optional(),
   /**
@@ -213,6 +241,11 @@ const SettingsSchema = z.object({
 const McpConfigSchema = z.object({
   settings: SettingsSchema.default(() => ({ ...DEFAULT_SETTINGS })),
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
+  /**
+   * Pi 1.3.0 top-level switch (default `true` when omitted): activate the built-in `codemode`
+   * tool automatically when a server with `"codemode"` exposure connects.
+   */
+  autoEnableCodemode: z.boolean().optional(),
 });
 
 /**
@@ -231,6 +264,7 @@ const ProjectSettingsSchema = z.object({
 const ProjectConfigSchema = z.object({
   settings: ProjectSettingsSchema.default({}),
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
+  autoEnableCodemode: z.boolean().optional(),
 });
 type ProjectConfig = z.output<typeof ProjectConfigSchema>;
 
@@ -350,11 +384,13 @@ function mergeConfigs(
   const stated = Object.fromEntries(
     Object.entries(projectCfg.settings).filter(([, v]) => v !== undefined),
   ) as Partial<Settings>;
+  const autoEnableCodemode = projectCfg.autoEnableCodemode ?? globalCfg.autoEnableCodemode;
   return {
     // Shallow spread: project settings override global settings per key
     settings: { ...globalCfg.settings, ...stated },
     // Per-server override: project server entry completely replaces global entry with same name
     mcpServers: { ...globalCfg.mcpServers, ...projectCfg.mcpServers },
+    ...(autoEnableCodemode === undefined ? {} : { autoEnableCodemode }),
   };
 }
 

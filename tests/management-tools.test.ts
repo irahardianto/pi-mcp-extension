@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import extension from "../src/index.js";
 import { acquireAuthLock, AuthLockError, AuthRequiredError, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
-import { formatMcpConnectError, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
+import { formatMcpConnectError, formatConnectSuccess, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 for (const { name, error, options, expected } of [
@@ -121,6 +121,80 @@ it("propagates in-flight mcp_list_resources cancellation instead of recording a 
   );
 });
 
+it("formats a successful mcp_connect message that reflects the configured exposure", () => {
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 6, active: 3, expected: 3 }),
+    "MCP server svc ready; tools discovered and active.",
+  );
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 6, active: 0, expected: 0 }),
+    "MCP server svc ready; no tool is configured as direct — all 6 are deferred, codemode, or hidden.",
+  );
+  // A tool_search-loaded tool must not leave the message claiming nothing is callable.
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 6, active: 2, expected: 0 }),
+    "MCP server svc ready; no tool is configured as direct — all 6 are deferred, codemode, or hidden (2 loaded through tool_search or codemode).",
+  );
+  assert.equal(
+    formatConnectSuccess("svc", { discovered: 0, active: 0, expected: 0 }),
+    "MCP server svc ready; it advertises no tools.",
+  );
+});
+
+it("reports mcp_connect success when exposure keeps most tools out of the model (#257)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-exposure-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const mockExt = createMockExtension();
+  const tools = mockExt.tools;
+  const events = mockExt.events;
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({
+      settings: { maxRetries: 0 },
+      mcpServers: {
+        partial: {
+          command: "node",
+          args: ["--import", tsxEsmLoader, mock],
+          lifecycle: "lazy",
+          exposure: "hidden",
+          toolExposure: { "get_*": "direct", add: "deferred" },
+        },
+      },
+    }));
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await events.get("session_start")({}, ctx);
+
+    const result = await tools.get("mcp_connect").execute("", { name: "partial" }, undefined, undefined, ctx);
+    assert.match(result.content[0].text, /ready; tools discovered and active/);
+    assert.deepEqual(
+      [...mockExt.activeTools].sort(),
+      ["mcp_partial_get_cwd", "mcp_partial_get_status"],
+      "only the tools configured as direct may be active",
+    );
+    // The mock server advertises six tools; four stay hidden or deferred by configuration.
+    const rows = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.deepEqual(rows[0].tools, { discovered: 6, active: 2, expected: 2 });
+
+    // A tool_search-loaded deferred tool must not mask a direct tool another extension removed:
+    // `active` (2) still equals `expected` (2), so only a per-name check catches it — and
+    // `mcp_status` surfaces `inactiveDirect: 1` so callers see the masked missing tool.
+    mockExt.activeTools = ["mcp_partial_add", "mcp_partial_get_cwd"];
+    await assert.rejects(
+      tools.get("mcp_connect").execute("", { name: "partial" }, undefined, undefined, ctx),
+      /configured as direct are inactive.*inactiveDirect/,
+      "an activated deferred tool must not mask an inactive direct tool",
+    );
+    assert.deepEqual(mockExt.activeTools, ["mcp_partial_add", "mcp_partial_get_cwd"]);
+    const maskedRows = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.deepEqual(maskedRows[0].tools, { discovered: 6, active: 2, expected: 2, inactiveDirect: 1 });
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it("registers agent-visible status and connect tools without eagerly starting a lazy server", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-management-"));
   const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
@@ -171,25 +245,30 @@ it("registers agent-visible status and connect tools without eagerly starting a 
     assert.ok(commands.has("mcp:start") && commands.has("mcp:stop") && commands.has("mcp:auth"));
     const discovered = active.length;
     const connectedStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
-    assert.deepEqual(connectedStatus[0].tools, { discovered, active: discovered });
+    assert.deepEqual(connectedStatus[0].tools, { discovered, active: discovered, expected: discovered });
     // Another extension may apply an intentional tool restriction after discovery.
     mockExt.activeTools = mockExt.activeTools.slice(1);
     await assert.rejects(
       tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
-      /connected, but some discovered tools are inactive/,
+      /connected, but some tools configured as direct are inactive/,
     );
     active = mockExt.activeTools;
     assert.equal(active.length, discovered - 1, "Connect must not override another extension's restriction");
     mockExt.activeTools = [];
     await assert.rejects(
       tools.get("mcp_connect").execute("", { name: "lazy" }, undefined, undefined, ctx),
-      /connected, but some discovered tools are inactive/,
+      /connected, but some tools configured as direct are inactive/,
     );
     active = mockExt.activeTools;
     assert.deepEqual(active, []);
     const inactiveStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(inactiveStatus[0].state, "ready", "Transport readiness and tool activation are separate states");
-    assert.deepEqual(inactiveStatus[0].tools, { discovered, active: 0 });
+    assert.deepEqual(inactiveStatus[0].tools, {
+      discovered,
+      active: 0,
+      expected: discovered,
+      inactiveDirect: discovered,
+    });
     await events.get("session_shutdown")({}, ctx);
     active = mockExt.activeTools;
     assert.equal(active.length, 0);
@@ -691,4 +770,285 @@ it("wires session_tree, input, before_agent_start, tool_execution_end, and befor
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("extension lifecycle activates reaching discovery tools, warns once when unreachable, and hides stopped/removed server tools (#257)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-exposure-e2e-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const notifications: Array<{ message: string; level: string | undefined }> = [];
+  const noopExecute = async () => ({ content: [{ type: "text", text: "ok" }] as [{ type: "text"; text: string }] });
+  const mockExt = createMockExtension({
+    activeTools: ["read"],
+    tools: [
+      { name: "read", description: "Read", execute: noopExecute },
+      { name: "codemode", description: "Codemode", reachesTools: true, execute: noopExecute },
+      { name: "tool_search", description: "Search", reachesTools: true, execute: noopExecute },
+    ],
+  });
+  const ctx = createMockContext({
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => {
+        notifications.push({ message, level });
+      },
+    },
+  });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          mock: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            env: {
+              MOCK_INSTRUCTIONS: "Prefer search_docs before fetch_doc; cite URIs.",
+            },
+            lifecycle: "eager",
+            description: "Mock reference server",
+            exposure: "codemode",
+            toolExposure: { echo: "direct", add: "deferred" },
+          },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "absent-global.json"),
+    });
+    await mockExt.events.get("session_start")({}, ctx);
+
+    // Both codemode and tool_search are auto-activated in deterministic order, and only echo is direct
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search", "mcp_mock_echo"]);
+    const addTool = mockExt.tools.get("mcp_mock_add");
+    const echoTool = mockExt.tools.get("mcp_mock_echo");
+    assert.equal(addTool.exposure, "deferred");
+    assert.equal(echoTool.exposure, "direct");
+    assert.deepEqual(addTool.namespace, {
+      name: "mcp_mock",
+      aliases: ["mock", "mcp__mock"],
+      description: "Mock reference server",
+      instructions: "Prefer search_docs before fetch_doc; cite URIs.",
+    });
+
+    // before_agent_start populates sections.mcp_servers for connected indirect servers
+    const promptSections: Record<string, string> = {};
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(promptSections["mcp_servers"] ?? "", /- mcp_mock \(codemode, tool_search\): Mock reference server/);
+    // No-op when before_agent_start carries no systemPromptOptions
+    await mockExt.events.get("before_agent_start")({}, ctx);
+
+    // Simulate tool_search loading `add` while a policy deactivates `echo` -> /mcp mock surfaces masked state
+    mockExt.activeTools = ["read", "codemode", "tool_search", "mcp_mock_add"];
+    notifications.length = 0;
+    await mockExt.commands.get("mcp").handler("mock", ctx);
+    assert.match(
+      notifications.at(-1)?.message ?? "",
+      /^Tools: 1\/6 active \(1 configured direct, 1 direct inactive\)$/m,
+    );
+
+    // /tree resets activeTools to an earlier turn's loadout; session_tree restores reaching
+    // discovery tools without re-activating inactive direct tools (`mcp_mock_echo`)
+    mockExt.activeTools = ["read"];
+    await mockExt.events.get("session_tree")({}, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+
+    // /mcp:stop hides every registered tool of the stopped server and marks it `not connected` in <mcp_servers>
+    await mockExt.commands.get("mcp:stop").handler("mock", ctx);
+    assert.equal(mockExt.tools.get("mcp_mock_echo").exposure, "hidden");
+    assert.equal(mockExt.tools.get("mcp_mock_add").exposure, "hidden");
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      /- mcp_mock \(codemode, tool_search, not connected — mcp_connect "mock"\): Mock reference server/,
+    );
+
+    // Reloading with a lazy indirect server pre-activates discovery tools at session_start before connecting,
+    // while an enabled:false server only contributes once manually connected (/mcp:start) and survives /tree
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          lazy_docs: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "lazy",
+            exposure: "deferred",
+          },
+          manual_code: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            env: {
+              MOCK_INSTRUCTIONS: "Handshake fallback line\nIgnored detail line",
+            },
+            enabled: false,
+            exposure: "codemode",
+          },
+        },
+      }),
+    );
+    mockExt.activeTools = ["read"];
+    await mockExt.events.get("session_start")({}, ctx);
+    // lazy_docs is enabled + deferred -> tool_search pre-activated; manual_code is enabled:false -> codemode stays off
+    assert.deepEqual(mockExt.activeTools, ["read", "tool_search"]);
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(promptSections["mcp_servers"] ?? "", /mcp_lazy_docs \(tool_search, not connected/);
+    assert.ok(!(promptSections["mcp_servers"] ?? "").includes("manual_code"));
+
+    // Manually starting enabled:false `manual_code` activates codemode, surfaces handshake instructions,
+    // and survives both /tree and mcp_servers_change reconciliations
+    await mockExt.commands.get("mcp:start").handler("manual_code", ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "tool_search", "codemode"]);
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(promptSections["mcp_servers"] ?? "", /- mcp_manual_code \(codemode\): Handshake fallback line/);
+    mockExt.activeTools = ["read"];
+    await mockExt.events.get("session_tree")({}, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+    mockExt.activeTools = ["read"];
+    mockExt.mcpServers.push({
+      name: "noop_direct",
+      config: { command: "node", args: ["--import", tsxEsmLoader, mock], lifecycle: "lazy" },
+      extensionPath: "/ext/noop.ts",
+    } as never);
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+    mockExt.mcpServers.length = 0;
+    await mockExt.events.get("mcp_servers_change")({ servers: [] }, ctx);
+
+    // Partial --exclude-tools (1 indirect tool excluded, others still in getAllTools) allows mcp_connect
+    const origGetAllTools = mockExt.api.getAllTools.bind(mockExt.api);
+    mockExt.api.getAllTools = () =>
+      origGetAllTools().filter((t: { name: string }) => t.name !== "mcp_lazy_docs_echo");
+    const partialRes = await mockExt.tools.get("mcp_connect").execute("c-part", { name: "lazy_docs" }, undefined, undefined, ctx);
+    assert.match(partialRes.content[0].text, /MCP server lazy_docs ready/);
+    await mockExt.commands.get("mcp:stop").handler("lazy_docs", ctx);
+
+    // Full --tools filtering (no mcp_lazy_docs_* tools in getAllTools) fails mcp_connect, warns, and annotates /mcp lazy_docs + mcp_status
+    mockExt.api.getAllTools = () =>
+      origGetAllTools().filter((t: { name: string }) => !t.name.startsWith("mcp_lazy_docs_"));
+    notifications.length = 0;
+    await assert.rejects(
+      () => mockExt.tools.get("mcp_connect").execute("c-filt", { name: "lazy_docs" }, undefined, undefined, ctx),
+      /filtered out its indirect tools; include mcp_\* in --tools/,
+    );
+    assert.ok(notifications.some((n) => n.level === "warning" && n.message.includes("include mcp_* in --tools")));
+    notifications.length = 0;
+    await mockExt.commands.get("mcp").handler("lazy_docs", ctx);
+    assert.match(
+      notifications.at(-1)?.message ?? "",
+      /^Tools: 0\/6 active \(0 configured direct, indirect filtered by --tools \/ --exclude-tools\)$/m,
+    );
+    const filteredStatusRows = JSON.parse(
+      (await mockExt.tools.get("mcp_status").execute("s-filt", {}, undefined, undefined, ctx)).content[0].text,
+    ) as Array<{ name: string; tools: Record<string, unknown> }>;
+    assert.deepEqual(filteredStatusRows.find((r) => r.name === "lazy_docs")?.tools, {
+      discovered: 6,
+      active: 0,
+      expected: 0,
+      indirectFiltered: true,
+    });
+    mockExt.api.getAllTools = origGetAllTools;
+
+    // Reloading with autoEnableCodemode: false and neither discovery tool active warns once per session
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        autoEnableCodemode: false,
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          mock: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "eager",
+            exposure: "codemode",
+          },
+        },
+      }),
+    );
+    mockExt.activeTools = ["read"];
+    notifications.length = 0;
+    await mockExt.events.get("session_start")({}, ctx);
+    const warnings = notifications.filter((n) => n.level === "warning");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!.message, /\(autoEnableCodemode is false\)/);
+
+    // Dynamic extension server registration and removal: hides unregistered tools, disambiguates
+    // colliding `-` vs `_` server namespaces in both `_toolRegistry` and `<mcp_servers>`, and
+    // rebinds back to the unhashed namespace once the colliding peer is removed.
+    mockExt.mcpServers.push({
+      name: "dyn-peer",
+      config: {
+        command: "node",
+        args: ["--import", tsxEsmLoader, mock],
+        exposure: "deferred",
+        description: "Hyphen peer",
+      },
+      extensionPath: "/ext/dyn-hyphen.ts",
+    } as never);
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    assert.ok(mockExt.activeTools.includes("tool_search"));
+    assert.equal(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.name, "mcp_dyn_peer");
+    assert.deepEqual(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.aliases, [
+      "dyn-peer",
+      "mcp__dyn_peer",
+    ]);
+
+    mockExt.mcpServers.push({
+      name: "dyn_peer",
+      config: {
+        command: "node",
+        args: ["--import", tsxEsmLoader, mock],
+        lifecycle: "lazy",
+        exposure: "deferred",
+        description: "Underscore peer",
+      },
+      extensionPath: "/ext/dyn-underscore.ts",
+    } as never);
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    const hyphenDisambiguated = mockExt.tools.get("mcp_dyn_peer_echo").namespace;
+    assert.match(hyphenDisambiguated?.name ?? "", /^mcp_dyn_peer_[0-9a-f]{8}$/);
+    assert.ok(!hyphenDisambiguated?.aliases?.includes("dyn-peer"));
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      new RegExp(`- ${hyphenDisambiguated!.name} \\(tool_search\\): Hyphen peer`),
+    );
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      /- mcp_dyn_peer \(tool_search, not connected — mcp_connect "dyn_peer"\): Underscore peer/,
+    );
+
+    // Removing `dyn_peer` restores `dyn-peer` to its canonical unhashed `mcp_dyn_peer` namespace
+    mockExt.mcpServers.pop();
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    assert.equal(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.name, "mcp_dyn_peer");
+    assert.deepEqual(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.aliases, [
+      "dyn-peer",
+      "mcp__dyn_peer",
+    ]);
+
+    mockExt.mcpServers.length = 0;
+    await mockExt.events.get("mcp_servers_change")({ servers: [] }, ctx);
+    assert.equal(mockExt.tools.get("mcp_dyn_peer_echo").exposure, "hidden");
+
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({ settings: { maxRetries: 0 }, mcpServers: {} }),
+    );
+    await mockExt.events.get("session_start")({}, ctx);
+    promptSections["mcp_servers"] = "stale";
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.equal("mcp_servers" in promptSections, false);
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 

@@ -73,7 +73,7 @@ function snapshot(overrides: Partial<ServerStatusSnapshot> = {}): ServerStatusSn
     lifecycle: "lazy",
     retryCount: 0,
     source: "global",
-    tools: { discovered: 0, active: 0 },
+    tools: { discovered: 0, active: 0, expected: 0 },
     auth: undefined,
     lastError: null,
     recentOutput: "(no stderr output from srv)",
@@ -188,7 +188,7 @@ describe("formatServerDetail", () => {
         transport: "streamable-http",
         lifecycle: "eager",
         source: "project",
-        tools: { discovered: 4, active: 3 },
+        tools: { discovered: 4, active: 3, expected: 4 },
         recentOutput: "listening",
       }),
       withExtensionServers(provenanceInput(), []),
@@ -208,13 +208,53 @@ describe("formatServerDetail", () => {
     assert.doesNotMatch(detail, /^Hint:/m);
   });
 
+  it("names the configured direct tools when exposure keeps the rest out of the active set", () => {
+    const detail = formatServerDetail(
+      snapshot({
+        state: "ready",
+        tools: { discovered: 24, active: 3, expected: 3 },
+        recentOutput: "listening",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+
+    assert.match(detail, /^Tools: 3\/24 active \(3 configured direct\)$/m);
+
+    const masked = formatServerDetail(
+      snapshot({
+        state: "ready",
+        tools: { discovered: 3, active: 2, expected: 2 },
+        inactiveDirectTools: 1,
+        recentOutput: "listening",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+
+    assert.match(masked, /^Tools: 2\/3 active \(2 configured direct, 1 direct inactive\)$/m);
+
+    const filtered = formatServerDetail(
+      snapshot({
+        state: "ready",
+        tools: { discovered: 4, active: 0, expected: 0 },
+        indirectToolsFiltered: true,
+        recentOutput: "listening",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+
+    assert.match(
+      filtered,
+      /^Tools: 0\/4 active \(0 configured direct, indirect filtered by --tools \/ --exclude-tools\)$/m,
+    );
+  });
+
   it("adds OAuth, last error, hint, and the skipped-project note for a failed untrusted server", () => {
     const detail = formatServerDetail(
       snapshot({
         state: "stopped",
         retryCount: 5,
         source: "global",
-        tools: { discovered: 2, active: 0 },
+        tools: { discovered: 2, active: 0, expected: 2 },
         auth: "credentials stored",
         lastError: new McpError("Connection timed out after 30000ms", "srv", "timeout"),
         recentOutput: "(no stderr output from srv)",
@@ -235,7 +275,7 @@ describe("collectServerStatus", () => {
     client.getInstructions = () => raw;
     return collectServerStatus({
       server: managedServer({ state, client }),
-      tools: { discovered: 1, active: 1 },
+      tools: { discovered: 1, active: 1, expected: 1 },
       source: "global",
       readAuthStatus: async () => null,
     });
@@ -299,13 +339,15 @@ describe("collectServerStatus", () => {
     assert.doesNotMatch(detail, /raw-secret|\u001b/);
   });
 
-  it("skips the credential probe entirely for a server without auth config", async () => {
+  it("skips the credential probe entirely for a server without auth config and gates exposure flags on ready state", async () => {
     let probes = 0;
     const status = await collectServerStatus({
-      server: managedServer(),
-      tools: { discovered: 1, active: 1 },
+      server: managedServer({ state: "ready" }),
+      tools: { discovered: 2, active: 0, expected: 0 },
       source: "extension",
       recentOutput: "out",
+      inactiveDirectTools: 1,
+      indirectToolsFiltered: true,
       readAuthStatus: async () => {
         probes++;
         return null;
@@ -314,9 +356,24 @@ describe("collectServerStatus", () => {
 
     assert.equal(probes, 0);
     assert.equal(status.auth, undefined);
-    assert.equal(status.tools.discovered, 1);
+    assert.equal(status.tools.discovered, 2);
+    assert.equal(status.inactiveDirectTools, 1);
+    assert.equal(status.indirectToolsFiltered, true);
     assert.deepEqual(status.recentOutput, "out");
     assert.equal(status.transport, "stdio");
+
+    for (const nonReady of ["stopped", "starting"] as const) {
+      const stale = await collectServerStatus({
+        server: managedServer({ state: nonReady }),
+        tools: { discovered: 2, active: 0, expected: 1 },
+        source: "extension",
+        inactiveDirectTools: 1,
+        indirectToolsFiltered: true,
+        readAuthStatus: async () => null,
+      });
+      assert.equal(Object.hasOwn(stale, "inactiveDirectTools"), false);
+      assert.equal(Object.hasOwn(stale, "indirectToolsFiltered"), false);
+    }
   });
 
   it("reports credential presence from the injected stored-state reader", async () => {
@@ -326,14 +383,14 @@ describe("collectServerStatus", () => {
     });
     const withTokens = await collectServerStatus({
       server,
-      tools: { discovered: 0, active: 0 },
+      tools: { discovered: 0, active: 0, expected: 0 },
       source: "global",
       recentOutput: "",
       readAuthStatus: async () => ({ hasTokens: true }),
     });
     const withoutState = await collectServerStatus({
       server,
-      tools: { discovered: 0, active: 0 },
+      tools: { discovered: 0, active: 0, expected: 0 },
       source: "global",
       readAuthStatus: async () => null,
     });
@@ -351,7 +408,7 @@ describe("collectServerStatus", () => {
 
     const status = await withoutStderr(() => collectServerStatus({
       server,
-      tools: { discovered: 0, active: 0 },
+      tools: { discovered: 0, active: 0, expected: 0 },
       source: "project",
       recentOutput: "",
       readAuthStatus: async () => {
@@ -364,13 +421,13 @@ describe("collectServerStatus", () => {
 });
 
 describe("toStatusRow", () => {
-  it("renders the mcp_status row including the config source", () => {
+  it("renders the mcp_status row including the config source and optional exposure diagnostics", () => {
     const row = toStatusRow(
       snapshot({
         name: "srv",
         lifecycle: "eager",
         state: "ready",
-        tools: { discovered: 3, active: 2 },
+        tools: { discovered: 3, active: 2, expected: 3 },
         lastError: null,
         source: "project",
       }),
@@ -380,10 +437,30 @@ describe("toStatusRow", () => {
       name: "srv",
       lifecycle: "eager",
       state: "ready",
-      tools: { discovered: 3, active: 2 },
+      tools: { discovered: 3, active: 2, expected: 3 },
       auth: "not configured",
       error: undefined,
       source: "project",
+    });
+
+    const maskedAndFiltered = toStatusRow(
+      snapshot({
+        name: "srv",
+        lifecycle: "eager",
+        state: "ready",
+        tools: { discovered: 6, active: 1, expected: 1 },
+        inactiveDirectTools: 1,
+        indirectToolsFiltered: true,
+        lastError: null,
+        source: "project",
+      }),
+    );
+    assert.deepEqual(maskedAndFiltered.tools, {
+      discovered: 6,
+      active: 1,
+      expected: 1,
+      inactiveDirect: 1,
+      indirectFiltered: true,
     });
   });
 

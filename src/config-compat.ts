@@ -5,13 +5,13 @@
  */
 
 import { McpError } from "./errors.js";
+import { normalizeExposureAlias } from "./tool-exposure.js";
 
 /**
  * Keys a Pi 1.3.0 project entry may override on the global entry of the same name (`/mcp` writes
  * such an entry as soon as a global server is disabled or its exposure is changed for one project).
- * `exposure` / `toolExposure` are Pi-native tool-exposure settings: they are accepted so a shared
- * `mcp.json` loads, and ignored because this extension decides tool activation itself. `lifecycle`
- * is this extension's equivalent of `enabled`.
+ * `exposure` / `toolExposure` are Pi-native tool-exposure settings and are honored by the tool
+ * bridge; `lifecycle` is this extension's equivalent of `enabled`.
  */
 export const PROJECT_OVERRIDE_KEYS = ["enabled", "exposure", "toolExposure", "lifecycle"] as const;
 
@@ -91,6 +91,21 @@ function normalizeTimeoutAlias(obj: Record<string, unknown>): void {
   obj.requestTimeoutMs = obj.timeout * 1000;
 }
 
+/**
+ * Map Pi's retired `codemode-deferred` exposure alias onto `codemode`, on the server `exposure`
+ * and on every `toolExposure` value. Pi accepts the alias in shared configs, so a config Pi
+ * wrote must not fail validation here.
+ */
+function normalizeExposureAliases(obj: Record<string, unknown>): void {
+  if (obj.exposure !== undefined) {
+    obj.exposure = normalizeExposureAlias(obj.exposure);
+  }
+  if (!isPlainObject(obj.toolExposure)) return;
+  obj.toolExposure = Object.fromEntries(
+    Object.entries(obj.toolExposure).map(([tool, value]) => [tool, normalizeExposureAlias(value)]),
+  );
+}
+
 /** Rewrite Pi 1.x config aliases (`type`, `oauth`, `timeout`, `enabled`) before schema validation. */
 export function normalizeServerConfigAliases(raw: unknown): unknown {
   if (!isPlainObject(raw)) return raw;
@@ -99,6 +114,7 @@ export function normalizeServerConfigAliases(raw: unknown): unknown {
   normalizeAuthAlias(obj);
   normalizeTimeoutAlias(obj);
   normalizeEnabledAlias(obj);
+  normalizeExposureAliases(obj);
   return obj;
 }
 

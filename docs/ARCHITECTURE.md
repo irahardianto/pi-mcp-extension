@@ -70,7 +70,33 @@ flowchart TD
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
-  server connects and disconnects. Each reconcile writes the active set once, with the
+  server connects and disconnects. Each tool's exposure is resolved from the server entry's
+  `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact raw-name key, then the first `*`
+  pattern in declaration order, then the server default `direct`), attached to a sanitized,
+  peer-disambiguated per-server `ToolNamespace` (`description` + MCP handshake `instructions`,
+  re-synced across connected peers via `syncServerNamespaces()` when servers are added or
+  removed), and given a
+  `CallToolResult` `outputSchema` (`buildMcpResultSchema()` with relocated
+  `#/properties/structuredContent` `$ref`s) plus `structuredContent` (`buildMcpScriptResult()`
+  without `_meta`) so `codemode` scripts receive raw MCP content blocks, typed return values,
+  and on Pi 1.3.0+ (`supportsToolErrorResult(ctx)`) structured `{ content, structuredContent, isError: true }`
+  tool-error envelopes while older Pi `< 1.3.0` runtimes still reject with `McpError(..., "tool")`.
+  Only `direct` tools enter the active set; `deferred` and `codemode` both register on Pi as
+  `deferred` so `codemode`'s own tool description never mutates mid-session with inlined MCP
+  schemas, while reaching `codemode` (when `autoEnableCodemode !== false`) and `tool_search`
+  tools are pre-activated at session start / server-config change across enabled and connected
+  indirect servers (`collectRequiredDiscoveryExposures()`), assessed against Pi's `--tools` /
+  `--exclude-tools` filter (`assessRegisteredServerExposures()`), ensured on tool refreshes
+  (`ensureDiscoveryTools()`), and restored on `session_tree` without re-activating inactive
+  `direct` tools; `before_agent_start` populates `systemPromptOptions.sections["mcp_servers"]`
+  (`renderMcpServersSection()`) with matching peer-disambiguated namespace headers and symmetric
+  `codemode` ↔ `tool_search` fallback (or omits it
+  when neither reaching tool is active) so the model sees indirect MCP domains, reach modes, and
+  `mcp_connect` hints for disconnected servers. `hidden` tools are registered inactive and never
+  exposed, stopping/removing/withdrawing a tool snapshots `activeTools` before re-registering it
+  as `hidden` and guards `execute` against stale calls, and a reconnect after a stop re-derives
+  the set from exposure alone (#257). Each reconcile
+  writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
   tool left at its position; `orderActiveTools()` re-applies that order without re-activating
   inactive tools on `session_tree` (when `/tree` restores active tools from transcript
@@ -139,11 +165,12 @@ what to do:
 While `ready`, three independent recovery paths exist:
 
 - `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-registers the
-  server's tools, deactivates ones the server no longer advertises (remembering whether Pi
-  had each active), and activates only tools the server did not expose before — the
-  active/inactive state of tools Pi already knew about is left alone, because another
-  extension or a user policy may have removed them, and a tool that reappears is restored to
-  the state it left in;
+  server's current tools, hides and deactivates tools the server no longer advertises
+  (remembering whether Pi had each active), activates newly discovered `direct` tools and
+  existing tools promoted into `direct`, deactivates tools narrowed out of `direct` or set
+  `hidden`, and preserves the active/inactive state of tools whose exposure class did not
+  cross `direct` (such as policies that deactivated a `direct` tool or `tool_search` loading
+  a `deferred` tool), restoring a re-advertised tool when compatible with its current exposure;
   `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,
@@ -428,8 +455,9 @@ Behavior:
   Pi's `/mcp` writes it (`{ "internal-tools": { "enabled": false } }`). The override is
   applied to the **raw** global entry before validation, so the global `command`/`url`,
   headers, and OAuth config are kept and the project only changes `enabled`,
-  `lifecycle`, `exposure`, or `toolExposure` (`exposure` / `toolExposure` are Pi-native
-  and ignored here). An override with any other key, or for a name no global file
+  `lifecycle`, `exposure`, or `toolExposure` (the two Pi-native exposure keys are honored
+  by the tool bridge, so a project can narrow what the agent sees without restating the
+  global credentials). An override with any other key, or for a name no global file
   defines, is a config error naming the file and the server.
 - **Pi 1.x aliases** are normalized before validation: `type` → `transport`, `"http"` →
   `"streamable-http"`, `oauth` → `auth`, `timeout` (seconds) → `requestTimeoutMs`, and
@@ -438,7 +466,10 @@ Behavior:
   `streamable-http` when `url` is set), `lifecycle` is `lazy` (eager for
   extension-registered servers unless `enabled: false`), `toolPrefix` is `mcp`,
   `requestTimeoutMs` is `30000`, and `maxRetries` is `5`.
-- **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `auth` is
+- **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `exposure`
+  and every `toolExposure` value must be `direct`, `deferred`, `codemode`, or `hidden`
+  (Pi's retired `codemode-deferred` alias is normalized to `codemode` before validation, on
+  the server value and on every per-tool value); `auth` is
   rejected on `stdio`; `auth.provider` (Pi's `/login` provider token, which this
   extension cannot forward) is rejected instead of being silently downgraded to OAuth;
   `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated

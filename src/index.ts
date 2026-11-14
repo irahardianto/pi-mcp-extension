@@ -29,8 +29,18 @@ import { authorize as runAuthorize } from "./authorize-flow.js";
 import {
   DebugLog,
   isDebugLogEnabled,
+  reportDiagnostic,
   setDebugLog,
 } from "./debug-log.js";
+import {
+  MCP_SERVERS_SECTION,
+  renderMcpServersSection,
+  type McpPromptServerEntry,
+} from "./mcp-servers-prompt.js";
+import {
+  collectConfiguredExposures,
+  collectRequiredDiscoveryExposures,
+} from "./tool-exposure.js";
 
 export {
   startupAuthNowOption,
@@ -50,7 +60,11 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
 
   // ── 2. Initialize bridge components ──────────────────────────────────────
   const manager = new ServerManager(initialState.config, paths.authStorageDir);
-  const bridge = new ToolBridge(initialState.config.settings, pi);
+  const bridge = new ToolBridge(
+    initialState.config.settings,
+    pi,
+    initialState.config.autoEnableCodemode,
+  );
   const resources = new ResourceBridge();
   const callbackServer = paths.callbackServer ?? new CallbackServer();
   const coordinator: ConnectionCoordinator = new ConnectionCoordinator({
@@ -76,6 +90,9 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       options?.requestTimeoutMs ??
       server?.config.requestTimeoutMs ??
       lifecycle.getConfig().settings.requestTimeoutMs;
+    // WHY: exposure lives on the server entry, and the manager's refresh options carry only
+    // timeouts — resolve it here so a config reload that changes `exposure` / `toolExposure`
+    // takes effect on the next discovery instead of being frozen at construction.
     await bridge.refreshTools(
       serverName,
       client,
@@ -83,6 +100,10 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
       {
         ...options,
         requestTimeoutMs,
+        exposure: server?.config.exposure,
+        toolExposure: server?.config.toolExposure,
+        description: server?.config.description,
+        peerServerNames: manager.getAllServers().map((entry) => entry.name),
       },
     );
   });
@@ -114,12 +135,29 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
   };
   bridge.setAuthErrorCallback(handleAuthError);
+  const seenDiscoveryWarnings = new Set<string>();
+  bridge.setDiscoveryWarningCallback((warning) => {
+    if (seenDiscoveryWarnings.has(warning)) return;
+    seenDiscoveryWarnings.add(warning);
+    reportDiagnostic({
+      level: "info",
+      event: "tools.discovery_unreachable",
+      message: warning,
+    });
+    const ctx = coordinator.getActiveContext();
+    if (ctx?.hasUI) {
+      ctx.ui.notify(`pi-mcp: ${warning}`, "warning");
+    }
+  });
   // WHY: a resources/* request can be the first call to hit an expired token, so it needs
   // the same re-authorization path as tools/call.
   resources.setAuthErrorCallback(handleAuthError);
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
-  pi.on("session_start", (_event, ctx: ExtensionContext) => lifecycle.handleSessionStart(ctx));
+  pi.on("session_start", (_event, ctx: ExtensionContext) => {
+    seenDiscoveryWarnings.clear();
+    return lifecycle.handleSessionStart(ctx);
+  });
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
   pi.on("mcp_servers_change", (event, ctx: ExtensionContext) =>
     lifecycle.handleServersChange(event, ctx),
@@ -132,9 +170,17 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   const normalizeActiveTools = (): void => {
     bridge.orderActiveTools();
   };
-  pi.on("session_tree", normalizeActiveTools);
+  pi.on("session_tree", () => {
+    restoreSessionTreeTools(manager, bridge);
+  });
   pi.on("input", normalizeActiveTools);
-  pi.on("before_agent_start", normalizeActiveTools);
+  pi.on("before_agent_start", (event) => {
+    bridge.orderActiveTools();
+    // WHY: read `pi.getActiveTools()` rather than `event.systemPromptOptions?.selectedTools` — an
+    // earlier `before_agent_start` handler may have called `pi.setActiveTools(...)`, which Pi only
+    // folds back into `systemPromptOptions.selectedTools` after all handlers finish.
+    syncMcpServersPromptSection(event?.systemPromptOptions?.sections, manager, bridge, pi.getActiveTools());
+  });
   pi.on("tool_execution_end", normalizeActiveTools);
   pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
 
@@ -162,6 +208,57 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     );
 
   registerManagementTools(pi, { manager, coordinator, bridge, resources, getProvenance });
+}
+
+function restoreSessionTreeTools(manager: ServerManager, bridge: ToolBridge): void {
+  // WHY: `/tree` runs `AgentSession._restoreToolsFromTranscript()`, which resets `activeTools` to
+  // the target turn's declared loadout. If an indirect (`codemode` / `deferred`) server was added
+  // or started after that turn, re-ensuring reaching discovery tools keeps its tools reachable
+  // without re-activating `direct` tools that the restored branch did not declare (#257, #278).
+  bridge.ensureDiscoveryTools(
+    collectRequiredDiscoveryExposures(
+      manager.getAllServers().map((server) => server.config),
+      bridge.getConnectedExposures(),
+    ),
+  );
+  bridge.orderActiveTools();
+}
+
+function buildPromptServerEntry(server: ManagedServer, bridge: ToolBridge): McpPromptServerEntry {
+  const connected = server.state === "ready" && bridge.isServerActive(server.name);
+  const instructions =
+    connected && typeof server.client?.getInstructions === "function"
+      ? server.client.getInstructions()
+      : undefined;
+  return {
+    name: server.name,
+    enabled: server.config.enabled,
+    connected,
+    exposures: connected
+      ? bridge.getServerExposures(server.name)
+      : collectConfiguredExposures([server.config]),
+    description: server.config.description,
+    instructions,
+  };
+}
+
+function syncMcpServersPromptSection(
+  sections: Record<string, string> | undefined,
+  manager: ServerManager,
+  bridge: ToolBridge,
+  activeTools: readonly string[],
+): void {
+  if (!sections) return;
+  const section = renderMcpServersSection({
+    servers: manager.getAllServers().map((server) => buildPromptServerEntry(server, bridge)),
+    toolPrefix: bridge.getToolPrefix(),
+    activeTools,
+  });
+  if (section !== undefined) {
+    sections[MCP_SERVERS_SECTION] = section;
+  } else {
+    delete sections[MCP_SERVERS_SECTION];
+  }
 }
 
 function isClientActive(

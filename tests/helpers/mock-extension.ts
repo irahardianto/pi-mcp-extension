@@ -40,6 +40,8 @@ export interface MockTool {
   promptSnippet?: string;
   promptGuidelines?: string[];
   parameters?: unknown;
+  exposure?: ToolDefinition["exposure"] | undefined;
+  namespace?: ToolDefinition["namespace"] | undefined;
   execute: (
     id: string,
     params: Record<string, unknown>,
@@ -73,6 +75,7 @@ export interface PartialMockApi {
   registerTool?: (tool: MockTool) => unknown;
   registerCommand?: (name: string, cmd: MockCommand) => unknown;
   on?: (event: string, handler: MockEventHandler) => unknown;
+  getAllTools?: () => readonly MockTool[];
   getActiveTools?: () => string[];
   setActiveTools?: (names: string[]) => void;
   getMcpServers?: () => Array<{ name: string; config: Record<string, unknown>; extensionPath: string }>;
@@ -92,6 +95,13 @@ export function asExtensionAPI(partial: PartialMockApi): ExtensionAPI {
       partial.on?.(event, handler as MockEventHandler);
       return () => {};
     },
+    ...(partial.getAllTools
+      ? {
+          getAllTools(): MockTool[] {
+            return [...partial.getAllTools!()];
+          },
+        }
+      : {}),
     getActiveTools(): string[] {
       return partial.getActiveTools ? partial.getActiveTools() : [];
     },
@@ -107,8 +117,12 @@ export function asExtensionAPI(partial: PartialMockApi): ExtensionAPI {
 export function createMockExtension(options?: {
   mcpServers?: RegisteredMcpServer[];
   activeTools?: string[];
+  tools?: MockTool[];
 }): MockExtension {
   const tools = createStrictMap<string, MockTool>();
+  for (const seeded of options?.tools ?? []) {
+    tools.set(seeded.name, seeded);
+  }
   const commands = createStrictMap<string, MockCommand>();
   const events = createStrictMap<string, MockEventHandler>();
   let active = options?.activeTools ?? [];
@@ -118,6 +132,7 @@ export function createMockExtension(options?: {
     registerTool: (tool) => tools.set(tool.name, tool),
     registerCommand: (name, cmd) => commands.set(name, cmd),
     on: (event, handler) => events.set(event, handler),
+    getAllTools: () => [...tools.values()],
     getActiveTools: () => active,
     setActiveTools: (names) => {
       active = names;

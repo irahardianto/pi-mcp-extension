@@ -28,6 +28,7 @@
 - **Stable tool names** — Sanitized, collision-avoiding names (`<prefix>_<server>_<tool>`, max 64 chars) that stay constant across reconnects, including when one server exposes two tools that sanitize to the same identifier: the name that needs no substitution keeps the unhashed form (`my_tool` wins over `my-tool`), remaining ties break by raw-name order, and the names that server's tools get never depend on `tools/list` order
 - **Stable tool order** — Active MCP tools keep one deterministic order across session starts, `/tree` navigation, and idle or mid-turn `setActiveTools` updates (including `tool_search`): each active owned tool is sorted by Pi name among the slots it occupies, inactive tools stay off, and other extensions' tools never move. The same order is applied to outgoing provider tool declarations (top-level `tools`, AWS Bedrock Converse `toolConfig.tools`, Google/Vertex `config.tools[].functionDeclarations`, and `pi-messages` `context.messages[].toolsAdded`), which Pi otherwise rebuilds from the transcript's first-appearance order, so the system prompt's tool section and the tools this extension declares stay identical across session starts whatever order the eager servers connected in or the servers list their tools in — keeping a server-side prefix cache warm. A server that connects after an earlier turn is announced on that later turn through the provider's mid-conversation tool-addition channel, which cannot move back into earlier turns
 - **No tool churn** — Activate/deactivate pattern ensures tools don't flicker during reconnection
+- **Tool exposure control** — Honor Pi 1.3.0's `exposure` / `toolExposure`: declare only the handful of tools a task needs `direct`, leave the rest to Pi's `tool_search` and codemode on-demand loading, or hide them entirely — so a 30–80-tool server (GitHub, Supabase, Playwright, Notion) no longer spends 10k–30k tokens of tool declarations per turn or degrades tool selection
 - **Layered config & trust boundary** — Global `<agent dir>/mcp.json`, project `.pi/mcp.json` (loaded only in trusted projects, including Pi 1.3.0 partial overrides), and Pi 1.x extension-registered servers (`pi.registerMcpServer()`)
 - **Rich tool results & annotations** — MCP `text`, `image` (`ImageContent`), `structuredContent`, embedded `resource` text/images/binary blobs, `resource_link` hints, and `audio` fallback descriptions, plus `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` surfaced in tool descriptions and passed to Pi as structured tool `annotations` (boolean hints only), so permission extensions can inspect them
 - **On-demand agent tools & commands** — `mcp_status`, `mcp_connect`, `mcp_list_resources`, and `mcp_read_resource` agent tools plus `/mcp`, `/mcp <name>` (with config provenance and failure hints), `/mcp:start`, `/mcp:stop`, `/mcp:auth`, and `/mcp:resources` slash commands with server-name autocomplete
@@ -171,6 +172,8 @@ In project-level `.pi/mcp.json`, `settings` keys carry no defaults — only the 
 | `requestTimeoutMs` | `number` | `30000` | Default per-request timeout in milliseconds. For `tools/call` this is an inactivity deadline: every `notifications/progress` event from the server restarts it, so page-by-page work is not cut off mid-flight. A server that reports progress indefinitely has no wall-clock cap — cancel the tool to stop it |
 | `maxRetries` | `number` | `5` | Max reconnection attempts (0–10) before giving up |
 
+At the top level of `mcp.json` (alongside `settings` and `mcpServers`), Pi 1.3.0's `autoEnableCodemode` (`boolean`, default `true`; project `.pi/mcp.json` overrides global when set) controls whether configuring any `"codemode"` server or tool automatically activates Pi's built-in `codemode` tool.
+
 ### Per-Server Config
 
 For Pi 1.x / 1.3.0 compatibility, server entries also accept:
@@ -192,10 +195,52 @@ For Pi 1.x / 1.3.0 compatibility, server entries also accept:
 | `url` | `string` | — | Server URL (**required** for `streamable-http` and `sse`) |
 | `headers` | `Record<string, string>` | — | Static headers sent with `streamable-http` and `sse` requests. When `auth` is set, OAuth owns `Authorization`, so an `Authorization` entry here is ignored (other headers still apply) |
 | `auth` (or `oauth`) | `object` | — | OAuth 2.1 configuration described below and in [OAUTH.md](./OAUTH.md) (`streamable-http` / `sse` only) |
+| `description` | `string` | — | Optional server summary attached to each registered tool's `namespace` and shown in Pi's `mcp_servers` system-prompt section for indirect servers (sanitized and secret-redacted, bounded to 250 characters; connected servers fall back to the first line of handshake `instructions` when omitted) |
 | `lifecycle` | `"eager" \| "lazy"` | `"lazy"` (`"eager"` for `pi.registerMcpServer()` unless `enabled: false`) | `eager` = auto-start on `session_start`, `lazy` = connect on request via `mcp_connect`, `/mcp:start`, or `/mcp:auth` |
 | `enabled` | `boolean` | `true` | Pi 1.3.0 switch: `false` keeps the entry configured but out of the eager set (normalized to `lifecycle: "lazy"`, even when `lifecycle: "eager"` is also set) |
+| `exposure` | `"direct" \| "deferred" \| "codemode" \| "hidden"` | `"direct"` | Pi 1.3.0 tool exposure for every tool of this server (see [Tool exposure](#tool-exposure)). `"codemode-deferred"` is accepted as an alias for `"codemode"` |
+| `toolExposure` | `Record<string, "direct" \| "deferred" \| "codemode" \| "hidden">` | — | Per-tool exposure overrides keyed by the raw MCP tool name or a `*` wildcard pattern; an exact key wins, then the first matching pattern in declaration order, then `exposure` |
 | `requestTimeoutMs` (or `timeout`) | `number` | global setting | Per-server timeout override in ms (`timeout` is specified in seconds and multiplied by `1000`) |
 | `healthCheckIntervalMs` | `number` | disabled | Opt-in ping interval in ms for proactive connection health monitoring |
+
+### Tool exposure
+
+Large MCP servers advertise 30–80 tools (GitHub, Supabase, Linear, Playwright, Notion, Jira). Declaring all of them to the model on every turn costs 10k–30k tokens of tool declarations and makes tool selection worse when the task needs three of them. Pi 1.3.0's `exposure` / `toolExposure` keys scope that declaration, and this extension honors them:
+
+```jsonc
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "description": "GitHub repository and pull-request read tools",
+      // Hide everything, then expose only the read-only tools the agent needs directly:
+      "exposure": "hidden",
+      "toolExposure": {
+        "get_*": "direct",
+        "list_*": "direct",
+        "search_*": "direct"
+      }
+    }
+  }
+}
+```
+
+| Exposure | What Pi does with the tool |
+|---|---|
+| `direct` | Registers it active: declared to the model like any other tool (this is the default here) |
+| `deferred` | Registers it inactive with server `namespace` metadata (`description` + MCP handshake `instructions`) and auto-activates Pi's `tool_search` tool when available so the model can load and call it on demand |
+| `codemode` | Registers it as Pi `deferred` with server `namespace` metadata and a `CallToolResult` `outputSchema` (keeping `codemode`'s own tool description stable across connects for prompt caching) and auto-activates Pi's `codemode` tool unless `autoEnableCodemode: false` is set. Reachable from `codemode` scripts (`searchTools()` / `describeTool()` inspect its input and output schemas, and on Pi 1.3.0+ calls — including MCP `isError: true` tool errors — resolve to `{ content, structuredContent, isError }`) and loadable by `tool_search`. `codemode-deferred` is an accepted alias |
+| `hidden` | Registers it inactive with `exposure: "hidden"`: it stays in `/mcp` counts and keeps its Pi tool name, yet neither the model, `tool_search`, nor `codemode` can see or call it |
+
+Resolution follows Pi: an exact `toolExposure` key wins, then the first matching `*` pattern in declaration order, then the server's `exposure`, then `direct`. Patterns are keyed by the **raw MCP tool name** (`tools/list`), not the Pi identifier, and `*` is the only wildcard — `get_*` matches `get_users`, while `.`, `+`, `(` and friends are literal. Matching is linear, so a pathological pattern in a shared `mcp.json` cannot hang the session.
+
+**System-prompt discovery, disconnect hiding, and backwards compatibility.** Pi's own MCP client defaults an omitted `exposure` to `codemode`; this extension keeps `direct`, so an existing `mcp.json` that says nothing about exposure keeps activating every discovered tool (and on Pi `< 1.3.0`, `isError: true` continues rejecting with `McpError`). Because `codemode` and `tool_search` do not inline MCP server lists in their own tool descriptions, `before_agent_start` populates `systemPromptOptions.sections["mcp_servers"]` (capped at 4,096 characters) with enabled or connected indirect servers, how to reach each (`codemode` vs `tool_search`, falling back symmetrically when only one is active and omitting the section when neither is active), `not connected — mcp_connect "<name>"` hints for lazy/stopped servers, and a sanitized one-line summary (`description`, or the connected server's first handshake `instructions` line). Server `namespace` identifiers and `<mcp_servers>` bullet headers are deterministically disambiguated across peer servers when distinct server names sanitize or project to the same script identifier (for example `my-srv` vs `my_srv`, `1srv` vs `_srv`, or `a` vs `_a`), while `mcp_connect "<name>"` hints preserve the raw server name. Reaching discovery tools (`codemode` / `tool_search`) are pre-activated at session start for all enabled or connected indirect servers (eager, lazy, and manually started `enabled: false`) so connecting a lazy server mid-session does not churn active tools, and restored after `/tree` (`session_tree`) without re-activating inactive `direct` tools. When indirect tools (`deferred` or `codemode`) are present and neither `tool_search` nor `codemode` ends up active — or when Pi's `--tools` / `--exclude-tools` filter removes all of a server's indirect tools — Pi surfaces a session warning. Stopping, removing, or withdrawing a server's tool re-registers it as `hidden` and rejects stale calls until the server reconnects, so `tool_search` and `codemode` never surface disconnected tools. A server whose tools are all deferred or hidden is working as configured, not broken: `mcp_connect` verifies configured `direct` tools and rejects if `--tools` / `--exclude-tools` filtered out all indirect tools, while `/mcp <name>` plus `mcp_status` report `tools: { discovered, active, expected, inactiveDirect?, indirectFiltered? }` — `expected` being the number of `direct` tools, with `inactiveDirect` set when configured `direct` tools on a ready server are missing from Pi's active set and `indirectFiltered: true` when `--tools` / `--exclude-tools` filtered out all indirect tools. `/mcp <name>` appends `(N configured direct)` — plus `, M direct inactive` or `, indirect filtered by --tools / --exclude-tools` when applicable — to the `Tools:` line whenever exposure narrows the discovered set.
+
+> [!NOTE]
+> Pi 1.3.0's `--tools` CLI allowlist only auto-exempts `mcp__*` (double-underscore) identifiers. Because this extension names tools `<toolPrefix>_<server>_<tool>` (`mcp_*` by default), include `mcp_*` (or `<toolPrefix>_*`) when passing `--tools` on the CLI so deferred and codemode MCP tools remain registered for `tool_search` and `codemode` (for example: `--tools read,codemode,mcp_*`).
+
+Not every tool Pi does not declare is free: `deferred` and `codemode` tools still live in `tool_search` / `codemode`'s registry, and `hidden` tools remain registered — the saving is the per-turn declaration and the model's choice space, not process memory.
 
 ### Project Override Entries
 
@@ -209,7 +254,7 @@ A trusted project's `.pi/mcp.json` may carry a Pi 1.3.0 **partial override** for
 { "mcpServers": { "internal-tools": { "enabled": false } } }
 ```
 
-An override may set `enabled`, `lifecycle`, and Pi's `exposure` / `toolExposure` (the two Pi-native exposure keys are accepted for Pi compatibility and ignored, because this extension decides tool activation itself). Any other key, or an override for a name no global entry defines, is reported as a config error naming the file and the server.
+An override may set `enabled`, `lifecycle`, and Pi's `exposure` / `toolExposure` (all honored — a per-project exposure narrows or widens what the agent sees without copying the global server's credentials). Any other key, or an override for a name no global entry defines, is reported as a config error naming the file and the server.
 
 ### OAuth Config
 
@@ -244,8 +289,8 @@ In addition to user slash commands, built-in **agent tools** let the LLM inspect
 
 | Agent Tool | Parameters | Description |
 |---|---|---|
-| `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active`), `auth` credential summary, `source` (`"global"` / `"project"` / `"extension"` / `"unknown"`), optional `instructions` (when connected), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
-| `mcp_connect` | `{ name: string }` | Connect one named server, run interactive OAuth if needed, and verify that discovered tools are active before returning success (includes sanitized server `instructions` when provided; returns fixed actionable categories on failure instead of raw server response text) |
+| `mcp_status` | `{}` | List configured servers with `lifecycle`, `state`, `tools` (`discovered` / `active` / `expected`, plus optional `inactiveDirect` / `indirectFiltered`), `auth` credential summary, `source` (`"global"` / `"project"` / `"extension"` / `"unknown"`), optional `instructions` (when connected), and safe `error` action hints (never returns tokens, headers, or authorization URLs) |
+| `mcp_connect` | `{ name: string }` | Connect one named server, run interactive OAuth if needed, and verify that the tools configured `direct` are active before returning success (includes sanitized server `instructions` when provided; returns fixed actionable categories on failure instead of raw server response text) |
 | `mcp_list_resources` | `{ server?: string }` | List `resources/list` entries (`uri`, `name`, `description`, `mimeType`) and `resources/templates/list` URI templates for connected servers, naming configured servers that are stopped (`stoppedServers`), servers that do not advertise the `resources` capability (`resourcesUnsupported`), and servers whose listing failed (`error`) without dropping the healthy servers' rows (read-only) |
 | `mcp_read_resource` | `{ server: string, uri: string }` | Read one resource with `resources/read`: text resources return their text (including empty text), `image/*` blobs return an image block, and other binary blobs return a `[Binary resource: uri (mimeType, N bytes)]` summary instead of filling the context window; a server without the `resources` capability is reported as such rather than as a protocol error (read-only) |
 
@@ -264,7 +309,7 @@ These are server-provided usage hints, not trusted local policy.
     "name": "supabase",
     "lifecycle": "eager",
     "state": "ready",
-    "tools": { "discovered": 12, "active": 12 },
+    "tools": { "discovered": 12, "active": 12, "expected": 12 },
     "auth": "credentials stored",
     "source": "global"
   }
@@ -293,7 +338,7 @@ Recent output:
 
 - `Source` is the entry that won: `global` (`<agent dir>/mcp.json`), `project` (`<cwd>/.pi/mcp.json`), or `extension` (`pi.registerMcpServer()`). `mcp_status` reports the same value as `source` on each row (or `"unknown"` if unrecorded).
 - When the project is untrusted, `Source` never says `project` and a `Project config: not loaded (<path>)` line explains why `mcp.json` in the workspace is not in effect.
-- `Tools` compares discovered tools with the ones Pi has active; a server can be `ready` with `0/N active` when another extension restricts tools.
+- `Tools` compares discovered tools with the ones Pi has active; a server can be `ready` with `0/N active` when another extension restricts tools, and a server whose `exposure` / `toolExposure` keeps some tools deferred, codemode-only, or hidden adds `(N configured direct)` so a deliberate `0/N` is not read as a failure.
 - `OAuth` appears only for servers with an `auth` config: `credentials stored`, `authorization may be required`, or `corrupt state file backed up (re-auth required)` (the corrupt file is backed up and the view still renders; `mcp_status` reports `"not configured"` when `auth` is unset).
 - A failed server adds one `Hint:` line: `/mcp:auth <name>` (plus `--reset` when stored credentials expired) for a missing/expired authorization, waiting for another Pi process holding the auth lock, or `PI_MCP_DEBUG=1 pi` plus the issue tracker for a connection failure.
 
@@ -307,11 +352,11 @@ Recent output:
 
 ### Connection readiness and active tools
 
-`mcp_status` reports `tools.discovered` and `tools.active` for each server. Connection state `ready` means the MCP handshake and discovery completed. It does not mean that another Pi extension has kept every discovered tool active.
+`mcp_status` reports `tools.discovered`, `tools.active`, and `tools.expected` for each server — everything registered, everything Pi has active, and how many tools are configured `direct` (the ones this extension activates) — plus optional `tools.inactiveDirect` when configured `direct` tools on a `ready` server are missing from Pi's active set (even if `tool_search`-loaded deferred tools keep `active >= expected`) and `tools.indirectFiltered: true` when `--tools` / `--exclude-tools` dropped all of the server's indirect tools. Connection state `ready` means the MCP handshake and discovery completed. It does not mean that another Pi extension has kept every direct tool active.
 
-`mcp_connect` checks current tool activation before reporting success, including when the server is already connected. If discovered tools are inactive, it reports that condition instead of overriding another extension's tool restrictions. Check the active tool policy or conflicting extension. A reconnect is not a substitute for fixing an extension that removes tools at each user turn.
+`mcp_connect` checks current tool activation before reporting success, including when the server is already connected. If any tool configured `direct` is inactive it reports that condition instead of overriding another extension's tool restrictions; tools hidden or deferred by `exposure` never count as missing, and the check is per tool name, so a `tool_search`-loaded non-direct tool cannot mask a `direct` one that a policy removed. Check the active tool policy or conflicting extension. A reconnect is not a substitute for fixing an extension that removes tools at each user turn.
 
-Tool discovery follows the same rule. When a connected server announces `notifications/tools/list_changed`, only the tools it newly exposes are activated; tools Pi currently has inactive stay inactive, a tool the server dropped and then advertises again comes back in the state it left in, and a refresh that discovers nothing new does not touch the active set at all. Stopping a connected server (`/mcp:stop`, background recovery, or session teardown) deactivates its tools and forgets those remembered states, so the next connect or reconnect activates the whole discovered set again.
+Tool discovery follows the same rule. When a connected server announces `notifications/tools/list_changed`, only the newly exposed tools whose exposure is `direct` are activated; tools Pi currently has inactive stay inactive, a tool the server dropped and then advertises again comes back in the state it left in, a deferred tool that `tool_search` activated stays active, and a refresh that discovers nothing new does not touch the active set at all. Stopping a connected server (`/mcp:stop`, background recovery, or session teardown) deactivates its tools and forgets those remembered states, so the next connect or reconnect derives the active set from `exposure` again.
 
 ## Debug log
 

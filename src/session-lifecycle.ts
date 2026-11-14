@@ -35,6 +35,10 @@ import {
   reportDiagnostic,
   setDiagnosticUi,
 } from "./debug-log.js";
+import {
+  collectConfiguredExposures,
+  collectRequiredDiscoveryExposures,
+} from "./tool-exposure.js";
 
 export const DEFAULT_SETTINGS = {
   toolPrefix: "mcp",
@@ -121,6 +125,9 @@ export function mergeWithRegisteredServers(
       ...registeredServers,
       ...fileConfig.mcpServers,
     },
+    ...(fileConfig.autoEnableCodemode === undefined
+      ? {}
+      : { autoEnableCodemode: fileConfig.autoEnableCodemode }),
   };
 }
 
@@ -384,10 +391,21 @@ export class SessionLifecycle {
     this.config = nextConfig;
   }
 
+  private syncConfiguredDiscoveryTools(servers: Record<string, ServerConfig>): void {
+    this.deps.bridge.syncServerNamespaces(Object.keys(servers));
+    this.deps.bridge.ensureDiscoveryTools(
+      collectRequiredDiscoveryExposures(
+        Object.values(servers),
+        this.deps.bridge.getConnectedExposures(),
+      ),
+    );
+  }
+
   private applyServers(next: Record<string, ServerConfig>, snapshotCount: number): void {
     this.extensionServers = next;
     this.config = mergeWithRegisteredServers(this.fileConfig, next);
     this.appliedChangeCount = snapshotCount;
+    this.syncConfiguredDiscoveryTools(this.config.mcpServers);
   }
 
   private removeAppliedServer(name: string): void {
@@ -437,6 +455,9 @@ export class SessionLifecycle {
         );
       }
       if (this.inFlightEagerBatch.length > 0) {
+        this.deps.bridge.ensureDiscoveryTools(
+          collectConfiguredExposures(this.inFlightEagerBatch.map(([, cfg]) => cfg)),
+        );
         await this.deps.coordinator.startEagerServers(this.inFlightEagerBatch, ctx);
       }
     } finally {
@@ -503,7 +524,9 @@ export class SessionLifecycle {
       nextConfig,
     );
     this.deps.bridge.updateSettings(nextConfig.settings);
+    this.deps.bridge.setAutoEnableCodemode(nextConfig.autoEnableCodemode);
     this.deps.manager.rebuildServers(nextConfig);
+    this.syncConfiguredDiscoveryTools(nextConfig.mcpServers);
     return Object.keys(nextExtensionServers).length > 0
       ? filterEagerServers(nextConfig.mcpServers)
       : [];
@@ -538,6 +561,7 @@ export class SessionLifecycle {
       nextExtensionServers,
       rebuild ? sessionConfig : this.config,
     );
+    this.deps.bridge.setAutoEnableCodemode(sessionConfig.autoEnableCodemode);
     if (rebuild) {
       this.deps.bridge.updateSettings(sessionConfig.settings);
       this.deps.manager.rebuildServers(sessionConfig);
@@ -547,6 +571,7 @@ export class SessionLifecycle {
       this.deps.manager.updateCwd(ctx.cwd);
       this.deps.coordinator.syncStatus(ctx);
     }
+    this.syncConfiguredDiscoveryTools(sessionConfig.mcpServers);
     return filterEagerServers(sessionConfig.mcpServers);
   }
 
