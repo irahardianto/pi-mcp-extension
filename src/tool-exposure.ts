@@ -69,6 +69,7 @@ export function toPiToolExposure(exposure: McpExposure): PiToolExposure {
 
 /** Server entry fields that decide tool exposure (a parsed `ServerConfig` satisfies this). */
 export interface ToolExposureConfig {
+  enabled?: boolean | undefined;
   exposure?: McpExposure | undefined;
   toolExposure?: Readonly<Record<string, McpExposure>> | undefined;
 }
@@ -236,12 +237,17 @@ export interface ServerToolNamespaceOptions {
   instructions?: string | undefined;
 }
 
-function sanitizeNamespaceText(raw: unknown, maxLength: number): string | undefined {
+export function sanitizeNamespaceText(raw: unknown, maxLength: number): string | undefined {
   if (typeof raw !== "string") return undefined;
   // WHY: strip terminal escapes before redacting so escape sequences inside a credential
   // cannot hide a `key=value` token shape, then bound after `[REDACTED]` expansion.
   const cleaned = sanitizeTerminalText(raw, { maxLength: raw.length }).trim();
   return sanitizeTerminalText(redactSecrets(cleaned), { maxLength }).trim() || undefined;
+}
+
+/** Build the canonical `<prefix>_<sanitizedServer>` namespace name for one MCP server. */
+export function buildServerNamespaceName(prefix: string, serverName: string): string {
+  return `${prefix}_${serverName.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 }
 
 /**
@@ -251,7 +257,7 @@ function sanitizeNamespaceText(raw: unknown, maxLength: number): string | undefi
  */
 export function buildServerToolNamespace(options: ServerToolNamespaceOptions): ToolNamespace {
   const sanitizedServer = options.serverName.replace(/[^a-zA-Z0-9_]/g, "_");
-  const name = `${options.prefix}_${sanitizedServer}`;
+  const name = buildServerNamespaceName(options.prefix, options.serverName);
   const aliases = [...new Set([options.serverName, `mcp__${sanitizedServer}`])].filter(
     (candidate) => candidate !== name,
   );
@@ -268,15 +274,29 @@ export function buildServerToolNamespace(options: ServerToolNamespaceOptions): T
   };
 }
 
-/** Collect every exposure level a set of server configs may assign before connecting. */
+/** Collect every exposure level an enabled set of server configs may assign before connecting. */
 export function collectConfiguredExposures(
   configs: Iterable<ToolExposureConfig>,
 ): Set<McpExposure> {
   const exposures = new Set<McpExposure>();
   for (const cfg of configs) {
+    if (cfg.enabled === false) continue;
     exposures.add(cfg.exposure ?? DEFAULT_EXPOSURE);
     for (const override of Object.values(cfg.toolExposure ?? {})) {
       exposures.add(override);
+    }
+  }
+  return exposures;
+}
+
+/** Collect resolved MCP exposures across all currently connected servers. */
+export function collectConnectedExposures(
+  serverExposures: Iterable<Iterable<McpExposure>>,
+): Set<McpExposure> {
+  const exposures = new Set<McpExposure>();
+  for (const perServer of serverExposures) {
+    for (const exposure of perServer) {
+      exposures.add(exposure);
     }
   }
   return exposures;

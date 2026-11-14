@@ -827,6 +827,13 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
       instructions: "Prefer search_docs before fetch_doc; cite URIs.",
     });
 
+    // before_agent_start populates sections.mcp_servers for connected indirect servers
+    const promptSections: Record<string, string> = {};
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(promptSections["mcp_servers"] ?? "", /- mcp_mock \(codemode, tool_search\): Mock reference server/);
+    // No-op when before_agent_start carries no systemPromptOptions
+    await mockExt.events.get("before_agent_start")({}, ctx);
+
     // Simulate tool_search loading `add` while a policy deactivates `echo` -> /mcp mock surfaces masked state
     mockExt.activeTools = ["read", "codemode", "tool_search", "mcp_mock_add"];
     notifications.length = 0;
@@ -836,10 +843,63 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
       /^Tools: 1\/6 active \(1 configured direct, 1 direct inactive\)$/m,
     );
 
-    // /mcp:stop hides every registered tool of the stopped server
+    // /tree resets activeTools to an earlier turn's loadout; session_tree restores reaching
+    // discovery tools without re-activating inactive direct tools (`mcp_mock_echo`)
+    mockExt.activeTools = ["read"];
+    await mockExt.events.get("session_tree")({}, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+
+    // /mcp:stop hides every registered tool of the stopped server and marks it `not connected` in <mcp_servers>
     await mockExt.commands.get("mcp:stop").handler("mock", ctx);
     assert.equal(mockExt.tools.get("mcp_mock_echo").exposure, "hidden");
     assert.equal(mockExt.tools.get("mcp_mock_add").exposure, "hidden");
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      /- mcp_mock \(codemode, tool_search, not connected — mcp_connect "mock"\): Mock reference server/,
+    );
+
+    // Reloading with a lazy indirect server pre-activates discovery tools at session_start before connecting,
+    // while an enabled:false server only contributes once manually connected (/mcp:start) and survives /tree
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          lazy_docs: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "lazy",
+            exposure: "deferred",
+          },
+          manual_code: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            env: {
+              MOCK_INSTRUCTIONS: "Handshake fallback line\nIgnored detail line",
+            },
+            enabled: false,
+            exposure: "codemode",
+          },
+        },
+      }),
+    );
+    mockExt.activeTools = ["read"];
+    await mockExt.events.get("session_start")({}, ctx);
+    // lazy_docs is enabled + deferred -> tool_search pre-activated; manual_code is enabled:false -> codemode stays off
+    assert.deepEqual(mockExt.activeTools, ["read", "tool_search"]);
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(promptSections["mcp_servers"] ?? "", /mcp_lazy_docs \(tool_search, not connected/);
+    assert.ok(!(promptSections["mcp_servers"] ?? "").includes("manual_code"));
+
+    // Manually starting enabled:false `manual_code` activates codemode, surfaces handshake instructions, and survives /tree
+    await mockExt.commands.get("mcp:start").handler("manual_code", ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "tool_search", "codemode"]);
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(promptSections["mcp_servers"] ?? "", /- mcp_manual_code \(codemode\): Handshake fallback line/);
+    mockExt.activeTools = ["read"];
+    await mockExt.events.get("session_tree")({}, ctx);
     assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
 
     // Reloading with autoEnableCodemode: false and neither discovery tool active warns once per session
@@ -865,7 +925,8 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!.message, /\(autoEnableCodemode is false\)/);
 
-    // Dynamic extension server registration and removal also hides unregistered tools
+    // Dynamic extension server registration and removal also hides unregistered tools, and
+    // switching to direct-only removes stale sections.mcp_servers
     const extEntry = {
       name: "dyn",
       config: {
@@ -883,6 +944,15 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
     mockExt.mcpServers.length = 0;
     await mockExt.events.get("mcp_servers_change")({ servers: [] }, ctx);
     assert.equal(mockExt.tools.get("mcp_dyn_echo").exposure, "hidden");
+
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({ settings: { maxRetries: 0 }, mcpServers: {} }),
+    );
+    await mockExt.events.get("session_start")({}, ctx);
+    promptSections["mcp_servers"] = "stale";
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.equal("mcp_servers" in promptSections, false);
   } finally {
     await mockExt.events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });

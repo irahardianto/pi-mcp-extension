@@ -11,6 +11,7 @@ import {
   TOOL_SEARCH_TOOL_NAME,
   buildServerToolNamespace,
   collectConfiguredExposures,
+  collectConnectedExposures,
   mergeRawToolExposures,
   normalizeExposureAlias,
   reconcileLiveRefreshState,
@@ -19,6 +20,11 @@ import {
   shouldActivateLiveTool,
   toPiToolExposure,
 } from "../src/tool-exposure.js";
+import {
+  MAX_SERVERS_SECTION_CHARS,
+  MCP_SERVERS_SECTION,
+  renderMcpServersSection,
+} from "../src/mcp-servers-prompt.js";
 
 describe("resolveToolExposure", () => {
   it("defaults to direct when the server entry states no exposure", () => {
@@ -239,12 +245,22 @@ describe("collectConfiguredExposures & resolveDiscoveryActivation", () => {
   const reachingCodemode = { name: CODEMODE_TOOL_NAME, reachesTools: true };
   const reachingToolSearch = { name: TOOL_SEARCH_TOOL_NAME, reachesTools: true };
 
-  it("collects default and overridden exposures across server configs", () => {
+  it("collects default and overridden exposures across enabled server configs and skips enabled: false", () => {
     const exposures = collectConfiguredExposures([
       {},
-      { exposure: "hidden", toolExposure: { search: "deferred", run: "codemode" } },
+      { enabled: true, exposure: "hidden", toolExposure: { search: "deferred", run: "codemode" } },
+      { enabled: false, exposure: "codemode", toolExposure: { extra: "deferred" } },
     ]);
     assert.deepEqual([...exposures].sort(), ["codemode", "deferred", "direct", "hidden"]);
+    assert.deepEqual([...collectConfiguredExposures([{ enabled: false, exposure: "codemode" }])], []);
+  });
+
+  it("collects exposures across connected server sets", () => {
+    const connected = collectConnectedExposures([
+      new Set(["direct", "codemode"] as const),
+      new Set(["deferred"] as const),
+    ]);
+    assert.deepEqual([...connected].sort(), ["codemode", "deferred", "direct"]);
   });
 
   it("activates codemode and tool_search in deterministic order and ignores non-reaching impostors", () => {
@@ -297,4 +313,168 @@ describe("collectConfiguredExposures & resolveDiscoveryActivation", () => {
     assert.deepEqual(savedByToolSearch, { activate: [] });
   });
 });
+
+describe("renderMcpServersSection", () => {
+  it("returns undefined when no indirect servers are enabled or connected", () => {
+    assert.equal(MCP_SERVERS_SECTION, "mcp_servers");
+    assert.equal(MAX_SERVERS_SECTION_CHARS, 4096);
+    assert.equal(renderMcpServersSection({ servers: [] }), undefined);
+    assert.equal(
+      renderMcpServersSection({
+        servers: [
+          { name: "direct-only", connected: true, exposures: ["direct", "hidden"] },
+          { name: "disabled-lazy", enabled: false, connected: false, exposures: ["codemode"] },
+        ],
+      }),
+      undefined,
+    );
+  });
+
+  it("renders connected and disconnected indirect servers in code-point order with adaptive intro", () => {
+    const rendered = renderMcpServersSection({
+      servers: [
+        {
+          name: "zeta-search",
+          connected: false,
+          exposures: ["deferred"],
+          description: "Documentation search",
+          // Disconnected servers must never surface stale handshake instructions
+          instructions: "Stale handshake instructions",
+        },
+        {
+          name: "alpha-code",
+          enabled: false, // manually connected disabled server still appears while active
+          connected: true,
+          exposures: ["codemode", "deferred"],
+          instructions: "\n   \nFirst handshake line\nSecond handshake line",
+        },
+      ],
+      activeTools: ["read", "codemode", "tool_search"],
+    });
+
+    assert.equal(
+      rendered,
+      [
+        "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts. Load the tools of `tool_search` servers with `tool_search`. Connect `not connected` servers with `mcp_connect` first.",
+        "- mcp_alpha_code (codemode, tool_search): First handshake line",
+        '- mcp_zeta_search (tool_search, not connected — mcp_connect "zeta-search"): Documentation search',
+      ].join("\n"),
+    );
+  });
+
+  it("falls back codemode to tool_search when tool_search is active without codemode", () => {
+    const fallback = renderMcpServersSection({
+      servers: [
+        {
+          name: "warehouse",
+          connected: true,
+          exposures: ["codemode", "deferred"],
+          description: "SQL warehouse\nIgnored second line",
+        },
+      ],
+      toolPrefix: "ext",
+      activeTools: ["read", "tool_search"],
+    });
+    assert.equal(
+      fallback,
+      [
+        "MCP servers whose tools are not declared to you. Load the tools of `tool_search` servers with `tool_search`.",
+        "- ext_warehouse (tool_search): SQL warehouse",
+      ].join("\n"),
+    );
+
+    // Without activeTools (or when codemode is active), codemode stays codemode
+    const directCodemode = renderMcpServersSection({
+      servers: [{ name: "warehouse", connected: true, exposures: ["codemode"] }],
+    });
+    assert.equal(
+      directCodemode,
+      [
+        "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts.",
+        "- mcp_warehouse (codemode)",
+      ].join("\n"),
+    );
+  });
+
+  it("strips ANSI escapes, redacts secrets, and falls back to namespace for control-only server names", () => {
+    const syntheticCred = ["api_key", ["tok", "987654"].join("-")].join("=");
+    const rendered = renderMcpServersSection({
+      servers: [
+        {
+          name: "\u0000\u0007",
+          connected: false,
+          exposures: ["deferred"],
+          description: `\u001b[31mInternal\u001b[0m ${syntheticCred}`,
+        },
+      ],
+    });
+    assert.ok(rendered);
+    assert.ok(!rendered.includes("\u001b"));
+    assert.ok(!rendered.includes("tok-987654"));
+    assert.ok(rendered.includes("[REDACTED]"));
+    assert.ok(rendered.includes('mcp_connect "mcp___"'));
+  });
+
+  it("shrinks summaries to fit MAX_SERVERS_SECTION_CHARS and emits singular/plural overflow lines", () => {
+    // 25 servers with 240-char descriptions exceed 4096 unless per-server summaries shrink
+    const twentyFive = Array.from({ length: 25 }, (_, i) => ({
+      name: `srv-${String(i).padStart(2, "0")}`,
+      connected: true,
+      exposures: ["codemode"] as const,
+      description: `Detailed domain summary ${"x".repeat(220)}`,
+    }));
+    const shrunk = renderMcpServersSection({ servers: twentyFive });
+    assert.ok(shrunk);
+    assert.ok(shrunk.length <= MAX_SERVERS_SECTION_CHARS);
+    assert.ok(shrunk.includes("- mcp_srv_00 (codemode): Detailed domain summary"));
+
+    // Tight head budget where perServerBudget drops to 0 omits summaries cleanly without trailing ": "
+    const tightCount = 155;
+    const tightServers = Array.from({ length: tightCount }, (_, i) => ({
+      name: `s${String(i).padStart(3, "0")}`,
+      connected: true,
+      exposures: ["codemode"] as const,
+      description: "Should be omitted when budget is tight",
+    }));
+    const tight = renderMcpServersSection({ servers: tightServers });
+    assert.ok(tight);
+    assert.ok(tight.length <= MAX_SERVERS_SECTION_CHARS);
+
+    // Overflow by exactly 1 server -> singular "1 more server"
+    let baseCount = 1;
+    while (
+      (renderMcpServersSection({
+        servers: Array.from({ length: baseCount }, (_, i) => ({
+          name: `overflow-server-${String(i).padStart(3, "0")}`,
+          connected: true,
+          exposures: ["codemode"] as const,
+        })),
+      }) ?? "").includes("more server") === false
+    ) {
+      baseCount += 1;
+    }
+    const singularOverflow = renderMcpServersSection({
+      servers: Array.from({ length: baseCount }, (_, i) => ({
+        name: `overflow-server-${String(i).padStart(3, "0")}`,
+        connected: true,
+        exposures: ["codemode"] as const,
+      })),
+    });
+    assert.ok(singularOverflow);
+    assert.ok(singularOverflow.length <= MAX_SERVERS_SECTION_CHARS);
+    assert.match(singularOverflow, /- … \d+ more server(s)?; find their tools with searchTools\(\)$/m);
+
+    const pluralOverflow = renderMcpServersSection({
+      servers: Array.from({ length: baseCount + 5 }, (_, i) => ({
+        name: `overflow-server-${String(i).padStart(3, "0")}`,
+        connected: true,
+        exposures: ["codemode"] as const,
+      })),
+    });
+    assert.ok(pluralOverflow);
+    assert.ok(pluralOverflow.length <= MAX_SERVERS_SECTION_CHARS);
+    assert.match(pluralOverflow, /- … \d+ more servers; find their tools with searchTools\(\)$/);
+  });
+});
+
 

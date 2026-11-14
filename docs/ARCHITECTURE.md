@@ -72,12 +72,20 @@ flowchart TD
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
   server connects and disconnects. Each tool's exposure is resolved from the server entry's
   `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact raw-name key, then the first `*`
-  pattern in declaration order, then the server default `direct`) and attached to a sanitized
-  per-server `ToolNamespace` (`description` + MCP handshake `instructions`). Only `direct`
-  tools enter the active set; `deferred` and `codemode` both register on Pi as `deferred` so
-  `codemode`'s own tool description never mutates mid-session with inlined MCP schemas, while
-  reaching `codemode` (when `autoEnableCodemode !== false`) and `tool_search` tools are
-  automatically activated ahead of eager server starts and on tool refreshes (`ensureDiscoveryTools()`).
+  pattern in declaration order, then the server default `direct`), attached to a sanitized
+  per-server `ToolNamespace` (`description` + MCP handshake `instructions`), and given a
+  `CallToolResult` `outputSchema` (`buildMcpResultSchema()` with relocated
+  `#/properties/structuredContent` `$ref`s) plus `structuredContent` (`buildMcpScriptResult()`
+  without `_meta`) on successful calls so `codemode` scripts receive raw MCP content blocks
+  and typed return values while `isError: true` still rejects with `McpError(..., "tool")`.
+  Only `direct` tools enter the active set; `deferred` and `codemode` both register on Pi as
+  `deferred` so `codemode`'s own tool description never mutates mid-session with inlined MCP
+  schemas, while reaching `codemode` (when `autoEnableCodemode !== false`) and `tool_search`
+  tools are pre-activated at session start / server-config change across all enabled indirect
+  servers (both `eager` and `lazy`), ensured on tool refreshes (`ensureDiscoveryTools()`), and
+  restored on `session_tree` without re-activating inactive `direct` tools; `before_agent_start`
+  populates `systemPromptOptions.sections["mcp_servers"]` (`renderMcpServersSection()`) so the
+  model sees indirect MCP domains, reach modes, and `mcp_connect` hints for disconnected servers.
   `hidden` tools are registered inactive and never exposed, stopping/removing/withdrawing a
   tool re-registers it as `hidden` and guards `execute` against stale calls, and a reconnect
   after a stop re-derives the set from exposure alone (#257). Each reconcile

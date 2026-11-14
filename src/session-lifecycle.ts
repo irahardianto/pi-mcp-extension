@@ -388,10 +388,15 @@ export class SessionLifecycle {
     this.config = nextConfig;
   }
 
+  private syncConfiguredDiscoveryTools(servers: Record<string, ServerConfig>): void {
+    this.deps.bridge.ensureDiscoveryTools(collectConfiguredExposures(Object.values(servers)));
+  }
+
   private applyServers(next: Record<string, ServerConfig>, snapshotCount: number): void {
     this.extensionServers = next;
     this.config = mergeWithRegisteredServers(this.fileConfig, next);
     this.appliedChangeCount = snapshotCount;
+    this.syncConfiguredDiscoveryTools(this.config.mcpServers);
   }
 
   private removeAppliedServer(name: string): void {
@@ -512,6 +517,7 @@ export class SessionLifecycle {
     this.deps.bridge.updateSettings(nextConfig.settings);
     this.deps.bridge.setAutoEnableCodemode(nextConfig.autoEnableCodemode);
     this.deps.manager.rebuildServers(nextConfig);
+    this.syncConfiguredDiscoveryTools(nextConfig.mcpServers);
     return Object.keys(nextExtensionServers).length > 0
       ? filterEagerServers(nextConfig.mcpServers)
       : [];
@@ -556,6 +562,7 @@ export class SessionLifecycle {
       this.deps.manager.updateCwd(ctx.cwd);
       this.deps.coordinator.syncStatus(ctx);
     }
+    this.syncConfiguredDiscoveryTools(sessionConfig.mcpServers);
     return filterEagerServers(sessionConfig.mcpServers);
   }
 

@@ -19,6 +19,8 @@ import {
   ToolBridge,
 } from "../src/tool-bridge.js";
 import {
+  buildMcpResultSchema,
+  buildMcpScriptResult,
   buildToolAnnotations,
   buildToolCallContent,
   buildToolDescription,
@@ -3661,4 +3663,208 @@ describe("MCP progress notifications", () => {
     assert.ok(!text.includes(" token=v"), `the credential must still be masked: ${text}`);
   });
 });
+
+// ── Codemode CallToolResult outputSchema & structuredContent (#257) ──────────
+
+describe("codemode CallToolResult outputSchema & structuredContent (#257)", () => {
+  it("relocates fragment $refs under #/properties/structuredContent while preserving data literals", () => {
+    const defaultSchema = buildMcpResultSchema() as Record<string, unknown>;
+    assert.equal(defaultSchema["type"], "object");
+    assert.deepEqual(defaultSchema["required"], ["content"]);
+    assert.deepEqual(
+      (defaultSchema["properties"] as Record<string, unknown>)["structuredContent"],
+      {},
+    );
+
+    const relocated = buildMcpResultSchema({
+      type: "object",
+      $defs: {
+        Row: {
+          type: "object",
+          properties: {
+            parent: { $ref: "#" },
+            sibling: { $ref: "#/$defs/Row" },
+            external: { $ref: "https://example.com/row.json" },
+            nonStringRef: { $ref: 42 },
+            literalConst: { const: { $ref: "#/$defs/Row" } },
+            literalEnum: { enum: [{ $ref: "#" }] },
+            literalDefault: { default: { $ref: "#/$defs/Row" } },
+            literalExamples: { examples: [{ $ref: "#" }] },
+          },
+        },
+      },
+      properties: {
+        rows: { type: "array", items: { $ref: "#/$defs/Row" } },
+      },
+    }) as { properties: { structuredContent: Record<string, unknown> } };
+
+    const sc = relocated.properties.structuredContent;
+    const rowDef = (
+      (sc["$defs"] as Record<string, Record<string, unknown>>)["Row"]!["properties"] as Record<
+        string,
+        Record<string, unknown>
+      >
+    );
+    assert.equal(rowDef["parent"]?.["$ref"], "#/properties/structuredContent");
+    assert.equal(rowDef["sibling"]?.["$ref"], "#/properties/structuredContent/$defs/Row");
+    assert.equal(rowDef["external"]?.["$ref"], "https://example.com/row.json");
+    assert.equal(rowDef["nonStringRef"]?.["$ref"], 42);
+    assert.deepEqual(rowDef["literalConst"]?.["const"], { $ref: "#/$defs/Row" });
+    assert.deepEqual(rowDef["literalEnum"]?.["enum"], [{ $ref: "#" }]);
+    assert.deepEqual(rowDef["literalDefault"]?.["default"], { $ref: "#/$defs/Row" });
+    assert.deepEqual(rowDef["literalExamples"]?.["examples"], [{ $ref: "#" }]);
+    assert.equal(
+      ((sc["properties"] as Record<string, Record<string, Record<string, unknown>>>)["rows"]?.[
+        "items"
+      ] as Record<string, unknown>)?.["$ref"],
+      "#/properties/structuredContent/$defs/Row",
+    );
+
+    // Cyclic and deeply nested outputSchema inputs terminate cleanly
+    const cycle: Record<string, unknown> = { type: "object" };
+    cycle["self"] = cycle;
+    const cyclicResult = buildMcpResultSchema(cycle) as {
+      properties: { structuredContent: Record<string, unknown> };
+    };
+    assert.deepEqual(cyclicResult.properties.structuredContent["self"], {});
+
+    let deep: Record<string, unknown> = { $ref: "#/$defs/Leaf" };
+    for (let i = 0; i < 40; i++) {
+      deep = { items: deep };
+    }
+    assert.ok(buildMcpResultSchema(deep));
+  });
+
+  it("normalizes CallToolResult for codemode scripts without _meta or non-JSON values", () => {
+    const cyclicExtra: Record<string, unknown> = { tag: "ok" };
+    cyclicExtra["loop"] = cyclicExtra;
+
+    const scriptResult = buildMcpScriptResult({
+      _meta: { progressToken: "tok-1" },
+      content: [
+        { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+        { type: "text", text: "Chart rendered" },
+      ],
+      structuredContent: {
+        rows: 2,
+        badNum: Number.NaN,
+        inf: Number.POSITIVE_INFINITY,
+        omitted: undefined,
+        arr: [1, undefined, Number.NEGATIVE_INFINITY, "x"],
+      },
+      extra: cyclicExtra,
+    }) as Record<string, unknown>;
+
+    assert.equal("_meta" in scriptResult, false);
+    assert.deepEqual(scriptResult["content"], [
+      { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+      { type: "text", text: "Chart rendered" },
+    ]);
+    assert.deepEqual(scriptResult["structuredContent"], {
+      rows: 2,
+      badNum: null,
+      inf: null,
+      arr: [1, null, null, "x"],
+    });
+    assert.deepEqual(scriptResult["extra"], { tag: "ok" });
+
+    // Legacy response without an array `content` normalizes `content` to `[]`
+    assert.deepEqual(buildMcpScriptResult({ structuredContent: { ok: true } }), {
+      content: [],
+      structuredContent: { ok: true },
+    });
+  });
+
+  it("wires outputSchema, structuredContent, and server exposure state on ToolBridge", async () => {
+    const registered = new Map<string, TestToolDefinition>();
+    let activeTools: string[] = [];
+    const bridge = new ToolBridge(
+      { toolPrefix: "custom", requestTimeoutMs: 30000, maxRetries: 0 },
+      {
+        registerTool: (t: unknown) => {
+          const tool = t as TestToolDefinition;
+          registered.set(tool.name, tool);
+        },
+        getActiveTools: () => [...activeTools],
+        setActiveTools: (names: string[]) => {
+          activeTools = [...names];
+        },
+      },
+    );
+
+    assert.equal(bridge.getToolPrefix(), "custom");
+    assert.equal(bridge.isServerActive("analytics"), false);
+
+    let shouldFail = false;
+    const client = {
+      request: async (req: { method: string }) => {
+        if (req.method === "tools/list") {
+          return {
+            tools: [
+              {
+                name: "render_chart",
+                description: "Render PNG chart",
+                inputSchema: { type: "object", properties: { sql: { type: "string" } } },
+                outputSchema: {
+                  type: "object",
+                  $defs: { Series: { type: "object", properties: { label: { type: "string" } } } },
+                  properties: { series: { $ref: "#/$defs/Series" } },
+                },
+              },
+            ],
+          };
+        }
+        return { content: [] };
+      },
+      callTool: async () =>
+        shouldFail
+          ? { content: [{ type: "text", text: "Query syntax error" }], isError: true }
+          : {
+              _meta: { traceId: "t-1" },
+              content: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
+              structuredContent: { series: { label: "Q1" } },
+            },
+    } as unknown as Client;
+
+    await bridge.refreshTools("analytics", client, { exposure: "codemode" });
+    assert.equal(bridge.isServerActive("analytics"), true);
+    assert.deepEqual([...bridge.getServerExposures("analytics")], ["codemode"]);
+    assert.deepEqual([...bridge.getConnectedExposures()], ["codemode"]);
+
+    const tool = registered.get("custom_analytics_render_chart");
+    assert.ok(tool);
+    const outSchema = tool.outputSchema as {
+      properties?: { structuredContent?: { properties?: { series?: { $ref?: string } } } };
+    };
+    assert.equal(
+      outSchema.properties?.structuredContent?.properties?.series?.$ref,
+      "#/properties/structuredContent/$defs/Series",
+    );
+
+    const outcome = await tool.execute("call-1", { sql: "SELECT 1" }, undefined, undefined, undefined);
+    assert.deepEqual(outcome.content, [{ type: "image", data: "YWJj", mimeType: "image/png" }]);
+    assert.deepEqual(outcome.structuredContent, {
+      content: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
+      structuredContent: { series: { label: "Q1" } },
+    });
+
+    // isError: true still rejects with McpError(..., "tool")
+    shouldFail = true;
+    await assert.rejects(
+      () => tool.execute("call-2", { sql: "BAD" }, undefined, undefined, undefined),
+      (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, "tool");
+        assert.equal(err.message, "Query syntax error");
+        return true;
+      },
+    );
+
+    bridge.deactivateServer("analytics");
+    assert.equal(bridge.isServerActive("analytics"), false);
+    assert.deepEqual([...bridge.getServerExposures("analytics")], []);
+    assert.deepEqual([...bridge.getConnectedExposures()], []);
+  });
+});
+
 

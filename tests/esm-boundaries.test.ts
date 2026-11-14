@@ -27,6 +27,7 @@ const PURE_MODULES = [
   "debug-log-format.ts",
   "errors.ts",
   "jsonc.ts",
+  "mcp-servers-prompt.ts",
   "oauth-policy.ts",
   "schema-allof.ts",
   "schema-convert.ts",

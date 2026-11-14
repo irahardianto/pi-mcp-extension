@@ -32,6 +32,12 @@ import {
   reportDiagnostic,
   setDebugLog,
 } from "./debug-log.js";
+import {
+  MCP_SERVERS_SECTION,
+  renderMcpServersSection,
+  type McpPromptServerEntry,
+} from "./mcp-servers-prompt.js";
+import { collectConfiguredExposures } from "./tool-exposure.js";
 
 export {
   startupAuthNowOption,
@@ -160,9 +166,14 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   const normalizeActiveTools = (): void => {
     bridge.orderActiveTools();
   };
-  pi.on("session_tree", normalizeActiveTools);
+  pi.on("session_tree", () => {
+    restoreSessionTreeTools(manager, bridge);
+  });
   pi.on("input", normalizeActiveTools);
-  pi.on("before_agent_start", normalizeActiveTools);
+  pi.on("before_agent_start", (event) => {
+    bridge.orderActiveTools();
+    syncMcpServersPromptSection(event?.systemPromptOptions?.sections, manager, bridge, pi.getActiveTools());
+  });
   pi.on("tool_execution_end", normalizeActiveTools);
   pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
 
@@ -190,6 +201,58 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     );
 
   registerManagementTools(pi, { manager, coordinator, bridge, resources, getProvenance });
+}
+
+function restoreSessionTreeTools(manager: ServerManager, bridge: ToolBridge): void {
+  // WHY: `/tree` runs `AgentSession._restoreToolsFromTranscript()`, which resets `activeTools` to
+  // the target turn's declared loadout. If an indirect (`codemode` / `deferred`) server was added
+  // or started after that turn, re-ensuring reaching discovery tools keeps its tools reachable
+  // without re-activating `direct` tools that the restored branch did not declare (#257, #278).
+  const required = collectConfiguredExposures(
+    manager.getAllServers().map((server) => server.config),
+  );
+  for (const exposure of bridge.getConnectedExposures()) {
+    required.add(exposure);
+  }
+  bridge.ensureDiscoveryTools(required);
+  bridge.orderActiveTools();
+}
+
+function buildPromptServerEntry(server: ManagedServer, bridge: ToolBridge): McpPromptServerEntry {
+  const connected = server.state === "ready" && bridge.isServerActive(server.name);
+  const instructions =
+    connected && typeof server.client?.getInstructions === "function"
+      ? server.client.getInstructions()
+      : undefined;
+  return {
+    name: server.name,
+    enabled: server.config.enabled,
+    connected,
+    exposures: connected
+      ? bridge.getServerExposures(server.name)
+      : collectConfiguredExposures([server.config]),
+    description: server.config.description,
+    instructions,
+  };
+}
+
+function syncMcpServersPromptSection(
+  sections: Record<string, string> | undefined,
+  manager: ServerManager,
+  bridge: ToolBridge,
+  activeTools: readonly string[],
+): void {
+  if (!sections) return;
+  const section = renderMcpServersSection({
+    servers: manager.getAllServers().map((server) => buildPromptServerEntry(server, bridge)),
+    toolPrefix: bridge.getToolPrefix(),
+    activeTools,
+  });
+  if (section !== undefined) {
+    sections[MCP_SERVERS_SECTION] = section;
+  } else {
+    delete sections[MCP_SERVERS_SECTION];
+  }
 }
 
 function isClientActive(

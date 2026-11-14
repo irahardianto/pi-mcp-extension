@@ -73,6 +73,14 @@ import {
   setDiagnosticUi,
 } from "../src/debug-log.js";
 import { createTransport } from "../src/transport-factory.js";
+import {
+  MAX_SERVERS_SECTION_CHARS,
+  renderMcpServersSection,
+} from "../src/mcp-servers-prompt.js";
+import {
+  buildMcpResultSchema,
+  buildMcpScriptResult,
+} from "../src/tool-content.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -2371,14 +2379,23 @@ describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct"
     await fc.assert(
       fc.asyncProperty(graphArb(), async ({ toolNames, serverExposure, overrides, collision }) => {
         const firstTool = toolNames[0]!; // the arbitrary guarantees at least one tool
-        const collisionEntries = [
+        const collisionEntries: Array<readonly [string, Exposure]> = [
           [`*${firstTool}*`, collision[0]],
           [firstTool, collision[1]],
-        ] as const;
-        const entries = [...collisionEntries, ...overrides];
+        ];
+        // Put random overrides first (excluding the two collision keys) and read `entries` back
+        // from `Object.entries(toolExposure)` so duplicate keys never diverge from `Object.fromEntries`.
+        const filteredOverrides = overrides.filter(
+          ([key]) => key !== firstTool && key !== `*${firstTool}*`,
+        );
+        const toolExposure: Record<string, Exposure> = Object.fromEntries([
+          ...filteredOverrides,
+          ...collisionEntries,
+        ]);
+        const entries = Object.entries(toolExposure);
         const config = {
           ...(serverExposure === undefined ? {} : { exposure: serverExposure }),
-          toolExposure: Object.fromEntries(entries),
+          toolExposure,
         };
         const registered = new Map<string, ToolDefinition>();
         let active: string[] = [];
@@ -2444,3 +2461,84 @@ describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct"
     );
   });
 });
+
+// ─── Suite 18: renderMcpServersSection, buildMcpResultSchema, buildMcpScriptResult (#257) ──
+
+describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScriptResult (#257)", () => {
+  it("renderMcpServersSection stays within budget, strips escapes/secrets, and is order-invariant", () => {
+    const exposureArb = fc.constantFrom("direct" as const, "deferred" as const, "codemode" as const, "hidden" as const);
+    const serverEntryArb = fc.record({
+      name: arbitraryString.filter((s) => s.length > 0),
+      enabled: fc.option(fc.boolean(), { nil: undefined }),
+      connected: fc.boolean(),
+      exposures: fc.uniqueArray(exposureArb, { maxLength: 4 }),
+      description: fc.option(arbitraryString, { nil: undefined }),
+      instructions: fc.option(arbitraryString, { nil: undefined }),
+    });
+    const uniqueServersArb = fc.uniqueArray(serverEntryArb, {
+      selector: (s) => s.name,
+      maxLength: 30,
+    });
+    const secretValArb = fc.stringMatching(/^[A-Za-z0-9]{10,20}$/);
+
+    fc.assert(
+      fc.property(
+        uniqueServersArb,
+        fc.option(fc.array(fc.constantFrom("read", "codemode", "tool_search"), { maxLength: 3 }), {
+          nil: undefined,
+        }),
+        secretValArb,
+        (servers, activeTools, rawSecret) => {
+          const credPair = ["api_key", rawSecret].join("=");
+          const withInjectedCred = servers.map((s, idx) =>
+            idx === 0
+              ? { ...s, description: `\u001b[31mSummary\u001b[0m ${credPair} ${s.description ?? ""}` }
+              : s,
+          );
+          const forward = renderMcpServersSection({ servers: withInjectedCred, activeTools });
+          const reversed = renderMcpServersSection({
+            servers: [...withInjectedCred].reverse(),
+            activeTools,
+          });
+          assert.equal(forward, reversed, "Server order must not change rendered section");
+          if (forward !== undefined) {
+            assert.ok(forward.length <= MAX_SERVERS_SECTION_CHARS);
+            assert.ok(!forward.includes("\u001b"), "ANSI escapes must be stripped");
+            assert.ok(!forward.includes(rawSecret), "Injected credential value must be redacted");
+          }
+        },
+      ),
+      testOptions(),
+    );
+  });
+
+  it("buildMcpResultSchema and buildMcpScriptResult preserve immutability and JSON roundtrip invariants", () => {
+    fc.assert(
+      fc.property(
+        fc.dictionary(fc.string(), fc.jsonValue(), { maxKeys: 8 }),
+        fc.dictionary(fc.string(), fc.jsonValue(), { maxKeys: 8 }),
+        (rawOutputSchema, rawResponse) => {
+          const schemaBefore = JSON.stringify(rawOutputSchema);
+          const builtSchema = buildMcpResultSchema(rawOutputSchema) as Record<string, unknown>;
+          assert.equal(JSON.stringify(rawOutputSchema), schemaBefore, "outputSchema must not mutate");
+          assert.equal(builtSchema["type"], "object");
+
+          const responseWithMeta = { _meta: { token: "1" }, ...rawResponse };
+          const scriptResult = buildMcpScriptResult(responseWithMeta) as Record<string, unknown>;
+          assert.equal(Object.getPrototypeOf(scriptResult), Object.prototype);
+          assert.equal("_meta" in scriptResult, false, "_meta must be stripped");
+          assert.ok(Array.isArray(scriptResult["content"]), "content must be normalized to an array");
+          assert.deepEqual(JSON.parse(JSON.stringify(scriptResult)), scriptResult);
+        },
+      ),
+      {
+        ...testOptions(),
+        examples: [
+          [{}, JSON.parse('{"__proto__":[]}') as Record<string, fc.JsonValue>],
+          [{}, { negZero: [-0] }],
+        ],
+      },
+    );
+  });
+});
+

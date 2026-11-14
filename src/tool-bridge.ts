@@ -24,6 +24,8 @@ import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { listAllTools, type McpToolDefinition } from "./tool-discovery.js";
 import {
+  buildMcpResultSchema,
+  buildMcpScriptResult,
   buildToolAnnotations,
   buildToolCallContent,
   buildToolDescription,
@@ -42,6 +44,7 @@ import {
 } from "./tool-order.js";
 import {
   buildServerToolNamespace,
+  collectConnectedExposures,
   mergeRawToolExposures,
   reconcileLiveRefreshState,
   resolveDiscoveryActivation,
@@ -261,6 +264,8 @@ export class ToolBridge {
   private readonly rawToolNames = new Map<string, Map<string, string>>();
   /** Per server, the resolved MCP exposure of each raw tool name on the active connection. */
   private readonly rawToolExposures = new Map<string, Map<string, McpExposure>>();
+  /** Per server, the distinct resolved MCP exposures of currently advertised tools while active. */
+  private readonly activeServerExposures = new Map<string, ReadonlySet<McpExposure>>();
   /**
    * Per server, the Pi names whose configured exposure is `direct` — the tools this bridge
    * registers active. Deferred, codemode-only, and hidden tools are registered too, but
@@ -293,6 +298,26 @@ export class ToolBridge {
   /** Update Pi 1.3.0 `autoEnableCodemode` (`undefined` resets to the default `true`). */
   setAutoEnableCodemode(autoEnableCodemode: boolean | undefined): void {
     this.autoEnableCodemode = autoEnableCodemode !== false;
+  }
+
+  /** Current configured tool prefix (e.g. `"mcp"`). */
+  getToolPrefix(): string {
+    return this.settings.toolPrefix;
+  }
+
+  /** Whether `serverName` currently has live discovered tools registered on this bridge. */
+  isServerActive(serverName: string): boolean {
+    return this.activeServers.has(serverName);
+  }
+
+  /** Distinct resolved MCP exposures of `serverName`'s currently advertised tools while connected. */
+  getServerExposures(serverName: string): Set<McpExposure> {
+    return new Set(this.activeServerExposures.get(serverName));
+  }
+
+  /** Distinct resolved MCP exposures across all currently connected servers. */
+  getConnectedExposures(): Set<McpExposure> {
+    return collectConnectedExposures(this.activeServerExposures.values());
   }
 
   /** Update bridge settings when session config is reloaded on session_start. */
@@ -427,6 +452,7 @@ export class ToolBridge {
   deactivateServer(serverName: string): void {
     this._bumpRefreshGeneration(serverName);
     this.activeServers.delete(serverName);
+    this.activeServerExposures.delete(serverName);
     // WHY: stopping the server turns every tool off, so what each one "left in" belongs to a
     // connection that no longer exists; a fresh connect rediscovers the state from scratch.
     this.droppedToolState.delete(serverName);
@@ -450,6 +476,7 @@ export class ToolBridge {
     this._bumpRefreshGeneration(serverName);
     this.serverTimeouts.delete(serverName);
     this.activeServers.delete(serverName);
+    this.activeServerExposures.delete(serverName);
     this.droppedToolState.delete(serverName);
     this.rawToolNames.delete(serverName);
     this.rawToolExposures.delete(serverName);
@@ -614,6 +641,7 @@ export class ToolBridge {
     this.serverToolNames.set(serverName, currentToolNames);
     this.rawToolNames.set(serverName, currentRawNames);
     this.directToolNames.set(serverName, directToolNames);
+    this.activeServerExposures.set(serverName, serverExposures);
     this.activeServers.add(serverName);
     const discoveryToActivate = this._resolveDiscoveryTools(serverExposures, activeBefore);
     this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore, discoveryToActivate);
@@ -641,12 +669,14 @@ export class ToolBridge {
       description,
       promptSnippet: description.slice(0, 120),
       parameters: convertJsonSchemaToTypebox(tool.inputSchema),
+      outputSchema: buildMcpResultSchema(tool.outputSchema),
       exposure: toPiToolExposure(exposure),
       namespace,
-      // WHY: explicit belt-and-suspenders alongside `exposure` — Pi declines to auto-activate
-      // `deferred` / `hidden` tools without an explicit `--tools` allowlist, and `_reconcileTools`
-      // strips any allowlist-pushed non-`direct` names in `_reconcileActiveTools`, while setting
-      // `defaultActive: false` documents inactive registration directly on the `ToolDefinition`.
+      // WHY: explicit belt-and-suspenders alongside `exposure` — older Pi 1.x runtimes do not
+      // inspect `exposure`, and when a `--tools` allowlist explicitly matches `<prefix>_*`,
+      // `_reconcileActiveTools` still keeps non-`direct` tools inactive until `tool_search` loads
+      // them (note: Pi 1.3.0's `isMcpToolName()` only auto-exempts `mcp__*`, so `--tools` callers
+      // must include `<prefix>_*` for single-underscore MCP tools to stay registered).
       ...(exposure === "direct" ? {} : { defaultActive: false }),
       ...(toolAnnotations ? { annotations: toolAnnotations } : {}),
 
@@ -803,7 +833,11 @@ export class ToolBridge {
       );
     }
 
-    return { content, details: {} };
+    return {
+      content,
+      details: {},
+      structuredContent: buildMcpScriptResult(result),
+    };
   }
 
   /** Filter a set of Pi tool names to those still owned by `serverName`. */
