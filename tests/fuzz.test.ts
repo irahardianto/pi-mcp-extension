@@ -73,6 +73,15 @@ import {
   setDiagnosticUi,
 } from "../src/debug-log.js";
 import { createTransport } from "../src/transport-factory.js";
+import {
+  MAX_SERVERS_SECTION_CHARS,
+  renderMcpServersSection,
+} from "../src/mcp-servers-prompt.js";
+import {
+  buildMcpResultSchema,
+  buildMcpScriptResult,
+} from "../src/tool-content.js";
+import { resolveServerNamespaceIds } from "../src/tool-names.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -2307,4 +2316,308 @@ describe("fuzz: openBrowser & browserOpenCommand", () => {
   });
 });
 
+// ─── Suite 6d: ToolBridge exposure activation (#257) ─────────────────────────
+
+describe("fuzz: ToolBridge activates exactly the tools whose exposure is direct", () => {
+  const exposures = ["codemode", "deferred", "direct", "hidden"] as const;
+  type Exposure = (typeof exposures)[number];
+
+  /**
+   * Reference resolution, computed independently of `src/tool-exposure.ts`. The generated
+   * patterns are limited to an exact name, `name*`, `*name`, `*name*`, and `*`, so the oracle
+   * is plain string work instead of a second copy of the matcher under test — a precondition of
+   * the property actually catching a precedence bug (exact-before-pattern, declaration order).
+   */
+  function expectedExposure(
+    toolName: string,
+    serverExposure: Exposure | undefined,
+    overrides: ReadonlyArray<readonly [string, Exposure]>,
+  ): Exposure {
+    const exact = overrides.find(([pattern]) => pattern === toolName);
+    if (exact) return exact[1];
+    const matching = overrides.find(([pattern]) => {
+      // A key without `*` is an exact name and only matches itself (handled above).
+      if (!pattern.includes("*")) return false;
+      if (pattern === "*") return true;
+      const core = pattern.replaceAll("*", "");
+      if (pattern.startsWith("*") && pattern.endsWith("*")) return toolName.includes(core);
+      if (pattern.endsWith("*")) return toolName.startsWith(core);
+      return toolName.endsWith(core);
+    });
+    return matching ? matching[1] : serverExposure ?? "direct";
+  }
+
+  function graphArb() {
+    const toolNames = fc.uniqueArray(fc.stringMatching(/^[a-z][a-z_]{1,7}$/), {
+      minLength: 1,
+      maxLength: 5,
+    });
+    const patterns = fc
+      .tuple(fc.stringMatching(/^[a-z][a-z_]{0,5}$/), fc.constantFrom("exact", "prefix", "suffix", "contains", "all"))
+      .map(([core, shape]) => {
+        if (shape === "prefix") return `${core}*`;
+        if (shape === "suffix") return `*${core}`;
+        if (shape === "contains") return `*${core}*`;
+        if (shape === "all") return "*";
+        return core;
+      });
+    const overrides = fc.uniqueArray(fc.tuple(patterns, fc.constantFrom(...exposures)), {
+      selector: ([pattern]) => pattern,
+      maxLength: 3,
+    });
+    return fc.record({
+      toolNames,
+      serverExposure: fc.option(fc.constantFrom(...exposures), { nil: undefined }),
+      overrides,
+      // Every run also draws a guaranteed exact-vs-pattern collision: a `*<tool>*` pattern
+      // declared BEFORE the tool's own key, with a different exposure. The exact key must win
+      // whatever its position, so a matcher that scans patterns first fails the property.
+      collision: fc.tuple(fc.constantFrom(...exposures), fc.constantFrom(...exposures)),
+    });
+  }
+
+  it("derives the active set from exposure alone, for any tool set and override map", async () => {
+    await fc.assert(
+      fc.asyncProperty(graphArb(), async ({ toolNames, serverExposure, overrides, collision }) => {
+        const firstTool = toolNames[0]!; // the arbitrary guarantees at least one tool
+        const collisionEntries: Array<readonly [string, Exposure]> = [
+          [`*${firstTool}*`, collision[0]],
+          [firstTool, collision[1]],
+        ];
+        // Put random overrides first (excluding the two collision keys) and read `entries` back
+        // from `Object.entries(toolExposure)` so duplicate keys never diverge from `Object.fromEntries`.
+        const filteredOverrides = overrides.filter(
+          ([key]) => key !== firstTool && key !== `*${firstTool}*`,
+        );
+        const toolExposure: Record<string, Exposure> = Object.fromEntries([
+          ...filteredOverrides,
+          ...collisionEntries,
+        ]);
+        const entries = Object.entries(toolExposure);
+        const config = {
+          ...(serverExposure === undefined ? {} : { exposure: serverExposure }),
+          toolExposure,
+        };
+        const registered = new Map<string, ToolDefinition>();
+        let active: string[] = [];
+        const bridge = new ToolBridge(
+          { toolPrefix: "mcp", requestTimeoutMs: 30000, maxRetries: 5 },
+          {
+            registerTool: (t: unknown) => {
+              const tool = t as ToolDefinition;
+              registered.set(tool.name, tool);
+            },
+            getActiveTools: () => [...active],
+            setActiveTools: (names: string[]) => {
+              active = [...names];
+            },
+          },
+        );
+        const client = {
+          request: async () => ({
+            tools: toolNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+          }),
+        } as unknown as Client;
+
+        await bridge.refreshTools("alpha", client, config);
+
+        const expectedActive = toolNames
+          .filter((name) => expectedExposure(name, serverExposure, entries) === "direct")
+          .map((name) => buildToolName("mcp", "alpha", name))
+          .sort();
+        assert.deepEqual([...active].sort(), expectedActive);
+        assert.deepEqual(bridge.getInactiveDirectTools("alpha"), []);
+        assert.deepEqual(bridge.getToolActivity("alpha"), {
+          discovered: toolNames.length,
+          active: expectedActive.length,
+          expected: expectedActive.length,
+        });
+
+        for (const [piName, tool] of registered) {
+          const rawName = toolNames.find((name) => buildToolName("mcp", "alpha", name) === piName);
+          assert.ok(rawName, `${piName} must map back to a raw tool name`);
+          const resolved = expectedExposure(rawName, serverExposure, entries);
+          assert.equal(tool.exposure, resolved === "codemode" ? "deferred" : resolved);
+          assert.equal(tool.namespace?.name, "mcp_alpha");
+        }
+
+        // Disconnecting hides every registered tool from tool_search / codemode, and reconnecting
+        // restores each tool's resolved Pi exposure and active set.
+        bridge.deactivateServer("alpha");
+        assert.deepEqual(active, []);
+        for (const tool of registered.values()) {
+          assert.equal(tool.exposure, "hidden");
+          assert.equal(tool.defaultActive, false);
+        }
+
+        await bridge.refreshTools("alpha", client, config);
+        assert.deepEqual([...active].sort(), expectedActive);
+        for (const [piName, tool] of registered) {
+          const rawName = toolNames.find((name) => buildToolName("mcp", "alpha", name) === piName)!;
+          const resolved = expectedExposure(rawName, serverExposure, entries);
+          assert.equal(tool.exposure, resolved === "codemode" ? "deferred" : resolved);
+        }
+      }),
+      testOptions(),
+    );
+  });
+});
+
+// ─── Suite 18: renderMcpServersSection, buildMcpResultSchema, buildMcpScriptResult (#257) ──
+
+describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScriptResult (#257)", () => {
+  it("renderMcpServersSection stays within budget, strips escapes/secrets, and is order-invariant", () => {
+    const exposureArb = fc.constantFrom("direct" as const, "deferred" as const, "codemode" as const, "hidden" as const);
+    const serverEntryArb = fc.record({
+      name: arbitraryString.filter((s) => s.length > 0),
+      enabled: fc.option(fc.boolean(), { nil: undefined }),
+      connected: fc.boolean(),
+      exposures: fc.uniqueArray(exposureArb, { maxLength: 4 }),
+      description: fc.option(arbitraryString, { nil: undefined }),
+      instructions: fc.option(arbitraryString, { nil: undefined }),
+    });
+    const uniqueServersArb = fc.uniqueArray(serverEntryArb, {
+      selector: (s) => s.name,
+      maxLength: 30,
+    });
+    const secretValArb = fc.stringMatching(/^[A-Za-z0-9]{10,20}$/);
+
+    fc.assert(
+      fc.property(
+        uniqueServersArb,
+        fc.option(fc.array(fc.constantFrom("read", "codemode", "tool_search"), { maxLength: 3 }), {
+          nil: undefined,
+        }),
+        secretValArb,
+        (servers, activeTools, rawSecret) => {
+          const credPair = ["api_key", rawSecret].join("=");
+          const withInjectedCred = servers.map((s, idx) =>
+            idx === 0
+              ? { ...s, description: `\u001b[31mSummary\u001b[0m ${credPair} ${s.description ?? ""}` }
+              : s,
+          );
+          const forward = renderMcpServersSection({ servers: withInjectedCred, activeTools });
+          const reversed = renderMcpServersSection({
+            servers: [...withInjectedCred].reverse(),
+            activeTools,
+          });
+          assert.equal(forward, reversed, "Server order must not change rendered section");
+          if (
+            activeTools !== undefined &&
+            !activeTools.includes("codemode") &&
+            !activeTools.includes("tool_search")
+          ) {
+            assert.equal(forward, undefined, "Section must be omitted when neither reaching tool is active");
+          }
+          if (forward !== undefined) {
+            assert.ok(forward.length <= MAX_SERVERS_SECTION_CHARS);
+            assert.ok(!forward.includes("\u001b"), "ANSI escapes must be stripped");
+            assert.ok(!forward.includes(rawSecret), "Injected credential value must be redacted");
+          }
+        },
+      ),
+      testOptions(),
+    );
+  });
+
+  it("buildMcpResultSchema and buildMcpScriptResult preserve immutability and JSON roundtrip invariants", () => {
+    fc.assert(
+      fc.property(
+        fc.dictionary(fc.string(), fc.jsonValue(), { maxKeys: 8 }),
+        fc.dictionary(fc.string(), fc.jsonValue(), { maxKeys: 8 }),
+        (rawOutputSchema, rawResponse) => {
+          const schemaBefore = JSON.stringify(rawOutputSchema);
+          const builtSchema = buildMcpResultSchema(rawOutputSchema) as Record<string, unknown>;
+          assert.equal(JSON.stringify(rawOutputSchema), schemaBefore, "outputSchema must not mutate");
+          assert.equal(builtSchema["type"], "object");
+
+          const responseWithMeta = { _meta: { token: "1" }, ...rawResponse };
+          const scriptResult = buildMcpScriptResult(responseWithMeta) as Record<string, unknown>;
+          assert.equal(Object.getPrototypeOf(scriptResult), Object.prototype);
+          assert.equal("_meta" in scriptResult, false, "_meta must be stripped");
+          assert.ok(Array.isArray(scriptResult["content"]), "content must be normalized to an array");
+          if ("isError" in scriptResult) {
+            assert.equal(typeof scriptResult["isError"], "boolean", "isError must canonicalize to boolean");
+          }
+          assert.deepEqual(JSON.parse(JSON.stringify(scriptResult)), scriptResult);
+        },
+      ),
+      {
+        ...testOptions(),
+        examples: [
+          [{}, JSON.parse('{"__proto__":[]}') as Record<string, fc.JsonValue>],
+          [{}, { negZero: [-0] }],
+        ],
+      },
+    );
+  });
+
+  it("resolveServerNamespaceIds is order-invariant, codemode-disjoint, and matches renderMcpServersSection", () => {
+    const toCodemodeId = (raw: string): string => {
+      let id = "";
+      for (const ch of raw) {
+        const ok = id === "" ? /^[A-Za-z_$]$/ : /^[A-Za-z0-9_$]$/;
+        id = `${id}${ok.test(ch) ? ch : "_"}`;
+      }
+      return id === "" ? "_" : id;
+    };
+    const matchesCodemodeNamespace = (
+      ns: { name: string; aliases: readonly string[] },
+      query: string,
+    ): boolean => {
+      const qId = toCodemodeId(query);
+      return [ns.name, ...ns.aliases].some((cand) => cand === query || toCodemodeId(cand) === qId);
+    };
+
+    const prefixArb = fc.constantFrom("mcp", "ext", "mcp_", "p1");
+    const collisionHeavyNameArb = fc.oneof(
+      fc.stringMatching(/^[ab1_-]{1,6}$/),
+      fc.constantFrom("my-srv", "my_srv", "my.srv", "my$srv", "_srv", "1srv", "mcp__srv"),
+      arbitraryString.filter((s) => s.length > 0 && s.length <= 24),
+    );
+    const peerListArb = fc.uniqueArray(collisionHeavyNameArb, { minLength: 1, maxLength: 12 });
+
+    fc.assert(
+      fc.property(prefixArb, peerListArb, (prefix, peers) => {
+        const reversedPeers = [...peers].reverse();
+        const resolvedByPeer = new Map(
+          peers.map((peer) => [peer, resolveServerNamespaceIds(prefix, peer, peers)]),
+        );
+
+        for (const peer of peers) {
+          const forward = resolvedByPeer.get(peer)!;
+          const reversed = resolveServerNamespaceIds(prefix, peer, reversedPeers);
+          assert.deepEqual(forward, reversed, "Peer iteration order must not alter resolved namespace");
+          assert.equal(matchesCodemodeNamespace(forward, forward.name), true);
+
+          for (const other of peers) {
+            if (other === peer) continue;
+            const otherNs = resolvedByPeer.get(other)!;
+            for (const query of [forward.name, ...forward.aliases]) {
+              assert.equal(
+                matchesCodemodeNamespace(otherNs, query),
+                false,
+                `Query "${query}" for server "${peer}" must never match peer "${other}"`,
+              );
+            }
+          }
+        }
+
+        const section = renderMcpServersSection({
+          toolPrefix: prefix,
+          servers: peers.map((name) => ({ name, connected: true, exposures: ["codemode"] as const })),
+        });
+        assert.ok(section);
+        for (const peer of peers) {
+          const nsName = resolvedByPeer.get(peer)!.name;
+          assert.ok(
+            section.includes(`- ${nsName} (codemode)`),
+            `Rendered section must list disambiguated namespace "${nsName}" for "${peer}"`,
+          );
+        }
+      }),
+      testOptions(),
+    );
+  });
+});
 
