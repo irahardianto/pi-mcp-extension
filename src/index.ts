@@ -103,6 +103,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
         exposure: server?.config.exposure,
         toolExposure: server?.config.toolExposure,
         description: server?.config.description,
+        peerServerNames: manager.getAllServers().map((entry) => entry.name),
       },
     );
   });
@@ -175,6 +176,9 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
   pi.on("input", normalizeActiveTools);
   pi.on("before_agent_start", (event) => {
     bridge.orderActiveTools();
+    // WHY: read `pi.getActiveTools()` rather than `event.systemPromptOptions?.selectedTools` — an
+    // earlier `before_agent_start` handler may have called `pi.setActiveTools(...)`, which Pi only
+    // folds back into `systemPromptOptions.selectedTools` after all handlers finish.
     syncMcpServersPromptSection(event?.systemPromptOptions?.sections, manager, bridge, pi.getActiveTools());
   });
   pi.on("tool_execution_end", normalizeActiveTools);

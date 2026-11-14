@@ -72,8 +72,10 @@ flowchart TD
 - **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
   server connects and disconnects. Each tool's exposure is resolved from the server entry's
   `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact raw-name key, then the first `*`
-  pattern in declaration order, then the server default `direct`), attached to a sanitized
-  per-server `ToolNamespace` (`description` + MCP handshake `instructions`), and given a
+  pattern in declaration order, then the server default `direct`), attached to a sanitized,
+  peer-disambiguated per-server `ToolNamespace` (`description` + MCP handshake `instructions`,
+  re-synced across connected peers via `syncServerNamespaces()` when servers are added or
+  removed), and given a
   `CallToolResult` `outputSchema` (`buildMcpResultSchema()` with relocated
   `#/properties/structuredContent` `$ref`s) plus `structuredContent` (`buildMcpScriptResult()`
   without `_meta`) so `codemode` scripts receive raw MCP content blocks, typed return values,
@@ -87,7 +89,8 @@ flowchart TD
   `--exclude-tools` filter (`assessRegisteredServerExposures()`), ensured on tool refreshes
   (`ensureDiscoveryTools()`), and restored on `session_tree` without re-activating inactive
   `direct` tools; `before_agent_start` populates `systemPromptOptions.sections["mcp_servers"]`
-  (`renderMcpServersSection()`) with symmetric `codemode` ↔ `tool_search` fallback (or omits it
+  (`renderMcpServersSection()`) with matching peer-disambiguated namespace headers and symmetric
+  `codemode` ↔ `tool_search` fallback (or omits it
   when neither reaching tool is active) so the model sees indirect MCP domains, reach modes, and
   `mcp_connect` hints for disconnected servers. `hidden` tools are registered inactive and never
   exposed, stopping/removing/withdrawing a tool snapshots `activeTools` before re-registering it

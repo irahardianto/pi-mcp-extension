@@ -48,11 +48,18 @@ export interface ServerStatusSnapshot {
   indirectToolsFiltered?: boolean | undefined;
 }
 
+export interface ServerStatusTools extends ToolActivity {
+  /** Configured `direct` tools absent from Pi's active set while ready (omitted when 0). */
+  inactiveDirect?: number | undefined;
+  /** Present (`true`) when Pi's `--tools` / `--exclude-tools` filter removed all indirect tools while ready. */
+  indirectFiltered?: true | undefined;
+}
+
 export interface ServerStatusRow {
   name: string;
   lifecycle: string;
   state: string;
-  tools: ToolActivity;
+  tools: ServerStatusTools;
   auth: string;
   error: string | undefined;
   source: ServerConfigSource | "unknown";
@@ -173,6 +180,16 @@ export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: C
   return `${lines.filter(isDefined).join("\n")}\n\nRecent output:\n${snapshot.recentOutput}`;
 }
 
+function toStatusTools(snapshot: ServerStatusSnapshot): ServerStatusTools {
+  return {
+    ...snapshot.tools,
+    ...((snapshot.inactiveDirectTools ?? 0) > 0
+      ? { inactiveDirect: snapshot.inactiveDirectTools }
+      : {}),
+    ...(snapshot.indirectToolsFiltered ? { indirectFiltered: true } : {}),
+  };
+}
+
 /** `mcp_status` row for one server. */
 export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
   const instructions = sanitizeServerInstructions(snapshot.instructions);
@@ -180,7 +197,7 @@ export function toStatusRow(snapshot: ServerStatusSnapshot): ServerStatusRow {
     name: snapshot.name,
     lifecycle: snapshot.lifecycle,
     state: snapshot.state,
-    tools: snapshot.tools,
+    tools: toStatusTools(snapshot),
     auth: snapshot.auth ?? "not configured",
     error: formatStatusError(snapshot.lastError),
     source: formatServerSource(snapshot.source),
@@ -233,7 +250,10 @@ export function getServerInstructions(server: ManagedServer | undefined): string
 
 export async function collectServerStatus(params: CollectServerStatusParams): Promise<ServerStatusSnapshot> {
   const { server } = params;
+  const ready = server.state === "ready";
   const instructions = getServerInstructions(server);
+  const inactiveDirectTools =
+    ready && (params.inactiveDirectTools ?? 0) > 0 ? params.inactiveDirectTools : undefined;
   return {
     name: server.name,
     state: server.state,
@@ -246,7 +266,7 @@ export async function collectServerStatus(params: CollectServerStatusParams): Pr
     lastError: server.lastError,
     recentOutput: params.recentOutput ?? "",
     ...(instructions === undefined ? {} : { instructions }),
-    ...(params.inactiveDirectTools ? { inactiveDirectTools: params.inactiveDirectTools } : {}),
-    ...(params.indirectToolsFiltered ? { indirectToolsFiltered: true } : {}),
+    ...(inactiveDirectTools === undefined ? {} : { inactiveDirectTools }),
+    ...(ready && params.indirectToolsFiltered ? { indirectToolsFiltered: true } : {}),
   };
 }

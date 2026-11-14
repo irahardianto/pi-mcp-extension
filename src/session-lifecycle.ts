@@ -392,6 +392,7 @@ export class SessionLifecycle {
   }
 
   private syncConfiguredDiscoveryTools(servers: Record<string, ServerConfig>): void {
+    this.deps.bridge.syncServerNamespaces(Object.keys(servers));
     this.deps.bridge.ensureDiscoveryTools(
       collectRequiredDiscoveryExposures(
         Object.values(servers),

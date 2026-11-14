@@ -13,10 +13,10 @@
 import {
   CODEMODE_TOOL_NAME,
   TOOL_SEARCH_TOOL_NAME,
-  buildServerNamespaceName,
   sanitizeNamespaceText,
   type McpExposure,
 } from "./tool-exposure.js";
+import { resolveAllServerNamespaceIds } from "./tool-names.js";
 import { compareCodePoints } from "./tool-order.js";
 
 /** Name of the Pi 1.3.0 system-prompt section listing indirect MCP servers. */
@@ -115,10 +115,9 @@ function resolveServerSummary(entry: McpPromptServerEntry, maxLength: number): s
 
 function buildServerHead(
   entry: McpPromptServerEntry,
-  prefix: string,
+  namespace: string,
   modes: readonly IndirectReachMode[],
 ): string {
-  const namespace = buildServerNamespaceName(prefix, entry.name);
   const reachTag = modes.join(", ");
   if (entry.connected) {
     return `- ${namespace} (${reachTag})`;
@@ -184,15 +183,20 @@ function preparePromptServers(
   prefix: string,
   available: ReachAvailability,
 ): PreparedPromptServer[] {
+  const namespaces = resolveAllServerNamespaceIds(
+    prefix,
+    servers.map((server) => server.name),
+  );
   const prepared: PreparedPromptServer[] = [];
   for (const entry of servers) {
     if (!entry.connected && entry.enabled === false) continue;
     const modes = resolveIndirectReachModes(new Set(entry.exposures), available);
     if (modes.length === 0) continue;
+    const namespace = namespaces.get(entry.name)!.name;
     prepared.push({
       entry,
       modes,
-      head: buildServerHead(entry, prefix, modes),
+      head: buildServerHead(entry, namespace, modes),
     });
   }
   return prepared.sort((a, b) => compareCodePoints(a.entry.name, b.entry.name));

@@ -178,14 +178,17 @@ it("reports mcp_connect success when exposure keeps most tools out of the model 
     assert.deepEqual(rows[0].tools, { discovered: 6, active: 2, expected: 2 });
 
     // A tool_search-loaded deferred tool must not mask a direct tool another extension removed:
-    // `active` (2) still equals `expected` (2), so only a per-name check catches it.
+    // `active` (2) still equals `expected` (2), so only a per-name check catches it — and
+    // `mcp_status` surfaces `inactiveDirect: 1` so callers see the masked missing tool.
     mockExt.activeTools = ["mcp_partial_add", "mcp_partial_get_cwd"];
     await assert.rejects(
       tools.get("mcp_connect").execute("", { name: "partial" }, undefined, undefined, ctx),
-      /configured as direct are inactive/,
+      /configured as direct are inactive.*inactiveDirect/,
       "an activated deferred tool must not mask an inactive direct tool",
     );
     assert.deepEqual(mockExt.activeTools, ["mcp_partial_add", "mcp_partial_get_cwd"]);
+    const maskedRows = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
+    assert.deepEqual(maskedRows[0].tools, { discovered: 6, active: 2, expected: 2, inactiveDirect: 1 });
   } finally {
     await events.get("session_shutdown")?.({}, ctx);
     await rm(dir, { recursive: true, force: true });
@@ -260,7 +263,12 @@ it("registers agent-visible status and connect tools without eagerly starting a 
     assert.deepEqual(active, []);
     const inactiveStatus = JSON.parse((await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx)).content[0].text);
     assert.equal(inactiveStatus[0].state, "ready", "Transport readiness and tool activation are separate states");
-    assert.deepEqual(inactiveStatus[0].tools, { discovered, active: 0, expected: discovered });
+    assert.deepEqual(inactiveStatus[0].tools, {
+      discovered,
+      active: 0,
+      expected: discovered,
+      inactiveDirect: discovered,
+    });
     await events.get("session_shutdown")({}, ctx);
     active = mockExt.activeTools;
     assert.equal(active.length, 0);
@@ -921,7 +929,7 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
     assert.match(partialRes.content[0].text, /MCP server lazy_docs ready/);
     await mockExt.commands.get("mcp:stop").handler("lazy_docs", ctx);
 
-    // Full --tools filtering (no mcp_lazy_docs_* tools in getAllTools) fails mcp_connect, warns, and annotates /mcp lazy_docs
+    // Full --tools filtering (no mcp_lazy_docs_* tools in getAllTools) fails mcp_connect, warns, and annotates /mcp lazy_docs + mcp_status
     mockExt.api.getAllTools = () =>
       origGetAllTools().filter((t: { name: string }) => !t.name.startsWith("mcp_lazy_docs_"));
     notifications.length = 0;
@@ -936,6 +944,15 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
       notifications.at(-1)?.message ?? "",
       /^Tools: 0\/6 active \(0 configured direct, indirect filtered by --tools \/ --exclude-tools\)$/m,
     );
+    const filteredStatusRows = JSON.parse(
+      (await mockExt.tools.get("mcp_status").execute("s-filt", {}, undefined, undefined, ctx)).content[0].text,
+    ) as Array<{ name: string; tools: Record<string, unknown> }>;
+    assert.deepEqual(filteredStatusRows.find((r) => r.name === "lazy_docs")?.tools, {
+      discovered: 6,
+      active: 0,
+      expected: 0,
+      indirectFiltered: true,
+    });
     mockExt.api.getAllTools = origGetAllTools;
 
     // Reloading with autoEnableCodemode: false and neither discovery tool active warns once per session
@@ -961,25 +978,64 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!.message, /\(autoEnableCodemode is false\)/);
 
-    // Dynamic extension server registration and removal also hides unregistered tools, and
-    // switching to direct-only removes stale sections.mcp_servers
-    const extEntry = {
-      name: "dyn",
+    // Dynamic extension server registration and removal: hides unregistered tools, disambiguates
+    // colliding `-` vs `_` server namespaces in both `_toolRegistry` and `<mcp_servers>`, and
+    // rebinds back to the unhashed namespace once the colliding peer is removed.
+    mockExt.mcpServers.push({
+      name: "dyn-peer",
       config: {
         command: "node",
         args: ["--import", tsxEsmLoader, mock],
         exposure: "deferred",
+        description: "Hyphen peer",
       },
-      extensionPath: "/ext/dyn.ts",
-    } as never;
-    mockExt.mcpServers.push(extEntry);
+      extensionPath: "/ext/dyn-hyphen.ts",
+    } as never);
     await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
     assert.ok(mockExt.activeTools.includes("tool_search"));
-    assert.equal(mockExt.tools.get("mcp_dyn_echo").exposure, "deferred");
+    assert.equal(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.name, "mcp_dyn_peer");
+    assert.deepEqual(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.aliases, [
+      "dyn-peer",
+      "mcp__dyn_peer",
+    ]);
+
+    mockExt.mcpServers.push({
+      name: "dyn_peer",
+      config: {
+        command: "node",
+        args: ["--import", tsxEsmLoader, mock],
+        lifecycle: "lazy",
+        exposure: "deferred",
+        description: "Underscore peer",
+      },
+      extensionPath: "/ext/dyn-underscore.ts",
+    } as never);
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    const hyphenDisambiguated = mockExt.tools.get("mcp_dyn_peer_echo").namespace;
+    assert.match(hyphenDisambiguated?.name ?? "", /^mcp_dyn_peer_[0-9a-f]{8}$/);
+    assert.ok(!hyphenDisambiguated?.aliases?.includes("dyn-peer"));
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      new RegExp(`- ${hyphenDisambiguated!.name} \\(tool_search\\): Hyphen peer`),
+    );
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      /- mcp_dyn_peer \(tool_search, not connected — mcp_connect "dyn_peer"\): Underscore peer/,
+    );
+
+    // Removing `dyn_peer` restores `dyn-peer` to its canonical unhashed `mcp_dyn_peer` namespace
+    mockExt.mcpServers.pop();
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    assert.equal(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.name, "mcp_dyn_peer");
+    assert.deepEqual(mockExt.tools.get("mcp_dyn_peer_echo").namespace?.aliases, [
+      "dyn-peer",
+      "mcp__dyn_peer",
+    ]);
 
     mockExt.mcpServers.length = 0;
     await mockExt.events.get("mcp_servers_change")({ servers: [] }, ctx);
-    assert.equal(mockExt.tools.get("mcp_dyn_echo").exposure, "hidden");
+    assert.equal(mockExt.tools.get("mcp_dyn_peer_echo").exposure, "hidden");
 
     await writeFile(
       join(dir, ".pi", "mcp.json"),

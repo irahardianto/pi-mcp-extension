@@ -3983,6 +3983,66 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
     assert.deepEqual([...bridge.getServerExposures("analytics")], []);
     assert.deepEqual([...bridge.getConnectedExposures()], []);
   });
+
+  it("disambiguates colliding server namespaces across sequential refreshes and preserves activeTools on syncServerNamespaces", async () => {
+    const registered = new Map<string, TestToolDefinition>();
+    let active: string[] = ["read"];
+    const pi = {
+      registerTool(t: unknown) {
+        const tool = t as TestToolDefinition;
+        registered.set(tool.name, tool);
+        // Simulate Pi's _refreshToolRegistry auto-activating newly registered direct tools
+        if (tool.exposure === "direct" && !active.includes(tool.name)) {
+          active = [...active, tool.name];
+        }
+      },
+      getActiveTools: () => [...active],
+      setActiveTools: (names: string[]) => {
+        active = [...names];
+      },
+      getAllTools: () => [...registered.values()].map((t) => ({ name: t.name })),
+    };
+
+    const bridge = new ToolBridge({ toolPrefix: "mcp", maxRetries: 0, requestTimeoutMs: 5_000 }, pi);
+    const makeClient = (toolName: string, instructions: string) =>
+      ({
+        getInstructions: () => instructions,
+        request: async (req: { method: string }) =>
+          req.method === "tools/list"
+            ? { tools: [{ name: toolName, description: "Tool", inputSchema: { type: "object" } }] }
+            : { content: [] },
+      }) as unknown as Client;
+
+    // 1. `my-srv` connects alone -> claims `mcp_my_srv`
+    await bridge.refreshTools("my-srv", makeClient("ping", "Hyphen guide"), {
+      exposure: "direct",
+      description: "Hyphen summary",
+    });
+    const pingName = buildToolName("mcp", "my-srv", "ping");
+    assert.equal(registered.get(pingName)?.namespace?.name, "mcp_my_srv");
+
+    // Simulate an external policy narrowing `pingName` out of `activeTools`
+    active = ["read"];
+
+    // 2. Colliding `my_srv` connects -> claims `mcp_my_srv` and rebinds `my-srv` without resurrecting `pingName`
+    await bridge.refreshTools("my_srv", makeClient("search", "Underscore guide"), {
+      exposure: "codemode",
+      description: "Underscore summary",
+    });
+    const searchName = buildToolName("mcp", "my_srv", "search");
+    assert.equal(registered.get(searchName)?.namespace?.name, "mcp_my_srv");
+    assert.match(registered.get(pingName)?.namespace?.name ?? "", /^mcp_my_srv_[0-9a-f]{8}$/);
+    assert.equal(registered.get(pingName)?.namespace?.description, "Hyphen summary");
+    assert.equal(registered.get(pingName)?.namespace?.instructions, "Hyphen guide");
+    assert.deepEqual(active, ["read"]);
+
+    // 3. Removing `my_srv` and syncing namespaces restores `my-srv` to `mcp_my_srv` while keeping `pingName` inactive
+    bridge.removeServer("my_srv");
+    bridge.syncServerNamespaces(["my-srv"]);
+    assert.equal(registered.get(pingName)?.namespace?.name, "mcp_my_srv");
+    assert.deepEqual(registered.get(pingName)?.namespace?.aliases, ["my-srv", "mcp__my_srv"]);
+    assert.deepEqual(active, ["read"]);
+  });
 });
 
 

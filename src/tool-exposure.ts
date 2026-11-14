@@ -18,6 +18,7 @@
 import type { ToolNamespace } from "@earendil-works/pi-coding-agent";
 import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
+import { resolveServerNamespaceIds } from "./tool-names.js";
 
 /** Exposure levels Pi accepts for MCP tools; Pi's `codemode-deferred` alias is normalized away. */
 export const MCP_EXPOSURES = ["codemode", "deferred", "direct", "hidden"] as const;
@@ -235,6 +236,8 @@ export interface ServerToolNamespaceOptions {
   serverName: string;
   description?: string | undefined;
   instructions?: string | undefined;
+  /** Optional peer server names so colliding sanitized names (`my-srv` vs `my_srv`) disambiguate deterministically. */
+  peerServerNames?: Iterable<string> | undefined;
 }
 
 export function sanitizeNamespaceText(raw: unknown, maxLength: number): string | undefined {
@@ -245,7 +248,7 @@ export function sanitizeNamespaceText(raw: unknown, maxLength: number): string |
   return sanitizeTerminalText(redactSecrets(cleaned), { maxLength }).trim() || undefined;
 }
 
-/** Build the canonical `<prefix>_<sanitizedServer>` namespace name for one MCP server. */
+/** Build the canonical uncollided `<prefix>_<sanitizedServer>` namespace name for one MCP server. */
 export function buildServerNamespaceName(prefix: string, serverName: string): string {
   return `${prefix}_${serverName.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 }
@@ -253,13 +256,14 @@ export function buildServerNamespaceName(prefix: string, serverName: string): st
 /**
  * Build Pi's `ToolNamespace` metadata for one MCP server so `tool_search` ranks tools with
  * server context and codemode's `searchTools({ namespace })` / `describeNamespace()` resolve
- * the server by `<prefix>_<server>`, raw `<server>`, or Pi's `mcp__<server>` convention.
+ * the server by `<prefix>_<server>`, raw `<server>`, or Pi's `mcp__<server>` convention without
+ * cross-matching colliding peer server names (`my-srv` vs `my_srv`).
  */
 export function buildServerToolNamespace(options: ServerToolNamespaceOptions): ToolNamespace {
-  const sanitizedServer = options.serverName.replace(/[^a-zA-Z0-9_]/g, "_");
-  const name = buildServerNamespaceName(options.prefix, options.serverName);
-  const aliases = [...new Set([options.serverName, `mcp__${sanitizedServer}`])].filter(
-    (candidate) => candidate !== name,
+  const { name, aliases } = resolveServerNamespaceIds(
+    options.prefix,
+    options.serverName,
+    options.peerServerNames,
   );
   const description = sanitizeNamespaceText(options.description, MAX_NAMESPACE_DESCRIPTION_LENGTH);
   const instructions = sanitizeNamespaceText(

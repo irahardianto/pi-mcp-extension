@@ -40,6 +40,8 @@ export interface MockTool {
   promptSnippet?: string;
   promptGuidelines?: string[];
   parameters?: unknown;
+  exposure?: ToolDefinition["exposure"] | undefined;
+  namespace?: ToolDefinition["namespace"] | undefined;
   execute: (
     id: string,
     params: Record<string, unknown>,

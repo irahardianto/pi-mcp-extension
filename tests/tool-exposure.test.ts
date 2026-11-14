@@ -27,6 +27,10 @@ import {
   MCP_SERVERS_SECTION,
   renderMcpServersSection,
 } from "../src/mcp-servers-prompt.js";
+import {
+  collectReboundToolDefinitions,
+  resolveServerNamespaceIds,
+} from "../src/tool-names.js";
 
 describe("resolveToolExposure", () => {
   it("defaults to direct when the server entry states no exposure", () => {
@@ -240,6 +244,136 @@ describe("buildServerToolNamespace", () => {
     assert.equal(ns.name, "mcp__mcp__plain");
     assert.equal("description" in ns, false);
     assert.equal("instructions" in ns, false);
+  });
+
+  it("disambiguates colliding server names deterministically and isolates codemode aliases", () => {
+    const toCodemodeId = (raw: string): string => {
+      let id = "";
+      for (const ch of raw) {
+        const ok = id === "" ? /^[A-Za-z_$]$/ : /^[A-Za-z0-9_$]$/;
+        id = `${id}${ok.test(ch) ? ch : "_"}`;
+      }
+      return id === "" ? "_" : id;
+    };
+    const matchesCodemodeNamespace = (
+      ns: { name: string; aliases?: readonly string[] },
+      query: string,
+    ): boolean => {
+      const qId = toCodemodeId(query);
+      return [ns.name, ...(ns.aliases ?? [])].some((cand) => cand === query || toCodemodeId(cand) === qId);
+    };
+
+    // Lossless `my_docs` beats lossy `my-docs` regardless of peer iteration order
+    const peersForward = ["my-docs", "my_docs"];
+    const peersReverse = ["my_docs", "my-docs"];
+    const underscoreNs = buildServerToolNamespace({
+      prefix: "mcp",
+      serverName: "my_docs",
+      peerServerNames: peersForward,
+    });
+    const hyphenNs = buildServerToolNamespace({
+      prefix: "mcp",
+      serverName: "my-docs",
+      peerServerNames: peersForward,
+    });
+    assert.deepEqual(
+      underscoreNs,
+      buildServerToolNamespace({ prefix: "mcp", serverName: "my_docs", peerServerNames: peersReverse }),
+    );
+    assert.deepEqual(
+      hyphenNs,
+      buildServerToolNamespace({ prefix: "mcp", serverName: "my-docs", peerServerNames: peersReverse }),
+    );
+    assert.equal(underscoreNs.name, "mcp_my_docs");
+    assert.deepEqual(underscoreNs.aliases, ["mcp__my_docs"]);
+    assert.match(hyphenNs.name, /^mcp_my_docs_[0-9a-f]{8}$/);
+    // Ambiguous bare `my-docs` / `my_docs` must not cross-route to the wrong server in codemode
+    assert.equal(matchesCodemodeNamespace(underscoreNs, "my-docs"), false);
+    assert.equal(matchesCodemodeNamespace(hyphenNs, "my_docs"), false);
+    assert.equal(matchesCodemodeNamespace(underscoreNs, underscoreNs.name), true);
+    assert.equal(matchesCodemodeNamespace(hyphenNs, hyphenNs.name), true);
+    assert.equal(matchesCodemodeNamespace(underscoreNs, hyphenNs.name), false);
+    assert.equal(matchesCodemodeNamespace(hyphenNs, underscoreNs.name), false);
+
+    // Two lossy names rank by code point (`-` < `.`), and literal collision with a hashed stem falls back to `_2`
+    const lossyWinner = resolveServerNamespaceIds("mcp", "my-docs", ["my.docs", "my-docs"]);
+    const lossyLoser = resolveServerNamespaceIds("mcp", "my.docs", ["my.docs", "my-docs"]);
+    assert.equal(lossyWinner.name, "mcp_my_docs");
+    assert.match(lossyLoser.name, /^mcp_my_docs_[0-9a-f]{8}$/);
+
+    const takenHashPeer = hyphenNs.name.slice("mcp_".length);
+    const suffixedFallback = resolveServerNamespaceIds("mcp", "my-docs", [
+      "my_docs",
+      "my-docs",
+      takenHashPeer,
+    ]);
+    assert.equal(suffixedFallback.name, `${hyphenNs.name}_2`);
+    assert.equal(
+      resolveServerNamespaceIds("mcp", takenHashPeer, ["my_docs", "my-docs", takenHashPeer]).name,
+      `mcp_${takenHashPeer}`,
+    );
+
+    // Leading-digit (`1srv` -> `_srv`) and `_`-prefixed (`_a` -> `mcp__a`) peers never share codemode aliases
+    const numNs = buildServerToolNamespace({ prefix: "mcp", serverName: "1srv", peerServerNames: ["1srv", "_srv"] });
+    const undNs = buildServerToolNamespace({ prefix: "mcp", serverName: "_srv", peerServerNames: ["1srv", "_srv"] });
+    assert.equal(matchesCodemodeNamespace(numNs, "_srv"), false);
+    assert.equal(matchesCodemodeNamespace(undNs, "1srv"), false);
+
+    const aNs = buildServerToolNamespace({ prefix: "mcp", serverName: "a", peerServerNames: ["a", "_a"] });
+    const underANs = buildServerToolNamespace({ prefix: "mcp", serverName: "_a", peerServerNames: ["a", "_a"] });
+    assert.equal(underANs.name, "mcp__a");
+    assert.equal(matchesCodemodeNamespace(aNs, "mcp__a"), false);
+    assert.equal(matchesCodemodeNamespace(underANs, "mcp__a"), true);
+  });
+
+  it("collectReboundToolDefinitions updates only active non-hidden owned tools whose namespace changed", () => {
+    const definitions = new Map([
+      [
+        "mcp_my_srv_search",
+        {
+          name: "mcp_my_srv_search",
+          exposure: "deferred",
+          namespace: {
+            name: "mcp_my_srv",
+            aliases: ["my-srv", "mcp__my_srv"],
+            description: "Docs",
+            instructions: "Cite URIs",
+          },
+        },
+      ],
+      [
+        "mcp_my_srv_hidden",
+        {
+          name: "mcp_my_srv_hidden",
+          exposure: "hidden",
+          namespace: { name: "mcp_my_srv", aliases: ["my-srv", "mcp__my_srv"] },
+        },
+      ],
+    ]);
+    const baseOpts = {
+      prefix: "mcp",
+      activeServers: new Set(["my-srv", "missing-tools"]),
+      serverToolNames: new Map([["my-srv", new Set(["mcp_my_srv_search", "mcp_my_srv_hidden", "foreign"])]]),
+      toolOwners: new Map([
+        ["mcp_my_srv_search", "my-srv"],
+        ["mcp_my_srv_hidden", "my-srv"],
+        ["foreign", "other"],
+      ]),
+      definitions,
+    };
+
+    assert.deepEqual(
+      collectReboundToolDefinitions({ ...baseOpts, peerServerNames: ["my-srv"] }),
+      [],
+    );
+    const rebound = collectReboundToolDefinitions({
+      ...baseOpts,
+      peerServerNames: ["my-srv", "my_srv"],
+    });
+    assert.equal(rebound.length, 1);
+    assert.match(rebound[0]!.namespace?.name ?? "", /^mcp_my_srv_[0-9a-f]{8}$/);
+    assert.equal(rebound[0]!.namespace?.description, "Docs");
+    assert.equal(rebound[0]!.namespace?.instructions, "Cite URIs");
   });
 });
 
@@ -562,6 +696,33 @@ describe("renderMcpServersSection", () => {
     assert.ok(toolSearchOverflow);
     assert.ok(toolSearchOverflow.length <= MAX_SERVERS_SECTION_CHARS);
     assert.match(toolSearchOverflow, /- … \d+ more servers; find their tools with tool_search$/);
+  });
+
+  it("renders disambiguated namespaces matching ToolDefinition.namespace when server names collide", () => {
+    const servers = [
+      {
+        name: "my-docs",
+        connected: false,
+        exposures: ["codemode"] as const,
+        description: "Hyphen docs",
+      },
+      {
+        name: "my_docs",
+        connected: true,
+        exposures: ["codemode"] as const,
+        description: "Underscore docs",
+      },
+    ];
+    const rendered = renderMcpServersSection({ servers });
+    const hyphenExpected = resolveServerNamespaceIds("mcp", "my-docs", ["my-docs", "my_docs"]).name;
+    assert.equal(
+      rendered,
+      [
+        "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts. Connect `not connected` servers with `mcp_connect` first.",
+        `- ${hyphenExpected} (codemode, not connected — mcp_connect "my-docs"): Hyphen docs`,
+        "- mcp_my_docs (codemode): Underscore docs",
+      ].join("\n"),
+    );
   });
 });
 

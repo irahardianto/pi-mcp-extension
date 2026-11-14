@@ -41,6 +41,8 @@ function collectStatusRow(
     server,
     tools: deps.bridge.getToolActivity(server.name),
     source: lookupServerSource(provenance, server.name),
+    inactiveDirectTools: deps.bridge.getInactiveDirectTools(server.name).length,
+    indirectToolsFiltered: deps.bridge.hasAllIndirectToolsFiltered(server.name),
     readAuthStatus: (name) => deps.manager.getServerAuthStatus(name),
   }).then(toStatusRow);
 }
@@ -147,7 +149,7 @@ export function registerManagementTools(
       // extension removed is still a failure. Totals cannot decide it: `active` also counts
       // non-direct tools `tool_search` loaded, and those would mask a missing direct tool.
       if (bridge.getInactiveDirectTools(name).length > 0) {
-        throw new Error("MCP server connected, but some tools configured as direct are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered, active, and expected counts.");
+        throw new Error("MCP server connected, but some tools configured as direct are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered, active, expected, and inactiveDirect counts.");
       }
       if (bridge.hasAllIndirectToolsFiltered(name)) {
         throw new Error(

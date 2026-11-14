@@ -339,13 +339,14 @@ describe("collectServerStatus", () => {
     assert.doesNotMatch(detail, /raw-secret|\u001b/);
   });
 
-  it("skips the credential probe entirely for a server without auth config", async () => {
+  it("skips the credential probe entirely for a server without auth config and gates exposure flags on ready state", async () => {
     let probes = 0;
     const status = await collectServerStatus({
-      server: managedServer(),
+      server: managedServer({ state: "ready" }),
       tools: { discovered: 2, active: 0, expected: 0 },
       source: "extension",
       recentOutput: "out",
+      inactiveDirectTools: 1,
       indirectToolsFiltered: true,
       readAuthStatus: async () => {
         probes++;
@@ -356,9 +357,23 @@ describe("collectServerStatus", () => {
     assert.equal(probes, 0);
     assert.equal(status.auth, undefined);
     assert.equal(status.tools.discovered, 2);
+    assert.equal(status.inactiveDirectTools, 1);
     assert.equal(status.indirectToolsFiltered, true);
     assert.deepEqual(status.recentOutput, "out");
     assert.equal(status.transport, "stdio");
+
+    for (const nonReady of ["stopped", "starting"] as const) {
+      const stale = await collectServerStatus({
+        server: managedServer({ state: nonReady }),
+        tools: { discovered: 2, active: 0, expected: 1 },
+        source: "extension",
+        inactiveDirectTools: 1,
+        indirectToolsFiltered: true,
+        readAuthStatus: async () => null,
+      });
+      assert.equal(Object.hasOwn(stale, "inactiveDirectTools"), false);
+      assert.equal(Object.hasOwn(stale, "indirectToolsFiltered"), false);
+    }
   });
 
   it("reports credential presence from the injected stored-state reader", async () => {
@@ -406,7 +421,7 @@ describe("collectServerStatus", () => {
 });
 
 describe("toStatusRow", () => {
-  it("renders the mcp_status row including the config source", () => {
+  it("renders the mcp_status row including the config source and optional exposure diagnostics", () => {
     const row = toStatusRow(
       snapshot({
         name: "srv",
@@ -426,6 +441,26 @@ describe("toStatusRow", () => {
       auth: "not configured",
       error: undefined,
       source: "project",
+    });
+
+    const maskedAndFiltered = toStatusRow(
+      snapshot({
+        name: "srv",
+        lifecycle: "eager",
+        state: "ready",
+        tools: { discovered: 6, active: 1, expected: 1 },
+        inactiveDirectTools: 1,
+        indirectToolsFiltered: true,
+        lastError: null,
+        source: "project",
+      }),
+    );
+    assert.deepEqual(maskedAndFiltered.tools, {
+      discovered: 6,
+      active: 1,
+      expected: 1,
+      inactiveDirect: 1,
+      indirectFiltered: true,
     });
   });
 

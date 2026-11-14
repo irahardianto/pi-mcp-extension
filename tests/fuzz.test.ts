@@ -81,6 +81,7 @@ import {
   buildMcpResultSchema,
   buildMcpScriptResult,
 } from "../src/tool-content.js";
+import { resolveServerNamespaceIds } from "../src/tool-names.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;
@@ -2548,6 +2549,74 @@ describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScrip
           [{}, { negZero: [-0] }],
         ],
       },
+    );
+  });
+
+  it("resolveServerNamespaceIds is order-invariant, codemode-disjoint, and matches renderMcpServersSection", () => {
+    const toCodemodeId = (raw: string): string => {
+      let id = "";
+      for (const ch of raw) {
+        const ok = id === "" ? /^[A-Za-z_$]$/ : /^[A-Za-z0-9_$]$/;
+        id = `${id}${ok.test(ch) ? ch : "_"}`;
+      }
+      return id === "" ? "_" : id;
+    };
+    const matchesCodemodeNamespace = (
+      ns: { name: string; aliases: readonly string[] },
+      query: string,
+    ): boolean => {
+      const qId = toCodemodeId(query);
+      return [ns.name, ...ns.aliases].some((cand) => cand === query || toCodemodeId(cand) === qId);
+    };
+
+    const prefixArb = fc.constantFrom("mcp", "ext", "mcp_", "p1");
+    const collisionHeavyNameArb = fc.oneof(
+      fc.stringMatching(/^[ab1_-]{1,6}$/),
+      fc.constantFrom("my-srv", "my_srv", "my.srv", "my$srv", "_srv", "1srv", "mcp__srv"),
+      arbitraryString.filter((s) => s.length > 0 && s.length <= 24),
+    );
+    const peerListArb = fc.uniqueArray(collisionHeavyNameArb, { minLength: 1, maxLength: 12 });
+
+    fc.assert(
+      fc.property(prefixArb, peerListArb, (prefix, peers) => {
+        const reversedPeers = [...peers].reverse();
+        const resolvedByPeer = new Map(
+          peers.map((peer) => [peer, resolveServerNamespaceIds(prefix, peer, peers)]),
+        );
+
+        for (const peer of peers) {
+          const forward = resolvedByPeer.get(peer)!;
+          const reversed = resolveServerNamespaceIds(prefix, peer, reversedPeers);
+          assert.deepEqual(forward, reversed, "Peer iteration order must not alter resolved namespace");
+          assert.equal(matchesCodemodeNamespace(forward, forward.name), true);
+
+          for (const other of peers) {
+            if (other === peer) continue;
+            const otherNs = resolvedByPeer.get(other)!;
+            for (const query of [forward.name, ...forward.aliases]) {
+              assert.equal(
+                matchesCodemodeNamespace(otherNs, query),
+                false,
+                `Query "${query}" for server "${peer}" must never match peer "${other}"`,
+              );
+            }
+          }
+        }
+
+        const section = renderMcpServersSection({
+          toolPrefix: prefix,
+          servers: peers.map((name) => ({ name, connected: true, exposures: ["codemode"] as const })),
+        });
+        assert.ok(section);
+        for (const peer of peers) {
+          const nsName = resolvedByPeer.get(peer)!.name;
+          assert.ok(
+            section.includes(`- ${nsName} (codemode)`),
+            `Rendered section must list disambiguated namespace "${nsName}" for "${peer}"`,
+          );
+        }
+      }),
+      testOptions(),
     );
   });
 });

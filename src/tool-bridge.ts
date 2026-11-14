@@ -33,6 +33,8 @@ import {
   type ToolCallResponse,
 } from "./tool-content.js";
 import {
+  collectReboundToolDefinitions,
+  mergePeerServerNames,
   orderToolsForNameAssignment,
   resolveUniqueToolName,
 } from "./tool-names.js";
@@ -76,6 +78,8 @@ export type ToolRefreshOptions = {
   toolExposure?: Readonly<Record<string, McpExposure>> | undefined;
   /** Optional configured server summary (Pi 1.3.0 `description`), forwarded on `namespace`. */
   description?: string | undefined;
+  /** Optional configured peer server names for deterministic `ToolNamespace` disambiguation. */
+  peerServerNames?: Iterable<string> | undefined;
 };
 
 /**
@@ -569,6 +573,34 @@ export class ToolBridge {
   }
 
   /**
+   * Re-sync `ToolDefinition.namespace` on active servers when `mcp_servers_change` adds or
+   * removes a peer whose sanitized name collides (`my-srv` vs `my_srv`), without network I/O.
+   */
+  syncServerNamespaces(peerServerNames: Iterable<string>): void {
+    const activeBefore = [...this.pi.getActiveTools()];
+    if (!this._rebindActiveNamespaces(peerServerNames)) return;
+    if (!sameToolList(this.pi.getActiveTools(), activeBefore)) {
+      this.pi.setActiveTools(activeBefore);
+    }
+  }
+
+  private _rebindActiveNamespaces(peerServerNames: Iterable<string>): boolean {
+    const rebound = collectReboundToolDefinitions({
+      prefix: this.settings.toolPrefix,
+      activeServers: this.activeServers,
+      serverToolNames: this.serverToolNames,
+      toolOwners: this.toolOwners,
+      definitions: this.registeredDefinitions,
+      peerServerNames,
+    });
+    for (const definition of rebound) {
+      this.registeredDefinitions.set(definition.name, definition);
+      this.pi.registerTool(definition);
+    }
+    return rebound.length > 0;
+  }
+
+  /**
    * Register the freshly discovered tools, hide and release ownership of any Pi names the
    * server no longer uses, and reconcile Pi's active tool set (including discovery tools).
    */
@@ -588,11 +620,17 @@ export class ToolBridge {
     const previousStateByRawName = isLiveRefresh
       ? this._snapshotActiveStateByRawName(serverName, ownedPreviousNames, new Set(activeBefore))
       : undefined;
+    const peerServerNames = mergePeerServerNames(
+      serverName,
+      this.activeServers,
+      options?.peerServerNames,
+    );
     const namespace = buildServerToolNamespace({
       prefix: this.settings.toolPrefix,
       serverName,
       description: options?.description,
       instructions: readClientInstructions(client),
+      peerServerNames,
     });
 
     const currentToolNames = new Set<string>();
@@ -663,6 +701,7 @@ export class ToolBridge {
     this.directToolNames.set(serverName, directToolNames);
     this.activeServerExposures.set(serverName, serverExposures);
     this.activeServers.add(serverName);
+    this._rebindActiveNamespaces(peerServerNames);
     const discoveryToActivate = this._resolveDiscoveryTools(serverExposures, activeBefore);
     this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore, discoveryToActivate);
   }
