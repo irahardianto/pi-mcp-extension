@@ -10,7 +10,11 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { AuthCancelledError, McpError } from "../src/errors.js";
-import { discoverServerTools, type McpToolDefinition } from "../src/tool-discovery.js";
+import {
+  discoverServerTools,
+  readClientInstructions,
+  type McpToolDefinition,
+} from "../src/tool-discovery.js";
 import {
   callToolWithClient,
   createPiToolDefinition,
@@ -18,6 +22,7 @@ import {
   executeMcpToolCall,
   formatProgressText,
   rethrowToolCallError,
+  toHiddenToolDefinition,
   type CreatePiToolDefinitionOptions,
 } from "../src/tool-execution.js";
 
@@ -281,30 +286,63 @@ describe("tool-execution: rethrowToolCallError and executeMcpToolCall", () => {
     assert.deepEqual(outcome, {
       content: [{ type: "text", text: "done" }],
       details: {},
+      structuredContent: { content: [{ type: "text", text: "done" }] },
     });
+
+    const structuredErrorOutcome = await executeMcpToolCall({
+      serverName: "srv",
+      toolName: "broken",
+      client: isErrorEmptyClient,
+      params: {},
+      timeoutMs: 1000,
+      supportsErrorResult: true,
+    });
+    assert.equal(structuredErrorOutcome.isError, true);
+    assert.equal(structuredErrorOutcome.content[1]?.type, "text");
+
+    await assert.rejects(
+      () =>
+        executeMcpToolCall({
+          serverName: "srv",
+          toolName: "ok_tool",
+          client: okClient,
+          params: {},
+          timeoutMs: 1000,
+          assertCallable: () => {
+            throw new McpError("server disconnected", "srv", "connection");
+          },
+        }),
+      (err: unknown) => err instanceof McpError && err.code === "connection",
+    );
   });
 });
 
-describe("tool-execution: createPiToolDefinition dynamic evaluation", () => {
-  it("evaluates getTimeoutMs() and onAuthError dynamically at execute() call time", async () => {
+describe("tool-execution: createPiToolDefinition and toHiddenToolDefinition", () => {
+  it("wires exposure, namespace, outputSchema, assertCallable, dynamic getTimeoutMs/onAuthError, and toHiddenToolDefinition", async () => {
     const seenTimeouts: number[] = [];
     let failUnauthorized = false;
+    let reportToolError = false;
     const client = {
       callTool: async (_args: unknown, _schema: unknown, opts: { timeout: number }) => {
         seenTimeouts.push(opts.timeout);
         if (failUnauthorized) {
           throw new UnauthorizedError("401 unauthorized");
         }
+        if (reportToolError) {
+          return { isError: true, content: [{ type: "text", text: "domain error" }] };
+        }
         return { content: [{ type: "text", text: "ok" }] };
       },
     } as unknown as Client;
 
     let currentTimeout = 2500;
+    let callable = true;
     const authEvents: string[] = [];
     const tool: McpToolDefinition = {
       name: "search",
       description: "Search records across the workspace with a long description that exceeds one hundred and twenty characters so promptSnippet slices cleanly.",
       inputSchema: { type: "object", properties: { q: { type: "string" } } },
+      outputSchema: { type: "object", properties: { count: { type: "number" } } },
       annotations: { title: "Search Records", readOnlyHint: true },
     };
 
@@ -313,12 +351,21 @@ describe("tool-execution: createPiToolDefinition dynamic evaluation", () => {
       serverName: "srv",
       tool,
       client,
+      exposure: "direct",
+      namespace: { name: "mcp_srv", aliases: ["srv"] },
       getTimeoutMs: () => currentTimeout,
+      assertCallable: () => {
+        if (!callable) throw new McpError("stopped", "srv", "connection");
+      },
     };
     const definition = createPiToolDefinition(defOptions);
 
     assert.equal(definition.name, "mcp_srv_search");
     assert.equal(definition.label, "Search Records");
+    assert.equal(definition.exposure, "direct");
+    assert.equal("defaultActive" in definition, false);
+    assert.deepEqual(definition.namespace, { name: "mcp_srv", aliases: ["srv"] });
+    assert.ok(definition.outputSchema);
     assert.equal(definition.promptSnippet?.length, 120);
     assert.deepEqual(definition.annotations, { readOnlyHint: true });
 
@@ -327,12 +374,28 @@ describe("tool-execution: createPiToolDefinition dynamic evaluation", () => {
       serverName: "srv",
       tool: { name: "plain", inputSchema: { type: "object", properties: {} } },
       client,
+      exposure: "codemode",
+      namespace: { name: "mcp_srv" },
       getTimeoutMs: () => currentTimeout,
     });
     assert.equal(bareDefinition.label, "plain");
+    assert.equal(bareDefinition.exposure, "deferred");
+    assert.equal((bareDefinition as { defaultActive?: boolean }).defaultActive, false);
     assert.equal("annotations" in bareDefinition, false);
 
+    const hiddenCopy = toHiddenToolDefinition(bareDefinition);
+    assert.ok(hiddenCopy);
+    assert.equal(hiddenCopy.exposure, "hidden");
+    assert.equal((hiddenCopy as { defaultActive?: boolean }).defaultActive, false);
+    assert.equal(toHiddenToolDefinition(hiddenCopy), undefined);
+
     await definition.execute("call-1", { q: "first" }, undefined, undefined, dummyCtx);
+    reportToolError = true;
+    const pi13Ctx = { executeTool: async () => ({}) } as unknown as ExtensionToolContext;
+    const errRes = await definition.execute("call-err", { q: "err" }, undefined, undefined, pi13Ctx);
+    assert.equal((errRes as { isError?: boolean }).isError, true);
+    reportToolError = false;
+
     currentTimeout = 9000;
     defOptions.onAuthError = (serverName) => {
       authEvents.push(serverName);
@@ -344,13 +407,25 @@ describe("tool-execution: createPiToolDefinition dynamic evaluation", () => {
       (err: unknown) => err instanceof McpError && err.code === "protocol",
     );
 
-    assert.deepEqual(seenTimeouts, [2500, 9000]);
+    callable = false;
+    await assert.rejects(
+      () => definition.execute("call-3", { q: "third" }, undefined, undefined, dummyCtx),
+      (err: unknown) => err instanceof McpError && err.code === "connection",
+    );
+
+    assert.deepEqual(seenTimeouts, [2500, 2500, 9000]);
     assert.deepEqual(authEvents, ["srv"]);
   });
 });
 
-describe("tool-discovery: discoverServerTools", () => {
-  it("returns discovered tools and classifies cancellation, 401 auth errors, SDK timeouts, and non-Error throws", async () => {
+describe("tool-discovery: discoverServerTools and readClientInstructions", () => {
+  it("reads handshake instructions safely and classifies discovery errors", async () => {
+    assert.equal(
+      readClientInstructions({ getInstructions: () => "Use search first" } as unknown as Client),
+      "Use search first",
+    );
+    assert.equal(readClientInstructions({} as unknown as Client), undefined);
+
     const okClient = {
       listTools: async () => ({
         tools: [{ name: "alpha", inputSchema: { type: "object", properties: {} } }],

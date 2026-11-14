@@ -18,6 +18,7 @@ export interface McpToolDefinition {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
   annotations?: {
     readOnlyHint?: boolean;
     destructiveHint?: boolean;
@@ -193,5 +194,10 @@ export async function discoverServerTools(
   } catch (err) {
     return await rethrowToolDiscoveryError(err, options);
   }
+}
+
+/** Read MCP initialize-handshake `instructions` when the SDK client exposes `getInstructions()`. */
+export function readClientInstructions(client: Client): string | undefined {
+  return typeof client.getInstructions === "function" ? client.getInstructions() : undefined;
 }
 
