@@ -1682,7 +1682,7 @@ describe("OAuth Security Fixes", () => {
         const statusResult = await tools.get("mcp_status").execute("", {}, undefined, undefined, ctx);
         const statusRows = JSON.parse(statusResult.content[0].text);
         assert.strictEqual(statusRows[0].state, "ready");
-        assert.deepStrictEqual(statusRows[0].tools, { discovered: 1, active: 1 });
+        assert.deepStrictEqual(statusRows[0].tools, { discovered: 1, active: 1, expected: 1 });
         assert.ok(activeTools.some((name) => name.includes("oauth_echo")));
       } finally {
         await events.get("session_shutdown")({}, ctx);
