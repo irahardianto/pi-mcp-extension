@@ -37,7 +37,10 @@ import {
   renderMcpServersSection,
   type McpPromptServerEntry,
 } from "./mcp-servers-prompt.js";
-import { collectConfiguredExposures } from "./tool-exposure.js";
+import {
+  collectConfiguredExposures,
+  collectRequiredDiscoveryExposures,
+} from "./tool-exposure.js";
 
 export {
   startupAuthNowOption,
@@ -131,10 +134,10 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     }
   };
   bridge.setAuthErrorCallback(handleAuthError);
-  let warnedUnreachable = false;
+  const seenDiscoveryWarnings = new Set<string>();
   bridge.setDiscoveryWarningCallback((warning) => {
-    if (warnedUnreachable) return;
-    warnedUnreachable = true;
+    if (seenDiscoveryWarnings.has(warning)) return;
+    seenDiscoveryWarnings.add(warning);
     reportDiagnostic({
       level: "info",
       event: "tools.discovery_unreachable",
@@ -151,7 +154,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx: ExtensionContext) => {
-    warnedUnreachable = false;
+    seenDiscoveryWarnings.clear();
     return lifecycle.handleSessionStart(ctx);
   });
   // Connect or disconnect MCP servers registered dynamically via pi.registerMcpServer().
@@ -208,13 +211,12 @@ function restoreSessionTreeTools(manager: ServerManager, bridge: ToolBridge): vo
   // the target turn's declared loadout. If an indirect (`codemode` / `deferred`) server was added
   // or started after that turn, re-ensuring reaching discovery tools keeps its tools reachable
   // without re-activating `direct` tools that the restored branch did not declare (#257, #278).
-  const required = collectConfiguredExposures(
-    manager.getAllServers().map((server) => server.config),
+  bridge.ensureDiscoveryTools(
+    collectRequiredDiscoveryExposures(
+      manager.getAllServers().map((server) => server.config),
+      bridge.getConnectedExposures(),
+    ),
   );
-  for (const exposure of bridge.getConnectedExposures()) {
-    required.add(exposure);
-  }
-  bridge.ensureDiscoveryTools(required);
   bridge.orderActiveTools();
 }
 

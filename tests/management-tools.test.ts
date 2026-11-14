@@ -893,7 +893,8 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
     assert.match(promptSections["mcp_servers"] ?? "", /mcp_lazy_docs \(tool_search, not connected/);
     assert.ok(!(promptSections["mcp_servers"] ?? "").includes("manual_code"));
 
-    // Manually starting enabled:false `manual_code` activates codemode, surfaces handshake instructions, and survives /tree
+    // Manually starting enabled:false `manual_code` activates codemode, surfaces handshake instructions,
+    // and survives both /tree and mcp_servers_change reconciliations
     await mockExt.commands.get("mcp:start").handler("manual_code", ctx);
     assert.deepEqual(mockExt.activeTools, ["read", "tool_search", "codemode"]);
     await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
@@ -901,6 +902,41 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
     mockExt.activeTools = ["read"];
     await mockExt.events.get("session_tree")({}, ctx);
     assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+    mockExt.activeTools = ["read"];
+    mockExt.mcpServers.push({
+      name: "noop_direct",
+      config: { command: "node", args: ["--import", tsxEsmLoader, mock], lifecycle: "lazy" },
+      extensionPath: "/ext/noop.ts",
+    } as never);
+    await mockExt.events.get("mcp_servers_change")({ servers: mockExt.mcpServers }, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "codemode", "tool_search"]);
+    mockExt.mcpServers.length = 0;
+    await mockExt.events.get("mcp_servers_change")({ servers: [] }, ctx);
+
+    // Partial --exclude-tools (1 indirect tool excluded, others still in getAllTools) allows mcp_connect
+    const origGetAllTools = mockExt.api.getAllTools.bind(mockExt.api);
+    mockExt.api.getAllTools = () =>
+      origGetAllTools().filter((t: { name: string }) => t.name !== "mcp_lazy_docs_echo");
+    const partialRes = await mockExt.tools.get("mcp_connect").execute("c-part", { name: "lazy_docs" }, undefined, undefined, ctx);
+    assert.match(partialRes.content[0].text, /MCP server lazy_docs ready/);
+    await mockExt.commands.get("mcp:stop").handler("lazy_docs", ctx);
+
+    // Full --tools filtering (no mcp_lazy_docs_* tools in getAllTools) fails mcp_connect, warns, and annotates /mcp lazy_docs
+    mockExt.api.getAllTools = () =>
+      origGetAllTools().filter((t: { name: string }) => !t.name.startsWith("mcp_lazy_docs_"));
+    notifications.length = 0;
+    await assert.rejects(
+      () => mockExt.tools.get("mcp_connect").execute("c-filt", { name: "lazy_docs" }, undefined, undefined, ctx),
+      /filtered out its indirect tools; include mcp_\* in --tools/,
+    );
+    assert.ok(notifications.some((n) => n.level === "warning" && n.message.includes("include mcp_* in --tools")));
+    notifications.length = 0;
+    await mockExt.commands.get("mcp").handler("lazy_docs", ctx);
+    assert.match(
+      notifications.at(-1)?.message ?? "",
+      /^Tools: 0\/6 active \(0 configured direct, indirect filtered by --tools \/ --exclude-tools\)$/m,
+    );
+    mockExt.api.getAllTools = origGetAllTools;
 
     // Reloading with autoEnableCodemode: false and neither discovery tool active warns once per session
     await writeFile(

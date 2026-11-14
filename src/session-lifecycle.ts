@@ -35,7 +35,10 @@ import {
   reportDiagnostic,
   setDiagnosticUi,
 } from "./debug-log.js";
-import { collectConfiguredExposures } from "./tool-exposure.js";
+import {
+  collectConfiguredExposures,
+  collectRequiredDiscoveryExposures,
+} from "./tool-exposure.js";
 
 export const DEFAULT_SETTINGS = {
   toolPrefix: "mcp",
@@ -389,7 +392,12 @@ export class SessionLifecycle {
   }
 
   private syncConfiguredDiscoveryTools(servers: Record<string, ServerConfig>): void {
-    this.deps.bridge.ensureDiscoveryTools(collectConfiguredExposures(Object.values(servers)));
+    this.deps.bridge.ensureDiscoveryTools(
+      collectRequiredDiscoveryExposures(
+        Object.values(servers),
+        this.deps.bridge.getConnectedExposures(),
+      ),
+    );
   }
 
   private applyServers(next: Record<string, ServerConfig>, snapshotCount: number): void {

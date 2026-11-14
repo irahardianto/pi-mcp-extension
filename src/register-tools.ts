@@ -149,6 +149,11 @@ export function registerManagementTools(
       if (bridge.getInactiveDirectTools(name).length > 0) {
         throw new Error("MCP server connected, but some tools configured as direct are inactive. Check Pi tool restrictions or extension conflicts; mcp_status reports discovered, active, and expected counts.");
       }
+      if (bridge.hasAllIndirectToolsFiltered(name)) {
+        throw new Error(
+          `MCP server connected, but Pi tool restrictions (--tools / --exclude-tools) filtered out its indirect tools; include ${bridge.getToolPrefix()}_* in --tools so codemode and tool_search can reach them.`,
+        );
+      }
       const activity = bridge.getToolActivity(name);
       const instructions = getServerInstructions(manager.getServer(name));
       const ready = formatConnectSuccess(name, activity);

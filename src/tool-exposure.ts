@@ -302,10 +302,93 @@ export function collectConnectedExposures(
   return exposures;
 }
 
+/**
+ * Union enabled configured exposures with currently connected server exposures so manually
+ * started `enabled: false` servers keep their reaching discovery tools (`codemode` /
+ * `tool_search`) active across `session_start`, `mcp_servers_change`, and `session_tree` (#257).
+ */
+export function collectRequiredDiscoveryExposures(
+  configs: Iterable<ToolExposureConfig>,
+  connectedExposures: Iterable<McpExposure>,
+): Set<McpExposure> {
+  const required = collectConfiguredExposures(configs);
+  for (const exposure of connectedExposures) {
+    required.add(exposure);
+  }
+  return required;
+}
+
 /** Minimal view of a `pi.getAllTools()` entry needed to detect reaching discovery tools. */
 export interface RegisteredToolSummary {
   name: string;
   reachesTools?: unknown;
+}
+
+export interface ServerExposureAssessmentInput {
+  serverName: string;
+  toolPrefix: string;
+  piExposures: ReadonlyMap<string, McpExposure>;
+  allTools?: readonly RegisteredToolSummary[] | undefined;
+}
+
+export interface ServerExposureAssessment {
+  /** Distinct exposures of tools actually registered in Pi (or all exposures when `allTools` is absent). */
+  exposures: Set<McpExposure>;
+  /** True when the server configured indirect tools and Pi's `--tools` / `--exclude-tools` dropped all of them. */
+  allIndirectFiltered: boolean;
+  /** Actionable warning when Pi's tool allowlist/denylist filtered out every indirect tool of this server. */
+  filteredWarning?: string | undefined;
+}
+
+function isIndirectExposure(exposure: McpExposure): boolean {
+  return exposure === "codemode" || exposure === "deferred";
+}
+
+function collectSurvivingExposures(
+  piExposures: ReadonlyMap<string, McpExposure>,
+  registeredNames: ReadonlySet<string>,
+): { exposures: Set<McpExposure>; allIndirectFiltered: boolean } {
+  const exposures = new Set<McpExposure>();
+  let hadIndirect = false;
+  let survivingIndirect = false;
+  for (const [piName, exposure] of piExposures) {
+    const indirect = isIndirectExposure(exposure);
+    if (indirect) hadIndirect = true;
+    if (exposure === "hidden" || registeredNames.has(piName)) {
+      exposures.add(exposure);
+      if (indirect) survivingIndirect = true;
+    }
+  }
+  return { exposures, allIndirectFiltered: hadIndirect && !survivingIndirect };
+}
+
+/**
+ * Reconcile a server's resolved tool exposures against Pi's post-registration `getAllTools()`
+ * registry so `--tools` / `--exclude-tools` filtering of single-underscore `<prefix>_*` tools is
+ * detected instead of leaving `<mcp_servers>` or `mcp_connect` claiming unreachable tools work (#257).
+ */
+export function assessRegisteredServerExposures(
+  input: ServerExposureAssessmentInput,
+): ServerExposureAssessment {
+  if (input.allTools === undefined) {
+    return { exposures: new Set(input.piExposures.values()), allIndirectFiltered: false };
+  }
+  const registeredNames = new Set(input.allTools.map((tool) => tool.name));
+  const { exposures, allIndirectFiltered } = collectSurvivingExposures(
+    input.piExposures,
+    registeredNames,
+  );
+  if (!allIndirectFiltered) {
+    return { exposures, allIndirectFiltered: false };
+  }
+  const safeServer = sanitizeNamespaceText(input.serverName, 120) ?? input.serverName;
+  return {
+    exposures,
+    allIndirectFiltered: true,
+    filteredWarning:
+      `Indirect MCP tools from "${safeServer}" were filtered out by Pi tool restrictions ` +
+      `(--tools / --exclude-tools); include ${input.toolPrefix}_* in --tools so codemode and tool_search can reach them.`,
+  };
 }
 
 export interface DiscoveryActivationInput {

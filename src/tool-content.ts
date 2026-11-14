@@ -6,6 +6,7 @@
 import * as Type from "typebox";
 import type { TSchema } from "typebox";
 import type { ToolAnnotations } from "@earendil-works/pi-coding-agent";
+import { McpError } from "./errors.js";
 import { convertResourceContent } from "./resource-bridge.js";
 import type { McpToolDefinition } from "./tool-discovery.js";
 
@@ -27,6 +28,7 @@ export interface ToolCallOutcome {
   content: PiContent[];
   details: Record<string, never>;
   structuredContent?: McpJsonValue;
+  isError?: boolean;
 }
 
 /**
@@ -324,14 +326,65 @@ function toMcpJsonValue(
 /**
  * Build the `CallToolResult` value (without `_meta`) exposed as `AgentToolResult.structuredContent`
  * so `codemode` scripts receive raw MCP `content` blocks (including images for `image(block)`)
- * alongside `structuredContent` (#257).
+ * alongside `structuredContent` and canonical boolean `isError` (#257).
  */
 export function buildMcpScriptResult(result: ToolCallResponse): McpJsonValue {
   const { _meta: _ignored, ...rest } = result;
   const normalized: Record<string, unknown> = {
     ...rest,
     content: Array.isArray(result.content) ? result.content : [],
+    ...(result.isError !== undefined ? { isError: Boolean(result.isError) } : {}),
   };
   return toMcpJsonObject(normalized, 0, new WeakSet<object>());
+}
+
+/**
+ * True when `execute` received Pi 1.3.0+'s `ExtensionToolContext` (`createToolContext`), which
+ * defines `executeTool` alongside `AgentToolResult.isError` and `structuredContent`.
+ *
+ * WHY: Pi `< 1.3.0` (`createContext()`) and direct `execute(..., undefined)` callers lack
+ * `AgentToolResult.isError` support and would treat a non-throwing `{ isError: true }` return as a
+ * successful tool call, whereas Pi 1.3.0+ preserves `structuredContent` and `isError: true` for
+ * `codemode` scripts and `tool_result` hooks when returned directly (#257).
+ */
+export function supportsToolErrorResult(ctx: unknown): boolean {
+  if (!isPlainRecord(ctx)) return false;
+  return typeof ctx["executeTool"] === "function";
+}
+
+/**
+ * Convert a raw MCP `tools/call` response into Pi's `ToolCallOutcome`.
+ *
+ * On Pi 1.3.0+ (`supportsErrorResult === true`), MCP `isError: true` returns an error result
+ * carrying `structuredContent` and `isError: true` so `codemode` scripts resolve to the structured
+ * `CallToolResult` object (matching `builtin:mcp`). On Pi `< 1.3.0` or direct callers, it throws
+ * `McpError(..., "tool")` as before.
+ */
+export function buildToolCallOutcome(
+  result: ToolCallResponse,
+  serverName: string,
+  supportsErrorResult = false,
+): ToolCallOutcome {
+  const content = buildToolCallContent(result);
+  if (!result.isError) {
+    return {
+      content,
+      details: {},
+      structuredContent: buildMcpScriptResult(result),
+    };
+  }
+  const errorMessage = toolErrorText(content) || "Tool reported an error";
+  if (!supportsErrorResult) {
+    throw new McpError(errorMessage, serverName, "tool");
+  }
+  const errorContent: PiContent[] = toolErrorText(content)
+    ? content
+    : [...content, { type: "text", text: errorMessage }];
+  return {
+    content: errorContent,
+    details: {},
+    structuredContent: buildMcpScriptResult(result),
+    isError: true,
+  };
 }
 

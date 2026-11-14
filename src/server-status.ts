@@ -44,6 +44,8 @@ export interface ServerStatusSnapshot {
   instructions?: string | undefined;
   /** Configured `direct` tools currently absent from Pi's active set while ready. */
   inactiveDirectTools?: number | undefined;
+  /** Whether Pi's `--tools` / `--exclude-tools` filter removed all indirect tools while ready. */
+  indirectToolsFiltered?: boolean | undefined;
 }
 
 export interface ServerStatusRow {
@@ -64,6 +66,8 @@ export interface CollectServerStatusParams {
   recentOutput?: string | undefined;
   /** Configured `direct` tools absent from Pi's active set while ready. */
   inactiveDirectTools?: number | undefined;
+  /** Whether Pi's `--tools` / `--exclude-tools` filter removed all indirect tools while ready. */
+  indirectToolsFiltered?: boolean | undefined;
   /** Reads stored OAuth state for a server; injected so tests avoid disk I/O. */
   readAuthStatus: (serverName: string) => Promise<StoredAuthStatus | null>;
 }
@@ -123,22 +127,33 @@ function isDefined(value: string | undefined): value is string {
 /**
  * `(N configured direct)` suffix for the `Tools:` line when exposure keeps some tools out of
  * the active set by design — without it a server configured with `exposure: "hidden"` and a
- * few overridden tools renders `3/12 active` and reads as a broken server (#257). When a
- * loaded deferred tool masks an inactive direct tool (`2/3 active (2 configured direct)`),
- * also state how many configured `direct` tools are currently inactive.
+ * few overridden tools renders `3/12 active` and reads as a broken server (#257). Also surfaces
+ * inactive configured `direct` tools and indirect tools dropped by `--tools` / `--exclude-tools`.
  */
-function formatExposureNote(tools: ToolActivity, inactiveDirectTools = 0): string {
+function formatExposureNote(
+  tools: ToolActivity,
+  inactiveDirectTools = 0,
+  indirectToolsFiltered = false,
+): string {
   if (tools.expected === tools.discovered) return "";
+  const parts = [`${tools.expected} configured direct`];
   if (inactiveDirectTools > 0) {
-    return ` (${tools.expected} configured direct, ${inactiveDirectTools} direct inactive)`;
+    parts.push(`${inactiveDirectTools} direct inactive`);
   }
-  return ` (${tools.expected} configured direct)`;
+  if (indirectToolsFiltered) {
+    parts.push("indirect filtered by --tools / --exclude-tools");
+  }
+  return ` (${parts.join(", ")})`;
 }
 
 /** `/mcp <name>` detail view: config provenance, tool counts, credentials, and next steps. */
 export function formatServerDetail(snapshot: ServerStatusSnapshot, provenance: ConfigProvenance): string {
   const instructions = sanitizeServerInstructions(snapshot.instructions);
-  const exposureNote = formatExposureNote(snapshot.tools, snapshot.inactiveDirectTools);
+  const exposureNote = formatExposureNote(
+    snapshot.tools,
+    snapshot.inactiveDirectTools,
+    snapshot.indirectToolsFiltered,
+  );
   const lines: Array<string | undefined> = [
     `Server: ${sanitizeTerminalText(snapshot.name)}`,
     `State:  ${snapshot.state}`,
@@ -232,5 +247,6 @@ export async function collectServerStatus(params: CollectServerStatusParams): Pr
     recentOutput: params.recentOutput ?? "",
     ...(instructions === undefined ? {} : { instructions }),
     ...(params.inactiveDirectTools ? { inactiveDirectTools: params.inactiveDirectTools } : {}),
+    ...(params.indirectToolsFiltered ? { indirectToolsFiltered: true } : {}),
   };
 }

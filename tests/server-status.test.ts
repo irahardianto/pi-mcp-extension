@@ -231,6 +231,21 @@ describe("formatServerDetail", () => {
     );
 
     assert.match(masked, /^Tools: 2\/3 active \(2 configured direct, 1 direct inactive\)$/m);
+
+    const filtered = formatServerDetail(
+      snapshot({
+        state: "ready",
+        tools: { discovered: 4, active: 0, expected: 0 },
+        indirectToolsFiltered: true,
+        recentOutput: "listening",
+      }),
+      withExtensionServers(provenanceInput(), []),
+    );
+
+    assert.match(
+      filtered,
+      /^Tools: 0\/4 active \(0 configured direct, indirect filtered by --tools \/ --exclude-tools\)$/m,
+    );
   });
 
   it("adds OAuth, last error, hint, and the skipped-project note for a failed untrusted server", () => {
@@ -328,9 +343,10 @@ describe("collectServerStatus", () => {
     let probes = 0;
     const status = await collectServerStatus({
       server: managedServer(),
-      tools: { discovered: 1, active: 1, expected: 1 },
+      tools: { discovered: 2, active: 0, expected: 0 },
       source: "extension",
       recentOutput: "out",
+      indirectToolsFiltered: true,
       readAuthStatus: async () => {
         probes++;
         return null;
@@ -339,7 +355,8 @@ describe("collectServerStatus", () => {
 
     assert.equal(probes, 0);
     assert.equal(status.auth, undefined);
-    assert.equal(status.tools.discovered, 1);
+    assert.equal(status.tools.discovered, 2);
+    assert.equal(status.indirectToolsFiltered, true);
     assert.deepEqual(status.recentOutput, "out");
     assert.equal(status.transport, "stdio");
   });

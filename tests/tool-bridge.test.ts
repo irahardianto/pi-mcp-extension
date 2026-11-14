@@ -23,7 +23,9 @@ import {
   buildMcpScriptResult,
   buildToolAnnotations,
   buildToolCallContent,
+  buildToolCallOutcome,
   buildToolDescription,
+  supportsToolErrorResult,
   toolErrorText,
 } from "../src/tool-content.js";
 import {
@@ -1582,17 +1584,23 @@ describe("ToolBridge", () => {
     assert.deepEqual(activeTools, ["mcp_db_beta"]);
   });
 
-  it("auto-activates reaching codemode / tool_search tools and warns when unreachable", async () => {
+  it("auto-activates reaching codemode / tool_search tools and warns when unreachable or filtered by --tools", async () => {
     let activeTools = ["read"];
-    let allTools: Array<{ name: string; reachesTools?: boolean }> = [
+    let baseTools: Array<{ name: string; reachesTools?: boolean }> = [
       { name: "read" },
       { name: "codemode", reachesTools: true },
       { name: "tool_search", reachesTools: true },
     ];
+    let allowMcpTools = true;
+    const registeredMcp = new Map<string, { name: string }>();
     const warnings: string[] = [];
     const mockPi = {
-      registerTool: () => {},
-      getAllTools: () => allTools,
+      registerTool: (def: { name: string }) => {
+        if (allowMcpTools) {
+          registeredMcp.set(def.name, { name: def.name });
+        }
+      },
+      getAllTools: () => [...baseTools, ...registeredMcp.values()],
       getActiveTools: () => activeTools,
       setActiveTools: (names: string[]) => { activeTools = names; },
     };
@@ -1613,10 +1621,69 @@ describe("ToolBridge", () => {
     assert.match(warnings[0]!, /\(autoEnableCodemode is false\)/);
 
     // Non-reaching tools of the same name are ignored and trigger an unreachable warning
-    allTools = [{ name: "tool_search", reachesTools: false }];
+    baseTools = [{ name: "tool_search", reachesTools: false }];
     await bridge.refreshTools("def", listingClient(["find"]), { exposure: "deferred" });
     assert.deepEqual(activeTools, ["read"]);
     assert.equal(warnings.length, 2);
+
+    // When Pi's --tools filter drops single-underscore mcp_* tools from getAllTools(),
+    // ToolBridge flags the server, excludes filtered exposures, and emits an actionable warning
+    baseTools = [{ name: "read" }, { name: "codemode", reachesTools: true }];
+    registeredMcp.clear();
+    allowMcpTools = false;
+    bridge.setAutoEnableCodemode(true);
+    await bridge.refreshTools("filtered", listingClient(["query"]), { exposure: "codemode" });
+    assert.equal(bridge.hasAllIndirectToolsFiltered("filtered"), true);
+    assert.deepEqual([...bridge.getServerExposures("filtered")], []);
+    assert.equal(warnings.length, 3);
+    assert.match(warnings[2]!, /include mcp_\* in --tools/);
+
+    bridge.deactivateServer("filtered");
+    assert.equal(bridge.hasAllIndirectToolsFiltered("filtered"), false);
+  });
+
+  it("does not resurrect another server's deactivated direct tool when deactivateServer or removeServerTools triggers --tools registry refresh", async () => {
+    let activeTools = ["read"];
+    const registered = new Map<string, TestToolDefinition>();
+    const mockPi = {
+      registerTool: (t: unknown) => {
+        const def = t as TestToolDefinition & { exposure?: string; defaultActive?: boolean };
+        registered.set(def.name, def);
+        // Simulate Pi's AgentSession._refreshToolRegistry() when `--tools read,mcp_*` is active:
+        // every registerTool() re-adds all declarable allowlisted tools into activeTools.
+        const next = new Set(activeTools);
+        for (const [name, entry] of registered) {
+          const entryDef = entry as TestToolDefinition & { exposure?: string; defaultActive?: boolean };
+          if (entryDef.exposure !== "hidden" && entryDef.defaultActive !== false) {
+            next.add(name);
+          } else {
+            next.delete(name);
+          }
+        }
+        activeTools = [...next];
+      },
+      getActiveTools: () => [...activeTools],
+      setActiveTools: (names: string[]) => {
+        activeTools = [...names];
+      },
+    };
+
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, mockPi);
+    await bridge.refreshTools("alpha", listingClient(["keep", "muted"]));
+    await bridge.refreshTools("beta", listingClient(["ping"]));
+
+    // User/policy mutes `mcp_alpha_muted` while keeping `mcp_alpha_keep` and `mcp_beta_ping`
+    activeTools = ["read", "mcp_alpha_keep", "mcp_beta_ping"];
+
+    // Stopping `beta` calls registerTool(hidden) on `mcp_beta_ping`; `mcp_alpha_muted` must stay muted
+    bridge.deactivateServer("beta");
+    assert.deepEqual(activeTools, ["read", "mcp_alpha_keep"]);
+
+    // Reconnect `beta`, mute `mcp_alpha_muted` again, and remove `beta` altogether
+    await bridge.refreshTools("beta", listingClient(["ping"]));
+    activeTools = ["read", "mcp_alpha_keep", "mcp_beta_ping"];
+    bridge.removeServerTools("beta");
+    assert.deepEqual(activeTools, ["read", "mcp_alpha_keep"]);
   });
 
   it("keeps externally deactivated tools inactive across a live tools/list_changed refresh", async () => {
@@ -3768,14 +3835,50 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
     });
     assert.deepEqual(scriptResult["extra"], { tag: "ok" });
 
-    // Legacy response without an array `content` normalizes `content` to `[]`
+    // Legacy response without an array `content` normalizes `content` to `[]`, and `isError` canonicalizes to boolean
     assert.deepEqual(buildMcpScriptResult({ structuredContent: { ok: true } }), {
       content: [],
       structuredContent: { ok: true },
     });
+    assert.deepEqual(buildMcpScriptResult({ content: [], isError: false }), {
+      content: [],
+      isError: false,
+    });
+    assert.deepEqual(
+      buildMcpScriptResult({ content: [], isError: 1 }),
+      { content: [], isError: true },
+    );
+
+    assert.equal(supportsToolErrorResult(undefined), false);
+    assert.equal(supportsToolErrorResult(null), false);
+    assert.equal(supportsToolErrorResult("ctx"), false);
+    assert.equal(supportsToolErrorResult({}), false);
+    assert.equal(supportsToolErrorResult({ executeTool: "not-a-fn" }), false);
+    assert.equal(supportsToolErrorResult({ executeTool: async () => ({}) }), true);
+
+    // buildToolCallOutcome preserves image blocks and structuredContent on Pi 1.3.0+ while appending fallback error text
+    const imageErrOutcome = buildToolCallOutcome(
+      {
+        content: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
+        structuredContent: { code: "E_SYNTAX", line: 4 },
+        isError: true,
+      },
+      "analytics",
+      true,
+    );
+    assert.equal(imageErrOutcome.isError, true);
+    assert.deepEqual(imageErrOutcome.content, [
+      { type: "image", data: "YWJj", mimeType: "image/png" },
+      { type: "text", text: "Tool reported an error" },
+    ]);
+    assert.deepEqual(imageErrOutcome.structuredContent, {
+      content: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
+      structuredContent: { code: "E_SYNTAX", line: 4 },
+      isError: true,
+    });
   });
 
-  it("wires outputSchema, structuredContent, and server exposure state on ToolBridge", async () => {
+  it("wires outputSchema, structuredContent, Pi 1.3.0 isError envelopes, and server exposure state on ToolBridge", async () => {
     const registered = new Map<string, TestToolDefinition>();
     let activeTools: string[] = [];
     const bridge = new ToolBridge(
@@ -3818,7 +3921,11 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
       },
       callTool: async () =>
         shouldFail
-          ? { content: [{ type: "text", text: "Query syntax error" }], isError: true }
+          ? {
+              content: [{ type: "text", text: "Query syntax error" }],
+              structuredContent: { code: "E_SQL" },
+              isError: true,
+            }
           : {
               _meta: { traceId: "t-1" },
               content: [{ type: "image", data: "YWJj", mimeType: "image/png" }],
@@ -3848,7 +3955,7 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
       structuredContent: { series: { label: "Q1" } },
     });
 
-    // isError: true still rejects with McpError(..., "tool")
+    // Legacy Pi < 1.3.0 / direct callers without `ctx.executeTool` reject with McpError(..., "tool")
     shouldFail = true;
     await assert.rejects(
       () => tool.execute("call-2", { sql: "BAD" }, undefined, undefined, undefined),
@@ -3859,6 +3966,17 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
         return true;
       },
     );
+
+    // Pi 1.3.0+ ExtensionToolContext (`ctx.executeTool` present) returns structured isError envelope
+    const pi13Ctx = { executeTool: async () => ({ content: [], details: {} }) };
+    const errOutcome = await tool.execute("call-3", { sql: "BAD" }, undefined, undefined, pi13Ctx);
+    assert.equal(errOutcome.isError, true);
+    assert.deepEqual(errOutcome.content, [{ type: "text", text: "Query syntax error" }]);
+    assert.deepEqual(errOutcome.structuredContent, {
+      content: [{ type: "text", text: "Query syntax error" }],
+      structuredContent: { code: "E_SQL" },
+      isError: true,
+    });
 
     bridge.deactivateServer("analytics");
     assert.equal(bridge.isServerActive("analytics"), false);

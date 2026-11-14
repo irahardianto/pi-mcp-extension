@@ -54,22 +54,46 @@ interface PreparedPromptServer {
   head: string;
 }
 
-function shouldFallbackCodemodeToToolSearch(activeTools: readonly string[] | undefined): boolean {
-  if (!activeTools) return false;
+interface ReachAvailability {
+  codemode: boolean;
+  toolSearch: boolean;
+}
+
+function resolveReachAvailability(activeTools: readonly string[] | undefined): ReachAvailability {
+  if (!activeTools) return { codemode: true, toolSearch: true };
   const active = new Set(activeTools);
-  return !active.has(CODEMODE_TOOL_NAME) && active.has(TOOL_SEARCH_TOOL_NAME);
+  return {
+    codemode: active.has(CODEMODE_TOOL_NAME),
+    toolSearch: active.has(TOOL_SEARCH_TOOL_NAME),
+  };
+}
+
+function mapExposureToReachMode(
+  exposure: "codemode" | "deferred",
+  available: ReachAvailability,
+): IndirectReachMode | undefined {
+  if (exposure === "codemode") {
+    if (available.codemode) return "codemode";
+    return available.toolSearch ? "tool_search" : undefined;
+  }
+  if (available.toolSearch) return "tool_search";
+  // WHY: in Pi 1.3.0, `AgentSession._getCallableTools()` exposes both `codemode` and `deferred`
+  // tools to codemode scripts, so `--tools read,codemode,mcp_*` (without `tool_search`) can still
+  // reach `deferred` tools via `codemode` (#257).
+  return available.codemode ? "codemode" : undefined;
 }
 
 function resolveIndirectReachModes(
   exposures: ReadonlySet<McpExposure>,
-  preferToolSearchForCodemode: boolean,
+  available: ReachAvailability,
 ): IndirectReachMode[] {
   const modes: IndirectReachMode[] = [];
-  if (exposures.has("codemode")) {
-    modes.push(preferToolSearchForCodemode ? "tool_search" : "codemode");
-  }
-  if (exposures.has("deferred") && !modes.includes("tool_search")) {
-    modes.push("tool_search");
+  for (const exposure of ["codemode", "deferred"] as const) {
+    if (!exposures.has(exposure)) continue;
+    const mode = mapExposureToReachMode(exposure, available);
+    if (mode && !modes.includes(mode)) {
+      modes.push(mode);
+    }
   }
   return modes;
 }
@@ -120,27 +144,37 @@ function buildSectionIntro(
   return sentences.join(" ");
 }
 
-function omittedTailLines(omittedCount: number): string[] {
+function omittedTailLines(omittedCount: number, hasCodemode: boolean): string[] {
   if (omittedCount <= 0) return [];
   const noun = omittedCount === 1 ? "server" : "servers";
-  return [`- … ${omittedCount} more ${noun}; find their tools with searchTools()`];
+  const finder = hasCodemode ? "searchTools()" : "tool_search";
+  return [`- … ${omittedCount} more ${noun}; find their tools with ${finder}`];
 }
 
-function measureSkeletonLength(intro: string, heads: readonly string[], kept: number): number {
-  return [intro, ...heads.slice(0, kept), ...omittedTailLines(heads.length - kept)].join("\n")
-    .length;
+function measureSkeletonLength(
+  intro: string,
+  heads: readonly string[],
+  kept: number,
+  hasCodemode: boolean,
+): number {
+  return [
+    intro,
+    ...heads.slice(0, kept),
+    ...omittedTailLines(heads.length - kept, hasCodemode),
+  ].join("\n").length;
 }
 
 function selectKeptServerCount(
   intro: string,
   heads: readonly string[],
+  hasCodemode: boolean,
 ): { kept: number; perServerBudget: number } {
   let kept = heads.length;
-  while (kept > 0 && measureSkeletonLength(intro, heads, kept) > MAX_SERVERS_SECTION_CHARS) {
+  while (kept > 0 && measureSkeletonLength(intro, heads, kept, hasCodemode) > MAX_SERVERS_SECTION_CHARS) {
     kept = kept - 1;
   }
   if (kept === 0) return { kept: 0, perServerBudget: 0 };
-  const remaining = MAX_SERVERS_SECTION_CHARS - measureSkeletonLength(intro, heads, kept);
+  const remaining = MAX_SERVERS_SECTION_CHARS - measureSkeletonLength(intro, heads, kept, hasCodemode);
   const rawBudget = Math.min(MAX_SERVER_SUMMARY_CHARS, Math.floor(remaining / kept) - 2);
   return { kept, perServerBudget: rawBudget <= 1 ? 0 : rawBudget };
 }
@@ -148,12 +182,12 @@ function selectKeptServerCount(
 function preparePromptServers(
   servers: readonly McpPromptServerEntry[],
   prefix: string,
-  preferToolSearchForCodemode: boolean,
+  available: ReachAvailability,
 ): PreparedPromptServer[] {
   const prepared: PreparedPromptServer[] = [];
   for (const entry of servers) {
     if (!entry.connected && entry.enabled === false) continue;
-    const modes = resolveIndirectReachModes(new Set(entry.exposures), preferToolSearchForCodemode);
+    const modes = resolveIndirectReachModes(new Set(entry.exposures), available);
     if (modes.length === 0) continue;
     prepared.push({
       entry,
@@ -166,26 +200,28 @@ function preparePromptServers(
 
 /**
  * Render the `mcp_servers` system-prompt section for enabled or connected servers with indirect
- * (`codemode` / `deferred`) tools, or `undefined` when none exist.
+ * (`codemode` / `deferred`) tools, or `undefined` when none exist (or when `activeTools` is
+ * supplied and neither `codemode` nor `tool_search` is active).
  */
 export function renderMcpServersSection(
   options: RenderMcpServersSectionOptions,
 ): string | undefined {
   const prefix = options.toolPrefix ?? "mcp";
-  const preferToolSearch = shouldFallbackCodemodeToToolSearch(options.activeTools);
-  const prepared = preparePromptServers(options.servers, prefix, preferToolSearch);
+  const available = resolveReachAvailability(options.activeTools);
+  const prepared = preparePromptServers(options.servers, prefix, available);
   if (prepared.length === 0) return undefined;
 
   const reaches = new Set<IndirectReachMode>(prepared.flatMap((item) => item.modes));
+  const hasCodemode = reaches.has("codemode");
   const hasDisconnected = prepared.some((item) => !item.entry.connected);
   const intro = buildSectionIntro(reaches, hasDisconnected);
   const heads = prepared.map((item) => item.head);
-  const { kept, perServerBudget } = selectKeptServerCount(intro, heads);
+  const { kept, perServerBudget } = selectKeptServerCount(intro, heads, hasCodemode);
 
   const lines = prepared.slice(0, kept).map((item) => {
     const summary =
       perServerBudget > 0 ? resolveServerSummary(item.entry, perServerBudget) : undefined;
     return summary ? `${item.head}: ${summary}` : item.head;
   });
-  return [intro, ...lines, ...omittedTailLines(prepared.length - kept)].join("\n");
+  return [intro, ...lines, ...omittedTailLines(prepared.length - kept, hasCodemode)].join("\n");
 }

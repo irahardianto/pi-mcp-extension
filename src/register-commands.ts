@@ -39,12 +39,15 @@ async function buildServerDetail(server: ManagedServer, deps: RegisterCommandsDe
   const provenance = deps.getProvenance();
   const inactiveDirectTools =
     server.state === "ready" ? deps.bridge.getInactiveDirectTools(serverName).length : 0;
+  const indirectToolsFiltered =
+    server.state === "ready" && deps.bridge.hasAllIndirectToolsFiltered(serverName);
   const snapshot = await collectServerStatus({
     server,
     tools: deps.bridge.getToolActivity(serverName),
     source: lookupServerSource(provenance, serverName),
     recentOutput: manager.getServerLogs(serverName),
     inactiveDirectTools,
+    indirectToolsFiltered,
     readAuthStatus: (name) => manager.getServerAuthStatus(name),
   });
   return formatServerDetail(snapshot, provenance);

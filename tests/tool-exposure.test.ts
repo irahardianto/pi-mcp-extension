@@ -9,9 +9,11 @@ import {
   DEFAULT_EXPOSURE,
   MCP_EXPOSURES,
   TOOL_SEARCH_TOOL_NAME,
+  assessRegisteredServerExposures,
   buildServerToolNamespace,
   collectConfiguredExposures,
   collectConnectedExposures,
+  collectRequiredDiscoveryExposures,
   mergeRawToolExposures,
   normalizeExposureAlias,
   reconcileLiveRefreshState,
@@ -255,12 +257,64 @@ describe("collectConfiguredExposures & resolveDiscoveryActivation", () => {
     assert.deepEqual([...collectConfiguredExposures([{ enabled: false, exposure: "codemode" }])], []);
   });
 
-  it("collects exposures across connected server sets", () => {
+  it("collects exposures across connected server sets and unions them with configured servers", () => {
     const connected = collectConnectedExposures([
       new Set(["direct", "codemode"] as const),
       new Set(["deferred"] as const),
     ]);
     assert.deepEqual([...connected].sort(), ["codemode", "deferred", "direct"]);
+
+    const required = collectRequiredDiscoveryExposures(
+      [{ enabled: false, exposure: "codemode" }, { exposure: "direct" }],
+      ["codemode"],
+    );
+    assert.deepEqual([...required].sort(), ["codemode", "direct"]);
+  });
+
+  it("assesses registered server exposures against Pi's --tools / --exclude-tools filter", () => {
+    const piExposures = new Map<string, "direct" | "codemode" | "deferred" | "hidden">([
+      ["mcp_docs_ping", "direct"],
+      ["mcp_docs_search", "deferred"],
+      ["mcp_docs_run", "codemode"],
+      ["mcp_docs_internal", "hidden"],
+    ]);
+
+    // Without getAllTools, all configured exposures remain intact
+    const unchecked = assessRegisteredServerExposures({
+      serverName: "docs",
+      toolPrefix: "mcp",
+      piExposures,
+    });
+    assert.equal(unchecked.allIndirectFiltered, false);
+    assert.equal(unchecked.filteredWarning, undefined);
+    assert.deepEqual([...unchecked.exposures].sort(), ["codemode", "deferred", "direct", "hidden"]);
+
+    // Partial --exclude-tools (1 indirect tool excluded, 1 surviving) is treated as intentional
+    const partial = assessRegisteredServerExposures({
+      serverName: "docs",
+      toolPrefix: "mcp",
+      piExposures,
+      allTools: [{ name: "mcp_docs_ping" }, { name: "mcp_docs_search" }],
+    });
+    assert.equal(partial.allIndirectFiltered, false);
+    assert.equal(partial.filteredWarning, undefined);
+    assert.deepEqual([...partial.exposures].sort(), ["deferred", "direct", "hidden"]);
+
+    // Full --tools filtering (no indirect tools surviving in allTools) suppresses indirect exposures and warns
+    const filtered = assessRegisteredServerExposures({
+      serverName: "evil\u001b[31mdocs",
+      toolPrefix: "ext",
+      piExposures: new Map([
+        ["ext_docs_ping", "direct"],
+        ["ext_docs_search", "deferred"],
+      ]),
+      allTools: [{ name: "read" }, { name: "codemode" }, { name: "ext_docs_ping" }],
+    });
+    assert.equal(filtered.allIndirectFiltered, true);
+    assert.deepEqual([...filtered.exposures], ["direct"]);
+    assert.ok(filtered.filteredWarning);
+    assert.equal(filtered.filteredWarning.includes("\u001b"), false);
+    assert.match(filtered.filteredWarning, /include ext_\* in --tools/);
   });
 
   it("activates codemode and tool_search in deterministic order and ignores non-reaching impostors", () => {
@@ -362,7 +416,7 @@ describe("renderMcpServersSection", () => {
     );
   });
 
-  it("falls back codemode to tool_search when tool_search is active without codemode", () => {
+  it("falls back symmetrically when only one discovery tool is active and omits when neither is active", () => {
     const fallback = renderMcpServersSection({
       servers: [
         {
@@ -383,7 +437,29 @@ describe("renderMcpServersSection", () => {
       ].join("\n"),
     );
 
-    // Without activeTools (or when codemode is active), codemode stays codemode
+    // Symmetric fallback: deferred server falls back to codemode when codemode is active without tool_search
+    const codemodeOnly = renderMcpServersSection({
+      servers: [{ name: "docs", connected: true, exposures: ["deferred"], description: "Reference docs" }],
+      activeTools: ["read", "codemode"],
+    });
+    assert.equal(
+      codemodeOnly,
+      [
+        "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts.",
+        "- mcp_docs (codemode): Reference docs",
+      ].join("\n"),
+    );
+
+    // Neither reaching tool active -> section omitted so the prompt never instructs calling undeclared tools
+    assert.equal(
+      renderMcpServersSection({
+        servers: [{ name: "warehouse", connected: true, exposures: ["codemode", "deferred"] }],
+        activeTools: ["read"],
+      }),
+      undefined,
+    );
+
+    // Without activeTools, codemode stays codemode
     const directCodemode = renderMcpServersSection({
       servers: [{ name: "warehouse", connected: true, exposures: ["codemode"] }],
     });
@@ -474,6 +550,18 @@ describe("renderMcpServersSection", () => {
     assert.ok(pluralOverflow);
     assert.ok(pluralOverflow.length <= MAX_SERVERS_SECTION_CHARS);
     assert.match(pluralOverflow, /- … \d+ more servers; find their tools with searchTools\(\)$/);
+
+    const toolSearchOverflow = renderMcpServersSection({
+      servers: Array.from({ length: baseCount + 5 }, (_, i) => ({
+        name: `overflow-server-${String(i).padStart(3, "0")}`,
+        connected: true,
+        exposures: ["deferred"] as const,
+      })),
+      activeTools: ["read", "tool_search"],
+    });
+    assert.ok(toolSearchOverflow);
+    assert.ok(toolSearchOverflow.length <= MAX_SERVERS_SECTION_CHARS);
+    assert.match(toolSearchOverflow, /- … \d+ more servers; find their tools with tool_search$/);
   });
 });
 

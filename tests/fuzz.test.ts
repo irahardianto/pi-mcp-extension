@@ -2501,6 +2501,13 @@ describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScrip
             activeTools,
           });
           assert.equal(forward, reversed, "Server order must not change rendered section");
+          if (
+            activeTools !== undefined &&
+            !activeTools.includes("codemode") &&
+            !activeTools.includes("tool_search")
+          ) {
+            assert.equal(forward, undefined, "Section must be omitted when neither reaching tool is active");
+          }
           if (forward !== undefined) {
             assert.ok(forward.length <= MAX_SERVERS_SECTION_CHARS);
             assert.ok(!forward.includes("\u001b"), "ANSI escapes must be stripped");
@@ -2528,6 +2535,9 @@ describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScrip
           assert.equal(Object.getPrototypeOf(scriptResult), Object.prototype);
           assert.equal("_meta" in scriptResult, false, "_meta must be stripped");
           assert.ok(Array.isArray(scriptResult["content"]), "content must be normalized to an array");
+          if ("isError" in scriptResult) {
+            assert.equal(typeof scriptResult["isError"], "boolean", "isError must canonicalize to boolean");
+          }
           assert.deepEqual(JSON.parse(JSON.stringify(scriptResult)), scriptResult);
         },
       ),

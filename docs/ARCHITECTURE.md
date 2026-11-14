@@ -76,19 +76,23 @@ flowchart TD
   per-server `ToolNamespace` (`description` + MCP handshake `instructions`), and given a
   `CallToolResult` `outputSchema` (`buildMcpResultSchema()` with relocated
   `#/properties/structuredContent` `$ref`s) plus `structuredContent` (`buildMcpScriptResult()`
-  without `_meta`) on successful calls so `codemode` scripts receive raw MCP content blocks
-  and typed return values while `isError: true` still rejects with `McpError(..., "tool")`.
+  without `_meta`) so `codemode` scripts receive raw MCP content blocks, typed return values,
+  and on Pi 1.3.0+ (`supportsToolErrorResult(ctx)`) structured `{ content, structuredContent, isError: true }`
+  tool-error envelopes while older Pi `< 1.3.0` runtimes still reject with `McpError(..., "tool")`.
   Only `direct` tools enter the active set; `deferred` and `codemode` both register on Pi as
   `deferred` so `codemode`'s own tool description never mutates mid-session with inlined MCP
   schemas, while reaching `codemode` (when `autoEnableCodemode !== false`) and `tool_search`
-  tools are pre-activated at session start / server-config change across all enabled indirect
-  servers (both `eager` and `lazy`), ensured on tool refreshes (`ensureDiscoveryTools()`), and
-  restored on `session_tree` without re-activating inactive `direct` tools; `before_agent_start`
-  populates `systemPromptOptions.sections["mcp_servers"]` (`renderMcpServersSection()`) so the
-  model sees indirect MCP domains, reach modes, and `mcp_connect` hints for disconnected servers.
-  `hidden` tools are registered inactive and never exposed, stopping/removing/withdrawing a
-  tool re-registers it as `hidden` and guards `execute` against stale calls, and a reconnect
-  after a stop re-derives the set from exposure alone (#257). Each reconcile
+  tools are pre-activated at session start / server-config change across enabled and connected
+  indirect servers (`collectRequiredDiscoveryExposures()`), assessed against Pi's `--tools` /
+  `--exclude-tools` filter (`assessRegisteredServerExposures()`), ensured on tool refreshes
+  (`ensureDiscoveryTools()`), and restored on `session_tree` without re-activating inactive
+  `direct` tools; `before_agent_start` populates `systemPromptOptions.sections["mcp_servers"]`
+  (`renderMcpServersSection()`) with symmetric `codemode` ↔ `tool_search` fallback (or omits it
+  when neither reaching tool is active) so the model sees indirect MCP domains, reach modes, and
+  `mcp_connect` hints for disconnected servers. `hidden` tools are registered inactive and never
+  exposed, stopping/removing/withdrawing a tool snapshots `activeTools` before re-registering it
+  as `hidden` and guards `execute` against stale calls, and a reconnect after a stop re-derives
+  the set from exposure alone (#257). Each reconcile
   writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
   tool left at its position; `orderActiveTools()` re-applies that order without re-activating
