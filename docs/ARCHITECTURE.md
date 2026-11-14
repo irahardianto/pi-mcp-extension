@@ -69,8 +69,10 @@ flowchart TD
   per-server config provenance.
 - **ServerManager** owns one 3-state lifecycle per configured server and hands each
   connection to a transport built by the **transport factory**.
-- **ToolBridge** turns `tools/list` into Pi tools and keeps them active/inactive as the
-  server connects and disconnects. Each reconcile writes the active set once, with the
+- **ToolBridge** turns `tools/list` (`discoverServerTools()`) into Pi tools
+  (`createPiToolDefinition()`, `executeMcpToolCall()`) and keeps them active/inactive as the
+  server connects and disconnects (`planServerToolBatch()`, `reconcileLiveRefreshState()`,
+  `planActiveToolReconciliation()`). Each reconcile writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
   tool left at its position; `orderActiveTools()` re-applies that order without re-activating
   inactive tools on `session_tree` (when `/tree` restores active tools from transcript
@@ -138,12 +140,14 @@ what to do:
 
 While `ready`, three independent recovery paths exist:
 
-- `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-registers the
-  server's tools, deactivates ones the server no longer advertises (remembering whether Pi
-  had each active), and activates only tools the server did not expose before — the
-  active/inactive state of tools Pi already knew about is left alone, because another
-  extension or a user policy may have removed them, and a tool that reappears is restored to
-  the state it left in;
+- `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-discovers tools via
+  `discoverServerTools()`, re-registers the server's tools (`planServerToolBatch()`,
+  `createPiToolDefinition()`), and reconciles live activation via
+  `reconcileLiveRefreshState()` and `planActiveToolReconciliation()` — deactivating ones the
+  server no longer advertises (remembering whether Pi had each active) and activating only
+  tools the server did not expose before, leaving the active/inactive state of tools Pi
+  already knew about alone because another extension or a user policy may have removed them,
+  and restoring a tool that reappears to the state it left in;
   `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,

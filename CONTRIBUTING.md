@@ -91,6 +91,7 @@ therefore reach users bundled with an unrelated fix.
 Run this checklist for PRs that touch `src/index.ts`,
 `src/session-lifecycle.ts`, `src/register-commands.ts`, `src/register-tools.ts`, `src/connection-coordinator.ts`,
 `src/server-manager.ts`, `src/mcp-client.ts`, `src/transport-factory.ts`, `src/transport-order.ts`, `src/stdio-process.ts`,
+`src/tool-bridge.ts`, `src/tool-execution.ts`, `src/tool-discovery.ts`,
 the OAuth/callback/lock modules (`oauth-*.ts`, `authorize-*.ts`,
 `oauth-state-store.ts`, `auth-lock.ts`, `callback-*.ts`), or `package.json`, and
 for any refactor that moves lifecycle code. Paste the checklist with its output
