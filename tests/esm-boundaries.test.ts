@@ -36,6 +36,7 @@ const PURE_MODULES = [
   "terminal-text.ts",
   "tool-names.ts",
   "tool-order.ts",
+  "tool-reconcile.ts",
 ] as const;
 
 const RUNTIME_MODULES = [
@@ -70,6 +71,7 @@ const RUNTIME_MODULES = [
   // from `resource-bridge.ts` (kept whole per #280), which pulls `debug-log.ts` (`node:fs/promises`).
   "tool-content.ts",
   "tool-discovery.ts",
+  "tool-execution.ts",
   "transport-factory.ts",
   "transport-order.ts",
 ] as const;
@@ -568,7 +570,7 @@ describe("ESM dependency boundaries and leaf imports", () => {
         dynamicCheckedCount += 1;
       }
     }
-    assert.equal(dynamicCheckedCount, 44, "Expected all 44 runtime compatibility re-exports to be verified");
+    assert.equal(dynamicCheckedCount, 45, "Expected all 45 runtime compatibility re-exports to be verified");
 
     const errors = await import("../src/errors.js");
     const authLock = await import("../src/auth-lock.js");
@@ -592,6 +594,7 @@ describe("ESM dependency boundaries and leaf imports", () => {
     const toolNames = await import("../src/tool-names.js");
     const toolContent = await import("../src/tool-content.js");
     const toolDiscovery = await import("../src/tool-discovery.js");
+    const toolExecution = await import("../src/tool-execution.js");
     const toolBridge = await import("../src/tool-bridge.js");
 
     assert.equal(authLock.AuthRequiredError, errors.AuthRequiredError);
@@ -651,6 +654,7 @@ describe("ESM dependency boundaries and leaf imports", () => {
 
     assert.equal(toolBridge.buildToolName, toolNames.buildToolName);
     assert.equal(toolBridge.convertMcpContent, toolContent.convertMcpContent);
+    assert.equal(toolBridge.formatProgressText, toolExecution.formatProgressText);
     assert.equal(toolBridge.listAllTools, toolDiscovery.listAllTools);
   });
 });

@@ -1,13 +1,15 @@
 /**
  * Paginated tools/list discovery for pi-mcp.
  *
- * Owns cursor-based pagination loop, max-page guard diagnostics, and
- * cooperative abort handling for MCP tools/list requests.
+ * Owns cursor-based pagination loop, max-page guard diagnostics, cooperative
+ * abort handling, and connect/refresh discovery error classification for MCP
+ * tools/list requests.
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ListToolsResultSchema, type ListToolsResult } from "@modelcontextprotocol/sdk/types.js";
-import { AuthCancelledError } from "./errors.js";
+import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
+import { AuthCancelledError, McpError } from "./errors.js";
 import { reportDiagnostic } from "./debug-log.js";
 
 // ─── Tool Listing ─────────────────────────────────────────────────────────────
@@ -145,3 +147,51 @@ export async function listAllTools(
 
   return tools;
 }
+
+export interface DiscoverServerToolsOptions {
+  client: Client;
+  serverName: string;
+  requestTimeoutMs: number;
+  signal?: AbortSignal | undefined;
+  onAuthError?: ((serverName: string, error: unknown) => Promise<void> | void) | undefined;
+}
+
+async function rethrowToolDiscoveryError(
+  err: unknown,
+  options: Pick<DiscoverServerToolsOptions, "serverName" | "signal" | "onAuthError">,
+): Promise<never> {
+  const { serverName, signal, onAuthError } = options;
+  if (isCancellationError(err, signal)) {
+    throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
+  }
+  if (isOAuthUnauthorizedError(err)) {
+    await onAuthError?.(serverName, err);
+  }
+  // WHY: an SDK request timeout is retryable — `classifyConnectFailure` fast-fails on
+  // "protocol", so mislabelling it would skip `maxRetries` and report a discovery
+  // timeout as a protocol violation (#209).
+  const code = isSdkTimeoutError(err) ? "timeout" : "protocol";
+  throw new McpError(
+    `Failed to list tools from ${serverName}: ${err instanceof Error ? err.message : String(err)}`,
+    serverName,
+    code,
+    err,
+  );
+}
+
+/**
+ * Discover a server's tools, normalizing aborts into {@link AuthCancelledError},
+ * SDK request timeouts into `McpError("timeout")`, and every other failure into
+ * `McpError("protocol")`.
+ */
+export async function discoverServerTools(
+  options: DiscoverServerToolsOptions,
+): Promise<McpToolDefinition[]> {
+  const { client, serverName, requestTimeoutMs, signal } = options;
+  try {
+    return await listAllTools(client, requestTimeoutMs, signal, serverName);
+  } catch (err) {
+    return await rethrowToolDiscoveryError(err, options);
+  }
+}
+
