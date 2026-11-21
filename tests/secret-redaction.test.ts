@@ -18,7 +18,7 @@ function readSourceFile(relativePath: string): string {
 describe("secret-redaction", () => {
   const sampleSecret = "s3cr3t-CREDENTIAL-99";
 
-  it("stays a zero-dependency leaf module, decouples startup-auth and tool-bridge from debug-log, and is the sole canonical redactSecrets import in src/", () => {
+  it("stays a zero-dependency leaf module, decouples startup-auth, tool-execution, and tool-bridge from debug-log, and is the sole canonical redactSecrets import in src/", () => {
     const redactionSource = readSourceFile("src/secret-redaction.ts");
     assert.doesNotMatch(
       redactionSource,
@@ -36,7 +36,7 @@ describe("secret-redaction", () => {
       "src/secret-redaction.ts must not use require()",
     );
 
-    for (const decoupledModule of ["src/startup-auth.ts", "src/tool-bridge.ts"]) {
+    for (const decoupledModule of ["src/startup-auth.ts", "src/tool-execution.ts"]) {
       const source = readSourceFile(decoupledModule);
       assert.match(
         source,
@@ -49,6 +49,12 @@ describe("secret-redaction", () => {
         `${decoupledModule} must not depend on debug-log.ts or debug-log-format.ts`,
       );
     }
+
+    assert.doesNotMatch(
+      readSourceFile("src/tool-bridge.ts"),
+      /debug-log(?:-format)?\.js/,
+      "src/tool-bridge.ts must not depend on debug-log.ts or debug-log-format.ts",
+    );
 
     const startupAuthSource = readSourceFile("src/startup-auth.ts");
     assert.doesNotMatch(
