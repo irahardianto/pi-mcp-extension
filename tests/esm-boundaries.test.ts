@@ -37,8 +37,10 @@ const PURE_MODULES = [
   "terminal-text.ts",
   "tool-exposure.ts",
   "tool-names.ts",
+  "tool-namespace.ts",
   "tool-order.ts",
   "tool-reconcile.ts",
+  "tool-result.ts",
 ] as const;
 
 const RUNTIME_MODULES = [

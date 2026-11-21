@@ -19,15 +19,17 @@ import {
   ToolBridge,
 } from "../src/tool-bridge.js";
 import {
-  buildMcpResultSchema,
-  buildMcpScriptResult,
   buildToolAnnotations,
   buildToolCallContent,
   buildToolCallOutcome,
   buildToolDescription,
-  supportsToolErrorResult,
   toolErrorText,
 } from "../src/tool-content.js";
+import {
+  buildMcpResultSchema,
+  buildMcpScriptResult,
+  supportsToolErrorResult,
+} from "../src/tool-result.js";
 import {
   compareToolsForNameAssignment,
   isLosslessToolName,

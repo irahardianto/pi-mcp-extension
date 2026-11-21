@@ -77,14 +77,14 @@ flowchart TD
   resolved from the server entry's `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact
   raw-name key, then the first `*` pattern in declaration order, then the server default
   `direct`), attached to a sanitized, peer-disambiguated per-server `ToolNamespace`
-  (`description` + MCP handshake `instructions`, re-synced across connected peers via
-  `syncServerNamespaces()` when servers are added or removed), and given a `CallToolResult`
-  `outputSchema` (`buildMcpResultSchema()` with relocated `#/properties/structuredContent`
-  `$ref`s) plus `structuredContent` (`buildMcpScriptResult()` without `_meta`) so `codemode`
-  scripts receive raw MCP content blocks, typed return values, and on Pi 1.3.0+
-  (`supportsToolErrorResult(ctx)`) structured `{ content, structuredContent, isError: true }`
-  tool-error envelopes while older Pi `< 1.3.0` runtimes still reject with
-  `McpError(..., "tool")`. Only `direct` tools enter the active set by default, plus any
+  (`src/tool-namespace.ts`: `description` + MCP handshake `instructions`, re-synced across
+  connected peers via `syncServerNamespaces()` when servers are added or removed), and given
+  a `CallToolResult` `outputSchema` (`src/tool-result.ts`: `buildMcpResultSchema()` with
+  relocated `#/properties/structuredContent` `$ref`s) plus `structuredContent`
+  (`buildMcpScriptResult()` without `_meta`) so `codemode` scripts receive raw MCP content
+  blocks, typed return values, and on Pi 1.3.0+ (`supportsToolErrorResult(ctx)`) structured
+  `{ content, structuredContent, isError: true }` tool-error envelopes while older Pi `< 1.3.0`
+  runtimes still reject with `McpError(..., "tool")`. Only `direct` tools enter the active set by default, plus any
   non-`hidden` indirect tools (`deferred` / `codemode`) that Pi 1.3.0 activated out of
   `AgentSession._pendingToolNames` during `registerTool` (`mergePendingRestoredTools()`, so
   sequential multi-server connects preserve restored active tools across `--continue`,

@@ -10,7 +10,6 @@ import {
   MCP_EXPOSURES,
   TOOL_SEARCH_TOOL_NAME,
   assessRegisteredServerExposures,
-  buildServerToolNamespace,
   collectConfiguredExposures,
   collectConnectedExposures,
   collectRequiredDiscoveryExposures,
@@ -25,9 +24,10 @@ import {
   renderMcpServersSection,
 } from "../src/mcp-servers-prompt.js";
 import {
+  buildServerToolNamespace,
   collectReboundToolDefinitions,
   resolveServerNamespaceIds,
-} from "../src/tool-names.js";
+} from "../src/tool-namespace.js";
 import {
   mergeRawToolExposures,
   reconcileLiveRefreshState,
@@ -725,6 +725,19 @@ describe("renderMcpServersSection", () => {
         "- mcp_my_docs (codemode): Underscore docs",
       ].join("\n"),
     );
+
+    const quotedName = 'corp "prod"\\docs';
+    const quotedRendered = renderMcpServersSection({
+      servers: [
+        {
+          name: quotedName,
+          connected: false,
+          exposures: ["codemode"] as const,
+          description: "Quoted name server",
+        },
+      ],
+    });
+    assert.ok(quotedRendered?.includes(`mcp_connect ${JSON.stringify(quotedName)}`));
   });
 
   it("accepts ReadonlySet<string> activeTools and omits disconnected servers when mcp_connect is inactive", () => {

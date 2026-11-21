@@ -13,10 +13,12 @@
 import {
   CODEMODE_TOOL_NAME,
   TOOL_SEARCH_TOOL_NAME,
-  sanitizeNamespaceText,
   type McpExposure,
 } from "./tool-exposure.js";
-import { resolveAllServerNamespaceIds } from "./tool-names.js";
+import {
+  resolveAllServerNamespaceIds,
+  sanitizeNamespaceText,
+} from "./tool-namespace.js";
 import { compareCodePoints } from "./tool-order.js";
 
 /** Name of the Pi 1.3.0 system-prompt section listing indirect MCP servers. */
@@ -128,7 +130,7 @@ function buildServerHead(
     return `- ${namespace} (${reachTag})`;
   }
   const safeName = sanitizeNamespaceText(entry.name, MAX_SAFE_SERVER_NAME_CHARS) ?? namespace;
-  return `- ${namespace} (${reachTag}, not connected — mcp_connect "${safeName}")`;
+  return `- ${namespace} (${reachTag}, not connected — mcp_connect ${JSON.stringify(safeName)})`;
 }
 
 function buildSectionIntro(

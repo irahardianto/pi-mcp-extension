@@ -80,8 +80,8 @@ import {
 import {
   buildMcpResultSchema,
   buildMcpScriptResult,
-} from "../src/tool-content.js";
-import { resolveServerNamespaceIds } from "../src/tool-names.js";
+} from "../src/tool-result.js";
+import { resolveServerNamespaceIds } from "../src/tool-namespace.js";
 
 function parsePositiveInteger(val: string | undefined): number | undefined {
   if (val === undefined) return undefined;

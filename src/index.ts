@@ -37,6 +37,7 @@ import {
   renderMcpServersSection,
   type McpPromptServerEntry,
 } from "./mcp-servers-prompt.js";
+import { readClientInstructions } from "./tool-discovery.js";
 import {
   collectConfiguredExposures,
   collectRequiredDiscoveryExposures,
@@ -231,10 +232,7 @@ function restoreSessionTreeTools(manager: ServerManager, bridge: ToolBridge): vo
 
 function buildPromptServerEntry(server: ManagedServer, bridge: ToolBridge): McpPromptServerEntry {
   const connected = server.state === "ready" && bridge.isServerActive(server.name);
-  const instructions =
-    connected && typeof server.client?.getInstructions === "function"
-      ? server.client.getInstructions()
-      : undefined;
+  const instructions = connected && server.client ? readClientInstructions(server.client) : undefined;
   return {
     name: server.name,
     enabled: server.config.enabled,

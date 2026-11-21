@@ -13,16 +13,18 @@ import { convertJsonSchemaToTypebox } from "./schema-convert.js";
 import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import {
-  buildMcpResultSchema,
   buildToolAnnotations,
   buildToolCallOutcome,
   buildToolDescription,
-  supportsToolErrorResult,
   type ToolCallOutcome,
-  type ToolCallResponse,
 } from "./tool-content.js";
 import type { McpToolDefinition } from "./tool-discovery.js";
 import { toPiToolExposure, type McpExposure } from "./tool-exposure.js";
+import {
+  buildMcpResultSchema,
+  supportsToolErrorResult,
+  type ToolCallResponse,
+} from "./tool-result.js";
 
 /** Pi's partial-result callback — the `onUpdate` argument of a tool's `execute`. */
 export type ToolUpdateCallback = (update: ToolCallOutcome) => void;

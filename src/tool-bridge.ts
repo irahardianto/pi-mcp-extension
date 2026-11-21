@@ -26,13 +26,16 @@ import {
 } from "./tool-execution.js";
 import {
   assessRegisteredServerExposures,
-  buildServerToolNamespace,
   collectConnectedExposures,
   resolveDiscoveryActivation,
   type McpExposure,
   type RegisteredToolSummary,
 } from "./tool-exposure.js";
-import { collectReboundToolDefinitions, mergePeerServerNames } from "./tool-names.js";
+import {
+  buildServerToolNamespace,
+  collectReboundToolDefinitions,
+  mergePeerServerNames,
+} from "./tool-namespace.js";
 import { orderOwnedEntries, orderPayloadToolEntries, sameToolList } from "./tool-order.js";
 import {
   deleteServerOwnedTools,

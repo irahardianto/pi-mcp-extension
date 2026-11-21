@@ -12,7 +12,6 @@ import { describeError, sanitizeLogText } from "./debug-log-format.js";
 import { reportDiagnostic } from "./debug-log.js";
 import { AuthLockError, AuthRequiredError, McpError } from "./errors.js";
 import type { ManagedServer } from "./server-manager.js";
-import { redactSecrets } from "./secret-redaction.js";
 import {
   formatProjectConfigNote,
   formatServerSource,
@@ -21,6 +20,7 @@ import {
 } from "./server-provenance.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import type { ToolActivity } from "./tool-bridge.js";
+import { sanitizeNamespaceText } from "./tool-namespace.js";
 
 /** Stored-credentials summary as far as a status view needs it. */
 export interface StoredAuthStatus {
@@ -235,11 +235,7 @@ async function summarizeAuth(params: CollectServerStatusParams): Promise<string 
  * redact credential-shaped substrings, and bound to 500 UTF-16 code units.
  */
 export function sanitizeServerInstructions(raw: unknown): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  // WHY: remove escapes before redaction so they cannot hide a credential key;
-  // bound the redacted result so masking cannot grow it beyond the UI budget.
-  const cleaned = sanitizeTerminalText(raw, { maxLength: raw.length }).trim();
-  return sanitizeTerminalText(redactSecrets(cleaned), { maxLength: 500 }).trim() || undefined;
+  return sanitizeNamespaceText(raw, 500);
 }
 
 /** Read and sanitize handshake instructions from a ready server. */

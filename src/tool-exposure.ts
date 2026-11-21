@@ -1,6 +1,6 @@
 /**
  * Pi 1.3.0 MCP tool exposure (`exposure` / `toolExposure`) resolution, Pi tool-exposure
- * mapping, server `ToolNamespace` construction, and discovery-tool (`codemode` /
+ * mapping, `--tools` indirect-filter assessment, and discovery-tool (`codemode` /
  * `tool_search`) activation planning.
  *
  * A server entry may declare how each of its tools reaches the model: `direct` (declared
@@ -15,10 +15,7 @@
  * registering and activating every discovered tool exactly as before (#257).
  */
 
-import type { ToolNamespace } from "@earendil-works/pi-coding-agent";
-import { redactSecrets } from "./secret-redaction.js";
-import { sanitizeTerminalText } from "./terminal-text.js";
-import { resolveServerNamespaceIds } from "./tool-names.js";
+import { sanitizeNamespaceText } from "./tool-namespace.js";
 
 /** Exposure levels Pi accepts for MCP tools; Pi's `codemode-deferred` alias is normalized away. */
 export const MCP_EXPOSURES = ["codemode", "deferred", "direct", "hidden"] as const;
@@ -46,10 +43,6 @@ export const DEFAULT_EXPOSURE: McpExposure = "direct";
 /** Built-in Pi discovery tool names that reach non-`direct` MCP tools. */
 export const CODEMODE_TOOL_NAME = "codemode";
 export const TOOL_SEARCH_TOOL_NAME = "tool_search";
-
-/** Character budgets matching Pi's namespace summary and server instruction caps. */
-const MAX_NAMESPACE_DESCRIPTION_LENGTH = 250;
-const MAX_NAMESPACE_INSTRUCTIONS_LENGTH = 500;
 
 /** Retired Pi exposure names mapped to the current name they stand for. */
 const EXPOSURE_ALIASES: Readonly<Record<string, McpExposure>> = {
@@ -130,48 +123,6 @@ export function resolveToolExposure(
     }
   }
   return config?.exposure ?? DEFAULT_EXPOSURE;
-}
-
-export interface ServerToolNamespaceOptions {
-  prefix: string;
-  serverName: string;
-  description?: string | undefined;
-  instructions?: string | undefined;
-  /** Optional peer server names so colliding sanitized names (`my-srv` vs `my_srv`) disambiguate deterministically. */
-  peerServerNames?: Iterable<string> | undefined;
-}
-
-export function sanitizeNamespaceText(raw: unknown, maxLength: number): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  // WHY: strip terminal escapes before redacting so escape sequences inside a credential
-  // cannot hide a `key=value` token shape, then bound after `[REDACTED]` expansion.
-  const cleaned = sanitizeTerminalText(raw, { maxLength: raw.length }).trim();
-  return sanitizeTerminalText(redactSecrets(cleaned), { maxLength }).trim() || undefined;
-}
-
-/**
- * Build Pi's `ToolNamespace` metadata for one MCP server so `tool_search` ranks tools with
- * server context and codemode's `searchTools({ namespace })` / `describeNamespace()` resolve
- * the server by `<prefix>_<server>`, raw `<server>`, or Pi's `mcp__<server>` convention without
- * cross-matching colliding peer server names (`my-srv` vs `my_srv`).
- */
-export function buildServerToolNamespace(options: ServerToolNamespaceOptions): ToolNamespace {
-  const { name, aliases } = resolveServerNamespaceIds(
-    options.prefix,
-    options.serverName,
-    options.peerServerNames,
-  );
-  const description = sanitizeNamespaceText(options.description, MAX_NAMESPACE_DESCRIPTION_LENGTH);
-  const instructions = sanitizeNamespaceText(
-    options.instructions,
-    MAX_NAMESPACE_INSTRUCTIONS_LENGTH,
-  );
-  return {
-    name,
-    ...(aliases.length > 0 ? { aliases } : {}),
-    ...(description ? { description } : {}),
-    ...(instructions ? { instructions } : {}),
-  };
 }
 
 /** Collect every exposure level an enabled set of server configs may assign before connecting. */
