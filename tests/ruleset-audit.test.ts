@@ -462,6 +462,15 @@ describe("parseRulesetFile", () => {
     assert.equal(parsed.normalized["target"], "branch");
   });
 
+  it("tolerates a UTF-8 BOM at the start of the file", () => {
+    const parsed = parseRulesetFile(
+      "windows-saved.json",
+      '\uFEFF// Saved by Notepad\r\n{\r\n  "name": "windows-saved",\r\n  "target": "branch"\r\n}',
+    );
+    assert.equal(parsed.ruleset["name"], "windows-saved");
+    assert.equal(parsed.normalized["target"], "branch");
+  });
+
   it("rejects invalid JSON with the file name", () => {
     assert.throws(() => parseRulesetFile("broken.json", "{"), /broken\.json is not valid JSON/);
   });

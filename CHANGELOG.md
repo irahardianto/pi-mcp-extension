@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A `mcp.json` saved with a UTF-8 byte order mark at the start of the file (Notepad, Visual Studio, and PowerShell 5 `Set-Content -Encoding UTF8` write one) no longer fails to parse and discard every configured server. `stripJsonComments()` — the single JSONC entry point shared by the runtime config loader and the ruleset audit — skips exactly one U+FEFF at that position before scanning, keeps every `\n` / `\r` so syntax-error line numbers still match the file, and leaves a BOM anywhere else as the syntax error it is (#352).
+
 ## [1.16.0] - 2026-11-22
 
 ### Added

@@ -618,6 +618,108 @@ describe("stripJsonComments", () => {
   });
 });
 
+describe("Issue #352: UTF-8 BOM in mcp.json", () => {
+  // Windows editors (Notepad, PowerShell 5 `Set-Content -Encoding UTF8`) prepend
+  // EF BB BF; `readFile(..., "utf-8")` keeps it as U+FEFF and JSON.parse rejects it
+  // as a token, which used to discard every configured server.
+  const bomErrorLocation = (input: string): string => {
+    try {
+      JSON.parse(stripJsonComments(input));
+      return "no error";
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return message.match(/line \d+ column \d+/)?.[0] ?? message;
+    }
+  };
+
+  it("stripJsonComments drops one leading BOM and still strips comments", () => {
+    const stripped = stripJsonComments(
+      '\uFEFF// Windows-saved config\r\n{\r\n  "a": 1 // trailing\r\n}',
+    );
+
+    assert.equal(stripJsonComments('\uFEFF{"a": 1}'), '{"a": 1}');
+    assert.deepEqual(JSON.parse(stripped), { a: 1 });
+  });
+
+  it("stripJsonComments skips only the first code unit and keeps later BOMs invalid", () => {
+    assert.equal(stripJsonComments("\uFEFF"), "");
+    assert.equal(stripJsonComments("\uFEFF\uFEFF{}"), "\uFEFF{}");
+    assert.throws(() => JSON.parse(stripJsonComments(" \uFEFF{}")), SyntaxError);
+  });
+
+  it("preserves BOM characters inside JSON string values", () => {
+    const value = { key: "prefix \uFEFF suffix" };
+
+    assert.deepEqual(JSON.parse(stripJsonComments(JSON.stringify(value))), value);
+    assert.deepEqual(JSON.parse(stripJsonComments(`\uFEFF${JSON.stringify(value)}`)), value);
+  });
+
+  it("keeps JSON.parse error line numbers aligned with the BOM-prefixed file", () => {
+    // Trailing comma after ""mcpServers"": the error lands on the closing brace at
+    // line 5 — the same line it occupies on disk, because the mask preserves CRLF.
+    const body = '{\r\n  /* comment\r\n     continues */\r\n  "mcpServers": {},\r\n}';
+
+    assert.equal(bomErrorLocation(`\uFEFF${body}`), "line 5 column 1");
+    assert.equal(bomErrorLocation(`\uFEFF${body}`), bomErrorLocation(body));
+  });
+
+  it("reports a first-line error column against the BOM-less text", () => {
+    // The BOM is deleted, not replaced by whitespace, so the character at file column 3
+    // reports column 2. Pinned rather than accidental: Pi's own stripBom does the same,
+    // and replacing the BOM with a space would make the stripped text stop being the
+    // document minus comments.
+    assert.equal(bomErrorLocation("\uFEFF{]"), "line 1 column 2");
+    assert.equal(bomErrorLocation("\uFEFF{]"), bomErrorLocation("{]"));
+  });
+
+  it("loads a BOM-prefixed global mcp.json", async () => {
+    await withTempDir(async (dir) => {
+      await writeFile(
+        join(dir, "isolated-global-mcp.json"),
+        '\uFEFF// Global config\r\n{\r\n  "settings": { "toolPrefix": "custom_mcp" }\r\n}',
+      );
+
+      const cfg = await loadConfig(dir);
+      assert.equal(cfg.settings.toolPrefix, "custom_mcp");
+    });
+  });
+
+  it("loads a BOM-prefixed project .pi/mcp.json", async () => {
+    await withTempDir(async (dir) => {
+      const piDir = join(dir, ".pi");
+      await mkdir(piDir, { recursive: true });
+      await writeFile(
+        join(piDir, "mcp.json"),
+        '\uFEFF{/* Project config */\r\n  "mcpServers": {\r\n    "remote": { "url": "https://example.invalid/mcp" } // keep\r\n  }\r\n}',
+      );
+
+      const cfg = await loadConfig(dir);
+      assert.equal(cfg.mcpServers["remote"]?.url, "https://example.invalid/mcp");
+    });
+  });
+
+  it("still wraps a BOM-prefixed invalid file in McpError with the on-disk path", async () => {
+    await withTempDir(async (dir) => {
+      const piDir = join(dir, ".pi");
+      await mkdir(piDir, { recursive: true });
+      const filePath = join(piDir, "mcp.json");
+      await writeFile(filePath, "\uFEFF{ invalid json");
+
+      await assert.rejects(
+        () => loadConfig(dir),
+        (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(err.message.includes(filePath), `Expected path ${filePath} in message: ${err.message}`);
+          assert.ok(err.cause instanceof SyntaxError);
+          assert.doesNotMatch(err.message, /\uFEFF/, "the BOM must not leak into the parse error");
+          return true;
+        },
+      );
+    });
+  });
+});
+
 describe("Issue #28: Config validation and error handling", () => {
   it("loads examples/mcp.json.example directly via loadConfig without error", async () => {
     await withTempDir(async (dir) => {
