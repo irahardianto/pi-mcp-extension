@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-11-22
+
 ### Added
 - Honor Pi 1.3.0 `exposure`, `toolExposure`, per-server `description`, and top-level `autoEnableCodemode` instead of ignoring them (#257). `exposure` sets the server default (remaining `direct` when omitted for backwards compatibility), `toolExposure` overrides per raw MCP tool name or linear `*` pattern (exact match, then first matching pattern in declaration order, then server default), and the retired `codemode-deferred` alias normalizes to `codemode` at load time.
 - Register `deferred` and `codemode` MCP tools on Pi as `deferred` with sanitized, secret-redacted, peer-disambiguated per-server `ToolNamespace` metadata (re-synced when colliding peers like `my-srv` vs `my_srv` are added or removed) plus a `CallToolResult` `outputSchema` (with relocated `#/properties/structuredContent` `$ref`s) and `structuredContent` (without `_meta`) so `codemode`'s declaration stays stable for prompt caching (#278) while scripts receive raw MCP content blocks, typed schemas, and on Pi 1.3.0+ structured `{ content, structuredContent, isError: true }` tool-error outcomes without breaking `McpError("tool")` rejections on Pi `< 1.3.0`.
