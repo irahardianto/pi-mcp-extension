@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Fall back to an MCP tool's `structuredContent` when its ordinary content contains only empty or whitespace text placeholders, while preserving non-text content such as images.
+
 ## [1.16.0] - 2026-11-22
 
 ### Added

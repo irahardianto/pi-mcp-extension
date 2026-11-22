@@ -131,17 +131,21 @@ export function buildToolAnnotations(
 
 /**
  * Convert a callTool result into Pi content blocks, falling back to
- * `structuredContent` when the server returned no content blocks.
+ * `structuredContent` when the server returned no usable content blocks.
  */
+function hasUsableContent(content: readonly PiContent[]): boolean {
+  // WHY: Some MCP servers emit blank text placeholders beside the real structured result.
+  return content.some((block) => block.type !== "text" || block.text.trim().length > 0);
+}
+
 export function buildToolCallContent(result: ToolCallResponse): PiContent[] {
   const content = convertMcpContent((result.content ?? []) as Array<Record<string, unknown>>);
-  if (content.length > 0 || result.structuredContent === undefined) return content;
+  if (result.structuredContent === undefined || hasUsableContent(content)) return content;
   const structured = result.structuredContent;
-  content.push({
+  return [{
     type: "text",
     text: typeof structured === "string" ? structured : JSON.stringify(structured, null, 2),
-  });
-  return content;
+  }];
 }
 
 /** Text blocks of a failed tool call, joined into the McpError message. */

@@ -3357,6 +3357,53 @@ describe("buildToolDescription, buildToolAnnotations, buildToolCallContent, and 
       "first line\nsecond line",
     );
   });
+
+  it("falls back to structuredContent when MCP content contains only blank text", () => {
+    const structuredContent = { temp: 22.5, unit: "C" };
+    const fallback = [{ type: "text", text: '{\n  "temp": 22.5,\n  "unit": "C"\n}' }];
+
+    assert.deepEqual(
+      buildToolCallContent({
+        content: [{ type: "text", text: "" }],
+        structuredContent,
+      }),
+      fallback,
+    );
+    assert.deepEqual(
+      buildToolCallContent({
+        content: [{ type: "text", text: "   \n  " }],
+        structuredContent,
+      }),
+      fallback,
+    );
+
+    const imageContent = [
+      { type: "text", text: "" },
+      { type: "image", data: "YWJj", mimeType: "image/png" },
+    ] as const;
+    assert.deepEqual(
+      buildToolCallContent({ content: [...imageContent], structuredContent }),
+      imageContent,
+    );
+    assert.deepEqual(buildToolCallContent({ content: [{ type: "text", text: "" }] }), [
+      { type: "text", text: "" },
+    ]);
+
+    const success = buildToolCallOutcome(
+      { content: [{ type: "text", text: "" }], structuredContent },
+      "weather",
+    );
+    assert.deepEqual(success.content, fallback);
+    assert.equal(success.isError, undefined);
+
+    const failure = buildToolCallOutcome(
+      { content: [{ type: "text", text: " \t" }], structuredContent, isError: true },
+      "weather",
+      true,
+    );
+    assert.deepEqual(failure.content, fallback);
+    assert.equal(failure.isError, true);
+  });
 });
 
 // ── Paginated listAllTools ─────────────────────────────────────────────────────
