@@ -1680,6 +1680,78 @@ describe("fuzz: resource bridge & /mcp:resources", () => {
     );
   });
 
+  it("convertMcpContent and convertResourceContents never throw on arbitrary image blocks/blobs and only emit atob-safe base64 + canonical raster MIME", () => {
+    const supportedRasterMimes = new Set([
+      "image/png",
+      "image/jpeg",
+      "image/gif",
+      "image/webp",
+      "image/bmp",
+      "image/x-ms-bmp",
+      "image/tiff",
+    ]);
+    const mimeArb = fc.oneof(
+      fc.anything(),
+      arbitraryString,
+      fc.constantFrom(
+        "image/png; charset=binary",
+        "IMAGE/JPG",
+        "image/svg+xml; charset=utf-8",
+        "image/bmp",
+        "image/tiff",
+        "image/png\x1b[31m",
+        "image/x-icon\x1b[31m",
+      ),
+    );
+    const base64BytesArb = fc.uint8Array({ minLength: 0, maxLength: 64 }).map((b) => Buffer.from(b).toString("base64"));
+    const dataArb = fc.oneof(fc.anything(), arbitraryString, base64BytesArb);
+    const imageBlockArb = fc.record(
+      {
+        type: fc.constant("image" as const),
+        data: dataArb,
+        mimeType: mimeArb,
+      },
+      { requiredKeys: ["type"] },
+    );
+    const blobResourceArb = fc.record(
+      {
+        uri: fc.oneof(fc.anything(), arbitraryString),
+        blob: fc.oneof(arbitraryString, base64BytesArb),
+        mimeType: mimeArb,
+      },
+      { requiredKeys: ["blob"] },
+    );
+
+    const assertSafeBlock = (out: { type: "image"; data: string; mimeType: string } | { type: "text"; text: string }) => {
+      if (out.type === "image") {
+        assert.ok(supportedRasterMimes.has(out.mimeType), `unexpected mimeType: ${out.mimeType}`);
+        assert.ok(out.data.length > 0 && out.data.length % 4 === 0);
+        assert.match(out.data, /^[A-Za-z0-9+/]+={0,2}$/);
+        assert.doesNotThrow(() => atob(out.data));
+      } else {
+        assert.equal(out.type, "text");
+        if (out.text.startsWith("[Image omitted: ") || out.text.startsWith("[Binary resource: ")) {
+          assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(out.text));
+        } else {
+          // Decoded SVG text must never contain XML-illegal NUL bytes.
+          assert.ok(!out.text.includes("\0"));
+        }
+      }
+    };
+
+    fc.assert(
+      fc.property(imageBlockArb, blobResourceArb, (block, blobResource) => {
+        const [toolOut, embeddedOut] = convertMcpContent([block, { type: "resource", resource: blobResource }]);
+        const [resourceOut] = convertResourceContents([blobResource]);
+        assert.ok(toolOut && embeddedOut && resourceOut);
+        assertSafeBlock(toolOut);
+        assertSafeBlock(resourceOut);
+        assert.deepEqual(embeddedOut, resourceOut);
+      }),
+      testOptions(),
+    );
+  });
+
   it("sanitizeServerInstructions strips controls, masks credentials, bounds to <= 500 chars, and is idempotent", () => {
     fc.assert(
       fc.property(

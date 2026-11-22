@@ -10,6 +10,7 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { AuthCancelledError, McpError } from "../src/errors.js";
+import { buildToolCallOutcome, convertMcpContent } from "../src/tool-content.js";
 import {
   discoverServerTools,
   readClientInstructions,
@@ -250,10 +251,12 @@ describe("tool-execution: rethrowToolCallError and executeMcpToolCall", () => {
         err.message === "invalid query syntax",
     );
 
+    const TINY_PNG =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     const isErrorEmptyClient = {
       callTool: async () => ({
         isError: true,
-        content: [{ type: "image", data: "abc", mimeType: "image/png" }],
+        content: [{ type: "image", data: TINY_PNG, mimeType: "image/png" }],
       }),
     } as unknown as Client;
     await assert.rejects(
@@ -415,6 +418,211 @@ describe("tool-execution: createPiToolDefinition and toHiddenToolDefinition", ()
 
     assert.deepEqual(seenTimeouts, [2500, 2500, 9000]);
     assert.deepEqual(authEvents, ["srv"]);
+  });
+});
+
+describe("tool-content: image MIME canonicalization, SVG decoding, and payload validation", () => {
+  const SAMPLE_BASE64 = "YWJj";
+  const SVG_MARKUP = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="5"/></svg>';
+  const SVG_BASE64 = Buffer.from(SVG_MARKUP, "utf8").toString("base64");
+
+  it("decodes image/svg+xml (including uppercase and parameters) to UTF-8 text while preserving structuredContent", () => {
+    const outcome = buildToolCallOutcome(
+      {
+        content: [
+          { type: "image", data: SVG_BASE64, mimeType: "image/svg+xml" },
+          { type: "image", data: SVG_BASE64, mimeType: "IMAGE/SVG+XML; charset=utf-8" },
+        ],
+      },
+      "srv",
+      true,
+    );
+
+    assert.deepEqual(outcome.content, [
+      { type: "text", text: SVG_MARKUP },
+      { type: "text", text: SVG_MARKUP },
+    ]);
+    assert.deepEqual(outcome.structuredContent, {
+      content: [
+        { type: "image", data: SVG_BASE64, mimeType: "image/svg+xml" },
+        { type: "image", data: SVG_BASE64, mimeType: "IMAGE/SVG+XML; charset=utf-8" },
+      ],
+    });
+  });
+
+  it("canonicalizes parameterized and jpg MIME types, preserves BMP/TIFF for Photon, and strips ASCII whitespace", () => {
+    const out = convertMcpContent([
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png; charset=binary" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "IMAGE/PNG; foo=bar" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "IMAGE/JPG; charset=binary" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-ms-bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/tiff" },
+      { type: "image", data: " YWJj \r\n\t ", mimeType: "image/webp" },
+    ]);
+
+    assert.deepEqual(out, [
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpeg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpeg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-ms-bmp" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/tiff" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/webp" },
+    ]);
+  });
+
+  it("degrades empty, invalid, and non-string image payloads (including empty SVG) to omission text without throwing", () => {
+    const invalidInputs = [
+      { type: "image", data: "", mimeType: "image/png" },
+      { type: "image", data: "   \n\t  ", mimeType: "image/png" },
+      { type: "image", data: "abc", mimeType: "image/png" },
+      { type: "image", data: "====", mimeType: "image/png" },
+      { type: "image", data: "a===", mimeType: "image/png" },
+      { type: "image", data: "ab=c", mimeType: "image/png" },
+      { type: "image", data: "ab-_", mimeType: "image/png" },
+      { type: "image", data: 1234, mimeType: "image/png" },
+      { type: "image", data: { toString: false }, mimeType: { toString: false } },
+      { type: "image", data: "", mimeType: "image/svg+xml" },
+      { type: "image", data: "abc", mimeType: "image/svg+xml" },
+    ];
+
+    const out = convertMcpContent(invalidInputs);
+    for (const block of out) {
+      assert.deepEqual(block, {
+        type: "text",
+        text: "[Image omitted: empty or invalid base64 payload]",
+      });
+    }
+  });
+
+  it("degrades unsupported and control-tainted image MIME types to sanitized omission text", () => {
+    const out = convertMcpContent([
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-icon" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/heic; profile=main" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "application/pdf" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/x-icon\u001b[31m" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png\u001b[31m" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpg\u001b[31m" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/svg+xml\u001b[31m" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "\u001b[31m" },
+    ]);
+
+    assert.deepEqual(out, [
+      { type: "text", text: "[Image omitted: unsupported image type (image/x-icon)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (image/heic)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (application/pdf)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (image/x-icon)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (invalid MIME type)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (invalid MIME type)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (invalid MIME type)]" },
+      { type: "text", text: "[Image omitted: unsupported image type (unknown)]" },
+    ]);
+  });
+
+  it("degrades binary or NUL-containing image/svg+xml payloads instead of emitting corrupted UTF-8", () => {
+    const binaryPng =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const out = convertMcpContent([
+      { type: "image", data: binaryPng, mimeType: "image/svg+xml" },
+      { type: "image", data: "AA==", mimeType: "IMAGE/SVG+XML; charset=utf-8" },
+    ]);
+
+    assert.deepEqual(out, [
+      { type: "text", text: "[Image omitted: invalid UTF-8 image/svg+xml payload]" },
+      { type: "text", text: "[Image omitted: invalid UTF-8 image/svg+xml payload]" },
+    ]);
+  });
+
+  it("normalizes embedded type=resource image blobs through convertMcpContent while preserving structuredContent", () => {
+    const rawContent = [
+      { type: "resource", resource: { uri: "res://diagram.svg", mimeType: "IMAGE/SVG+XML; charset=utf-8", blob: SVG_BASE64 } },
+      { type: "resource", resource: { uri: "res://pic.png", mimeType: "image/png; charset=binary", blob: SAMPLE_BASE64 } },
+      { type: "resource", resource: { uri: "res://photo.jpg", mimeType: "image/jpg", blob: SAMPLE_BASE64 } },
+      { type: "resource", resource: { uri: "res://scan.bmp", mimeType: "image/bmp", blob: SAMPLE_BASE64 } },
+      { type: "resource", resource: { uri: "res://empty.png", mimeType: "image/png", blob: "" } },
+      { type: "resource", resource: { uri: "res://nul.svg", mimeType: "image/svg+xml", blob: "AA==" } },
+      { type: "resource", resource: { uri: "res://fav.ico", mimeType: "image/x-icon", blob: SAMPLE_BASE64 } },
+    ];
+    const outcome = buildToolCallOutcome({ content: rawContent }, "srv", true);
+
+    assert.deepEqual(outcome.content, [
+      { type: "text", text: SVG_MARKUP },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/png" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/jpeg" },
+      { type: "image", data: SAMPLE_BASE64, mimeType: "image/bmp" },
+      { type: "text", text: "[Binary resource: res://empty.png (image/png, empty or invalid base64 payload)]" },
+      { type: "text", text: "[Binary resource: res://nul.svg (image/svg+xml, invalid UTF-8 payload)]" },
+      { type: "text", text: "[Binary resource: res://fav.ico (image/x-icon, 3 bytes)]" },
+    ]);
+    assert.deepEqual(outcome.structuredContent, { content: rawContent });
+  });
+
+  it("composes cleanly with blank-text structuredContent fallback (#359)", () => {
+    // Empty/invalid image produces a non-blank omission notice rather than hiding the omission.
+    const invalidImageOutcome = buildToolCallOutcome(
+      {
+        content: [{ type: "image", data: "", mimeType: "image/png" }],
+        structuredContent: { ok: true },
+      },
+      "srv",
+      true,
+    );
+    assert.deepEqual(invalidImageOutcome.content, [
+      { type: "text", text: "[Image omitted: empty or invalid base64 payload]" },
+    ]);
+
+    // A whitespace-only decoded SVG falls back to structuredContent on success and generic error text on isError.
+    const whitespaceSvg = Buffer.from("  \n\t", "utf8").toString("base64");
+    const blankSvgOutcome = buildToolCallOutcome(
+      {
+        content: [{ type: "image", data: whitespaceSvg, mimeType: "image/svg+xml" }],
+        structuredContent: { rendered: false },
+      },
+      "srv",
+      true,
+    );
+    assert.deepEqual(blankSvgOutcome.content, [
+      { type: "text", text: '{\n  "rendered": false\n}' },
+    ]);
+
+    const blankSvgError = buildToolCallOutcome(
+      {
+        isError: true,
+        content: [{ type: "image", data: whitespaceSvg, mimeType: "image/svg+xml" }],
+      },
+      "srv",
+      true,
+    );
+    assert.equal(blankSvgError.isError, true);
+    assert.deepEqual(blankSvgError.content, [{ type: "text", text: "Tool reported an error" }]);
+  });
+
+  it("never leaks broken ImageContent from isError: true tool responses", () => {
+    assert.throws(
+      () =>
+        buildToolCallOutcome(
+          { isError: true, content: [{ type: "image", data: "", mimeType: "image/png" }] },
+          "srv",
+          false,
+        ),
+      (err: unknown) =>
+        err instanceof McpError &&
+        err.code === "tool" &&
+        err.message === "[Image omitted: empty or invalid base64 payload]",
+    );
+
+    const structured = buildToolCallOutcome(
+      { isError: true, content: [{ type: "image", data: "abc", mimeType: "image/svg+xml" }] },
+      "srv",
+      true,
+    );
+    assert.equal(structured.isError, true);
+    assert.deepEqual(structured.content, [
+      { type: "text", text: "[Image omitted: empty or invalid base64 payload]" },
+    ]);
   });
 });
 

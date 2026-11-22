@@ -187,7 +187,8 @@ export function registerManagementTools(
   pi.registerTool({
     name: "mcp_read_resource",
     label: "Read MCP resource",
-    description: "Read one MCP resource by server and URI. Text resources return their text; image blobs return an image; other binary blobs return a size summary.",
+    description:
+      "Read one MCP resource by server and URI. Text resources return their text; valid image/svg+xml blobs decode to UTF-8 text; supported image blobs return an image; other or invalid binary blobs return a summary.",
     promptSnippet: "Read an MCP resource document or data stream by its URI from a connected server.",
     parameters: Type.Object({
       server: Type.String({ description: "Exact configured MCP server name" }),

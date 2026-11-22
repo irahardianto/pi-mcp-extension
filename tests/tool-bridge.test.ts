@@ -3275,7 +3275,7 @@ describe("convertMcpContent", () => {
         { type: "text", text: "null" },
         { type: "text", text: "42" },
         { type: "text", text: "" },
-        { type: "image", data: "", mimeType: "image/png" },
+        { type: "text", text: "[Image omitted: empty or invalid base64 payload]" },
         { type: "text", text: "[Audio: unknown, base64 encoded]" },
         { type: "text", text: '{"type":"custom","payload":true}' },
       ],

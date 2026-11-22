@@ -18,6 +18,7 @@ import extension from "../src/index.js";
 import { formatResourceCatalog } from "../src/register-commands.js";
 import {
   ResourceBridge,
+  canonicalizeImageMimeType,
   collectPages,
   convertResourceContents,
   listAllResources,
@@ -323,6 +324,67 @@ it("falls back to a URI placeholder or string coercion for unrecognised content 
       { type: "text", text: "raw" },
     ],
   );
+});
+
+it("canonicalizes image MIME types and handles SVG, parameterized/uppercase raster, BMP/TIFF, and invalid/unsupported image blobs", async () => {
+  assert.equal(canonicalizeImageMimeType(undefined, "image/png"), "image/png");
+  assert.equal(canonicalizeImageMimeType("  ", "image/png"), "image/png");
+  assert.equal(canonicalizeImageMimeType("; charset=binary", "image/png"), "image/png");
+  assert.equal(canonicalizeImageMimeType("IMAGE/JPG; charset=utf-8", "image/png"), "image/jpeg");
+  assert.equal(canonicalizeImageMimeType(" image/WebP ; q=0.9 ", "image/png"), "image/webp");
+
+  const svgMarkup = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>';
+  const svgBase64 = Buffer.from(svgMarkup, "utf8").toString("base64");
+
+  const client = fakeClient({
+    readResource: async () => ({
+      contents: [
+        { uri: "mock://svg-text", mimeType: "image/svg+xml", text: svgMarkup },
+        { uri: "mock://svg-blob", mimeType: "IMAGE/SVG+XML; charset=utf-8", blob: svgBase64 },
+        { uri: "mock://png-param", mimeType: "image/png; charset=binary", blob: TINY_PNG },
+        { uri: "mock://png-upper", mimeType: "IMAGE/PNG", blob: TINY_PNG },
+        { uri: "mock://jpg", mimeType: "image/jpg", blob: TINY_PNG },
+        { uri: "mock://bmp", mimeType: "image/bmp", blob: TINY_PNG },
+        { uri: "mock://ms-bmp", mimeType: "image/x-ms-bmp", blob: TINY_PNG },
+        { uri: "mock://tiff", mimeType: "image/tiff", blob: TINY_PNG },
+        { uri: "mock://empty-img", mimeType: "image/png", blob: "" },
+        { uri: "mock://bad-img", mimeType: "image/png", blob: "abc" },
+        { uri: "mock://url-img", mimeType: "image/jpeg", blob: "ab-_" },
+        { uri: "mock://bad-svg", mimeType: "image/svg+xml", blob: "" },
+        { uri: "mock://ico", mimeType: "image/x-icon", blob: "AAEC" },
+        { uri: "mock://heic", mimeType: "image/heic; profile=main", blob: "AAECAw==" },
+        { uri: "mock://ansi", mimeType: "image/x-icon\u001b[31m", blob: "AAEC" },
+        { uri: "mock://tainted-png\u001b[31m", mimeType: "image/png\u001b[31m", blob: TINY_PNG },
+        { uri: "mock://binary-svg", mimeType: "image/svg+xml", blob: TINY_PNG },
+        { uri: "mock://nul-svg", mimeType: "image/svg+xml", blob: "AA==" },
+        { uri: "mock://ansi-bin\u001b[31m", mimeType: "application/pdf\u001b[31m", blob: "AAEC" },
+      ],
+    }),
+  });
+
+  const content = await new ResourceBridge().readResource("srv", client, "mock://all", OPTIONS);
+
+  assert.deepEqual(content, [
+    { type: "text", text: svgMarkup },
+    { type: "text", text: svgMarkup },
+    { type: "image", data: TINY_PNG, mimeType: "image/png" },
+    { type: "image", data: TINY_PNG, mimeType: "image/png" },
+    { type: "image", data: TINY_PNG, mimeType: "image/jpeg" },
+    { type: "image", data: TINY_PNG, mimeType: "image/bmp" },
+    { type: "image", data: TINY_PNG, mimeType: "image/x-ms-bmp" },
+    { type: "image", data: TINY_PNG, mimeType: "image/tiff" },
+    { type: "text", text: "[Binary resource: mock://empty-img (image/png, empty or invalid base64 payload)]" },
+    { type: "text", text: "[Binary resource: mock://bad-img (image/png, empty or invalid base64 payload)]" },
+    { type: "text", text: "[Binary resource: mock://url-img (image/jpeg, empty or invalid base64 payload)]" },
+    { type: "text", text: "[Binary resource: mock://bad-svg (image/svg+xml, empty or invalid base64 payload)]" },
+    { type: "text", text: "[Binary resource: mock://ico (image/x-icon, 3 bytes)]" },
+    { type: "text", text: "[Binary resource: mock://heic (image/heic, 4 bytes)]" },
+    { type: "text", text: "[Binary resource: mock://ansi (image/x-icon, 3 bytes)]" },
+    { type: "text", text: `[Binary resource: mock://tainted-png (invalid MIME type, ${Buffer.byteLength(TINY_PNG, "base64")} bytes)]` },
+    { type: "text", text: "[Binary resource: mock://binary-svg (image/svg+xml, invalid UTF-8 payload)]" },
+    { type: "text", text: "[Binary resource: mock://nul-svg (image/svg+xml, invalid UTF-8 payload)]" },
+    { type: "text", text: "[Binary resource: mock://ansi-bin (application/pdf, 3 bytes)]" },
+  ]);
 });
 
 it("rejects an already-aborted catalog request on both cold and warm caches", async () => {
