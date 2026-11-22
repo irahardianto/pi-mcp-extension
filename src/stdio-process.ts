@@ -14,8 +14,21 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { ChildProcess } from "node:child_process";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  listDescendantPidsSync,
+  StdioExitGuard,
+  terminatePidTreeSync,
+} from "./stdio-exit-guard.js";
 
 const execFileAsync = promisify(execFile);
+
+const defaultStdioExitGuard = new StdioExitGuard({
+  terminatePidTreeSync: (pid) =>
+    terminatePidTreeSync(pid, {
+      listDescendantPidsSync: (root) =>
+        listDescendantPidsSync(root, undefined, indexProcessTable),
+    }),
+});
 
 // ─── Line Splitting ───────────────────────────────────────────────────────────
 
@@ -88,6 +101,7 @@ export const POST_CLOSE_FLUSH_DELAY_MS = 100;
 interface StdioChildRecord {
   process: ChildProcess;
   closed: boolean;
+  trackedPid?: number | undefined;
   /** Flush the buffered partial stderr line before the pipe is destroyed. */
   flushStderr(): void;
 }
@@ -176,6 +190,42 @@ export function instrumentStderr(
   return flush;
 }
 
+function isLiveChildProcess(
+  proc: ChildProcess | undefined,
+): proc is ChildProcess & { pid: number } {
+  if (!proc || typeof proc.once !== "function" || typeof proc.kill !== "function") {
+    return false;
+  }
+  return (
+    asPositivePid(proc.pid) !== null &&
+    proc.exitCode === null &&
+    proc.signalCode === null
+  );
+}
+
+function registerChildRecord(
+  transport: StdioClientTransport,
+  proc: ChildProcess,
+  flushStderr: (() => void) | null,
+): void {
+  const trackedPid = isLiveChildProcess(proc) ? proc.pid : undefined;
+  const record: StdioChildRecord = {
+    process: proc,
+    closed: false,
+    trackedPid,
+    flushStderr: () => flushStderr?.(),
+  };
+  if (trackedPid !== undefined) {
+    defaultStdioExitGuard.track(trackedPid);
+    proc.once("exit", () => defaultStdioExitGuard.untrack(trackedPid));
+  }
+  proc.once?.("close", () => {
+    record.closed = true;
+    defaultStdioExitGuard.untrack(trackedPid);
+  });
+  childRecords.set(transport, record);
+}
+
 export interface InstrumentStdioTransportOptions {
   onPid(pid: number): void;
   onStderrLine(line: string): void;
@@ -202,15 +252,7 @@ export function instrumentStdioTransport(
   const recordProcess = (proc: ChildProcess | undefined): void => {
     if (!proc?.pid) return;
     if (!childRecords.has(transport)) {
-      const record: StdioChildRecord = {
-        process: proc,
-        closed: false,
-        flushStderr: () => flushStderr?.(),
-      };
-      proc.once?.("close", () => {
-        record.closed = true;
-      });
-      childRecords.set(transport, record);
+      registerChildRecord(transport, proc, flushStderr);
     }
     onPid(proc.pid);
   };
@@ -285,6 +327,7 @@ export function destroyStdioStreams(transport: object | null | undefined): void 
   const record = childRecords.get(transport);
   if (!record) return;
   childRecords.delete(transport);
+  defaultStdioExitGuard.untrack(record.trackedPid);
   // WHY: Flush the buffered partial stderr line first. Destroying our read end keeps the
   // SDK's PassThrough from ever emitting 'end', so without this a forced teardown drops the
   // server's last words (the buffered remainder of a line with no trailing newline).

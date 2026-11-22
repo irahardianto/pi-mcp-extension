@@ -167,7 +167,7 @@ what to do:
 - **auth-required** — `AuthRequiredError`, or a genuine 401 (during `initialize` and
   `tools/list`) / 403 `insufficient_scope`; invalidates stale tokens when applicable and
   raises `AuthRequiredError` so the coordinator can offer interactive authorization.
-- **fail** — a fast-fail `config` or `protocol` `McpError`; no retry.
+- **fail** — a fast-fail `config` or `protocol` `McpError`, or a deterministic local `stdio` spawn errno (`ENOENT`, `EACCES`, `ENOEXEC`, `ENOTDIR`, `EISDIR`); no retry.
 - **give-up** — `retryCount >= maxRetries`; wrap in an `McpError` (`timeout` or
   `connection`).
 - **retry** — wait `RETRY_DELAYS_MS[retryCount]` (capped at the last entry) and reconnect.
@@ -208,6 +208,12 @@ microtask; the generation guard prevents a stop during cleanup from being resurr
 deactivates tools, closes the client, and — for stdio — runs
 `ensurePidTerminated()` (SIGTERM → bounded wait → SIGKILL, for the PIDs that accept a signal)
 and then `destroyStdioStreams()`.
+While any live `stdio` `ChildProcess` is running, `instrumentStdioTransport()` also tracks its PID
+in the process-level `StdioExitGuard` (`src/stdio-exit-guard.ts`, untracked on `exit`, `close`, and
+`destroyStdioStreams()`), attaching `SIGINT` and `exit` listeners only while live PIDs exist so
+unhandled `SIGINT` or unexpected process exit in headless modes (`--mode rpc`, `--mode json`,
+`--print`) terminates tracked trees synchronously while yielding to active host `SIGINT` handlers
+(such as interactive TUI `Ctrl+Z` suspend) and discounting passive `signal-exit` wrappers.
 
 `ensurePidTerminated()` snapshots the child's descendant tree first
 (`/proc/<pid>/task/*/children` on Linux, `ps -A -o pid=,ppid=` on other POSIX systems — e.g. an

@@ -351,6 +351,40 @@ export interface ClassifyConnectFailureInput {
   serverName?: string;
 }
 
+/**
+ * Local OS spawn errnos on `stdio` that cannot succeed on retry without user intervention
+ * (missing binary/cwd, missing execute permission, invalid binary format, or bad path type).
+ */
+const NON_RETRYABLE_STDIO_SPAWN_CODES = new Set([
+  "ENOENT",
+  "EACCES",
+  "ENOEXEC",
+  "ENOTDIR",
+  "EISDIR",
+]);
+
+/**
+ * Whether `error` is a deterministic local OS spawn failure on `stdio` that cannot
+ * succeed on retry without user intervention.
+ */
+export function isNonRetryableStdioSpawnError(
+  transport: TransportType,
+  error: unknown,
+): boolean {
+  if (transport !== "stdio" || typeof error !== "object" || error === null) {
+    return false;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && NON_RETRYABLE_STDIO_SPAWN_CODES.has(code);
+}
+
+function isFastFailConnectError(input: ClassifyConnectFailureInput, error: Error): boolean {
+  if (error instanceof McpError) {
+    return error.code === "protocol" || error.code === "config";
+  }
+  return isNonRetryableStdioSpawnError(input.transport, input.error);
+}
+
 function classifyOAuthFailure(
   input: ClassifyConnectFailureInput,
   error: Error,
@@ -387,7 +421,7 @@ function classifyPreRetryFailure(
   const oauthAction = classifyOAuthFailure(input, error);
   if (oauthAction) return oauthAction;
 
-  if (error instanceof McpError && (error.code === "protocol" || error.code === "config")) {
+  if (isFastFailConnectError(input, error)) {
     return { kind: "fail", error };
   }
 

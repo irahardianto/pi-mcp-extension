@@ -69,6 +69,7 @@ const RUNTIME_MODULES = [
   "server-status.ts",
   "session-lifecycle.ts",
   "startup-auth.ts",
+  "stdio-exit-guard.ts",
   "stdio-process.ts",
   "tool-bridge.ts",
   // WHY: tool-content.ts transforms are pure at call time, but it imports `convertResourceContent`
