@@ -188,28 +188,52 @@ function invalidProjectConfig(projectPath: string, detail: string): McpError {
   return new McpError(`Invalid mcp.json at ${projectPath}:\n  ${detail}`, "<config>", "config");
 }
 
-/** Merge a partial project override onto the raw global entry, keeping the global credentials. */
-function mergeProjectOverride(
+export type ProjectOverrideResolution =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; error: McpError };
+
+/**
+ * Return a config `McpError` when a partial project override sets keys outside
+ * `PROJECT_OVERRIDE_KEYS`, or `undefined` when all keys are allowed.
+ */
+export function validateProjectOverrideKeys(
+  name: string,
+  override: Record<string, unknown>,
+  projectPath: string,
+): McpError | undefined {
+  const unsupported = Object.keys(override).filter(
+    (key) => !(PROJECT_OVERRIDE_KEYS as readonly string[]).includes(key),
+  );
+  if (unsupported.length === 0) return undefined;
+  return invalidProjectConfig(
+    projectPath,
+    `mcpServers.${name}: a project override can only set ${PROJECT_OVERRIDE_KEYS.join(", ")} (found ${unsupported.join(", ")})`,
+  );
+}
+
+/**
+ * Resolve a partial project override onto the raw global entry, returning either the merged
+ * candidate or a config `McpError` without throwing.
+ */
+export function resolveProjectOverride(
   name: string,
   override: Record<string, unknown>,
   globalServers: Record<string, unknown>,
   projectPath: string,
-): Record<string, unknown> {
+): ProjectOverrideResolution {
   const base = Object.hasOwn(globalServers, name) ? globalServers[name] : undefined;
   if (!isPlainObject(base)) {
-    throw invalidProjectConfig(
-      projectPath,
-      `mcpServers.${name}: a project override needs "command" or "url" in this file, or a global server of that name`,
-    );
+    return {
+      ok: false,
+      error: invalidProjectConfig(
+        projectPath,
+        `mcpServers.${name}: a project override needs "command" or "url" in this file, or a global server of that name`,
+      ),
+    };
   }
-  const unsupported = Object.keys(override).filter(
-    (key) => !(PROJECT_OVERRIDE_KEYS as readonly string[]).includes(key),
-  );
-  if (unsupported.length > 0) {
-    throw invalidProjectConfig(
-      projectPath,
-      `mcpServers.${name}: a project override can only set ${PROJECT_OVERRIDE_KEYS.join(", ")} (found ${unsupported.join(", ")})`,
-    );
+  const keyError = validateProjectOverrideKeys(name, override, projectPath);
+  if (keyError) {
+    return { ok: false, error: keyError };
   }
   const merged: Record<string, unknown> = { ...base };
   if (override.lifecycle !== undefined && override.enabled === undefined) {
@@ -220,7 +244,21 @@ function mergeProjectOverride(
       merged[key] = override[key];
     }
   }
-  return merged;
+  return { ok: true, value: merged };
+}
+
+/** Merge a partial project override onto the raw global entry, keeping the global credentials. */
+function mergeProjectOverride(
+  name: string,
+  override: Record<string, unknown>,
+  globalServers: Record<string, unknown>,
+  projectPath: string,
+): Record<string, unknown> {
+  const resolution = resolveProjectOverride(name, override, globalServers, projectPath);
+  if (!resolution.ok) {
+    throw resolution.error;
+  }
+  return resolution.value;
 }
 
 /**
@@ -236,9 +274,15 @@ export function applyProjectOverrides(projectRaw: unknown, globalRaw: unknown, p
     : {};
   const servers: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(projectRaw.mcpServers)) {
-    servers[name] = isProjectOverrideEntry(value)
+    const resolved = isProjectOverrideEntry(value)
       ? mergeProjectOverride(name, value, globalServers, projectPath)
       : value;
+    Object.defineProperty(servers, name, {
+      value: resolved,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return { ...projectRaw, mcpServers: servers };
 }
