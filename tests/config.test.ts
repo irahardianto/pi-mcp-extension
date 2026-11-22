@@ -562,6 +562,15 @@ describe("Pi 1.x server schema compatibility", () => {
 // ── Issue #28: JSONC comments, McpError wrapping, toolPrefix, auth validation ─
 
 describe("stripJsonComments", () => {
+  it("preserves the syntax error line in BOM-prefixed JSONC with CRLF line endings", () => {
+    const input = '\uFEFF{\r\n  /* comment\r\n     continues */\r\n  "mcpServers": {},\r\n}';
+
+    assert.throws(() => JSON.parse(stripJsonComments(input)), {
+      name: "SyntaxError",
+      message: /line 5 column 1/,
+    });
+  });
+
   it("strips // line comments and /* */ block comments while preserving newlines", () => {
     const input = [
       "// Leading comment",
@@ -654,6 +663,25 @@ describe("Issue #28: Config validation and error handling", () => {
       const cfg = await loadConfig(dir);
       assert.equal(cfg.settings.toolPrefix, "custom_mcp");
       assert.equal(cfg.mcpServers["remote"]?.url, "https://example.com/mcp");
+    });
+  });
+
+  it("loads BOM-prefixed mcp.json with comments in both config locations", async () => {
+    await withTempDir(async (dir) => {
+      const piDir = join(dir, ".pi");
+      await mkdir(piDir, { recursive: true });
+      await writeFile(
+        join(dir, "isolated-global-mcp.json"),
+        '\uFEFF// Global config\r\n{"settings":{"toolPrefix":"custom_mcp"}}',
+      );
+      await writeFile(
+        join(piDir, "mcp.json"),
+        '\uFEFF{/* Project config */"mcpServers":{"remote":{"url":"https://example.invalid/mcp"}}}',
+      );
+
+      const cfg = await loadConfig(dir);
+      assert.equal(cfg.settings.toolPrefix, "custom_mcp");
+      assert.equal(cfg.mcpServers["remote"]?.url, "https://example.invalid/mcp");
     });
   });
 

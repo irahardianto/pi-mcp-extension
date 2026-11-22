@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Load `mcp.json` files that start with a UTF-8 byte order mark (#352).
+
 ## [1.16.0] - 2026-11-22
 
 ### Added
