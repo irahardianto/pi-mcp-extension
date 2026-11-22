@@ -9,14 +9,19 @@ import {
   collectWithdrawnTools,
   deleteServerOwnedTools,
   filterOwnedTools,
+  forgetServerCollisionState,
   mergePendingRestoredTools,
   normalizeRefreshArgs,
   orderOwnedActiveTools,
   planActiveToolReconciliation,
   planServerToolBatch,
+  planTreeDirectToolRestore,
+  pruneTreeDeactivatedDirectTools,
   reconcileLiveRefreshState,
   snapshotActiveStateByRawName,
+  updateTreeDeactivatedDirectTools,
 } from "../src/tool-reconcile.js";
+import { isCollidingServerStemLoser } from "../src/tool-names.js";
 
 function makeTool(name: string): McpToolDefinition {
   return { name, inputSchema: { type: "object", properties: {} } };
@@ -284,5 +289,180 @@ describe("tool-reconcile: orderOwnedActiveTools and planActiveToolReconciliation
       extraActive: ["tool_search"],
     });
     assert.deepEqual(reorderedOrChanged, ["read", "mcp_a_one", "bash", "mcp_b_two", "tool_search"]);
+  });
+});
+
+describe("tool-reconcile: cross-server stem disambiguation, reservedNames, and baseNameOwners (#331, #332)", () => {
+  it("isCollidingServerStemLoser picks lossless then code-point winner and leaves distinct prefixes untouched", () => {
+    assert.equal(isCollidingServerStemLoser("my-srv", ["my-srv", "my_srv"]), true);
+    assert.equal(isCollidingServerStemLoser("my_srv", ["my-srv", "my_srv"]), false);
+    assert.equal(isCollidingServerStemLoser("a-b", ["a-b", "a.b", "a_b"]), true);
+    assert.equal(isCollidingServerStemLoser("a.b", ["a-b", "a.b", "a_b"]), true);
+    assert.equal(isCollidingServerStemLoser("a_b", ["a-b", "a.b", "a_b"]), false);
+    assert.equal(isCollidingServerStemLoser("a-b", ["a-b", "a.b"]), false);
+    assert.equal(isCollidingServerStemLoser("a.b", ["a-b", "a.b"]), true);
+    assert.equal(isCollidingServerStemLoser("github", ["github", "github_enterprise"]), false);
+    assert.equal(isCollidingServerStemLoser("github_enterprise", ["github", "github_enterprise"]), false);
+  });
+
+  it("planServerToolBatch respects peerServerNames, collidedBaseNames, baseNameOwners, and reservedNames", () => {
+    const loserPlan = planServerToolBatch({
+      prefix: "mcp",
+      serverName: "my-srv",
+      tools: [makeTool("run")],
+      toolOwners: new Map(),
+      peerServerNames: ["my-srv", "my_srv"],
+    });
+    assert.match(loserPlan.plannedTools[0]!.piName, /^mcp_my_srv_run_[0-9a-f]{8}$/);
+    assert.equal(loserPlan.crossServerCollisions.size, 0);
+
+    const winnerPlan = planServerToolBatch({
+      prefix: "mcp",
+      serverName: "my_srv",
+      tools: [makeTool("run")],
+      toolOwners: new Map(),
+      peerServerNames: ["my-srv", "my_srv"],
+    });
+    assert.equal(winnerPlan.plannedTools[0]!.piName, "mcp_my_srv_run");
+
+    const distinctPlan = planServerToolBatch({
+      prefix: "mcp",
+      serverName: "github_enterprise",
+      tools: [makeTool("list_issues")],
+      toolOwners: new Map([["mcp_github_list_issues", "github"]]),
+      peerServerNames: ["github", "github_enterprise"],
+    });
+    assert.equal(distinctPlan.plannedTools[0]!.piName, "mcp_github_enterprise_list_issues");
+
+    // Transient withdrawal held in baseNameOwners still triggers crossServerCollisions
+    const baseOwnerPlan = planServerToolBatch({
+      prefix: "mcp",
+      serverName: "a_b",
+      tools: [makeTool("c")],
+      toolOwners: new Map(),
+      baseNameOwners: new Map([["mcp_a_b_c", "a"]]),
+    });
+    assert.match(baseOwnerPlan.plannedTools[0]!.piName, /^mcp_a_b_c_[0-9a-f]{8}$/);
+    assert.deepEqual(baseOwnerPlan.crossServerCollisions, new Map([["mcp_a_b_c", "a"]]));
+
+    // reservedNames forces hashed fallback (and _2 suffix if hashed candidate is also reserved) without recording crossServerCollisions
+    const reserved = new Set(["mcp_list_resources"]);
+    const reservedPlan = planServerToolBatch({
+      prefix: "mcp",
+      serverName: "list",
+      tools: [makeTool("resources")],
+      toolOwners: new Map(),
+      reservedNames: reserved,
+    });
+    const firstHash = reservedPlan.plannedTools[0]!.piName;
+    assert.match(firstHash, /^mcp_list_resources_[0-9a-f]{8}$/);
+    assert.equal(reservedPlan.crossServerCollisions.size, 0);
+
+    const doubleReserved = new Set(["mcp_list_resources", firstHash]);
+    const suffixedPlan = planServerToolBatch({
+      prefix: "mcp",
+      serverName: "list",
+      tools: [makeTool("resources")],
+      toolOwners: new Map(),
+      reservedNames: doubleReserved,
+    });
+    assert.equal(suffixedPlan.plannedTools[0]!.piName, `${firstHash}_2`);
+  });
+
+  it("forgetServerCollisionState transfers sole survivor to baseNameOwners and clears on final removal (#331)", () => {
+    // 2-way collision set -> drop 1 -> survivor moves to baseNameOwners -> drop survivor -> empty
+    const baseOwners2 = new Map<string, string>([["mcp_a_other", "a_b"]]);
+    const collided2 = new Map<string, Set<string>>([["mcp_a_b_c", new Set(["a", "a_b"])]]);
+    forgetServerCollisionState("a_b", baseOwners2, collided2);
+    assert.equal(collided2.has("mcp_a_b_c"), false);
+    assert.deepEqual(baseOwners2, new Map([["mcp_a_b_c", "a"]]));
+
+    forgetServerCollisionState("a", baseOwners2, collided2);
+    assert.equal(collided2.size, 0);
+    assert.equal(baseOwners2.size, 0);
+
+    // 3-way collision set -> drop 1 keeps collision set -> drop 2nd hands off survivor -> drop 3rd clears
+    const baseOwners3 = new Map<string, string>();
+    const collided3 = new Map<string, Set<string>>([
+      ["mcp_x_y_z_w", new Set(["x", "x_y", "x_y_z"])],
+    ]);
+    forgetServerCollisionState("x", baseOwners3, collided3);
+    assert.deepEqual(collided3.get("mcp_x_y_z_w"), new Set(["x_y", "x_y_z"]));
+    assert.equal(baseOwners3.size, 0);
+
+    forgetServerCollisionState("x_y_z", baseOwners3, collided3);
+    assert.equal(collided3.has("mcp_x_y_z_w"), false);
+    assert.deepEqual(baseOwners3, new Map([["mcp_x_y_z_w", "x_y"]]));
+
+    forgetServerCollisionState("x_y", baseOwners3, collided3);
+    assert.equal(collided3.size, 0);
+    assert.equal(baseOwners3.size, 0);
+  });
+});
+
+describe("tool-reconcile: /tree deactivated direct tool helpers (#333)", () => {
+  it("accumulates multi-hop /tree deactivations, ignores missing beforeActive, and clears on forward hop", () => {
+    const direct = new Set(["mcp_s_a", "mcp_s_b"]);
+    // Hop 1: Turn 2 (only a active) -> Turn 1a (neither active)
+    const hop1 = updateTreeDeactivatedDirectTools(
+      undefined,
+      direct,
+      new Set(["read", "mcp_s_a"]),
+      new Set(["read"]),
+    );
+    assert.deepEqual(hop1, new Set(["mcp_s_a"]));
+
+    // Hop 2: Turn 1a -> Turn 1b (neither active) retains mcp_s_a
+    const hop2 = updateTreeDeactivatedDirectTools(
+      hop1,
+      direct,
+      new Set(["read"]),
+      new Set(["read"]),
+    );
+    assert.deepEqual(hop2, new Set(["mcp_s_a"]));
+
+    // Missing beforeActive records no new deactivations, only prunes currentActive
+    assert.equal(
+      updateTreeDeactivatedDirectTools(undefined, direct, undefined, new Set(["read"])),
+      undefined,
+    );
+    assert.deepEqual(
+      updateTreeDeactivatedDirectTools(hop2, direct, undefined, new Set(["read"])),
+      new Set(["mcp_s_a"]),
+    );
+
+    // Forward hop to Turn 2 where mcp_s_a is active clears it
+    assert.equal(
+      updateTreeDeactivatedDirectTools(hop2, direct, new Set(["read"]), new Set(["read", "mcp_s_a"])),
+      undefined,
+    );
+  });
+
+  it("prunes deactivated direct tools and plans additive ordered restoration", () => {
+    const pruned = pruneTreeDeactivatedDirectTools(
+      new Set(["mcp_s_a", "mcp_s_b", "mcp_s_gone"]),
+      new Set(["mcp_s_a", "mcp_s_b"]),
+      new Set(["mcp_s_b"]),
+    );
+    assert.deepEqual(pruned, new Set(["mcp_s_a"]));
+
+    const owned = new Set(["mcp_s_a", "mcp_s_b", "mcp_other_z"]);
+    const next = planTreeDirectToolRestore(
+      new Set(["mcp_s_a"]),
+      new Set(["mcp_s_a", "mcp_s_b"]),
+      ["read", "mcp_other_z"],
+      (n) => owned.has(n),
+    );
+    assert.deepEqual(next, ["read", "mcp_other_z", "mcp_s_a"]);
+
+    assert.equal(
+      planTreeDirectToolRestore(
+        new Set(["mcp_s_a"]),
+        new Set(["mcp_s_a"]),
+        ["read", "mcp_s_a"],
+        (n) => owned.has(n),
+      ),
+      undefined,
+    );
   });
 });

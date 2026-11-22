@@ -22,6 +22,7 @@ import {
   type ServerStatusRow,
 } from "./server-status.js";
 import type { ToolActivity, ToolBridge } from "./tool-bridge.js";
+import { MANAGEMENT_TOOL_NAMES } from "./tool-names.js";
 
 export interface ManagementToolDeps {
   manager: ServerManager;
@@ -114,7 +115,7 @@ export function registerManagementTools(
   // when `codemode.mode` is `"only"`, and excludes them from `codemode`'s pre-snapshotted QuickJS
   // `tools.*` helpers (`mcp_list_resources` / `mcp_read_resource` stay `"direct"` for scripts) (#257).
   pi.registerTool({
-    name: "mcp_status",
+    name: MANAGEMENT_TOOL_NAMES.status,
     label: "MCP status",
     description: "List configured MCP servers, lifecycle, connection and OAuth state. Use mcp_connect to connect one server.",
     promptSnippet: "Inspect configured MCP servers, their connection state, discovered tools, and authentication status.",
@@ -130,7 +131,7 @@ export function registerManagementTools(
   });
 
   pi.registerTool({
-    name: "mcp_connect",
+    name: MANAGEMENT_TOOL_NAMES.connect,
     label: "Connect MCP server",
     description: "Connect one named configured MCP server and activate its tools. May request interactive OAuth authorization.",
     promptSnippet: "Connect or reconnect to a configured MCP server by name and register its tools.",
@@ -147,6 +148,7 @@ export function registerManagementTools(
         });
         throw new Error(message);
       }
+      bridge.restoreTreeDeactivatedDirectTools(name);
       // WHY: check the tools whose exposure is `direct` by name, not every discovered one. A
       // server configured with `exposure: "hidden"` plus a few `toolExposure` overrides, or one
       // whose tools are all deferred to `tool_search`, is working as configured — the old
@@ -170,7 +172,7 @@ export function registerManagementTools(
   });
 
   pi.registerTool({
-    name: "mcp_list_resources",
+    name: MANAGEMENT_TOOL_NAMES.listResources,
     label: "List MCP resources",
     description: "List MCP resources and URI templates exposed by connected servers. Use mcp_read_resource to read one by URI.",
     promptSnippet: "Discover read-only MCP resources (documents, schemas, data streams) and URI templates, optionally for one server.",
@@ -185,7 +187,7 @@ export function registerManagementTools(
   });
 
   pi.registerTool({
-    name: "mcp_read_resource",
+    name: MANAGEMENT_TOOL_NAMES.readResource,
     label: "Read MCP resource",
     description:
       "Read one MCP resource by server and URI. Text resources return their text; valid image/svg+xml blobs decode to UTF-8 text; supported image blobs return an image; other or invalid binary blobs return a summary.",

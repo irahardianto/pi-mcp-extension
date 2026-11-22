@@ -58,9 +58,9 @@ flowchart TD
 
 - The **entry** runs untrusted-safe bootstrap config loading (`loadBootstrapConfigState()`),
   constructs the collaborators, and registers
-  `session_start` / `mcp_servers_change` / `session_tree` / `input` / `before_agent_start` /
-  `tool_execution_end` / `before_provider_request` / `session_shutdown`, the `/mcp*`
-  commands, and the `mcp_status` / `mcp_connect` (`exposure: "model-only"`) and
+  `session_start` / `mcp_servers_change` / `session_before_tree` / `session_tree` / `input` /
+  `before_agent_start` / `tool_execution_end` / `before_provider_request` / `session_shutdown`,
+  the `/mcp*` commands, and the `mcp_status` / `mcp_connect` (`exposure: "model-only"`) and
   `mcp_list_resources` / `mcp_read_resource` tools. It registers them even when bootstrap
   config loading fails, so a later `session_start` in another directory can still load a
   valid project config.
@@ -73,7 +73,18 @@ flowchart TD
 - **ToolBridge** turns `tools/list` (`discoverServerTools()`) into Pi tools
   (`createPiToolDefinition()`, `executeMcpToolCall()`) and keeps them active/inactive as the
   server connects and disconnects (`planServerToolBatch()`, `reconcileLiveRefreshState()`,
-  `mergePendingRestoredTools()`, `planActiveToolReconciliation()`). Each tool's exposure is
+  `mergePendingRestoredTools()`, `planActiveToolReconciliation()`). Tool names are resolved
+  deterministically across both intra-server and cross-server collisions: peer servers sharing
+  a sanitized stem (`isCollidingServerStemLoser()`) award unhashed names only to the
+  lossless/code-point winner, cross-server `_` boundary collisions symmetrically hide the
+  ambiguous base name and move both tools to their deterministic hashed identifiers (tracking
+  `baseNameOwners` across transient `tools/list_changed` withdrawals, rebinding live
+  incumbents via `liveToolBindings`, promoting displaced `direct` tools when `--tools` /
+  `--exclude-tools` excluded only the unhashed base name, and resetting session-scoped
+  collision/ownership state via `resetSessionState()` on non-reload `session_shutdown`), and
+  `RESERVED_MANAGEMENT_TOOL_NAMES` plus foreign `pi.getAllTools()` entries
+  (`!bridgeRegisteredNames.has(name)`) keep built-in resource and peer-extension tools
+  protected without blocking retired MCP tools from reclaiming their names. Each tool's exposure is
   resolved from the server entry's `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact
   raw-name key, then the first `*` pattern in declaration order, then the server default
   `direct`), attached to a sanitized, peer-disambiguated per-server `ToolNamespace`
@@ -95,7 +106,10 @@ flowchart TD
   enabled and connected indirect servers (`collectRequiredDiscoveryExposures()`), assessed
   against Pi's `--tools` / `--exclude-tools` filter (`assessRegisteredServerExposures()`),
   ensured on tool refreshes (`ensureDiscoveryTools()`), and restored on `session_tree`
-  without re-activating inactive `direct` tools; `before_agent_start` populates
+  without re-activating inactive `direct` tools (`session_before_tree` + `session_tree` record
+  only `/tree`-stripped `direct` tools into `treeDeactivatedDirectTools` across multi-hop
+  navigation so `mcp_connect` and `/mcp:start` can restore them once without overriding
+  another extension's restrictions); `before_agent_start` populates
   `systemPromptOptions.sections["mcp_servers"]` (`renderMcpServersSection()`) with matching
   peer-disambiguated namespace headers and symmetric `codemode` ↔ `tool_search` fallback (or
   omits it when neither reaching tool is active) so the model sees indirect MCP domains,
