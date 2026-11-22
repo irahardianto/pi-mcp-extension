@@ -103,7 +103,7 @@ function consumeNextChunk(text: string, index: number): ConsumedChunk {
 
 /**
  * Strip `//` line comments and `/* ... *\/` block comments outside of double-quoted
- * JSON strings in a single character-by-character pass.
+ * JSON strings in a single character-by-character pass. Skip a leading UTF-8 BOM.
  *
  * Preserves `\n` and `\r` characters so line numbers in `JSON.parse` error messages
  * remain accurate. Unterminated `/*` block comments are left intact so `JSON.parse`
@@ -117,7 +117,7 @@ function consumeNextChunk(text: string, index: number): ConsumedChunk {
  */
 export function stripJsonComments(text: string): string {
   let out = "";
-  let index = 0;
+  let index = text.charCodeAt(0) === 0xfeff ? 1 : 0;
 
   while (index < text.length) {
     const consumed = consumeNextChunk(text, index);
