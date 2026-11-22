@@ -3359,6 +3359,81 @@ describe("buildToolDescription, buildToolAnnotations, buildToolCallContent, and 
   });
 });
 
+describe("structured tool results with blank text placeholders (#359)", () => {
+  for (const [label, text] of [["empty", ""], ["whitespace-only", "  \n\t"]] as const) {
+    it(`renders structured data on success with ${label} text`, () => {
+      const outcome = buildToolCallOutcome({
+        content: [{ type: "text", text }],
+        structuredContent: { temperature: 22.5 },
+        isError: false,
+      }, "weather");
+      assert.deepEqual(outcome.content, [{ type: "text", text: '{\n  "temperature": 22.5\n}' }]);
+    });
+
+    it(`renders structured data in Pi error outcomes with ${label} text`, () => {
+      const result = {
+        content: [{ type: "text", text }],
+        structuredContent: { code: "E_WEATHER" },
+        isError: true,
+      };
+      const outcome = buildToolCallOutcome(result, "weather", true);
+      assert.equal(outcome.isError, true);
+      assert.deepEqual(outcome.content, [{ type: "text", text: '{\n  "code": "E_WEATHER"\n}' }]);
+      assert.deepEqual(outcome.structuredContent, result);
+    });
+
+    it(`uses structured data in the legacy error message with ${label} text`, () => {
+      assert.throws(() => buildToolCallOutcome({
+        content: [{ type: "text", text }],
+        structuredContent: { code: "E_WEATHER" },
+        isError: true,
+      }, "weather"), {
+        name: "McpError",
+        code: "tool",
+        server: "weather",
+        message: '{\n  "code": "E_WEATHER"\n}',
+      });
+    });
+  }
+
+  it("renders structured strings and JSON scalars when all text blocks are blank", () => {
+    const content = [{ type: "text", text: "" }, { type: "text", text: " \n" }];
+    for (const [structuredContent, text] of [["raw \n", "raw \n"], [0, "0"], [false, "false"], [null, "null"]] as const) {
+      assert.deepEqual(buildToolCallContent({ content, structuredContent }), [{ type: "text", text }]);
+    }
+  });
+
+  it("keeps blank text blocks when structured data is absent", () => {
+    const content = [{ type: "text", text: "" }, { type: "text", text: " \n" }];
+    assert.deepEqual(buildToolCallContent({ content }), content);
+  });
+
+  it("keeps converted content and its order when any block is usable", () => {
+    const empty = { type: "text", text: "" };
+    const image = { type: "image", data: "YWJj", mimeType: "image/png" };
+    const text = { type: "text", text: "  Existing output \n" };
+    const cases = [
+      { block: image, expected: image },
+      { block: text, expected: text },
+      { block: { type: "custom", payload: true }, expected: { type: "text", text: '{"type":"custom","payload":true}' } },
+      { block: { type: "resource", resource: { uri: "file:///result.png", blob: "YWJj", mimeType: "image/png" } }, expected: image },
+    ];
+    for (const { block, expected } of cases) {
+      assert.deepEqual(
+        buildToolCallContent({ content: [empty, block], structuredContent: { ignored: true } }),
+        [empty, expected],
+      );
+    }
+  });
+
+  it("uses the fallback when an embedded resource converts to blank text", () => {
+    assert.deepEqual(buildToolCallContent({
+      content: [{ type: "resource", resource: { uri: "file:///result.txt", text: " \n" } }],
+      structuredContent: "fallback",
+    }), [{ type: "text", text: "fallback" }]);
+  });
+});
+
 // ── Paginated listAllTools ─────────────────────────────────────────────────────
 
 describe("listAllTools pagination", () => {
