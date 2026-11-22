@@ -64,7 +64,7 @@ export interface ServerCompletionEntry {
 
 export function serverNameCompletions(
   argumentPrefix: string,
-  servers: ServerCompletionEntry[],
+  servers: readonly ServerCompletionEntry[],
   options: { authOnly?: boolean } = {},
 ) {
   const prefix = argumentPrefix.trimStart();
@@ -85,6 +85,28 @@ export function serverNameCompletions(
         .join(" · "),
     }));
 
+  return completions.length > 0 ? completions : null;
+}
+
+export function authArgumentCompletions(argumentPrefix: string, servers: readonly ServerCompletionEntry[]) {
+  const prefix = argumentPrefix.trimStart();
+  const literalMatches = serverNameCompletions(prefix, servers, { authOnly: true });
+  const resetPrefix = /^--reset\s+/.exec(prefix);
+  if (!resetPrefix) return literalMatches;
+
+  const serverPrefix = prefix.slice(resetPrefix[0].length);
+  const resetMatches = serverNameCompletions(serverPrefix, servers, { authOnly: true });
+  if (!resetMatches) return literalMatches;
+
+  const serverNames = servers.map((server) => server.name);
+  const completions = [...(literalMatches ?? [])];
+  for (const item of resetMatches) {
+    // WHY: Pi replaces the entire argument prefix, so the completion must reinsert the flag.
+    const value = `${resetPrefix[0]}${item.value}`;
+    // Exact configured names and trailing flags can take precedence over a leading flag.
+    const parsed = parseAuthArguments(value, serverNames);
+    if (parsed.reset && parsed.name === item.value) completions.push({ ...item, value });
+  }
   return completions.length > 0 ? completions : null;
 }
 
