@@ -13,7 +13,9 @@
 import {
   CODEMODE_TOOL_NAME,
   TOOL_SEARCH_TOOL_NAME,
+  hasReachingTool,
   type McpExposure,
+  type RegisteredToolSummary,
 } from "./tool-exposure.js";
 import {
   resolveAllServerNamespaceIds,
@@ -51,6 +53,8 @@ export interface RenderMcpServersSectionOptions {
   servers: readonly McpPromptServerEntry[];
   toolPrefix?: string | undefined;
   activeTools?: Iterable<string> | undefined;
+  /** Optional `pi.getAllTools()` snapshot so non-reaching tools named `codemode`/`tool_search` are not advertised. */
+  allTools?: readonly RegisteredToolSummary[] | undefined;
 }
 
 interface PreparedPromptServer {
@@ -65,13 +69,24 @@ interface ReachAvailability {
   mcpConnect: boolean;
 }
 
-function resolveReachAvailability(activeTools: Iterable<string> | undefined): ReachAvailability {
-  if (!activeTools) return { codemode: true, toolSearch: true, mcpConnect: true };
-  const active = new Set(activeTools);
+function isReachingAvailable(
+  active: ReadonlySet<string> | undefined,
+  allTools: readonly RegisteredToolSummary[] | undefined,
+  toolName: string,
+): boolean {
+  if (active && !active.has(toolName)) return false;
+  return allTools === undefined || hasReachingTool(allTools, toolName);
+}
+
+function resolveReachAvailability(
+  activeTools: Iterable<string> | undefined,
+  allTools: readonly RegisteredToolSummary[] | undefined,
+): ReachAvailability {
+  const active = activeTools ? new Set(activeTools) : undefined;
   return {
-    codemode: active.has(CODEMODE_TOOL_NAME),
-    toolSearch: active.has(TOOL_SEARCH_TOOL_NAME),
-    mcpConnect: active.has(MCP_CONNECT_TOOL_NAME),
+    codemode: isReachingAvailable(active, allTools, CODEMODE_TOOL_NAME),
+    toolSearch: isReachingAvailable(active, allTools, TOOL_SEARCH_TOOL_NAME),
+    mcpConnect: active ? active.has(MCP_CONNECT_TOOL_NAME) : true,
   };
 }
 
@@ -221,7 +236,7 @@ export function renderMcpServersSection(
   options: RenderMcpServersSectionOptions,
 ): string | undefined {
   const prefix = options.toolPrefix ?? "mcp";
-  const available = resolveReachAvailability(options.activeTools);
+  const available = resolveReachAvailability(options.activeTools, options.allTools);
   const prepared = preparePromptServers(options.servers, prefix, available);
   if (prepared.length === 0) return undefined;
 

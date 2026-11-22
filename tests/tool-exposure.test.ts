@@ -871,6 +871,53 @@ describe("renderMcpServersSection", () => {
       ].join("\n"),
     );
   });
+
+  it("ignores active non-reaching codemode or tool_search tools when allTools is supplied", () => {
+    const servers = [
+      {
+        name: "docs",
+        connected: true,
+        exposures: ["codemode"] as const,
+        description: "Documentation server",
+      },
+    ];
+
+    // Active `codemode` without `reachesTools` and no `tool_search` -> omit section
+    assert.equal(
+      renderMcpServersSection({
+        servers,
+        activeTools: ["read", "codemode"],
+        allTools: [{ name: "read" }, { name: "codemode" }],
+      }),
+      undefined,
+    );
+
+    // Active non-reaching `codemode` alongside a reaching `tool_search` -> falls back to `tool_search`
+    assert.equal(
+      renderMcpServersSection({
+        servers,
+        activeTools: ["read", "codemode", "tool_search"],
+        allTools: [
+          { name: "read" },
+          { name: "codemode" },
+          { name: "tool_search", reachesTools: () => "all" },
+        ],
+      }),
+      [
+        "MCP servers whose tools are not declared to you. Load the tools of `tool_search` servers with `tool_search`.",
+        "- mcp_docs (tool_search): Documentation server",
+      ].join("\n"),
+    );
+
+    // Omitted `activeTools` with `allTools` still checks `reachesTools`
+    assert.equal(
+      renderMcpServersSection({
+        servers,
+        allTools: [{ name: "codemode" }],
+      }),
+      undefined,
+    );
+  });
 });
 
 

@@ -553,6 +553,17 @@ describe("config-compat pure alias normalizers and project override merger", () 
         err.message.includes("/proj/.pi/mcp.json") &&
         err.message.includes("found env"),
     );
+
+    // Prototype-keyed partial override (`__proto__`) must not match Object.prototype on globalServers
+    const protoOverride = JSON.parse('{"mcpServers":{"__proto__":{"enabled":false}}}') as unknown;
+    assert.throws(
+      () => applyProjectOverrides(protoOverride, globalRaw, "/proj/.pi/mcp.json"),
+      (err: unknown) =>
+        err instanceof McpError &&
+        err.code === "config" &&
+        err.message.includes("mcpServers.__proto__") &&
+        err.message.includes("global server of that name"),
+    );
   });
 });
 

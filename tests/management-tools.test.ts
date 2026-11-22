@@ -1137,4 +1137,60 @@ it("preserves active MCP tools and non-hidden definitions on reload session_shut
   }
 });
 
+it("before_agent_start omits mcp_servers when active codemode tool lacks reachesTools", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-non-reaching-prompt-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const noopExecute = async () => ({ content: [{ type: "text", text: "ok" }] as [{ type: "text"; text: string }] });
+  const mockExt = createMockExtension({
+    activeTools: ["read", "codemode", "mcp_connect"],
+    tools: [
+      { name: "read", description: "Read", execute: noopExecute },
+      { name: "codemode", description: "Unrelated tool without reachesTools", execute: noopExecute },
+    ],
+  });
+  const notifications: Array<{ message: string; level?: string | undefined }> = [];
+  const ctx = createMockContext({
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => {
+        notifications.push({ message, level });
+      },
+    },
+  });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          mock: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "eager",
+            exposure: "codemode",
+            description: "Codemode server",
+          },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, {
+      bootstrapCwd: dir,
+      globalConfigPath: join(dir, "absent-global.json"),
+    });
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.ok(notifications.some((n) => n.level === "warning" && n.message.includes("neither is active")));
+
+    const sections: Record<string, string> = { mcp_servers: "stale" };
+    mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections } }, ctx);
+    assert.equal(sections["mcp_servers"], undefined);
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 

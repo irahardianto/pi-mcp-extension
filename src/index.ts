@@ -180,7 +180,7 @@ export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string;
     // WHY: read `pi.getActiveTools()` rather than `event.systemPromptOptions?.selectedTools` — an
     // earlier `before_agent_start` handler may have called `pi.setActiveTools(...)`, which Pi only
     // folds back into `systemPromptOptions.selectedTools` after all handlers finish.
-    syncMcpServersPromptSection(event?.systemPromptOptions?.sections, manager, bridge, pi.getActiveTools());
+    syncMcpServersPromptSection(event?.systemPromptOptions?.sections, manager, bridge, pi);
   });
   pi.on("tool_execution_end", normalizeActiveTools);
   pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
@@ -249,13 +249,15 @@ function syncMcpServersPromptSection(
   sections: Record<string, string> | undefined,
   manager: ServerManager,
   bridge: ToolBridge,
-  activeTools: Iterable<string> | undefined,
+  pi: ExtensionAPI,
 ): void {
   if (!sections) return;
+  const allTools = typeof pi.getAllTools === "function" ? pi.getAllTools() : undefined;
   const section = renderMcpServersSection({
     servers: manager.getAllServers().map((server) => buildPromptServerEntry(server, bridge)),
     toolPrefix: bridge.getToolPrefix(),
-    activeTools,
+    activeTools: pi.getActiveTools(),
+    allTools,
   });
   if (section !== undefined) {
     sections[MCP_SERVERS_SECTION] = section;

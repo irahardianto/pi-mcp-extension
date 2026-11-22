@@ -257,9 +257,10 @@ export interface DiscoveryActivationPlan {
   unreachableWarning?: string | undefined;
 }
 
-function hasReachingTool(allTools: readonly RegisteredToolSummary[], name: string): boolean {
+/** Whether `allTools` registers `name` with Pi's `reachesTools` hook (excluding unrelated same-named tools). */
+export function hasReachingTool(allTools: readonly RegisteredToolSummary[], name: string): boolean {
   // WHY: only Pi's reaching discovery tools declare `reachesTools`; an unrelated tool of the
-  // same name from another extension must never be auto-activated (#257).
+  // same name from another extension must never be auto-activated or advertised as reaching (#257).
   return allTools.some((tool) => tool.name === name && Boolean(tool.reachesTools));
 }
 

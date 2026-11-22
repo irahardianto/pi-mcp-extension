@@ -154,7 +154,7 @@ function mergeProjectOverride(
   globalServers: Record<string, unknown>,
   projectPath: string,
 ): Record<string, unknown> {
-  const base = globalServers[name];
+  const base = Object.hasOwn(globalServers, name) ? globalServers[name] : undefined;
   if (!isPlainObject(base)) {
     throw invalidProjectConfig(
       projectPath,
