@@ -456,8 +456,9 @@ Behavior:
 - **Bootstrap** calls the loader with `includeProjectConfig: false`, so the global
   file is read but a project file never is, before trust is resolved.
 - **`session_start`** sets `includeProjectConfig` from `ctx.isProjectTrusted()`.
-- **JSONC.** `//` and `/* ... */` comments are stripped in a single pass that preserves
-  newlines, so `JSON.parse` error messages keep accurate line numbers.
+- **JSONC.** A leading UTF-8 byte order mark and `//` / `/* ... */` comments are stripped
+  in a single pass that preserves newlines, so `JSON.parse` error messages keep accurate
+  line numbers.
 - **Merge.** Project `settings` override only the keys they state (project settings
   carry no defaults), and a project server entry replaces the global entry with the same
   name entirely. If neither file exists, `loadConfig()` returns an empty valid config

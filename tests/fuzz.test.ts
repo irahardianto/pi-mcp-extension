@@ -1141,6 +1141,17 @@ describe("fuzz: stripJsonComments & parseRegisteredServerConfig", () => {
     );
   });
 
+  it("stripJsonComments ignores one leading UTF-8 BOM without changing the document", () => {
+    fc.assert(
+      fc.property(fc.json(), (json) => {
+        const stripped = stripJsonComments(`\uFEFF${json}`);
+        assert.equal(stripped, stripJsonComments(json));
+        assert.deepEqual(JSON.parse(stripped), JSON.parse(json));
+      }),
+      testOptions(),
+    );
+  });
+
   it("stripJsonComments strictly preserves newline counts across arbitrary strings", () => {
     fc.assert(
       fc.property(arbitraryString, (text) => {

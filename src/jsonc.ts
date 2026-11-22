@@ -5,8 +5,9 @@
  * non-runtime consumers stay free of runtime MCP imports.
  *
  * The only behaviour this module performs is `stripJsonComments` — a single-pass
- * character scan that removes `//` line comments and `/* ... *\/` block comments
- * while leaving the rest of the document byte-equivalent. Comments inside
+ * character scan that removes a leading UTF-8 byte order mark and `//` line
+ * comments and `/* ... *\/` block comments while leaving the rest of the document
+ * byte-equivalent. Comments inside
  * double-quoted strings are preserved verbatim, so a JSON value such as
  * `"https://example.com/foo"` is never accidentally truncated. Trailing commas
  * (the other common JSONC extension) are **not** handled here — none of the
@@ -102,8 +103,9 @@ function consumeNextChunk(text: string, index: number): ConsumedChunk {
 }
 
 /**
- * Strip `//` line comments and `/* ... *\/` block comments outside of double-quoted
- * JSON strings in a single character-by-character pass.
+ * Strip a leading UTF-8 byte order mark, `//` line comments and `/* ... *\/` block
+ * comments outside of double-quoted JSON strings in a single character-by-character
+ * pass.
  *
  * Preserves `\n` and `\r` characters so line numbers in `JSON.parse` error messages
  * remain accurate. Unterminated `/*` block comments are left intact so `JSON.parse`
@@ -117,7 +119,14 @@ function consumeNextChunk(text: string, index: number): ConsumedChunk {
  */
 export function stripJsonComments(text: string): string {
   let out = "";
-  let index = 0;
+  // WHY: RFC 8259 §8.1 lets a parser ignore one leading BOM, and Windows editors
+  // (Notepad, PowerShell 5 `Set-Content -Encoding UTF8`) write one; JSON.parse does
+  // not, so a BOM-prefixed mcp.json would fail to parse and silently discard every
+  // configured server. Starting the scan after the code unit — instead of slicing or
+  // replacing it — allocates nothing and keeps every `\n` / `\r`, so `JSON.parse`
+  // error line numbers still match the on-disk file. A BOM anywhere else is a real
+  // syntax error and is deliberately left for JSON.parse to report.
+  let index = text.charCodeAt(0) === 0xfeff ? 1 : 0;
 
   while (index < text.length) {
     const consumed = consumeNextChunk(text, index);
