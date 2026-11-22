@@ -111,6 +111,10 @@ function consumeNextChunk(text: string, index: number): ConsumedChunk {
  * remain accurate. Unterminated `/*` block comments are left intact so `JSON.parse`
  * fails with a syntax error rather than silently truncating the document.
  *
+ * The BOM is removed rather than replaced by whitespace, so a syntax error on the first
+ * line reports its column against the BOM-less text — one less than the character's
+ * column in the file. Line numbers are unaffected. Pi's own `stripBom` does the same.
+ *
  * WHY: this module exists so `scripts/ruleset-audit.ts` and `tests/repo-policy.test.ts`
  * can read `.github/rulesets/*.json` with the same JSONC tolerance the runtime uses
  * for `mcp.json`. A future maintainer can add `// WHY: …` style comments to the

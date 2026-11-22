@@ -622,6 +622,16 @@ describe("Issue #352: UTF-8 BOM in mcp.json", () => {
   // Windows editors (Notepad, PowerShell 5 `Set-Content -Encoding UTF8`) prepend
   // EF BB BF; `readFile(..., "utf-8")` keeps it as U+FEFF and JSON.parse rejects it
   // as a token, which used to discard every configured server.
+  const bomErrorLocation = (input: string): string => {
+    try {
+      JSON.parse(stripJsonComments(input));
+      return "no error";
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return message.match(/line \d+ column \d+/)?.[0] ?? message;
+    }
+  };
+
   it("stripJsonComments drops one leading BOM and still strips comments", () => {
     const stripped = stripJsonComments(
       '\uFEFF// Windows-saved config\r\n{\r\n  "a": 1 // trailing\r\n}',
@@ -648,18 +658,18 @@ describe("Issue #352: UTF-8 BOM in mcp.json", () => {
     // Trailing comma after ""mcpServers"": the error lands on the closing brace at
     // line 5 — the same line it occupies on disk, because the mask preserves CRLF.
     const body = '{\r\n  /* comment\r\n     continues */\r\n  "mcpServers": {},\r\n}';
-    const errorLocation = (input: string): string => {
-      try {
-        JSON.parse(stripJsonComments(input));
-        return "no error";
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return message.match(/line \d+ column \d+/)?.[0] ?? message;
-      }
-    };
 
-    assert.equal(errorLocation(`\uFEFF${body}`), "line 5 column 1");
-    assert.equal(errorLocation(`\uFEFF${body}`), errorLocation(body));
+    assert.equal(bomErrorLocation(`\uFEFF${body}`), "line 5 column 1");
+    assert.equal(bomErrorLocation(`\uFEFF${body}`), bomErrorLocation(body));
+  });
+
+  it("reports a first-line error column against the BOM-less text", () => {
+    // The BOM is deleted, not replaced by whitespace, so the character at file column 3
+    // reports column 2. Pinned rather than accidental: Pi's own stripBom does the same,
+    // and replacing the BOM with a space would make the stripped text stop being the
+    // document minus comments.
+    assert.equal(bomErrorLocation("\uFEFF{]"), "line 1 column 2");
+    assert.equal(bomErrorLocation("\uFEFF{]"), bomErrorLocation("{]"));
   });
 
   it("loads a BOM-prefixed global mcp.json", async () => {

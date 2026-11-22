@@ -54,7 +54,7 @@
    }
    ```
 
-3. **Create a config file** at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (trusted project). Both files support **JSONC** (`//` line and `/* ... */` block comments) and tolerate a leading UTF-8 byte order mark written by Windows editors:
+3. **Create a config file** at `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (trusted project). Both files support **JSONC** (`//` line and `/* ... */` block comments) and tolerate a UTF-8 byte order mark at the very start of the file, as written by Windows editors:
    ```jsonc
    {
      "mcpServers": {
@@ -81,7 +81,7 @@
 
 ## Configuration
 
-Servers can be configured via JSON/JSONC files (a leading UTF-8 BOM, `//` and `/* */` comments are supported) or registered programmatically by other Pi 1.x extensions:
+Servers can be configured via JSON/JSONC files (a UTF-8 BOM at the start of the file, `//` and `/* */` comments are supported) or registered programmatically by other Pi 1.x extensions:
 
 | Source | Precedence & Scope |
 |---|---|

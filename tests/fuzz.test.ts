@@ -1144,9 +1144,11 @@ describe("fuzz: stripJsonComments & parseRegisteredServerConfig", () => {
   it("stripJsonComments ignores one leading UTF-8 BOM without changing the document", () => {
     fc.assert(
       fc.property(fc.json(), (json) => {
-        const stripped = stripJsonComments(`\uFEFF${json}`);
-        assert.equal(stripped, stripJsonComments(json));
-        assert.deepEqual(JSON.parse(stripped), JSON.parse(json));
+        const expected = JSON.parse(json) as unknown;
+        assert.deepEqual(JSON.parse(stripJsonComments(`\uFEFF${json}`)), expected);
+        // Same property with a Windows-style line comment behind the BOM, so the scan
+        // still has to skip the mark first and then handle the comment on every input.
+        assert.deepEqual(JSON.parse(stripJsonComments(`\uFEFF// windows-saved\r\n${json}`)), expected);
       }),
       testOptions(),
     );
