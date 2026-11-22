@@ -180,11 +180,18 @@ function mergeSubSchemaProperties(
     return;
   }
   for (const [key, value] of Object.entries(props)) {
-    if (!(key in mergedProperties)) {
-      mergedProperties[key] = {
-        schema: value as Record<string, unknown>,
-        seenRefs,
-      };
+    if (!Object.hasOwn(mergedProperties, key)) {
+      // WHY: Define via `CreateDataProperty` rather than `[[Set]]` so `"__proto__"` and other
+      // `Object.prototype` keys become own enumerable properties even on a plain `{}` accumulator.
+      Object.defineProperty(mergedProperties, key, {
+        value: {
+          schema: value as Record<string, unknown>,
+          seenRefs,
+        },
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
   }
 }
@@ -257,7 +264,7 @@ export function collectObjectSchemaMembers(
   ctx: ConversionContext,
 ): AllOfMerge {
   const merge: AllOfMerge = {
-    properties: {},
+    properties: Object.create(null) as Record<string, MergedProperty>,
     required: new Set<string>(),
     visitedRefs: new Set<string>(),
   };

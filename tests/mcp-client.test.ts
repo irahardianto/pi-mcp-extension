@@ -10,18 +10,34 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError as SdkMcpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import {
   buildWorkspaceRoot,
   connectClientWithTimeout,
   createConnectRaceGuard,
   createMcpClient,
+  createResilientOutputSchemaValidator,
   formatServerLogNotification,
   pingClientWithTimeout,
   rethrowNormalizedConnectError,
   startHealthCheck,
 } from "../src/mcp-client.js";
+import {
+  DebugLog,
+  DEBUG_LOG_MAX_SERVER_LENGTH,
+  getDebugLog,
+  isUiActive,
+  setDebugLog,
+  setDiagnosticUi,
+} from "../src/debug-log.js";
 import { McpError, AuthCancelledError } from "../src/errors.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -572,5 +588,242 @@ describe("createMcpClient", () => {
     });
 
     assert.deepEqual(lines, ["[error] db: connection lost"]);
+  });
+
+  it("discovers and executes tools even when one tool has a non-Unicode outputSchema pattern while keeping strict validation for healthy tools (#329)", async () => {
+    await withCapturedDiagnostics(async ({ entries, notifications }) => {
+      const server = new Server(
+        { name: "test-output-schema", version: "1.0.0" },
+        { capabilities: { tools: {} } },
+      );
+      let returnBadHealthyOutput = false;
+      let omitStructuredContent = false;
+
+      server.setRequestHandler(ListToolsRequestSchema, async () => ({
+        tools: [
+          {
+            name: "output_bad_pattern",
+            inputSchema: { type: "object", properties: {} },
+            outputSchema: {
+              type: "object",
+              properties: {
+                code: { type: "string", pattern: "(?i)^[a-z]+$" },
+              },
+              required: ["code"],
+            },
+          },
+          {
+            name: "healthy_sibling",
+            inputSchema: { type: "object", properties: {} },
+            outputSchema: {
+              type: "object",
+              properties: {
+                ok: { type: "string", pattern: "^[a-z]+$" },
+              },
+              required: ["ok"],
+            },
+          },
+        ],
+      }));
+
+      server.setRequestHandler(CallToolRequestSchema, async (req) => {
+        if (req.params.name === "output_bad_pattern") {
+          if (omitStructuredContent) {
+            return { content: [{ type: "text", text: "missing" }] };
+          }
+          return {
+            content: [{ type: "text", text: "ok" }],
+            structuredContent: { code: "ABC" },
+          };
+        }
+        if (returnBadHealthyOutput) {
+          return {
+            content: [{ type: "text", text: "bad" }],
+            structuredContent: { ok: "INVALID_UPPER" },
+          };
+        }
+        return {
+          content: [{ type: "text", text: "yes" }],
+          structuredContent: { ok: "yes" },
+        };
+      });
+
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = createMcpClient({
+        serverName: "bad",
+        getCwd: () => "/tmp",
+        onToolsChanged: async () => {},
+        onResourcesChanged: () => {},
+        onLogLine: () => {},
+      });
+
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      try {
+        const listed = await client.listTools();
+        assert.deepEqual(
+          listed.tools.map((t) => t.name),
+          ["output_bad_pattern", "healthy_sibling"],
+        );
+
+        const logged = await entries();
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0]?.event, "tools.output_schema_uncompilable");
+        assert.equal(logged[0]?.server, "bad");
+        assert.equal(logged[0]?.kind, "SyntaxError");
+        assert.deepEqual(notifications, []);
+
+        const badPatternRes = await client.callTool({ name: "output_bad_pattern", arguments: {} });
+        assert.deepEqual(badPatternRes.structuredContent, { code: "ABC" });
+
+        omitStructuredContent = true;
+        await assert.rejects(
+          () => client.callTool({ name: "output_bad_pattern", arguments: {} }),
+          /has an output schema but did not return structured content/,
+        );
+
+        const healthyRes = await client.callTool({ name: "healthy_sibling", arguments: {} });
+        assert.deepEqual(healthyRes.structuredContent, { ok: "yes" });
+
+        returnBadHealthyOutput = true;
+        await assert.rejects(
+          () => client.callTool({ name: "healthy_sibling", arguments: {} }),
+          /Structured content does not match the tool's output schema/,
+        );
+      } finally {
+        await Promise.all([client.close(), server.close()]);
+      }
+    });
+  });
+});
+
+async function withCapturedDiagnostics<T>(
+  fn: (ctx: { entries: () => Promise<Array<Record<string, unknown>>>; notifications: string[] }) => Promise<T>,
+): Promise<T> {
+  const lines: string[] = [];
+  const notifications: string[] = [];
+  const prevLogger = getDebugLog();
+  const prevUiActive = isUiActive();
+  const logger = new DebugLog("/virtual/logs", {
+    now: () => new Date("2026-01-01T00:00:00.000Z"),
+    fs: {
+      mkdir: async () => undefined,
+      appendFile: async (_filePath, data) => {
+        lines.push(data);
+      },
+      stat: async () => ({ size: 0 }),
+      rename: async () => undefined,
+      chmod: async () => undefined,
+    },
+  });
+  setDebugLog(logger);
+  setDiagnosticUi(
+    {
+      notify: (message) => {
+        notifications.push(message);
+      },
+    },
+    true,
+  );
+  try {
+    return await fn({
+      entries: async () => {
+        await logger.flush();
+        return lines.map((line) => JSON.parse(line.trim()) as Record<string, unknown>);
+      },
+      notifications,
+    });
+  } finally {
+    setDebugLog(prevLogger);
+    setDiagnosticUi(null, prevUiActive);
+  }
+}
+
+describe("createResilientOutputSchemaValidator (#329)", () => {
+  it("validates compilable schemas strictly and falls back to pass-through on non-/u patterns or patternProperties", async () => {
+    await withCapturedDiagnostics(async ({ entries, notifications }) => {
+      const provider = createResilientOutputSchemaValidator("srv");
+
+      const strict = provider.getValidator<{ ok: string }>({
+        type: "object",
+        properties: { ok: { type: "string", pattern: "^[a-z]+$" } },
+        required: ["ok"],
+      });
+      assert.deepEqual(strict({ ok: "abc" }), {
+        valid: true,
+        data: { ok: "abc" },
+        errorMessage: undefined,
+      });
+      const failed = strict({ ok: "BAD" });
+      assert.equal(failed.valid, false);
+      assert.ok(failed.errorMessage);
+
+      for (const badPattern of ["(?i)^[a-z]+$", "\\A[a-z0-9-]+\\z", "^[\\w-\\.]+$", "([a-z"]) {
+        const validator = provider.getValidator({
+          type: "object",
+          properties: { code: { type: "string", pattern: badPattern } },
+        });
+        const sample = { code: "ABC" };
+        assert.deepEqual(validator(sample), {
+          valid: true,
+          data: sample,
+          errorMessage: undefined,
+        });
+      }
+
+      const badPatternProps = provider.getValidator({
+        type: "object",
+        patternProperties: { "(?i)^k_": { type: "string" } },
+      });
+      assert.deepEqual(badPatternProps({ k_1: "v" }), {
+        valid: true,
+        data: { k_1: "v" },
+        errorMessage: undefined,
+      });
+
+      const logged = await entries();
+      assert.equal(logged.length, 5);
+      for (const entry of logged) {
+        assert.equal(entry.level, "warn");
+        assert.equal(entry.event, "tools.output_schema_uncompilable");
+        assert.equal(entry.server, "srv");
+        assert.equal(entry.kind, "SyntaxError");
+      }
+      assert.deepEqual(notifications, []);
+    });
+  });
+
+  it("emits a sanitized, redacted tools.output_schema_uncompilable diagnostic and caps entry.server to DEBUG_LOG_MAX_SERVER_LENGTH", async () => {
+    await withCapturedDiagnostics(async ({ entries, notifications }) => {
+      const longServerName = "s".repeat(DEBUG_LOG_MAX_SERVER_LENGTH + 40);
+      const provider = createResilientOutputSchemaValidator(longServerName);
+      const syntheticBearer = "synthetic-bearer-value-for-test";
+      const validator = provider.getValidator({
+        type: "object",
+        properties: {
+          code: {
+            type: "string",
+            pattern: `(?i)\u001b[31mBearer ${syntheticBearer}\u001b[0m`,
+          },
+        },
+      });
+      assert.deepEqual(validator({ code: "ok" }), {
+        valid: true,
+        data: { code: "ok" },
+        errorMessage: undefined,
+      });
+
+      const logged = await entries();
+      assert.equal(logged.length, 1);
+      const entry = logged[0]!;
+      assert.equal(entry.level, "warn");
+      assert.equal(entry.event, "tools.output_schema_uncompilable");
+      assert.equal(entry.kind, "SyntaxError");
+      assert.equal(typeof entry.server, "string");
+      assert.equal((entry.server as string).length, DEBUG_LOG_MAX_SERVER_LENGTH);
+      assert.equal(typeof entry.message, "string");
+      assert.ok(!(entry.message as string).includes("\u001b"));
+      assert.ok(!(entry.message as string).includes(syntheticBearer));
+      assert.deepEqual(notifications, []);
+    });
   });
 });
