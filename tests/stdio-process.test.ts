@@ -10,6 +10,7 @@ import {
   createLineSplitter,
   destroyStdioStreams,
   ensurePidTerminated,
+  getStdioSpawnError,
   indexProcessTable,
   instrumentStdioTransport,
   isPidAlive,
@@ -433,6 +434,60 @@ setInterval(() => {}, 1000);
         }
         await rm(dir, { recursive: true, force: true });
       }
+    });
+
+    it("captures non-retryable spawn errnos even on pid-less processes and deduplicates listeners", async () => {
+      assert.equal(getStdioSpawnError(null), undefined);
+      assert.equal(getStdioSpawnError(undefined), undefined);
+
+      const procWithoutPid = new EventEmitter() as EventEmitter & { pid?: number };
+      const fakeTransport = {
+        _process: undefined as (EventEmitter & { pid?: number }) | undefined,
+        pid: null,
+        stderr: null,
+        start(): Promise<void> {
+          fakeTransport._process = procWithoutPid;
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+
+      instrumentStdioTransport(fakeTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: () => {},
+      });
+      await fakeTransport.start();
+
+      // Even without a pid, the error listener was attached exactly once.
+      assert.equal(procWithoutPid.listenerCount("error"), 1);
+      const enoent = Object.assign(new Error("spawn uvx ENOENT"), { code: "ENOENT" });
+      procWithoutPid.emit("error", enoent);
+      assert.equal(getStdioSpawnError(fakeTransport), enoent);
+
+      // Non-spawn errors (e.g. generic runtime errors) are not captured as spawn failures.
+      const procWithPid = new EventEmitter() as EventEmitter & { pid?: number };
+      procWithPid.pid = 8181;
+      const otherTransport = {
+        _process: procWithPid,
+        pid: 8181,
+        stderr: null,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+      instrumentStdioTransport(otherTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: () => {},
+      });
+      await otherTransport.start();
+      assert.equal(procWithPid.listenerCount("error"), 1);
+      procWithPid.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+      assert.equal(getStdioSpawnError(otherTransport), undefined);
     });
   });
 
@@ -1538,7 +1593,7 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     const baseSigint = process.listenerCount("SIGINT");
     const baseExit = process.listenerCount("exit");
 
-    // Plain fake PID stub must NEVER attach OS signal listeners.
+    // Plain and duck-typed EventEmitter fake PID stubs must NEVER attach OS signal listeners.
     const fakeTransport = {
       _process: { pid: 4242 },
       pid: 4242,
@@ -1548,6 +1603,24 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     } as unknown as StdioClientTransport;
     instrumentStdioTransport(fakeTransport, { onPid: () => {}, onStderrLine: () => {} });
     await fakeTransport.start();
+    assert.equal(process.listenerCount("SIGINT"), baseSigint);
+    assert.equal(process.listenerCount("exit"), baseExit);
+
+    const duckTypedProc = Object.assign(new EventEmitter(), {
+      pid: 4243,
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    });
+    const duckTypedTransport = {
+      _process: duckTypedProc,
+      pid: 4243,
+      stderr: null,
+      start: async () => {},
+      close: async () => {},
+    } as unknown as StdioClientTransport;
+    instrumentStdioTransport(duckTypedTransport, { onPid: () => {}, onStderrLine: () => {} });
+    await duckTypedTransport.start();
     assert.equal(process.listenerCount("SIGINT"), baseSigint);
     assert.equal(process.listenerCount("exit"), baseExit);
 

@@ -19,6 +19,7 @@
  */
 
 import { basename } from "node:path";
+import { getStdioSpawnError } from "./stdio-process.js";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -188,7 +189,12 @@ export async function connectClientWithTimeout(
   try {
     await Promise.race([connectPromise, guard.outcome]);
   } catch (err) {
-    rethrowNormalizedConnectError(err, signal, serverName, timeoutMs);
+    rethrowNormalizedConnectError(
+      getStdioSpawnError(transport) ?? err,
+      signal,
+      serverName,
+      timeoutMs,
+    );
   } finally {
     guard.dispose();
   }

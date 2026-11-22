@@ -8,12 +8,12 @@
  * cleanup with injectable process/timer dependencies.
  */
 
-import { execFile } from "node:child_process";
+import { ChildProcess, execFile } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import type { ChildProcess } from "node:child_process";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { isNonRetryableStdioSpawnError } from "./connect-policy.js";
 import {
   listDescendantPidsSync,
   StdioExitGuard,
@@ -114,6 +114,38 @@ interface StdioChildRecord {
  * keeps both reachable without pinning a closed transport in memory.
  */
 const childRecords = new WeakMap<object, StdioChildRecord>();
+const stdioSpawnErrors = new WeakMap<object, Error>();
+const spawnErrorObservedProcs = new WeakSet<object>();
+
+function attachSpawnErrorCapture(
+  transport: object,
+  proc: ChildProcess | undefined,
+): void {
+  if (!proc || typeof proc.once !== "function" || spawnErrorObservedProcs.has(proc)) {
+    return;
+  }
+  spawnErrorObservedProcs.add(proc);
+  proc.once("error", (err: unknown) => {
+    if (err instanceof Error && isNonRetryableStdioSpawnError("stdio", err)) {
+      stdioSpawnErrors.set(transport, err);
+    }
+  });
+}
+
+/**
+ * Return any deterministic non-retryable stdio spawn error captured on `transport`'s child process.
+ *
+ * WHY: On Windows, `StdioClientTransport.start()` uses `cross-spawn`, which wraps
+ * non-`.exe`/`.com` commands (like `uvx` or `missing-pi-mcp-executable-335`) in
+ * `cmd.exe /d /s /c "..."`. Because `cmd.exe` spawns, `transport.start()` resolves on
+ * `'spawn'` and `Client.connect()` sends `initialize`; when `cmd.exe` exits with status 1,
+ * `cross-spawn` hooks `'exit'` and emits `'error'` (`ENOENT`) on the `ChildProcess`
+ * asynchronously right before `'close'` causes SDK `Protocol._onclose()` to reject
+ * `initialize` with `McpError(-32000, "MCP error -32000: Connection closed")`.
+ */
+export function getStdioSpawnError(transport: object | null | undefined): Error | undefined {
+  return transport ? stdioSpawnErrors.get(transport) : undefined;
+}
 
 /** A transport whose child stderr can be wired and whose `close()` can be wrapped. */
 interface StderrCarrier {
@@ -193,7 +225,7 @@ export function instrumentStderr(
 function isLiveChildProcess(
   proc: ChildProcess | undefined,
 ): proc is ChildProcess & { pid: number } {
-  if (!proc || typeof proc.once !== "function" || typeof proc.kill !== "function") {
+  if (!(proc instanceof ChildProcess)) {
     return false;
   }
   return (
@@ -208,6 +240,7 @@ function registerChildRecord(
   proc: ChildProcess,
   flushStderr: (() => void) | null,
 ): void {
+  attachSpawnErrorCapture(transport, proc);
   const trackedPid = isLiveChildProcess(proc) ? proc.pid : undefined;
   const record: StdioChildRecord = {
     process: proc,
@@ -250,6 +283,7 @@ export function instrumentStdioTransport(
   const flushStderr = instrumentStderr(transport, onStderrLine);
 
   const recordProcess = (proc: ChildProcess | undefined): void => {
+    attachSpawnErrorCapture(transport, proc);
     if (!proc?.pid) return;
     if (!childRecords.has(transport)) {
       registerChildRecord(transport, proc, flushStderr);

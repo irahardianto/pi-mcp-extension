@@ -5,6 +5,8 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ServerManager } from "../src/server-manager.js";
 import {
   classifyConnectFailure,
@@ -2414,6 +2416,89 @@ describe("fast-fail deterministic stdio spawn errors (#335)", () => {
       assert.equal(srv.state, "stopped");
     } finally {
       await realManager.shutdownAll();
+    }
+  });
+
+  it("fast-fails on attempt 1 with unwrapped ENOENT when Windows cross-spawn wrapper resolves start() then emits ENOENT before close (#335)", async (t) => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 5 };
+    const manager = new ServerManager({
+      settings,
+      mcpServers: {
+        "win-cross-spawn": {
+          command: "missing-pi-mcp-executable-335",
+          args: [],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+
+    const enoentError = Object.assign(
+      new Error("spawn missing-pi-mcp-executable-335 ENOENT"),
+      {
+        code: "ENOENT",
+        errno: -2,
+        syscall: "spawn missing-pi-mcp-executable-335",
+        path: "missing-pi-mcp-executable-335",
+      },
+    );
+
+    let createTransportCalls = 0;
+    t.mock.method(manager, "createTransport", () => {
+      createTransportCalls += 1;
+      const transport = new StdioClientTransport({
+        command: "missing-pi-mcp-executable-335",
+        args: [],
+        stderr: "pipe",
+      });
+      const fakeProc = Object.assign(new EventEmitter(), {
+        pid: 43210 + createTransportCalls,
+        exitCode: null as number | null,
+        signalCode: null,
+      });
+
+      // Simulate Windows cross-spawn: cmd.exe spawns (start() resolves), initialize is sent,
+      // then cmd.exe exits with 1 -> cross-spawn emits ENOENT right before close triggers -32000.
+      transport.start = async () => {
+        (transport as unknown as { _process: unknown })._process = fakeProc;
+        fakeProc.on("error", (err) => {
+          transport.onerror?.(err as Error);
+        });
+        fakeProc.on("close", () => {
+          (transport as unknown as { _process: undefined })._process = undefined;
+          transport.onclose?.();
+        });
+      };
+      transport.send = async () => {
+        queueMicrotask(() => {
+          fakeProc.exitCode = 1;
+          fakeProc.emit("error", enoentError);
+          fakeProc.emit("close", 1);
+        });
+      };
+      transport.close = async () => {
+        (transport as unknown as { _process: undefined })._process = undefined;
+      };
+      return transport;
+    });
+
+    try {
+      await assert.rejects(
+        () => manager.startServer("win-cross-spawn", process.cwd()),
+        (err: unknown) => {
+          assert.equal(err instanceof McpError, false);
+          assert.equal(err, enoentError);
+          assert.equal((err as NodeJS.ErrnoException).code, "ENOENT");
+          return true;
+        },
+      );
+      assert.equal(createTransportCalls, 1);
+      const srv = manager.getServer("win-cross-spawn");
+      assert.equal(srv?.retryCount, 0);
+      assert.equal(srv?.state, "stopped");
+      assert.equal(srv?.lastError, enoentError);
+    } finally {
+      await manager.shutdownAll();
     }
   });
 });
