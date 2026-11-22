@@ -5,9 +5,12 @@ import { callbackServerConfigFromRedirectUrl } from "./callback-url.js";
 import {
   discoverManualAuthChallenge,
   createHeadersFetch,
+  resolveAuthorizeChallenge,
   stripAuthorizationHeader,
   type ManualAuthChallenge,
+  type PendingAuthChallenge,
 } from "./auth-challenge.js";
+import { urlsMatch } from "./oauth-policy.js";
 import { acquireAuthLock, type AuthLockHandle } from "./auth-lock.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import { McpError, AuthCancelledError, AuthLockError } from "./errors.js";
@@ -164,6 +167,35 @@ function reportCorruptOAuthState(serverName: string, err: McpError): void {
     message,
     fields: { kind },
   });
+}
+
+function readPendingChallenge(
+  deps: AuthorizeDeps,
+  serverName: string,
+  serverUrl: string,
+  reset: boolean,
+): PendingAuthChallenge | undefined {
+  if (reset) return undefined;
+  const pending = deps.manager.getPendingAuthChallenge?.(serverName);
+  if (!pending || !urlsMatch(pending.serverUrl, serverUrl)) return undefined;
+  return pending;
+}
+
+async function readStoredTokenScopeForStepUp(
+  authProvider: McpOAuthProvider,
+  pending: PendingAuthChallenge | undefined,
+  serverName: string,
+): Promise<string | undefined> {
+  if (pending?.error !== "insufficient_scope" || pending.grantedScope) {
+    return undefined;
+  }
+  try {
+    return (await authProvider.tokens())?.scope;
+  } catch (err) {
+    if (!isCorruptOAuthStateError(err)) throw err;
+    reportCorruptOAuthState(serverName, err);
+    return undefined;
+  }
 }
 
 function notifyAuthorizationSucceeded(ctx: ExtensionContext, serverName: string): void {
@@ -516,6 +548,14 @@ export async function authorize(
       onAuthRequired: launchAuthorizationBrowser,
     });
 
+    const pendingChallenge = readPendingChallenge(deps, serverName, serverUrl, reset);
+    const storedTokenScope = await readStoredTokenScopeForStepUp(
+      authProvider,
+      pendingChallenge,
+      serverName,
+    );
+    assertActive();
+
     if (!reset) {
       await clearStoredTokensBeforeInteractiveAuth(authProvider, serverName);
       assertActive();
@@ -532,13 +572,19 @@ export async function authorize(
     // authorization server is usually a different origin.
     const staticHeaders = stripAuthorizationHeader(config.headers);
 
-    const authChallenge = await discoverChallengeWithFallback({
+    const discoveredChallenge = await discoverChallengeWithFallback({
       serverName,
       serverUrl,
       headers: staticHeaders,
       signal,
     });
     assertActive();
+    const authChallenge = resolveAuthorizeChallenge({
+      configuredScope: config.auth?.scope,
+      pending: pendingChallenge,
+      discovered: discoveredChallenge,
+      storedTokenScope,
+    });
 
     const callbackPromise = registerCallbackPromise(callbackServer, oauthState);
     const customFetch = staticHeaders ? createHeadersFetch(staticHeaders) : undefined;
@@ -581,6 +627,7 @@ export async function authorize(
     }
 
     assertActive();
+    deps.manager.clearPendingAuthChallenge?.(serverName);
     reportDiagnostic({
       level: "info",
       event: "auth.completed",

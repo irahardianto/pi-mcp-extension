@@ -18,6 +18,12 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { AuthCancelledError, AuthRequiredError, McpError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { getAuthStatus, invalidateStoredTokens, resetAuth } from "./oauth-status.js";
+import {
+  mergePendingAuthChallenge,
+  withGrantedScope,
+  type CapturedAuthChallenge,
+  type PendingAuthChallenge,
+} from "./auth-challenge.js";
 import type { ToolRefreshOptions } from "./tool-bridge.js";
 import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
@@ -86,6 +92,8 @@ export interface ManagedServer {
   generation?: number;
   /** Timestamp of the last state transition — used for the debug log's `ms` field. */
   stateSince?: number | undefined;
+  /** Latest captured OAuth 401/403 WWW-Authenticate challenge for interactive step-up. */
+  pendingAuthChallenge?: PendingAuthChallenge | undefined;
 }
 
 /** Called after tool list is refreshed for a server (e.g. on list_changed notification). */
@@ -197,8 +205,22 @@ export class ServerManager {
     });
   }
 
-  createTransport(name: string, config: ServerConfig, cwd?: string): Transport {
-    return createTransport(name, config, cwd, this.storageDir, cwd);
+  createTransport(
+    name: string,
+    config: ServerConfig,
+    cwd?: string,
+    onAuthChallenge?: (challenge: CapturedAuthChallenge) => void,
+  ): Transport {
+    return createTransport(name, config, cwd, this.storageDir, { cwd, onAuthChallenge });
+  }
+
+  getPendingAuthChallenge(name: string): PendingAuthChallenge | undefined {
+    return this.servers.get(name)?.pendingAuthChallenge;
+  }
+
+  clearPendingAuthChallenge(name: string): void {
+    const server = this.servers.get(name);
+    if (server) server.pendingAuthChallenge = undefined;
   }
 
   getServer(name: string): ManagedServer | undefined {
@@ -249,6 +271,7 @@ export class ServerManager {
 
   /** Reset OAuth credentials for a server, forcing re-authorization on next connect. */
   async resetServerAuth(name: string): Promise<void> {
+    this.clearPendingAuthChallenge(name);
     await resetAuth(name, this.storageDir);
   }
 
@@ -295,7 +318,9 @@ export class ServerManager {
     // synchronously and cancels any concurrent _recover() microtask queued by client.onerror.
     await this._shutdown(server);
     server.lastError = authError;
-    await invalidateStoredTokens(name, this.storageDir, server.config.url);
+    await invalidateStoredTokens(name, this.storageDir, server.config.url, (scope) => {
+      server.pendingAuthChallenge = withGrantedScope(server.pendingAuthChallenge, scope);
+    });
     server.lastError = authError;
     return authError;
   }
@@ -418,7 +443,12 @@ export class ServerManager {
   private _createAndInstrumentTransport(server: ManagedServer, cwd: string): Transport {
     let transport: Transport;
     try {
-      transport = this.createTransport(server.name, server.config, cwd);
+      transport = this.createTransport(server.name, server.config, cwd, (challenge) => {
+        server.pendingAuthChallenge = mergePendingAuthChallenge(
+          server.pendingAuthChallenge,
+          challenge,
+        );
+      });
     } catch (err) {
       this._setState(server, "stopped", "transport");
       server.lastError = err instanceof Error ? err : new Error(String(err));
@@ -568,6 +598,7 @@ export class ServerManager {
     this._setState(server, "ready");
     server.retryCount = 0;
     server.lastError = null;
+    server.pendingAuthChallenge = undefined;
     // WHY: Fire only after the server is observably ready with a cleared lastError, so a
     // listener that repaints session state never sees a half-transitioned server.
     this.onServerReady?.(server.name);
@@ -872,7 +903,9 @@ export class ServerManager {
   ): Promise<never> {
     server.lastError = err instanceof Error ? err : new Error(String(err));
     if (invalidateTokens) {
-      await invalidateStoredTokens(server.name, this.storageDir, server.config.url);
+      await invalidateStoredTokens(server.name, this.storageDir, server.config.url, (scope) => {
+        server.pendingAuthChallenge = withGrantedScope(server.pendingAuthChallenge, scope);
+      });
     }
     const authError = err instanceof AuthRequiredError ? err : new AuthRequiredError(server.name);
     server.lastError = authError;

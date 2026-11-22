@@ -16,11 +16,21 @@ import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.
 import { McpError } from "./errors.js";
 import type { ServerConfig } from "./config.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
-import { isAuthorizationHeader, stripAuthorizationHeader } from "./auth-challenge.js";
+import {
+  createChallengeCaptureFetch,
+  isAuthorizationHeader,
+  stripAuthorizationHeader,
+  type CapturedAuthChallenge,
+} from "./auth-challenge.js";
 import { reportDiagnostic } from "./debug-log.js";
 import { instrumentStderr } from "./stdio-process.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import { instrumentTransportMessageOrder } from "./transport-order.js";
+
+export interface CreateTransportOptions {
+  cwd?: string | undefined;
+  onAuthChallenge?: ((challenge: CapturedAuthChallenge) => void) | undefined;
+}
 
 function resolveEnv(extra?: Record<string, string>): Record<string, string> {
   // Build clean env: process.env may contain undefined values,
@@ -44,7 +54,7 @@ function createOAuthProvider(
   serverName: string,
   config: ServerConfig,
   storageDir?: string,
-): OAuthClientProvider | undefined {
+): McpOAuthProvider | undefined {
   if (!config.auth || config.transport === "stdio") return undefined;
   // Silent transport attempts must not write PKCE or launch a browser.
   return new McpOAuthProvider({
@@ -54,6 +64,23 @@ function createOAuthProvider(
     mode: "silent",
     serverUrl: config.url,
   });
+}
+
+function resolveChallengeFetch(
+  config: ServerConfig,
+  authProvider: McpOAuthProvider | undefined,
+  onAuthChallenge: ((challenge: CapturedAuthChallenge) => void) | undefined,
+): typeof fetch | undefined {
+  if (!config.auth || !config.url || !onAuthChallenge) return undefined;
+  return createChallengeCaptureFetch(
+    config.url,
+    (challenge) =>
+      onAuthChallenge({
+        ...challenge,
+        grantedScope: authProvider?.getLastTokenScope(),
+      }),
+    { rejectInsufficientScope: config.transport === "sse" },
+  );
 }
 
 /**
@@ -117,12 +144,14 @@ function createStreamableHttpTransport(
   config: ServerConfig,
   requestInit: RequestInit | undefined,
   authProvider: OAuthClientProvider | undefined,
+  fetchFn?: typeof fetch,
 ): Transport {
   return new StreamableHTTPClientTransport(
     new URL(config.url!),
     {
       ...(requestInit && { requestInit }),
       ...(authProvider && { authProvider }),
+      ...(fetchFn && { fetch: fetchFn }),
       // WHY: Disable internal SDK SSE stream retries so unexpected disconnects
       // immediately surface to ServerManager._recover() for deterministic backoff.
       reconnectionOptions: {
@@ -139,12 +168,14 @@ function createSseTransport(
   config: ServerConfig,
   requestInit: RequestInit | undefined,
   authProvider: OAuthClientProvider | undefined,
+  fetchFn?: typeof fetch,
 ): Transport {
   const transport = new SSEClientTransport(
     new URL(config.url!),
     {
       ...(requestInit && { requestInit }),
       ...(authProvider && { authProvider }),
+      ...(fetchFn && { fetch: fetchFn }),
     },
   );
   // WHY: SSEClientTransport.start() awaits the initial `event: endpoint` SSE frame,
@@ -185,8 +216,10 @@ export function createTransport(
   config: ServerConfig,
   cwdOrOnStderr?: string | ((line: string) => void),
   storageDir?: string,
-  cwdArg?: string,
+  cwdOrOptions?: string | CreateTransportOptions,
 ): Transport {
+  const options = typeof cwdOrOptions === "object" && cwdOrOptions !== null ? cwdOrOptions : undefined;
+  const cwdArg = typeof cwdOrOptions === "string" ? cwdOrOptions : options?.cwd;
   const cwd = typeof cwdOrOnStderr === "string" ? cwdOrOnStderr : cwdArg;
   const onStderr = typeof cwdOrOnStderr === "function" ? cwdOrOnStderr : undefined;
   // WHY: with OAuth configured the SDK owns `Authorization` (see stripAuthorizationHeader);
@@ -202,6 +235,7 @@ export function createTransport(
   }
   const requestInit = createRequestInit(staticHeaders);
   const authProvider = createOAuthProvider(serverName, config, storageDir);
+  const challengeFetch = resolveChallengeFetch(config, authProvider, options?.onAuthChallenge);
 
   switch (config.transport) {
     case "stdio":
@@ -212,12 +246,12 @@ export function createTransport(
     case "streamable-http":
       return instrumentTransportMessageOrder(
         serverName,
-        createStreamableHttpTransport(config, requestInit, authProvider),
+        createStreamableHttpTransport(config, requestInit, authProvider, challengeFetch),
       );
     case "sse":
       return instrumentTransportMessageOrder(
         serverName,
-        createSseTransport(config, requestInit, authProvider),
+        createSseTransport(config, requestInit, authProvider, challengeFetch),
       );
   }
 }

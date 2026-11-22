@@ -309,6 +309,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return toOAuthTokens(storedTokens);
   }
 
+  /** Scope string from the most recently read or saved tokens on this provider instance. */
+  getLastTokenScope(): string | undefined {
+    return this._lastReadTokens?.scope;
+  }
+
   // --- saveTokens ---
 
   private async _saveTokensSilent(storedTokens: StoredTokens): Promise<void> {
