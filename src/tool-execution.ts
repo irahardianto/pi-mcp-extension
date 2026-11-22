@@ -1,12 +1,12 @@
 /**
  * Stateless MCP `tools/call` execution, `notifications/progress` formatting and
- * deduplication (#254), failure normalization (#209), and Pi `ToolDefinition`
- * construction for pi-mcp.
+ * deduplication (#254), failure normalization (#209), Pi 1.3.0 structured `CallToolResult`
+ * error/result conversion (#257), and Pi `ToolDefinition` construction for pi-mcp.
  */
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, type Progress } from "@modelcontextprotocol/sdk/types.js";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition, ToolNamespace } from "@earendil-works/pi-coding-agent";
 import { isCancellationError, isOAuthUnauthorizedError, isSdkTimeoutError } from "./connect-policy.js";
 import { McpError } from "./errors.js";
 import { convertJsonSchemaToTypebox } from "./schema-convert.js";
@@ -14,13 +14,17 @@ import { redactSecrets } from "./secret-redaction.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import {
   buildToolAnnotations,
-  buildToolCallContent,
+  buildToolCallOutcome,
   buildToolDescription,
-  toolErrorText,
   type ToolCallOutcome,
-  type ToolCallResponse,
 } from "./tool-content.js";
 import type { McpToolDefinition } from "./tool-discovery.js";
+import { toPiToolExposure, type McpExposure } from "./tool-exposure.js";
+import {
+  buildMcpResultSchema,
+  supportsToolErrorResult,
+  type ToolCallResponse,
+} from "./tool-result.js";
 
 /** Pi's partial-result callback — the `onUpdate` argument of a tool's `execute`. */
 export type ToolUpdateCallback = (update: ToolCallOutcome) => void;
@@ -28,10 +32,11 @@ export type ToolUpdateCallback = (update: ToolCallOutcome) => void;
 /** Callback notified when a mid-session `tools/call` fails with an OAuth 401/403 challenge. */
 export type ToolAuthErrorHandler = (serverName: string, error: unknown) => Promise<void> | void;
 
-/** Per-call streaming and cancellation options for one `tools/call`. */
+/** Per-call streaming, cancellation, and structured error-envelope options for one `tools/call`. */
 export interface ToolCallOptions {
   signal?: AbortSignal | undefined;
   onUpdate?: ToolUpdateCallback | undefined;
+  supportsErrorResult?: boolean | undefined;
 }
 
 /** Input for running a single MCP `tools/call` and converting its result for Pi. */
@@ -43,6 +48,8 @@ export interface ExecuteMcpToolCallOptions {
   timeoutMs: number;
   signal?: AbortSignal | undefined;
   onUpdate?: ToolUpdateCallback | undefined;
+  supportsErrorResult?: boolean | undefined;
+  assertCallable?: (() => void) | undefined;
 }
 
 /** Input for constructing a Pi `ToolDefinition` backed by an MCP server tool. */
@@ -51,7 +58,10 @@ export interface CreatePiToolDefinitionOptions {
   serverName: string;
   tool: McpToolDefinition;
   client: Client;
+  exposure: McpExposure;
+  namespace: ToolNamespace;
   getTimeoutMs: () => number;
+  assertCallable?: (() => void) | undefined;
   onAuthError?: ToolAuthErrorHandler | undefined;
 }
 
@@ -173,20 +183,36 @@ export async function rethrowToolCallError(
 }
 
 /**
- * Run one `tools/call`: dispatch through the SDK client, convert the result
- * into Pi content blocks, and surface `isError` as `McpError(..., "tool")`.
+ * Run one `tools/call`: guard against disconnected/withdrawn/hidden tools, dispatch through
+ * the SDK client, and convert the MCP response into Pi's tool outcome (preserving structured
+ * `isError` envelopes on Pi 1.3.0+ and throwing `McpError("tool")` on older runtimes).
  */
 export async function executeMcpToolCall(
   options: ExecuteMcpToolCallOptions,
 ): Promise<ToolCallOutcome> {
-  const { serverName, toolName, client, params, timeoutMs, signal, onUpdate } = options;
+  const {
+    serverName,
+    toolName,
+    client,
+    params,
+    timeoutMs,
+    signal,
+    onUpdate,
+    supportsErrorResult,
+    assertCallable,
+  } = options;
+  assertCallable?.();
   if (signal?.aborted) {
     throw new McpError("Tool execution cancelled", serverName, "protocol");
   }
 
   let result: ToolCallResponse;
   try {
-    result = await callToolWithClient(client, toolName, params, timeoutMs, { signal, onUpdate });
+    result = await callToolWithClient(client, toolName, params, timeoutMs, {
+      signal,
+      onUpdate,
+      supportsErrorResult,
+    });
   } catch (err) {
     // WHY: an abort mid-call is rejected by the SDK with its RequestTimeout error, so the
     // cancellation has to be recognised here — otherwise a caller cancellation is reported
@@ -196,35 +222,36 @@ export async function executeMcpToolCall(
     }
     throw err;
   }
-  const content = buildToolCallContent(result);
-
-  // Tool execution errors (isError: true) — distinct from protocol errors
-  if (result.isError) {
-    throw new McpError(toolErrorText(content) || "Tool reported an error", serverName, "tool");
-  }
-
-  return { content, details: {} };
+  return buildToolCallOutcome(result, serverName, supportsErrorResult ?? false);
 }
 
 /** Construct a Pi `ToolDefinition` backed by one discovered MCP tool. */
 export function createPiToolDefinition(options: CreatePiToolDefinitionOptions): ToolDefinition {
-  const { piName, serverName, tool, client } = options;
+  const { piName, serverName, tool, client, exposure, namespace } = options;
   const annotations = tool.annotations;
   const description = buildToolDescription(tool, annotations);
   const toolAnnotations = buildToolAnnotations(annotations);
   // WHY: `execute` runs with `this` bound to the registered-tool literal rather than the
-  // caller, and both timeout settings (`updateSettings`) and auth handlers
-  // (`setAuthErrorCallback`) can change after registration, so read `options.getTimeoutMs()`
-  // and `options.onAuthError` dynamically at call time.
+  // caller, and timeout settings (`updateSettings`), callability guards, and auth handlers
+  // (`setAuthErrorCallback`) can change after registration, so read them via `options` at call time.
   return {
     name: piName,
     label: annotations?.title ?? tool.name,
     description,
     promptSnippet: description.slice(0, 120),
     parameters: convertJsonSchemaToTypebox(tool.inputSchema),
+    outputSchema: buildMcpResultSchema(tool.outputSchema),
+    exposure: toPiToolExposure(exposure),
+    namespace,
+    // WHY: explicit belt-and-suspenders alongside `exposure` — older Pi 1.x runtimes do not
+    // inspect `exposure`, and when a `--tools` allowlist explicitly matches `<prefix>_*`,
+    // `_reconcileActiveTools` still keeps non-`direct` tools inactive until `tool_search` loads
+    // them (note: Pi 1.3.0's `isMcpToolName()` only auto-exempts `mcp__*`, so `--tools` callers
+    // must include `<prefix>_*` for single-underscore MCP tools to stay registered).
+    ...(exposure === "direct" ? {} : { defaultActive: false }),
     ...(toolAnnotations ? { annotations: toolAnnotations } : {}),
 
-    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       try {
         return await executeMcpToolCall({
           serverName,
@@ -234,10 +261,25 @@ export function createPiToolDefinition(options: CreatePiToolDefinitionOptions): 
           timeoutMs: options.getTimeoutMs(),
           signal,
           onUpdate,
+          supportsErrorResult: supportsToolErrorResult(ctx),
+          assertCallable: options.assertCallable,
         });
       } catch (err) {
         return await rethrowToolCallError(serverName, err, options.onAuthError);
       }
     },
+  };
+}
+
+/**
+ * Return a `hidden` copy of `existing` (`defaultActive: false`) so `tool_search` and `codemode`
+ * stop exposing a disconnected or withdrawn tool, or `undefined` when already `"hidden"`.
+ */
+export function toHiddenToolDefinition(existing: ToolDefinition): ToolDefinition | undefined {
+  if (existing.exposure === "hidden") return undefined;
+  return {
+    ...existing,
+    exposure: "hidden",
+    defaultActive: false,
   };
 }

@@ -60,9 +60,10 @@ flowchart TD
   constructs the collaborators, and registers
   `session_start` / `mcp_servers_change` / `session_tree` / `input` / `before_agent_start` /
   `tool_execution_end` / `before_provider_request` / `session_shutdown`, the `/mcp*`
-  commands, and the `mcp_status` / `mcp_connect` / `mcp_list_resources` / `mcp_read_resource`
-  tools. It registers them even when bootstrap config loading fails, so a later
-  `session_start` in another directory can still load a valid project config.
+  commands, and the `mcp_status` / `mcp_connect` (`exposure: "model-only"`) and
+  `mcp_list_resources` / `mcp_read_resource` tools. It registers them even when bootstrap
+  config loading fails, so a later `session_start` in another directory can still load a
+  valid project config.
 - **SessionLifecycle** owns the epoch-guarded state machine and serialized reconcile queue
   for `session_start`, `mcp_servers_change`, and `session_shutdown`, merging global and
   trusted project `mcp.json` files with dynamically registered extension servers and tracking
@@ -72,7 +73,40 @@ flowchart TD
 - **ToolBridge** turns `tools/list` (`discoverServerTools()`) into Pi tools
   (`createPiToolDefinition()`, `executeMcpToolCall()`) and keeps them active/inactive as the
   server connects and disconnects (`planServerToolBatch()`, `reconcileLiveRefreshState()`,
-  `planActiveToolReconciliation()`). Each reconcile writes the active set once, with the
+  `mergePendingRestoredTools()`, `planActiveToolReconciliation()`). Each tool's exposure is
+  resolved from the server entry's `exposure` / `toolExposure` (`src/tool-exposure.ts`: exact
+  raw-name key, then the first `*` pattern in declaration order, then the server default
+  `direct`), attached to a sanitized, peer-disambiguated per-server `ToolNamespace`
+  (`src/tool-namespace.ts`: `description` + MCP handshake `instructions`, re-synced across
+  connected peers via `syncServerNamespaces()` when servers are added or removed), and given
+  a `CallToolResult` `outputSchema` (`src/tool-result.ts`: `buildMcpResultSchema()` with
+  relocated `#/properties/structuredContent` `$ref`s) plus `structuredContent`
+  (`buildMcpScriptResult()` without `_meta`) so `codemode` scripts receive raw MCP content
+  blocks, typed return values, and on Pi 1.3.0+ (`supportsToolErrorResult(ctx)`) structured
+  `{ content, structuredContent, isError: true }` tool-error envelopes while older Pi `< 1.3.0`
+  runtimes still reject with `McpError(..., "tool")`. Only `direct` tools enter the active set by default, plus any
+  non-`hidden` indirect tools (`deferred` / `codemode`) that Pi 1.3.0 activated out of
+  `AgentSession._pendingToolNames` during `registerTool` (`mergePendingRestoredTools()`, so
+  sequential multi-server connects preserve restored active tools across `--continue`,
+  `/resume`, `/fork`, `/tree`, and `/reload`); `deferred` and `codemode` both register on Pi
+  as `deferred` so `codemode`'s own tool description never mutates mid-session with inlined
+  MCP schemas, while reaching `codemode` (when `autoEnableCodemode !== false`) and
+  `tool_search` tools are pre-activated at session start / server-config change across
+  enabled and connected indirect servers (`collectRequiredDiscoveryExposures()`), assessed
+  against Pi's `--tools` / `--exclude-tools` filter (`assessRegisteredServerExposures()`),
+  ensured on tool refreshes (`ensureDiscoveryTools()`), and restored on `session_tree`
+  without re-activating inactive `direct` tools; `before_agent_start` populates
+  `systemPromptOptions.sections["mcp_servers"]` (`renderMcpServersSection()`) with matching
+  peer-disambiguated namespace headers and symmetric `codemode` ↔ `tool_search` fallback (or
+  omits it when neither reaching tool is active) so the model sees indirect MCP domains,
+  reach modes, and `mcp_connect` hints for disconnected servers (omitting disconnected
+  servers when `mcp_connect` itself is filtered out of active tools). `hidden` tools are
+  registered inactive and never exposed; stopping/removing/withdrawing a tool snapshots
+  `activeTools` before re-registering it as `hidden` (`toHiddenToolDefinition()`) and guards
+  `execute` against stale calls, except during `session_shutdown` with `reason === "reload"`
+  (`setReloadShutdown()`), where the outgoing runner keeps active MCP tools and non-`hidden`
+  definitions intact so `AgentSession.reload()` snapshots them into `_pendingToolNames` while
+  still rejecting stale calls (#257). Each reconcile writes the active set once, with the
   bridge's tools sorted by Pi name among the slots they occupy and every other extension's
   tool left at its position; `orderActiveTools()` re-applies that order without re-activating
   inactive tools on `session_tree` (when `/tree` restores active tools from transcript
@@ -141,13 +175,15 @@ what to do:
 While `ready`, three independent recovery paths exist:
 
 - `notifications/tools/list_changed` → `ToolBridge.refreshTools()` re-discovers tools via
-  `discoverServerTools()`, re-registers the server's tools (`planServerToolBatch()`,
-  `createPiToolDefinition()`), and reconciles live activation via
-  `reconcileLiveRefreshState()` and `planActiveToolReconciliation()` — deactivating ones the
-  server no longer advertises (remembering whether Pi had each active) and activating only
-  tools the server did not expose before, leaving the active/inactive state of tools Pi
-  already knew about alone because another extension or a user policy may have removed them,
-  and restoring a tool that reappears to the state it left in;
+  `discoverServerTools()`, re-registers the server's current tools (`planServerToolBatch()`,
+  `createPiToolDefinition()`), hides and deactivates tools the server no longer advertises
+  (`toHiddenToolDefinition()`, remembering whether Pi had each active), and reconciles live
+  activation via `reconcileLiveRefreshState()` and `planActiveToolReconciliation()` —
+  activating newly discovered `direct` tools and existing tools promoted into `direct`,
+  deactivating tools narrowed out of `direct` or set `hidden`, preserving the
+  active/inactive state of tools whose exposure class did not cross `direct` (such as
+  policies that deactivated a `direct` tool or `tool_search` loading a `deferred` tool), and
+  restoring a re-advertised tool when compatible with its current exposure;
   `notifications/resources/list_changed` → `ResourceBridge.invalidate()` marks the
   server's cached resource catalog stale so the next listing re-fetches it.
 - an opt-in **health check** timer pings at `healthCheckIntervalMs`; pings never overlap,
@@ -432,8 +468,9 @@ Behavior:
   Pi's `/mcp` writes it (`{ "internal-tools": { "enabled": false } }`). The override is
   applied to the **raw** global entry before validation, so the global `command`/`url`,
   headers, and OAuth config are kept and the project only changes `enabled`,
-  `lifecycle`, `exposure`, or `toolExposure` (`exposure` / `toolExposure` are Pi-native
-  and ignored here). An override with any other key, or for a name no global file
+  `lifecycle`, `exposure`, or `toolExposure` (the two Pi-native exposure keys are honored
+  by the tool bridge, so a project can narrow what the agent sees without restating the
+  global credentials). An override with any other key, or for a name no global file
   defines, is a config error naming the file and the server.
 - **Pi 1.x aliases** are normalized before validation: `type` → `transport`, `"http"` →
   `"streamable-http"`, `oauth` → `auth`, `timeout` (seconds) → `requestTimeoutMs`, and
@@ -442,7 +479,10 @@ Behavior:
   `streamable-http` when `url` is set), `lifecycle` is `lazy` (eager for
   extension-registered servers unless `enabled: false`), `toolPrefix` is `mcp`,
   `requestTimeoutMs` is `30000`, and `maxRetries` is `5`.
-- **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `auth` is
+- **Load-time validation.** `toolPrefix` must match `^[a-zA-Z][a-zA-Z0-9_]*$`; `exposure`
+  and every `toolExposure` value must be `direct`, `deferred`, `codemode`, or `hidden`
+  (Pi's retired `codemode-deferred` alias is normalized to `codemode` before validation, on
+  the server value and on every per-tool value); `auth` is
   rejected on `stdio`; `auth.provider` (Pi's `/login` provider token, which this
   extension cannot forward) is rejected instead of being silently downgraded to OAuth;
   `auth.redirectUrl` (including the `callbackUrl` / `callbackPort` aliases) is validated

@@ -80,12 +80,38 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
       "lifecycle": "lazy"
+    },
+
+    // ── Tool exposure (Pi 1.3.0) ───────────────────────────────────────────
+    // A server that advertises dozens of tools can declare only a few of them to
+    // the model. "exposure" applies to every tool of the server; "toolExposure"
+    // overrides it per raw MCP tool name ("*" matches any characters, an exact
+    // name wins, then the first matching pattern in declaration order).
+    // Omitted exposure means "direct" here — every discovered tool is active.
+    // Other values: "deferred" (inactive until Pi's tool_search loads it, auto-
+    // activating tool_search), "codemode" (callable from codemode scripts via
+    // searchTools() and loadable by tool_search, auto-activating codemode unless
+    // top-level "autoEnableCodemode": false is set), and "hidden" (registered
+    // inactive and never exposed to the model, tool_search, or codemode).
+
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "description": "GitHub repository and pull-request read tools",
+      "exposure": "hidden",
+      "toolExposure": {
+        "get_*": "direct",
+        "list_*": "direct",
+        "search_*": "direct"
+      },
+      "lifecycle": "lazy"
     }
 
     // ── Project-level partial overrides (.pi/mcp.json only) ────────────────
     // In a trusted project's .pi/mcp.json, an entry with no "command", "url",
-    // "type", or "transport" overrides only per-project settings ("enabled" or
-    // "lifecycle") while keeping the global server's URL, command, and credentials:
+    // "type", or "transport" overrides only per-project settings ("enabled",
+    // "lifecycle", "exposure", or "toolExposure") while keeping the global
+    // server's URL, command, and credentials:
     //
     // "supabase": {
     //   "enabled": false

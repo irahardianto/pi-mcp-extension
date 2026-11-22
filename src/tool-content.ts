@@ -4,8 +4,14 @@
  */
 
 import type { ToolAnnotations } from "@earendil-works/pi-coding-agent";
+import { McpError } from "./errors.js";
 import { convertResourceContent } from "./resource-bridge.js";
 import type { McpToolDefinition } from "./tool-discovery.js";
+import {
+  buildMcpScriptResult,
+  type McpJsonValue,
+  type ToolCallResponse,
+} from "./tool-result.js";
 
 export type PiTextContent = { type: "text"; text: string };
 export type PiImageContent = { type: "image"; data: string; mimeType: string };
@@ -15,19 +21,8 @@ export type PiContent = PiTextContent | PiImageContent;
 export interface ToolCallOutcome {
   content: PiContent[];
   details: Record<string, never>;
-}
-
-/**
- * The subset of an SDK `tools/call` response the bridge consumes.
- * Legacy servers answer with `toolResult` instead of `content`, so every field
- * stays optional and unvalidated here — `convertMcpContent` handles the blocks.
- * The index signature keeps the SDK's compatibility result assignable.
- */
-export interface ToolCallResponse {
-  [key: string]: unknown;
-  content?: unknown;
-  structuredContent?: unknown;
-  isError?: unknown;
+  structuredContent?: McpJsonValue;
+  isError?: boolean;
 }
 
 function pickNonEmptyText(value: unknown): string | undefined {
@@ -156,3 +151,40 @@ export function toolErrorText(content: readonly PiContent[]): string {
     .map((c) => c.text)
     .join("\n");
 }
+
+/**
+ * Convert a raw MCP `tools/call` response into Pi's `ToolCallOutcome`.
+ *
+ * On Pi 1.3.0+ (`supportsErrorResult === true`), MCP `isError: true` returns an error result
+ * carrying `structuredContent` and `isError: true` so `codemode` scripts resolve to the structured
+ * `CallToolResult` object (matching `builtin:mcp`). On Pi `< 1.3.0` or direct callers, it throws
+ * `McpError(..., "tool")` as before.
+ */
+export function buildToolCallOutcome(
+  result: ToolCallResponse,
+  serverName: string,
+  supportsErrorResult = false,
+): ToolCallOutcome {
+  const content = buildToolCallContent(result);
+  if (!result.isError) {
+    return {
+      content,
+      details: {},
+      structuredContent: buildMcpScriptResult(result),
+    };
+  }
+  const errorMessage = toolErrorText(content) || "Tool reported an error";
+  if (!supportsErrorResult) {
+    throw new McpError(errorMessage, serverName, "tool");
+  }
+  const errorContent: PiContent[] = toolErrorText(content)
+    ? content
+    : [...content, { type: "text", text: errorMessage }];
+  return {
+    content: errorContent,
+    details: {},
+    structuredContent: buildMcpScriptResult(result),
+    isError: true,
+  };
+}
+

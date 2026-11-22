@@ -1,6 +1,6 @@
 /**
  * Pure tool-name sanitization, SHA-256 truncation hashing, lossless intra-server
- * ordering (#213), and cross-server collision suffix resolution for pi-mcp.
+ * ordering (#213), and cross-server tool-name collision resolution for pi-mcp.
  */
 
 import { createHash } from "node:crypto";
@@ -15,6 +15,16 @@ export interface ResolveUniqueToolNameOptions {
   rawToolName: string;
   seenInBatch: ReadonlySet<string>;
   toolOwners: ReadonlyMap<string, string>;
+}
+
+/** Replace any character outside `[a-zA-Z0-9_]` with `_`. */
+export function sanitizeIdentifierSegment(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+/** Deterministic 8-character lowercase SHA-256 hex digest used for identifier collision disambiguation. */
+export function shortSha256Hex(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 8);
 }
 
 /**
@@ -33,21 +43,26 @@ export function buildToolName(
   // WHY: Hash the raw unsanitized components separated by NUL bytes so distinct
   // server/tool pairs that sanitize to the same "_" sequence (e.g. "my-tool" vs
   // "my_tool", or server "a_b" + tool "c" vs server "a" + tool "b_c") never collide.
-  const hash = createHash("sha256")
-    .update(`${prefix}\0${serverName}\0${toolName}`)
-    .digest("hex")
-    .slice(0, 8);
+  const hash = shortSha256Hex(`${prefix}\0${serverName}\0${toolName}`);
   const raw = `${prefix}_${serverName}_${toolName}`;
-  const safe = raw.replace(/[^a-zA-Z0-9_]/g, "_");
+  const safe = sanitizeIdentifierSegment(raw);
   if (!forceHash && safe.length <= MAX_TOOL_NAME_LEN) {
     return safe;
   }
   return `${safe.slice(0, MAX_TOOL_NAME_LEN - 9)}_${hash}`;
 }
 
-/** True when sanitizing the raw tool name loses nothing (already a valid Pi identifier body). */
+/** True when sanitizing the raw tool or server name loses nothing (already `[a-zA-Z0-9_]+`). */
 export function isLosslessToolName(rawToolName: string): boolean {
   return /^[a-zA-Z0-9_]+$/.test(rawToolName);
+}
+
+/** Compare raw MCP tool or server names: lossless `[a-zA-Z0-9_]+` wins, then code-point order. */
+export function compareNamesForAssignment(a: string, b: string): number {
+  const aLossless = isLosslessToolName(a);
+  const bLossless = isLosslessToolName(b);
+  if (aLossless !== bLossless) return aLossless ? -1 : 1;
+  return compareCodePoints(a, b);
 }
 
 /**
@@ -59,10 +74,7 @@ export function isLosslessToolName(rawToolName: string): boolean {
  * tool owned the unhashed name, so a reconnect could silently swap tool targets.
  */
 export function compareToolsForNameAssignment(a: McpToolDefinition, b: McpToolDefinition): number {
-  const aLossless = isLosslessToolName(a.name);
-  const bLossless = isLosslessToolName(b.name);
-  if (aLossless !== bLossless) return aLossless ? -1 : 1;
-  return compareCodePoints(a.name, b.name);
+  return compareNamesForAssignment(a.name, b.name);
 }
 
 /**

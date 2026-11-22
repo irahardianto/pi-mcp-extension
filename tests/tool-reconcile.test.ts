@@ -9,6 +9,7 @@ import {
   collectWithdrawnTools,
   deleteServerOwnedTools,
   filterOwnedTools,
+  mergePendingRestoredTools,
   normalizeRefreshArgs,
   orderOwnedActiveTools,
   planActiveToolReconciliation,
@@ -77,7 +78,7 @@ describe("tool-reconcile: ownership accounting", () => {
 });
 
 describe("tool-reconcile: planServerToolBatch", () => {
-  it("assigns deterministic collision-free Pi names and computes withdrawn tools when ownedPreviousNames is given", () => {
+  it("assigns deterministic collision-free Pi names, resolves exposures, and computes withdrawn tools", () => {
     const toolOwners = new Map<string, string>([["mcp_a_b_shared", "a_b"]]);
     const tools = [makeTool("my-tool"), makeTool("my_tool"), makeTool("b_shared")];
 
@@ -87,6 +88,10 @@ describe("tool-reconcile: planServerToolBatch", () => {
       tools,
       toolOwners,
       ownedPreviousNames: new Set(["mcp_a_my_tool", "mcp_a_retired"]),
+      exposureConfig: {
+        exposure: "deferred",
+        toolExposure: { my_tool: "direct", "my-*": "codemode" },
+      },
     });
     const planB = planServerToolBatch({
       prefix: "mcp",
@@ -99,8 +104,14 @@ describe("tool-reconcile: planServerToolBatch", () => {
     assert.equal(planB.currentRawNames.get("mcp_a_my_tool"), "my_tool");
     assert.equal(planA.currentToolNames.has("mcp_a_b_shared"), false);
     assert.equal(planA.plannedTools.length, 3);
+    assert.deepEqual(planA.directToolNames, new Set(["mcp_a_my_tool"]));
+    assert.equal(planA.currentExposures.get("my_tool"), "direct");
+    assert.equal(planA.currentExposures.get("my-tool"), "codemode");
+    assert.equal(planA.currentExposures.get("b_shared"), "deferred");
+    assert.equal(planA.piExposures.get("mcp_a_my_tool"), "direct");
     assert.deepEqual(planA.withdrawnToolNames, new Set(["mcp_a_retired"]));
     assert.deepEqual(planB.withdrawnToolNames, new Set());
+    assert.equal(planB.directToolNames.size, 3);
   });
 });
 
@@ -144,7 +155,7 @@ describe("tool-reconcile: snapshotActiveStateByRawName and reconcileLiveRefreshS
 
     assert.deepEqual(firstDrop.desiredActive, new Set(["mcp_db_fresh"]));
     assert.deepEqual(
-      firstDrop.droppedState,
+      firstDrop.dropped,
       new Map([
         ["dropped_active", true],
         ["dropped_muted", false],
@@ -162,14 +173,79 @@ describe("tool-reconcile: snapshotActiveStateByRawName and reconcileLiveRefreshS
         ["read", false],
         ["fresh", true],
       ]),
-      previousDroppedState: firstDrop.droppedState,
+      previousDropped: firstDrop.dropped,
     });
 
     assert.deepEqual(
       reAdvertised.desiredActive,
       new Set(["mcp_db_fresh", "mcp_db_dropped_active"]),
     );
-    assert.equal(reAdvertised.droppedState, undefined);
+    assert.equal(reAdvertised.dropped, undefined);
+  });
+});
+
+describe("tool-reconcile: mergePendingRestoredTools", () => {
+  it("preserves deferred and codemode tools activated from _pendingToolNames, ignores hidden and live-narrowed tools, and no-ops on Pi < 1.3.0", () => {
+    const piExposures = new Map([
+      ["mcp_s_direct", "direct" as const],
+      ["mcp_s_deferred", "deferred" as const],
+      ["mcp_s_codemode", "codemode" as const],
+      ["mcp_s_narrowed", "deferred" as const],
+      ["mcp_s_hidden", "hidden" as const],
+      ["mcp_s_inactive", "deferred" as const],
+    ]);
+    const pi13Tools = [
+      { name: "mcp_s_direct", exposure: "direct" },
+      { name: "mcp_s_deferred", exposure: "deferred" },
+      { name: "mcp_s_codemode", exposure: "deferred" },
+      { name: "mcp_s_narrowed", exposure: "deferred" },
+      { name: "mcp_s_hidden", exposure: "hidden" },
+      { name: "mcp_s_inactive", exposure: "deferred" },
+    ];
+
+    const merged = mergePendingRestoredTools({
+      desiredActive: ["mcp_s_direct"],
+      piExposures,
+      // `mcp_s_narrowed` was ALREADY active before registration (live narrowing from direct -> deferred),
+      // so it must NOT be treated as restored from `_pendingToolNames`.
+      activeBefore: ["read", "mcp_s_narrowed"],
+      activeAfterRegistration: [
+        "read",
+        "mcp_s_direct",
+        "mcp_s_deferred",
+        "mcp_s_codemode",
+        "mcp_s_narrowed",
+        "mcp_s_hidden",
+      ],
+      allTools: pi13Tools,
+    });
+
+    assert.deepEqual(
+      merged,
+      new Set(["mcp_s_direct", "mcp_s_deferred", "mcp_s_codemode"]),
+    );
+
+    // Pi < 1.3.0 (`allTools` undefined or lacking `exposure: "deferred"`) returns desiredActive unchanged
+    assert.deepEqual(
+      mergePendingRestoredTools({
+        desiredActive: ["mcp_s_direct"],
+        piExposures,
+        activeBefore: ["read"],
+        activeAfterRegistration: ["read", "mcp_s_direct", "mcp_s_deferred", "mcp_s_codemode"],
+        allTools: [{ name: "mcp_s_deferred" }, { name: "mcp_s_codemode" }],
+      }),
+      new Set(["mcp_s_direct"]),
+    );
+    assert.deepEqual(
+      mergePendingRestoredTools({
+        desiredActive: ["mcp_s_direct"],
+        piExposures,
+        activeBefore: ["read"],
+        activeAfterRegistration: ["read", "mcp_s_direct", "mcp_s_deferred"],
+        allTools: undefined,
+      }),
+      new Set(["mcp_s_direct"]),
+    );
   });
 });
 
@@ -186,7 +262,7 @@ describe("tool-reconcile: orderOwnedActiveTools and planActiveToolReconciliation
     );
   });
 
-  it("returns undefined when currentActive already matches nextActive, and returns sorted nextActive on membership or order drift", () => {
+  it("returns undefined when currentActive already matches nextActive, and includes extraActive discovery tools", () => {
     const owned = new Set(["mcp_a_one", "mcp_b_two"]);
     const isOwned = (name: string) => owned.has(name);
 
@@ -205,7 +281,8 @@ describe("tool-reconcile: orderOwnedActiveTools and planActiveToolReconciliation
       activeBefore: ["read", "mcp_b_two", "mcp_old_gone", "bash"],
       currentActive: ["read", "mcp_b_two", "bash", "mcp_a_one"],
       isOwned,
+      extraActive: ["tool_search"],
     });
-    assert.deepEqual(reorderedOrChanged, ["read", "mcp_a_one", "bash", "mcp_b_two"]);
+    assert.deepEqual(reorderedOrChanged, ["read", "mcp_a_one", "bash", "mcp_b_two", "tool_search"]);
   });
 });

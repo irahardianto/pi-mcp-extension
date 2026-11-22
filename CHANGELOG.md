@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Honor Pi 1.3.0 `exposure`, `toolExposure`, per-server `description`, and top-level `autoEnableCodemode` instead of ignoring them (#257). `exposure` sets the server default (remaining `direct` when omitted for backwards compatibility), `toolExposure` overrides per raw MCP tool name or linear `*` pattern (exact match, then first matching pattern in declaration order, then server default), and the retired `codemode-deferred` alias normalizes to `codemode` at load time.
+- Register `deferred` and `codemode` MCP tools on Pi as `deferred` with sanitized, secret-redacted, peer-disambiguated per-server `ToolNamespace` metadata (re-synced when colliding peers like `my-srv` vs `my_srv` are added or removed) plus a `CallToolResult` `outputSchema` (with relocated `#/properties/structuredContent` `$ref`s) and `structuredContent` (without `_meta`) so `codemode`'s declaration stays stable for prompt caching (#278) while scripts receive raw MCP content blocks, typed schemas, and on Pi 1.3.0+ structured `{ content, structuredContent, isError: true }` tool-error outcomes without breaking `McpError("tool")` rejections on Pi `< 1.3.0`.
+- Automatically activate Pi's built-in `codemode` (unless `autoEnableCodemode: false`) and `tool_search` discovery tools in deterministic order across enabled and connected indirect servers on session start, config change, and `/tree` (`session_tree`), populate `systemPromptOptions.sections["mcp_servers"]` (capped at 4,096 characters) with reachable indirect servers and `mcp_connect` hints (omitting disconnected entries when `mcp_connect` is inactive), and register `mcp_status` and `mcp_connect` with `exposure: "model-only"` while keeping `mcp_list_resources` and `mcp_read_resource` callable from `codemode` scripts.
+- Preserve non-`hidden` indirect tools restored from Pi 1.3.0's `_pendingToolNames` across sequential multi-server connects and `/reload` (`session_shutdown` with `reason: "reload"` leaves active MCP tools and non-`hidden` definitions intact on the outgoing runner), hide owned tools on normal stop/removal/withdrawal with stale-call guards, preserve unchanged-exposure active/inactive state across live `tools/list_changed` refreshes while enforcing `hidden` and `direct` ↔ indirect crossings, and surface `expected`, `inactiveDirect`, and `--tools` / `--exclude-tools` `indirectFiltered` status in `mcp_connect`, `mcp_status`, and `/mcp <name>`.
+
 ## [1.15.3] - 2026-11-13
 
 ### Security
