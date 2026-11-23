@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.2] - 2026-11-23
+
 ### Fixed
 - Complete OAuth server names after `/mcp:auth --reset ` without dropping the reset flag (#357).
 
