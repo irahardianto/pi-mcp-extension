@@ -40,6 +40,8 @@
 
 > **Prerequisite:** Node.js 22+ and the [Pi coding agent](https://pi.dev).
 
+> **Disable MCP for one run:** `pi --no-mcp` also disables this installed extension, even when it replaces `builtin:mcp`. No MCP config is loaded, no servers connect, and no MCP commands or tools are registered. As with Pi, `--no-mcp` has no effect when it appears after `--` or is passed as another option's value.
+
 1. **Install the extension** (or run once without installing via `pi -e npm:pi-mcp-extension`):
    ```bash
    pi install npm:pi-mcp-extension

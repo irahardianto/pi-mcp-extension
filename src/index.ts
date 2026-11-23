@@ -19,6 +19,7 @@ import {
   loadBootstrapConfigState,
 } from "./session-lifecycle.js";
 import { registerCommands } from "./register-commands.js";
+import { hasNoMcpFlag } from "./commands.js";
 import { registerManagementTools } from "./register-tools.js";
 import { ServerManager, type ManagedServer } from "./server-manager.js";
 import { ToolBridge } from "./tool-bridge.js";
@@ -48,7 +49,21 @@ export {
   startupAuthLaterOption,
 } from "./startup-auth.js";
 
-export default async function (pi: ExtensionAPI, paths: { bootstrapCwd?: string; globalConfigPath?: string; authStorageDir?: string; browserOpen?: (url: string) => void | Promise<void>; callbackServer?: CallbackServer } = {}): Promise<void> {
+export default async function (
+  pi: ExtensionAPI,
+  paths: {
+    bootstrapCwd?: string;
+    globalConfigPath?: string;
+    authStorageDir?: string;
+    browserOpen?: (url: string) => void | Promise<void>;
+    callbackServer?: CallbackServer;
+    argv?: readonly string[];
+  } = {},
+): Promise<void> {
+  // WHY: Pi's --no-mcp only disables builtin:mcp, not installed replacements.
+  // Exit before logs, config reads, server setup, event handlers, commands, or tools.
+  if (hasNoMcpFlag(paths.argv ?? process.argv.slice(2))) return;
+
   // ── 0. Opt-in diagnostic log ───────────────────────────────────────────────
   // WHY: The debug log is created before anything else so bootstrap failures
   // are captured too. The file is only touched when the first event is written.
