@@ -22,10 +22,17 @@ export interface ObservedRequest {
   readonly headers: IncomingHttpHeaders;
 }
 
+export interface CodeExchangeError {
+  statusCode?: number;
+  error: string;
+  errorDescription?: string;
+}
+
 export interface FakeOAuthServerOptions {
   serverName?: string;
   toolName?: string;
   failRefresh?: boolean;
+  codeExchangeError?: CodeExchangeError | null;
   expiresInSeconds?: number;
 }
 
@@ -48,6 +55,7 @@ export interface FakeOAuthServer {
   unauthorizedMcpCount: number;
   browserOpenCount: number;
   failRefresh: boolean;
+  codeExchangeError: CodeExchangeError | null;
   readonly issuedAccessTokens: string[];
   readonly issuedRefreshTokens: string[];
   /** Every request received so far, in arrival order, with the exact `Authorization` value. */
@@ -102,6 +110,7 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
   let unauthorizedMcpCount = 0;
   let browserOpenCount = 0;
   let failRefresh = options.failRefresh ?? false;
+  let codeExchangeError: CodeExchangeError | null = options.codeExchangeError ?? null;
   let lastError: Error | null = null;
 
   let authCodeCounter = 0;
@@ -241,6 +250,15 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
 
         if (grantType === "authorization_code") {
           codeExchangeCount += 1;
+          if (codeExchangeError) {
+            sendJson(res, codeExchangeError.statusCode ?? 401, {
+              error: codeExchangeError.error,
+              ...(codeExchangeError.errorDescription
+                ? { error_description: codeExchangeError.errorDescription }
+                : {}),
+            });
+            return;
+          }
           const code = params.get("code") ?? "";
           const codeVerifier = params.get("code_verifier") ?? "";
           const pending = pendingAuthCodes.get(code);
@@ -480,6 +498,12 @@ export async function startFakeOAuthServer(options: FakeOAuthServerOptions = {})
     },
     set failRefresh(value: boolean) {
       failRefresh = value;
+    },
+    get codeExchangeError() {
+      return codeExchangeError;
+    },
+    set codeExchangeError(value: CodeExchangeError | null) {
+      codeExchangeError = value;
     },
     get requestLog() {
       return requestLog;

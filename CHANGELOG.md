@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Surface actionable OAuth error messages when the token endpoint rejects client credentials with `invalid_client` or `unauthorized_client` during authorization-code exchange (#355). Previously, `@modelcontextprotocol/sdk`'s `auth()` caught the error, called `invalidateCredentials("all")` (wiping stored client info, discovery state, and the PKCE verifier), and immediately retried `authInternal()` with `authorizationCode` still set—producing cryptic `"Existing OAuth client information is required when exchanging an authorization code"` (DCR) or double-prefixed `pi-mcp: [pi-mcp] No PKCE code verifier found` (static `clientId`) errors while re-fetching and re-saving discovery state. `completeRedirectAuthFlow` now stops that futile retry immediately after credential cleanup completes and throws a clear `McpError("auth")` tailored to static vs. DCR configs, and `McpOAuthProvider.codeVerifier()` no longer embeds a redundant `[pi-mcp] ` prefix.
+
 ## [1.16.0] - 2026-11-22
 
 ### Added

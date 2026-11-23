@@ -411,7 +411,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   async codeVerifier(): Promise<string> {
     if (!this._codeVerifier) {
-      throw new Error(`[pi-mcp] No PKCE code verifier found for "${this.serverName}"`);
+      throw new Error(`No PKCE code verifier found for "${this.serverName}"`);
     }
     return this._codeVerifier;
   }

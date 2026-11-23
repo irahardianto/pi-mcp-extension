@@ -3663,7 +3663,270 @@ describe("OAuth Security Fixes", () => {
       });
     }
   });
+
+  describe("token endpoint invalid_client / unauthorized_client during code exchange (Issue #355)", () => {
+    const cases: Array<{
+      label: string;
+      oauthError: "invalid_client" | "unauthorized_client";
+      statusCode: number;
+      staticClient: boolean;
+      expectedFragment: string;
+    }> = [
+      {
+        label: "DCR server returning invalid_client",
+        oauthError: "invalid_client",
+        statusCode: 401,
+        staticClient: false,
+        expectedFragment:
+          'pi-mcp: OAuth client registration for "oauthsrv" was rejected by the token endpoint (invalid_client) and cleared. Run /mcp:auth oauthsrv to register a new client.',
+      },
+      {
+        label: "static clientId/clientSecret server returning invalid_client",
+        oauthError: "invalid_client",
+        statusCode: 401,
+        staticClient: true,
+        expectedFragment:
+          'pi-mcp: OAuth client credentials for "oauthsrv" were rejected by the token endpoint (invalid_client). Check auth.clientId and auth.clientSecret in mcp.json.',
+      },
+      {
+        label: "DCR server returning unauthorized_client",
+        oauthError: "unauthorized_client",
+        statusCode: 400,
+        staticClient: false,
+        expectedFragment:
+          'pi-mcp: OAuth client registration for "oauthsrv" was rejected by the token endpoint (unauthorized_client) and cleared. Run /mcp:auth oauthsrv to register a new client.',
+      },
+      {
+        label: "static clientId/clientSecret server returning unauthorized_client",
+        oauthError: "unauthorized_client",
+        statusCode: 400,
+        staticClient: true,
+        expectedFragment:
+          'pi-mcp: OAuth client credentials for "oauthsrv" were rejected by the token endpoint (unauthorized_client). Check auth.clientId and auth.clientSecret in mcp.json.',
+      },
+    ];
+
+    for (const tc of cases) {
+      it(`surfaces actionable auth error and clears stored state for ${tc.label}`, async () => {
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        const { loadState } = await import("../src/oauth-state-store.js");
+        const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-355-"));
+        const authDir = join(dir, "auth");
+        const fakeServer = await startFakeOAuthServer({
+          serverName: "oauthsrv",
+          toolName: "protected_ping",
+          codeExchangeError: {
+            statusCode: tc.statusCode,
+            error: tc.oauthError,
+            errorDescription: "Client authentication failed",
+          },
+        });
+        const mockExt = createMockExtension();
+        const { commands, events } = mockExt;
+        const notifications: Array<{ message: string; type?: string }> = [];
+        const ctx = createMockContext({
+          cwd: dir,
+          hasUI: true,
+          ui: {
+            notify: (message: string, type?: string) => {
+              notifications.push({ message, ...(type ? { type } : {}) });
+            },
+          },
+        });
+
+        try {
+          await mkdir(join(dir, ".pi"));
+          await writeFile(
+            join(dir, ".pi", "mcp.json"),
+            JSON.stringify({
+              settings: { maxRetries: 0 },
+              mcpServers: {
+                oauthsrv: {
+                  lifecycle: "lazy",
+                  transport: "streamable-http",
+                  url: fakeServer.mcpUrl,
+                  auth: tc.staticClient
+                    ? {
+                        type: "oauth",
+                        clientId: "static-client-id",
+                        clientSecret: "wrong-static-secret",
+                      }
+                    : { type: "oauth" },
+                },
+              },
+            }),
+          );
+
+          // For static client, seed previously bound clientInfo so we verify disk cleanup too.
+          if (tc.staticClient) {
+            const seeder = new McpOAuthProvider({
+              serverName: "oauthsrv",
+              authConfig: {
+                type: "oauth",
+                clientId: "static-client-id",
+                clientSecret: "wrong-static-secret",
+              },
+              storageDir: authDir,
+              serverUrl: fakeServer.mcpUrl,
+            });
+            await seeder.saveClientInformation({
+              client_id: "static-client-id",
+              issuer: `${fakeServer.baseUrl}/`,
+            });
+          }
+
+          await extension(mockExt.api, {
+            bootstrapCwd: dir,
+            globalConfigPath: join(dir, "missing.json"),
+            authStorageDir: authDir,
+            browserOpen: fakeServer.browserOpen,
+          });
+          await events.get("session_start")({}, ctx);
+
+          await commands.get("mcp:auth").handler("oauthsrv", ctx);
+
+          const errorNotifies = notifications.filter((n) => n.type === "error");
+          assert.strictEqual(
+            errorNotifies.length,
+            1,
+            `expected exactly one error notification, got ${JSON.stringify(notifications)}`,
+          );
+          assert.strictEqual(errorNotifies[0]?.message, tc.expectedFragment);
+          assert.strictEqual(
+            errorNotifies[0]?.message.includes("Existing OAuth client information is required"),
+            false,
+          );
+          assert.strictEqual(
+            errorNotifies[0]?.message.includes("No PKCE code verifier"),
+            false,
+          );
+          assert.strictEqual(
+            errorNotifies[0]?.message.includes("pi-mcp: [pi-mcp]"),
+            false,
+          );
+
+          assert.strictEqual(fakeServer.tokenCount, 1, "token endpoint must only be called once");
+          assert.strictEqual(fakeServer.codeExchangeCount, 1, "code exchange must only be attempted once");
+          assert.strictEqual(fakeServer.browserOpenCount, 1, "browser must not reopen automatically");
+
+          const tokenIdx = fakeServer.requestLog.findIndex((r) => r.path === "/token");
+          assert.ok(tokenIdx >= 0, "expected /token request in log");
+          const postTokenRequests = fakeServer.requestLog.slice(tokenIdx + 1);
+          assert.deepStrictEqual(
+            postTokenRequests,
+            [],
+            `expected no redundant discovery/retry requests after /token failure, got ${JSON.stringify(postTokenRequests)}`,
+          );
+
+          const diskState = await loadState("oauthsrv", authDir, fakeServer.mcpUrl);
+          assert.strictEqual(diskState.clientInfo, undefined, "clientInfo must be cleared from disk");
+          assert.strictEqual(diskState.tokens, undefined, "tokens must be cleared from disk");
+          assert.strictEqual(diskState.discoveryState, undefined, "discoveryState must be cleared from disk");
+
+          // Verify DCR recovery: once the server accepts new registrations, a fresh /mcp:auth succeeds.
+          if (!tc.staticClient && tc.oauthError === "invalid_client") {
+            fakeServer.codeExchangeError = null;
+            await commands.get("mcp:auth").handler("oauthsrv", ctx);
+            assert.strictEqual(fakeServer.dcrCount, 2, "subsequent /mcp:auth must register a fresh DCR client");
+            assert.ok(
+              mockExt.activeTools.some((name) => name.includes("protected_ping")),
+              "subsequent /mcp:auth must connect and activate tools",
+            );
+          }
+        } finally {
+          await events.get("session_shutdown")({}, ctx);
+          await fakeServer.close();
+          await rm(dir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it("does not misclassify invalid_grant during code exchange or clear DCR clientInfo", async () => {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { loadState } = await import("../src/oauth-state-store.js");
+      const dir = await mkdtemp(join(tmpdir(), "pi-mcp-issue-355-grant-"));
+      const authDir = join(dir, "auth");
+      const fakeServer = await startFakeOAuthServer({
+        serverName: "oauthsrv",
+        toolName: "protected_ping",
+        codeExchangeError: {
+          statusCode: 400,
+          error: "invalid_grant",
+          errorDescription: "Authorization code expired",
+        },
+      });
+      const mockExt = createMockExtension();
+      const { commands, events } = mockExt;
+      const notifications: Array<{ message: string; type?: string }> = [];
+      const ctx = createMockContext({
+        cwd: dir,
+        hasUI: true,
+        ui: {
+          notify: (message: string, type?: string) => {
+            notifications.push({ message, ...(type ? { type } : {}) });
+          },
+        },
+      });
+
+      try {
+        await mkdir(join(dir, ".pi"));
+        await writeFile(
+          join(dir, ".pi", "mcp.json"),
+          JSON.stringify({
+            settings: { maxRetries: 0 },
+            mcpServers: {
+              oauthsrv: {
+                lifecycle: "lazy",
+                transport: "streamable-http",
+                url: fakeServer.mcpUrl,
+                auth: { type: "oauth" },
+              },
+            },
+          }),
+        );
+
+        await extension(mockExt.api, {
+          bootstrapCwd: dir,
+          globalConfigPath: join(dir, "missing.json"),
+          authStorageDir: authDir,
+          browserOpen: fakeServer.browserOpen,
+        });
+        await events.get("session_start")({}, ctx);
+
+        await commands.get("mcp:auth").handler("oauthsrv", ctx);
+
+        const errorNotifies = notifications.filter((n) => n.type === "error");
+        assert.strictEqual(errorNotifies.length, 1);
+        assert.match(errorNotifies[0]?.message ?? "", /Authorization code expired/);
+        assert.strictEqual(errorNotifies[0]?.message.includes("invalid_client"), false);
+
+        const diskState = await loadState("oauthsrv", authDir, fakeServer.mcpUrl);
+        assert.ok(diskState.clientInfo?.client_id, "DCR clientInfo must remain stored on invalid_grant");
+      } finally {
+        await events.get("session_shutdown")({}, ctx);
+        await fakeServer.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("omits redundant [pi-mcp] prefix from McpOAuthProvider.codeVerifier() error", async () => {
+      const p = new McpOAuthProvider({
+        serverName: "oauthsrv",
+        authConfig: { type: "oauth" },
+        mode: "interactive",
+      });
+      await assert.rejects(
+        () => p.codeVerifier(),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.strictEqual(err.message, 'No PKCE code verifier found for "oauthsrv"');
+          return true;
+        },
+      );
+    });
+  });
 });
+
 
 
 

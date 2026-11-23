@@ -10,6 +10,11 @@ import {
 } from "./auth-challenge.js";
 import { acquireAuthLock, type AuthLockHandle } from "./auth-lock.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
+import {
+  buildTokenClientRejectionError,
+  parseTokenClientRejectionError,
+  type TokenClientRejectionErrorCode,
+} from "./oauth-policy.js";
 import { McpError, AuthCancelledError, AuthLockError } from "./errors.js";
 import { describeError } from "./debug-log-format.js";
 import { reportDiagnostic } from "./debug-log.js";
@@ -103,6 +108,7 @@ interface ChallengeDiscoveryParams {
 interface RedirectAuthFlowParams {
   serverName: string;
   serverUrl: string;
+  hasStaticClientId: boolean;
   ctx: ExtensionContext;
   authProvider: McpOAuthProvider;
   authChallenge: ManualAuthChallenge;
@@ -111,6 +117,17 @@ interface RedirectAuthFlowParams {
   oauthState: string;
   reopenBrowser: () => Promise<void>;
   onPasteResolved: () => void;
+  assertActive: () => void;
+}
+
+interface ExchangeAuthorizationCodeParams {
+  serverName: string;
+  serverUrl: string;
+  hasStaticClientId: boolean;
+  authProvider: McpOAuthProvider;
+  authChallenge: ManualAuthChallenge;
+  customFetch: typeof fetch | undefined;
+  code: string;
   assertActive: () => void;
 }
 
@@ -367,6 +384,89 @@ async function runInitialSdkAuth(
   }
 }
 
+function isPostRequest(
+  input: Parameters<typeof fetch>[0],
+  init: RequestInit | undefined,
+): boolean {
+  const method = init?.method ?? (input instanceof Request ? input.method : undefined);
+  return method?.toUpperCase() === "POST";
+}
+
+async function readTokenClientRejection(
+  response: Response,
+): Promise<TokenClientRejectionErrorCode | undefined> {
+  try {
+    return parseTokenClientRejectionError(await response.clone().text());
+  } catch {
+    // WHY: Non-cloneable or unreadable response bodies fall back to the default client-rejection
+    // code; the SDK still parses the original response body and drives credential invalidation.
+    return undefined;
+  }
+}
+
+/**
+ * Wrap `fetch` during authorization-code exchange so an `invalid_client` or
+ * `unauthorized_client` body from `/token` is recorded before the MCP SDK
+ * swallows the error and invokes `invalidateCredentials("all")`.
+ */
+function createTokenExchangeFetch(
+  baseFetch: typeof fetch | undefined,
+  onClientRejection: (code: TokenClientRejectionErrorCode) => void,
+): typeof fetch {
+  return async (input, init) => {
+    const response = await (baseFetch ?? globalThis.fetch)(input, init);
+    if (!response.ok && isPostRequest(input, init)) {
+      const code = await readTokenClientRejection(response);
+      if (code) onClientRejection(code);
+    }
+    return response;
+  };
+}
+
+/**
+ * Exchange the authorization code for tokens while guarding against the MCP SDK's
+ * `InvalidClientError` / `UnauthorizedClientError` retry loop: after `auth()` runs
+ * `invalidateCredentials("all")` to wipe stored client info and the PKCE verifier,
+ * it immediately re-enters `authInternal()` with `authorizationCode` still set, which
+ * would run redundant discovery, re-write discoveryState to disk, and fail with a
+ * cryptic missing-client or missing-PKCE error. Throwing an actionable `McpError`
+ * right after cleanup completes stops that futile retry and surfaces the real cause.
+ */
+async function exchangeAuthorizationCode(
+  params: ExchangeAuthorizationCodeParams,
+): Promise<SdkAuthResult> {
+  const {
+    serverName,
+    serverUrl,
+    hasStaticClientId,
+    authProvider,
+    authChallenge,
+    customFetch,
+    code,
+    assertActive,
+  } = params;
+  let clientRejectionError: TokenClientRejectionErrorCode | undefined;
+  const exchangeFetch = createTokenExchangeFetch(customFetch, (errorCode) => {
+    clientRejectionError = errorCode;
+  });
+  const originalInvalidate = authProvider.invalidateCredentials.bind(authProvider);
+  authProvider.invalidateCredentials = async (scope) => {
+    await originalInvalidate(scope);
+    if (scope === "all") {
+      assertActive();
+      throw buildTokenClientRejectionError(serverName, hasStaticClientId, clientRejectionError);
+    }
+  };
+  try {
+    return await auth(
+      authProvider,
+      buildFinishAuthOptions(serverUrl, authChallenge, exchangeFetch, code),
+    );
+  } finally {
+    authProvider.invalidateCredentials = originalInvalidate;
+  }
+}
+
 /**
  * Drive the REDIRECT half of the flow: wait for the loopback callback (or a
  * pasted redirect URL), then exchange the authorization code for tokens.
@@ -375,6 +475,7 @@ async function completeRedirectAuthFlow(params: RedirectAuthFlowParams): Promise
   const {
     serverName,
     serverUrl,
+    hasStaticClientId,
     ctx,
     authProvider,
     authChallenge,
@@ -405,10 +506,16 @@ async function completeRedirectAuthFlow(params: RedirectAuthFlowParams): Promise
   );
 
   // 8. Complete the OAuth flow with the authorization code
-  const finishAuthResult = await auth(
+  const finishAuthResult = await exchangeAuthorizationCode({
+    serverName,
+    serverUrl,
+    hasStaticClientId,
     authProvider,
-    buildFinishAuthOptions(serverUrl, authChallenge, customFetch, code),
-  );
+    authChallenge,
+    customFetch,
+    code,
+    assertActive,
+  });
   assertActive();
 
   if (finishAuthResult !== "AUTHORIZED") {
@@ -557,6 +664,7 @@ export async function authorize(
       await completeRedirectAuthFlow({
         serverName,
         serverUrl,
+        hasStaticClientId: Boolean(config.auth?.clientId),
         ctx,
         authProvider,
         authChallenge,

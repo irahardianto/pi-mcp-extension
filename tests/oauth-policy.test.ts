@@ -12,6 +12,7 @@ import {
   buildNewSilentStoredClientInfo,
   buildOAuthClientMetadata,
   buildStaticClientInformation,
+  buildTokenClientRejectionError,
   DEFAULT_CALLBACK_PORT,
   DEFAULT_REDIRECT_URL,
   hasRedirectUriMismatch,
@@ -19,6 +20,7 @@ import {
   isPeerRotatedTokens,
   mergeSilentStoredClientInfo,
   numberOrUndefined,
+  parseTokenClientRejectionError,
   redirectUrisOrUndefined,
   resolveProviderRedirectUrl,
   stampStateServerUrl,
@@ -456,4 +458,48 @@ describe("McpOAuthProvider state() guards and CSRF retry preservation", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("parses only invalid_client and unauthorized_client from token error bodies", () => {
+    assert.equal(
+      parseTokenClientRejectionError(JSON.stringify({ error: "invalid_client", error_description: "bad secret" })),
+      "invalid_client",
+    );
+    assert.equal(
+      parseTokenClientRejectionError(JSON.stringify({ error: "unauthorized_client" })),
+      "unauthorized_client",
+    );
+    assert.equal(parseTokenClientRejectionError(JSON.stringify({ error: "invalid_grant" })), undefined);
+    assert.equal(parseTokenClientRejectionError(JSON.stringify({ error: 401 })), undefined);
+    assert.equal(parseTokenClientRejectionError("not json"), undefined);
+    assert.equal(parseTokenClientRejectionError(""), undefined);
+  });
+
+  it("builds actionable McpError('auth') messages for static and DCR client rejections", () => {
+    const staticDefault = buildTokenClientRejectionError("srv", true);
+    assert.ok(staticDefault instanceof McpError);
+    assert.equal(staticDefault.server, "srv");
+    assert.equal(staticDefault.code, "auth");
+    assert.equal(
+      staticDefault.message,
+      'OAuth client credentials for "srv" were rejected by the token endpoint (invalid_client). Check auth.clientId and auth.clientSecret in mcp.json.',
+    );
+
+    const staticUnauth = buildTokenClientRejectionError("srv", true, "unauthorized_client");
+    assert.equal(staticUnauth.code, "auth");
+    assert.match(staticUnauth.message, /\(unauthorized_client\)/);
+
+    const dcrDefault = buildTokenClientRejectionError("srv", false);
+    assert.ok(dcrDefault instanceof McpError);
+    assert.equal(dcrDefault.server, "srv");
+    assert.equal(dcrDefault.code, "auth");
+    assert.equal(
+      dcrDefault.message,
+      'OAuth client registration for "srv" was rejected by the token endpoint (invalid_client) and cleared. Run /mcp:auth srv to register a new client.',
+    );
+
+    const dcrUnauth = buildTokenClientRejectionError("srv", false, "unauthorized_client");
+    assert.equal(dcrUnauth.code, "auth");
+    assert.match(dcrUnauth.message, /\(unauthorized_client\)/);
+  });
 });
+

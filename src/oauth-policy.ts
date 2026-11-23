@@ -8,6 +8,7 @@
  * separate from lock and filesystem I/O in oauth-provider.ts.
  */
 
+import { z } from "zod";
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
@@ -365,3 +366,52 @@ export function applyStoredStateInvalidation(
   }
   return changedDisk;
 }
+
+// ─── Token-Endpoint Client Rejection Helpers ─────────────────────────────────
+
+const TokenClientRejectionSchema = z.object({
+  error: z.enum(["invalid_client", "unauthorized_client"]),
+});
+
+export type TokenClientRejectionErrorCode = z.infer<typeof TokenClientRejectionSchema>["error"];
+
+/**
+ * Extract `invalid_client` or `unauthorized_client` from an OAuth 2.1 error
+ * response body without exposing arbitrary server-controlled text.
+ */
+export function parseTokenClientRejectionError(
+  body: string,
+): TokenClientRejectionErrorCode | undefined {
+  try {
+    const parsed = TokenClientRejectionSchema.safeParse(JSON.parse(body));
+    return parsed.success ? parsed.data.error : undefined;
+  } catch {
+    // WHY: Malformed or non-JSON token error bodies are handled by the SDK's own
+    // parseErrorResponse; returning undefined lets the caller fall back safely.
+    return undefined;
+  }
+}
+
+/**
+ * Build the actionable `McpError("auth")` surfaced when `/token` rejects client
+ * credentials during authorization-code exchange and triggers `invalidateCredentials("all")`.
+ */
+export function buildTokenClientRejectionError(
+  serverName: string,
+  hasStaticClientId: boolean,
+  errorCode: TokenClientRejectionErrorCode = "invalid_client",
+): McpError {
+  if (hasStaticClientId) {
+    return new McpError(
+      `OAuth client credentials for "${serverName}" were rejected by the token endpoint (${errorCode}). Check auth.clientId and auth.clientSecret in mcp.json.`,
+      serverName,
+      "auth",
+    );
+  }
+  return new McpError(
+    `OAuth client registration for "${serverName}" was rejected by the token endpoint (${errorCode}) and cleared. Run /mcp:auth ${serverName} to register a new client.`,
+    serverName,
+    "auth",
+  );
+}
+
