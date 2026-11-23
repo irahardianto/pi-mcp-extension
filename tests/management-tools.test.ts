@@ -1066,6 +1066,65 @@ it("extension lifecycle activates reaching discovery tools, warns once when unre
   }
 });
 
+it("before_agent_start never hints an unmatchable sanitized server name to mcp_connect (#342)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-prompt-hint-e2e-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const noopExecute = async () => ({ content: [{ type: "text", text: "ok" }] as [{ type: "text"; text: string }] });
+  const mockExt = createMockExtension({
+    activeTools: ["read", "mcp_connect"],
+    tools: [
+      { name: "read", description: "Read", execute: noopExecute },
+      { name: "codemode", description: "Codemode", reachesTools: true, execute: noopExecute },
+    ],
+  });
+  const ctx = createMockContext({ cwd: dir, hasUI: true });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          "basic calculator": {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "lazy",
+            exposure: "codemode",
+          },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "codemode"]);
+
+    // Without an active mcp_status the model only learns to connect, never a redacted name.
+    const promptSections: Record<string, string> = {};
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      /- mcp_basic_calculator \(codemode, not connected — connect with mcp_connect\)/,
+    );
+    assert.ok(!(promptSections["mcp_servers"] ?? "").includes("[REDACTED]"));
+    assert.ok(!(promptSections["mcp_servers"] ?? "").includes('mcp_connect "basic'));
+
+    // With mcp_status active the hint points at the verbatim configured name instead.
+    mockExt.activeTools = [...mockExt.activeTools, "mcp_status"];
+    await mockExt.events.get("before_agent_start")({ systemPromptOptions: { sections: promptSections } }, ctx);
+    assert.match(
+      promptSections["mcp_servers"] ?? "",
+      /- mcp_basic_calculator \(codemode, not connected — check mcp_status for the exact name and call mcp_connect\)/,
+    );
+    assert.ok(!(promptSections["mcp_servers"] ?? "").includes("[REDACTED]"));
+    assert.ok(!(promptSections["mcp_servers"] ?? "").includes('mcp_connect "basic'));
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it("preserves active MCP tools and non-hidden definitions on reload session_shutdown while hiding and deactivating on quit (#257)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-mcp-reload-shutdown-"));
   const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");

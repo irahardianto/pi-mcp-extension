@@ -624,7 +624,10 @@ describe("renderMcpServersSection", () => {
     assert.ok(!rendered.includes("\u001b"));
     assert.ok(!rendered.includes("tok-987654"));
     assert.ok(rendered.includes("[REDACTED]"));
-    assert.ok(rendered.includes('mcp_connect "mcp___"'));
+    // WHY: a control-only name sanitizes to nothing, so the namespace fallback is no configured
+    // name either; the bullet must direct the model to `mcp_status` instead (#342).
+    assert.ok(!rendered.includes('mcp_connect "mcp___"'));
+    assert.ok(rendered.includes("not connected — check mcp_status for the exact name and call mcp_connect"));
   });
 
   it("shrinks summaries to fit MAX_SERVERS_SECTION_CHARS and emits singular/plural overflow lines", () => {

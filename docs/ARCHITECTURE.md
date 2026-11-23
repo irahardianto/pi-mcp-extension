@@ -99,8 +99,10 @@ flowchart TD
   `systemPromptOptions.sections["mcp_servers"]` (`renderMcpServersSection()`) with matching
   peer-disambiguated namespace headers and symmetric `codemode` ↔ `tool_search` fallback (or
   omits it when neither reaching tool is active) so the model sees indirect MCP domains,
-  reach modes, and `mcp_connect` hints for disconnected servers (omitting disconnected
-  servers when `mcp_connect` itself is filtered out of active tools). `hidden` tools are
+  reach modes, and `mcp_connect` hints for disconnected servers whose configured name
+  survives sanitization unchanged (an altered name points at `mcp_status` for the exact
+  name instead, and disconnected servers are omitted when `mcp_connect` itself is filtered
+  out of active tools). `hidden` tools are
   registered inactive and never exposed; stopping/removing/withdrawing a tool snapshots
   `activeTools` before re-registering it as `hidden` (`toHiddenToolDefinition()`) and guards
   `execute` against stale calls, except during `session_shutdown` with `reason === "reload"`

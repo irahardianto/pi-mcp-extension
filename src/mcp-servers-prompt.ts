@@ -38,6 +38,9 @@ const MAX_SAFE_SERVER_NAME_CHARS = 120;
 /** Management tool name required to connect lazy/stopped servers from the prompt. */
 const MCP_CONNECT_TOOL_NAME = "mcp_connect";
 
+/** Management tool name that reports every configured server name verbatim. */
+const MCP_STATUS_TOOL_NAME = "mcp_status";
+
 export type IndirectReachMode = "codemode" | "tool_search";
 
 export interface McpPromptServerEntry {
@@ -67,6 +70,7 @@ interface ReachAvailability {
   codemode: boolean;
   toolSearch: boolean;
   mcpConnect: boolean;
+  mcpStatus: boolean;
 }
 
 function isReachingAvailable(
@@ -87,6 +91,7 @@ function resolveReachAvailability(
     codemode: isReachingAvailable(active, allTools, CODEMODE_TOOL_NAME),
     toolSearch: isReachingAvailable(active, allTools, TOOL_SEARCH_TOOL_NAME),
     mcpConnect: active ? active.has(MCP_CONNECT_TOOL_NAME) : true,
+    mcpStatus: active ? active.has(MCP_STATUS_TOOL_NAME) : true,
   };
 }
 
@@ -135,17 +140,32 @@ function resolveServerSummary(entry: McpPromptServerEntry, maxLength: number): s
   return pickFirstSummaryLine(entry.instructions, maxLength);
 }
 
+function formatDisconnectedConnectHint(entryName: string, hasMcpStatus: boolean): string {
+  const safeName = sanitizeNamespaceText(entryName, MAX_SAFE_SERVER_NAME_CHARS);
+  // WHY: `sanitizeNamespaceText` strips terminal escapes, trims, redacts secret-shaped text and
+  // truncates, so its output only matches `manager.getServer(name)` when it left the name intact.
+  // A redacted or truncated name is an argument `mcp_connect` rejects as unknown, while
+  // `mcp_status` returns every configured name verbatim (#342).
+  if (safeName === entryName) {
+    return `not connected — mcp_connect ${JSON.stringify(safeName)}`;
+  }
+  return hasMcpStatus
+    ? "not connected — check mcp_status for the exact name and call mcp_connect"
+    : "not connected — connect with mcp_connect";
+}
+
 function buildServerHead(
   entry: McpPromptServerEntry,
   namespace: string,
   modes: readonly IndirectReachMode[],
+  hasMcpStatus: boolean,
 ): string {
   const reachTag = modes.join(", ");
   if (entry.connected) {
     return `- ${namespace} (${reachTag})`;
   }
-  const safeName = sanitizeNamespaceText(entry.name, MAX_SAFE_SERVER_NAME_CHARS) ?? namespace;
-  return `- ${namespace} (${reachTag}, not connected — mcp_connect ${JSON.stringify(safeName)})`;
+  const hint = formatDisconnectedConnectHint(entry.name, hasMcpStatus);
+  return `- ${namespace} (${reachTag}, ${hint})`;
 }
 
 function buildSectionIntro(
@@ -221,7 +241,7 @@ function preparePromptServers(
     prepared.push({
       entry,
       modes,
-      head: buildServerHead(entry, namespace, modes),
+      head: buildServerHead(entry, namespace, modes, available.mcpStatus),
     });
   }
   return prepared.sort((a, b) => compareCodePoints(a.entry.name, b.entry.name));
