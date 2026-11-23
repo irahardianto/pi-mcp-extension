@@ -64,7 +64,7 @@ export interface ServerCompletionEntry {
 
 export function serverNameCompletions(
   argumentPrefix: string,
-  servers: ServerCompletionEntry[],
+  servers: readonly ServerCompletionEntry[],
   options: { authOnly?: boolean } = {},
 ) {
   const prefix = argumentPrefix.trimStart();
@@ -85,6 +85,53 @@ export function serverNameCompletions(
         .join(" · "),
     }));
 
+  return completions.length > 0 ? completions : null;
+}
+
+const RESET_FLAG = "--reset";
+const RESET_FLAG_DESCRIPTION = "Discard stored credentials and re-authorize";
+
+function resetFlagCompletion(prefix: string, servers: readonly ServerCompletionEntry[]) {
+  if (!prefix.startsWith("-") || !RESET_FLAG.startsWith(prefix)) return null;
+  if (!servers.some((server) => Boolean(server.config.auth))) return null;
+  return { value: `${RESET_FLAG} `, label: RESET_FLAG, description: RESET_FLAG_DESCRIPTION };
+}
+
+function leadingResetServerCompletions(
+  resetSeparator: string,
+  serverPrefix: string,
+  servers: readonly ServerCompletionEntry[],
+) {
+  const resetMatches = serverNameCompletions(serverPrefix, servers, { authOnly: true });
+  if (!resetMatches) return [];
+
+  const serverNames = servers.map((server) => server.name);
+  const completions = [];
+  for (const item of resetMatches) {
+    // WHY: Pi replaces the entire argument prefix, so the completion must reinsert the flag.
+    const value = `${resetSeparator}${item.value}`;
+    // Exact configured names and trailing flags can take precedence over a leading flag.
+    const parsed = parseAuthArguments(value, serverNames);
+    if (parsed.reset && parsed.name === item.value) completions.push({ ...item, value });
+  }
+  return completions;
+}
+
+export function authArgumentCompletions(argumentPrefix: string, servers: readonly ServerCompletionEntry[]) {
+  const prefix = argumentPrefix.trimStart();
+  const literalMatches = serverNameCompletions(prefix, servers, { authOnly: true }) ?? [];
+  const resetPrefix = /^--reset\s+/.exec(prefix);
+  if (!resetPrefix) {
+    const flagCompletion = resetFlagCompletion(prefix, servers);
+    const completions = flagCompletion ? [...literalMatches, flagCompletion] : literalMatches;
+    return completions.length > 0 ? completions : null;
+  }
+
+  const serverPrefix = prefix.slice(resetPrefix[0].length);
+  const completions = [
+    ...literalMatches,
+    ...leadingResetServerCompletions(resetPrefix[0], serverPrefix, servers),
+  ];
   return completions.length > 0 ? completions : null;
 }
 

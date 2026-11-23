@@ -1,6 +1,51 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { serverNameCompletions } from "../src/commands.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { RegisteredCommand } from "@earendil-works/pi-coding-agent";
+import { authArgumentCompletions, parseAuthArguments, serverNameCompletions } from "../src/commands.js";
+import extension from "../src/index.js";
+import { createMockExtension } from "./helpers/mock-extension.js";
+
+type AutocompleteItem = NonNullable<
+  Awaited<ReturnType<NonNullable<RegisteredCommand["getArgumentCompletions"]>>>
+>[number];
+
+interface PiAutocompleteProvider {
+  getSuggestions(
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    options: { signal: AbortSignal; force?: boolean },
+  ): Promise<{ items: AutocompleteItem[]; prefix: string } | null>;
+  applyCompletion(
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    item: AutocompleteItem,
+    prefix: string,
+  ): { lines: string[]; cursorLine: number; cursorCol: number };
+}
+
+async function createPiAutocompleteProvider(
+  commands: Array<{ name: string; getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"] }>,
+  basePath: string,
+): Promise<PiAutocompleteProvider> {
+  // WHY: `@earendil-works/pi-tui` is a dependency of `@earendil-works/pi-coding-agent`, not a
+  // direct dependency in package.json, so resolve it from pi-coding-agent's package scope.
+  const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const tuiModuleUrl = pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href;
+  const { CombinedAutocompleteProvider } = (await import(tuiModuleUrl)) as {
+    CombinedAutocompleteProvider: new (
+      commands: Array<{ name: string; getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"] }>,
+      basePath: string,
+    ) => PiAutocompleteProvider;
+  };
+  return new CombinedAutocompleteProvider(commands, basePath);
+}
 
 describe("serverNameCompletions", () => {
   const servers = [
@@ -86,4 +131,104 @@ describe("serverNameCompletions", () => {
     assert.strictEqual(serverNameCompletions("", []), null);
     assert.strictEqual(serverNameCompletions("missing", servers), null);
   });
+});
+
+describe("authArgumentCompletions", () => {
+  const oauthServer = {
+    state: "stopped",
+    config: { transport: "streamable-http", lifecycle: "lazy", auth: { type: "oauth" } },
+  };
+  const plainServer = { state: "stopped", config: { transport: "stdio", lifecycle: "lazy" } };
+
+  it("keeps ordinary OAuth completions and completes partial --reset prefixes when OAuth servers exist", () => {
+    const servers = [{ ...oauthServer, name: "oauth server" }, { ...plainServer, name: "oauth-local" }];
+    const [item] = authArgumentCompletions("oa", servers) ?? [];
+    assert.deepStrictEqual(item, {
+      value: "oauth server",
+      label: "oauth server",
+      description: "stopped · streamable-http · lazy · OAuth",
+    });
+    assert.deepStrictEqual(parseAuthArguments(`${item.value} --reset`, servers.map(({ name }) => name)), {
+      name: "oauth server",
+      reset: true,
+    });
+    const expectedFlag = [
+      { value: "--reset ", label: "--reset", description: "Discard stored credentials and re-authorize" },
+    ];
+    assert.deepStrictEqual(authArgumentCompletions("-", servers), expectedFlag);
+    assert.deepStrictEqual(authArgumentCompletions("--res", servers), expectedFlag);
+    assert.deepStrictEqual(authArgumentCompletions("--reset", servers), expectedFlag);
+    assert.strictEqual(authArgumentCompletions("--resetx", servers), null);
+    assert.strictEqual(authArgumentCompletions("--res", [servers[1]!]), null);
+    assert.strictEqual(authArgumentCompletions("--res", []), null);
+    assert.strictEqual(authArgumentCompletions("--reset oauth-local", servers), null);
+    assert.strictEqual(authArgumentCompletions("--reset ", [servers[1]!]), null);
+  });
+
+  it("keeps completions for literal server names that look like reset flags", () => {
+    const servers = ["--reset", "--resetfoo", "--reset oauth server", "oauth server"].map((name) => ({ ...oauthServer, name }));
+    assert.deepStrictEqual(authArgumentCompletions("--res", servers)?.map(({ value }) => value), [
+      "--reset", "--reset oauth server", "--resetfoo", "--reset ",
+    ]);
+    assert.deepStrictEqual(authArgumentCompletions("--reset oa", servers)?.map(({ value, label }) => ({ value, label })), [
+      { value: "--reset oauth server", label: "--reset oauth server" },
+    ]);
+    assert.deepStrictEqual(authArgumentCompletions("--reset\t oa", servers)?.map(({ value, label }) => ({ value, label })), [
+      { value: "--reset\t oauth server", label: "oauth server" },
+    ]);
+  });
+
+  it("omits reset suggestions when the parser would select a different server or drop the reset", () => {
+    const servers = [
+      { ...oauthServer, name: "oauth server" },
+      { ...plainServer, name: "--reset oauth server" },
+      { ...oauthServer, name: "release --reset" },
+    ];
+    assert.strictEqual(authArgumentCompletions("--reset oa", servers), null);
+    assert.strictEqual(authArgumentCompletions("--reset rel", servers), null);
+  });
+});
+
+it("completes a leading --reset through the registered command and Pi autocomplete", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-auth-completions-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configPath = join(dir, "mcp.json");
+  const mcpServers = {
+    "oauth server": { type: "streamable-http", url: "http://127.0.0.1:1/mcp", auth: { type: "oauth" } },
+    "oauth-lookalike": { type: "stdio", command: "unused-test-command" },
+  };
+  await writeFile(configPath, JSON.stringify({ mcpServers }));
+  const mock = createMockExtension();
+  await extension(mock.api, { bootstrapCwd: dir, globalConfigPath: configPath, authStorageDir: join(dir, "auth") });
+  const { getArgumentCompletions } = mock.commands.get("mcp:auth");
+  assert.ok(getArgumentCompletions);
+  const provider = await createPiAutocompleteProvider([{ name: "mcp:auth", getArgumentCompletions }], dir);
+
+  for (const input of ["/mcp:auth --res", "/mcp:auth   --res"]) {
+    const suggestions = await provider.getSuggestions([input], 0, input.length, { signal: t.signal });
+    assert.ok(suggestions, `Expected --reset flag completion for ${JSON.stringify(input)}`);
+    assert.deepStrictEqual(suggestions.items.map(({ value, label }) => ({ value, label })), [
+      { value: "--reset ", label: "--reset" },
+    ]);
+    const [flagItem] = suggestions.items;
+    assert.ok(flagItem);
+    const { lines } = provider.applyCompletion([input], 0, input.length, flagItem, suggestions.prefix);
+    assert.deepStrictEqual(lines, ["/mcp:auth --reset "]);
+  }
+
+  for (const input of ["/mcp:auth --reset ", "/mcp:auth --reset oa", "/mcp:auth   --reset oa"]) {
+    const suggestions = await provider.getSuggestions([input], 0, input.length, { signal: t.signal });
+    assert.ok(suggestions, `Expected OAuth server completions for ${JSON.stringify(input)}`);
+    assert.deepStrictEqual(suggestions.items.map(({ value, label }) => ({ value, label })), [
+      { value: "--reset oauth server", label: "oauth server" },
+    ]);
+    const [item] = suggestions.items;
+    assert.ok(item);
+    const { lines } = provider.applyCompletion([input], 0, input.length, item, suggestions.prefix);
+    assert.deepStrictEqual(lines, ["/mcp:auth --reset oauth server"]);
+    assert.deepStrictEqual(parseAuthArguments(lines[0]?.slice("/mcp:auth ".length), Object.keys(mcpServers)), {
+      name: "oauth server",
+      reset: true,
+    });
+  }
 });
