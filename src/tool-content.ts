@@ -131,17 +131,17 @@ export function buildToolAnnotations(
 
 /**
  * Convert a callTool result into Pi content blocks, falling back to
- * `structuredContent` when the server returned no content blocks.
+ * `structuredContent` when the converted blocks contain no images or nonblank text.
  */
 export function buildToolCallContent(result: ToolCallResponse): PiContent[] {
   const content = convertMcpContent((result.content ?? []) as Array<Record<string, unknown>>);
-  if (content.length > 0 || result.structuredContent === undefined) return content;
   const structured = result.structuredContent;
-  content.push({
-    type: "text",
-    text: typeof structured === "string" ? structured : JSON.stringify(structured, null, 2),
-  });
-  return content;
+  if (structured === undefined ||
+    content.some((block) => block.type !== "text" || block.text.trim().length > 0)) {
+    return content;
+  }
+  const text = typeof structured === "string" ? structured : JSON.stringify(structured, null, 2);
+  return typeof text === "string" && text.trim().length > 0 ? [{ type: "text", text }] : content;
 }
 
 /** Text blocks of a failed tool call, joined into the McpError message. */
@@ -173,13 +173,15 @@ export function buildToolCallOutcome(
       structuredContent: buildMcpScriptResult(result),
     };
   }
-  const errorMessage = toolErrorText(content) || "Tool reported an error";
+  const errorText = toolErrorText(content);
+  const hasErrorText = errorText.trim().length > 0;
+  const errorMessage = hasErrorText ? errorText : "Tool reported an error";
   if (!supportsErrorResult) {
     throw new McpError(errorMessage, serverName, "tool");
   }
-  const errorContent: PiContent[] = toolErrorText(content)
+  const errorContent: PiContent[] = hasErrorText
     ? content
-    : [...content, { type: "text", text: errorMessage }];
+    : [...content.filter((c) => c.type !== "text"), { type: "text", text: errorMessage }];
   return {
     content: errorContent,
     details: {},

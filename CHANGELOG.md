@@ -9,6 +9,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - Report a connection cancellation when `/mcp:stop` interrupts `/mcp:start` for a non-OAuth server (#358).
 
+## [1.16.1] - 2026-11-23
+
+### Fixed
+- MCP tool calls now show structured results when the server returns only empty or whitespace-only text blocks (#359).
+
 ## [1.16.0] - 2026-11-22
 
 ### Added
