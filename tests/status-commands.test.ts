@@ -313,3 +313,57 @@ it("points a headless authorization failure at /mcp:auth", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+for (const { name, auth, cancellation } of [
+  { name: "plain server", auth: undefined, cancellation: "Connection cancelled" },
+  { name: "OAuth server", auth: { type: "oauth" }, cancellation: "Authentication cancelled" },
+] as const) {
+  it(`reports an informational ${cancellation.toLowerCase()} notification when /mcp:stop cancels /mcp:start for ${name}`, async () => {
+    const { createServer } = await import("node:http");
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-status-cancel-"));
+    let markRequestReached!: () => void;
+    const requestReached = new Promise<void>((resolve) => { markRequestReached = resolve; });
+    const listener = createServer(() => markRequestReached());
+    const { api, commands, events } = createMockExtension();
+    const notifications: { message: string; level: string | undefined }[] = [];
+    const ctx = createMockContext({
+      cwd: dir,
+      hasUI: true,
+      ui: { notify: (message, level) => notifications.push({ message, level }) },
+    });
+
+    try {
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const address = listener.address();
+      assert.ok(address && typeof address === "object");
+      const configPath = join(dir, "mcp.json");
+      await writeFile(configPath, JSON.stringify({
+        settings: { maxRetries: 0, requestTimeoutMs: 5000 },
+        mcpServers: {
+          [name]: { transport: "streamable-http", url: `http://127.0.0.1:${address.port}/mcp`, auth },
+        },
+      }));
+      await extension(api, { bootstrapCwd: dir, globalConfigPath: configPath, authStorageDir: join(dir, "auth") });
+      await events.get("session_start")({}, ctx);
+
+      const start = commands.get("mcp:start").handler(name, ctx);
+      const inFlight = await Promise.race([
+        requestReached.then(() => true),
+        start.then(() => false),
+      ]);
+      assert.ok(inFlight, "The connection must still be in flight when stopped");
+      await commands.get("mcp:stop").handler(name, ctx);
+      await start;
+
+      assert.deepEqual(notifications.sort((a, b) => a.message.localeCompare(b.message)), [
+        { message: `pi-mcp: ${cancellation} for ${name}`, level: "info" },
+        { message: `pi-mcp: Stopped ${name}`, level: "info" },
+      ]);
+    } finally {
+      await events.get("session_shutdown")?.({}, ctx);
+      listener.closeAllConnections();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
