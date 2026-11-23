@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
+  authArgumentCompletions,
   parseAuthArguments,
   parseResourceArguments,
   serverNameCompletions,
@@ -333,7 +334,7 @@ export function registerCommands(pi: ExtensionAPI, deps: RegisterCommandsDeps): 
   pi.registerCommand("mcp:auth", {
     description: "Connect with OAuth; use /mcp:auth <name> --reset to discard stored credentials.",
     handler: (args, ctx) => handleMcpAuth(args, ctx, deps),
-    getArgumentCompletions: (prefix) => serverNameCompletions(prefix, manager.getAllServers(), { authOnly: true }),
+    getArgumentCompletions: (prefix) => authArgumentCompletions(prefix, manager.getAllServers()),
   });
 
   // ── 7. /mcp:resources — list or read MCP resources ───────────────────────

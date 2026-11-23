@@ -69,7 +69,7 @@ jobs:
         # WHY: Run only on the Node 22 leg where test:coverage generates lcov.info,
         # and skip on fork PRs where GitHub provides no OIDC token.
         if: matrix.node-version == 22 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: qltysh/qlty-action/coverage@ebcd284bf32e36a030afe15f1e136c7be08b9506 # v2.5.0
+        uses: qltysh/qlty-action/coverage@0ff2178667bf8eb28ed0013a7ef54857a24d4056 # v2.7.0
         with:
           oidc: true
           files: lcov.info

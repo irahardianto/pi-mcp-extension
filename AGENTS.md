@@ -53,7 +53,7 @@ Semgrep and ESLint enforce several of these rules. Suppress a finding only with 
 | `src/register-tools.ts` | Pi `mcp_status` / `mcp_connect` (`exposure: "model-only"`) and `mcp_list_resources` / `mcp_read_resource` tool registration (`registerManagementTools`), connection status/error formatting (`formatConnectSuccess`, `formatMcpConnectError`), and resource queries |
 | `src/connection-coordinator.ts` | Connection and auth coordination (`ConnectionCoordinator`: in-flight `connectAttempts`, `authQueue`, eager server starts, session teardown) |
 | `src/startup-auth.ts` | Abort-aware auth-queue turn waiter (`waitForQueueTurn`), startup authorization prompt (`promptStartupAuth`, `startupAuthNowOption`, `startupAuthLaterOption`), and error message formatting (`formatErrorMessage`) |
-| `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`, `parseResourceArguments`) and server-name tab completions (`serverNameCompletions`) |
+| `src/commands.ts` | Pure `/mcp*` command argument parsing (`parseAuthArguments`, `parseResourceArguments`) and tab completions (`serverNameCompletions`, `authArgumentCompletions`) |
 | `src/authorize-flow.ts` | Interactive OAuth authorization flow coordinator (`authorize`, `AuthorizeDeps`) |
 | `src/authorize-browser.ts` | OS browser process launcher (`openBrowser`, `browserOpenCommand`, `OpenBrowserDeps`) and safe-URL authorization redirect gate (`createAuthorizationBrowserLauncher`, `reopenAuthorizationBrowser`) |
 | `src/authorize-dialog.ts` | Interactive OAuth callback dialog waiter (`waitForOAuthCallback`, `OAuthPasteOptions`) and dialog option constants (`authRetryOption`, `authPasteOption`, `authCancelOption`) |
