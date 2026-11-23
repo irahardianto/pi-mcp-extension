@@ -3432,6 +3432,44 @@ describe("structured tool results with blank text placeholders (#359)", () => {
       structuredContent: "fallback",
     }), [{ type: "text", text: "fallback" }]);
   });
+
+  it("keeps original content when structuredContent is a blank string", () => {
+    const content = [{ type: "text", text: " \n" }];
+    for (const structuredContent of ["", "   "]) {
+      assert.deepEqual(buildToolCallContent({ content, structuredContent }), content);
+    }
+  });
+
+  it("falls back to a generic error message when error content and structuredContent are blank", () => {
+    const image = { type: "image", data: "YWJj", mimeType: "image/png" };
+    for (const structuredContent of [undefined, "", "   "]) {
+      for (const text of ["", " \n"]) {
+        const result = {
+          content: [{ type: "text", text }],
+          ...(structuredContent !== undefined ? { structuredContent } : {}),
+          isError: true,
+        };
+        const outcome = buildToolCallOutcome(result, "weather", true);
+        assert.equal(outcome.isError, true);
+        assert.deepEqual(outcome.content, [{ type: "text", text: "Tool reported an error" }]);
+        assert.deepEqual(outcome.structuredContent, result);
+
+        assert.throws(() => buildToolCallOutcome(result, "weather"), {
+          name: "McpError",
+          code: "tool",
+          server: "weather",
+          message: "Tool reported an error",
+        });
+      }
+    }
+
+    const imageWithBlankText = buildToolCallOutcome({
+      content: [{ type: "text", text: " \n" }, image],
+      structuredContent: "",
+      isError: true,
+    }, "weather", true);
+    assert.deepEqual(imageWithBlankText.content, [image, { type: "text", text: "Tool reported an error" }]);
+  });
 });
 
 // ── Paginated listAllTools ─────────────────────────────────────────────────────

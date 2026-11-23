@@ -140,10 +140,8 @@ export function buildToolCallContent(result: ToolCallResponse): PiContent[] {
     content.some((block) => block.type !== "text" || block.text.trim().length > 0)) {
     return content;
   }
-  return [{
-    type: "text",
-    text: typeof structured === "string" ? structured : JSON.stringify(structured, null, 2),
-  }];
+  const text = typeof structured === "string" ? structured : JSON.stringify(structured, null, 2);
+  return typeof text === "string" && text.trim().length > 0 ? [{ type: "text", text }] : content;
 }
 
 /** Text blocks of a failed tool call, joined into the McpError message. */
@@ -175,13 +173,15 @@ export function buildToolCallOutcome(
       structuredContent: buildMcpScriptResult(result),
     };
   }
-  const errorMessage = toolErrorText(content) || "Tool reported an error";
+  const errorText = toolErrorText(content);
+  const hasErrorText = errorText.trim().length > 0;
+  const errorMessage = hasErrorText ? errorText : "Tool reported an error";
   if (!supportsErrorResult) {
     throw new McpError(errorMessage, serverName, "tool");
   }
-  const errorContent: PiContent[] = toolErrorText(content)
+  const errorContent: PiContent[] = hasErrorText
     ? content
-    : [...content, { type: "text", text: errorMessage }];
+    : [...content.filter((c) => c.type !== "text"), { type: "text", text: errorMessage }];
   return {
     content: errorContent,
     details: {},
