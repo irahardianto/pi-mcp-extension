@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.1] - 2026-11-23
+
 ### Fixed
 - MCP tool calls now show structured results when the server returns only empty or whitespace-only text blocks (#359).
 
