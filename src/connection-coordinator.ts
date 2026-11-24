@@ -10,7 +10,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { McpConfig, ServerConfig } from "./config.js";
 import type { ManagedServer, ServerManager } from "./server-manager.js";
 import type { ToolBridge } from "./tool-bridge.js";
-import { McpError, AuthCancelledError, AuthRequiredError } from "./errors.js";
+import { McpError, AuthCancelledError, AuthRequiredError, type CancellationPhase } from "./errors.js";
 import {
   formatErrorMessage,
   promptStartupAuth,
@@ -39,6 +39,7 @@ type ConnectAttemptEntry = {
   controller: AbortController;
   reset: boolean;
   waiters: number;
+  phase: CancellationPhase;
 };
 
 type ActiveStartupTurn = {
@@ -417,9 +418,9 @@ export class ConnectionCoordinator {
           }
           entry.controller.abort();
           stopPromise = this.deps.manager.stopServer(serverName);
-          void stopPromise.finally(() => reject(new AuthCancelledError(serverName)));
+          void stopPromise.finally(() => reject(new AuthCancelledError(serverName, entry.phase)));
         } else {
-          reject(new AuthCancelledError(serverName));
+          reject(new AuthCancelledError(serverName, entry.phase));
         }
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -441,7 +442,7 @@ export class ConnectionCoordinator {
   ): ManagedServer {
     const server = this.deps.manager.getServer(serverName);
     if (!server) throw new McpError(`Unknown server "${serverName}"`, serverName, "config");
-    if (signal?.aborted) throw new AuthCancelledError(serverName);
+    if (signal?.aborted) throw new AuthCancelledError(serverName, reset ? "auth" : "connection");
     if (reset && !server.config.auth) {
       throw new McpError(`Server "${serverName}" has no OAuth configuration`, serverName, "config");
     }
@@ -471,9 +472,11 @@ export class ConnectionCoordinator {
     entry: ConnectAttemptEntry,
   ): Promise<void> {
     const { serverName, controller } = params;
-    const task = this._executeConnectTask(params)
+    const task = this._executeConnectTask(params, entry)
       .catch((err: unknown) => {
-        if (controller.signal.aborted) throw new AuthCancelledError(serverName);
+        if (controller.signal.aborted || err instanceof AuthCancelledError) {
+          throw new AuthCancelledError(serverName, entry.phase);
+        }
         throw err;
       })
       .finally(() => {
@@ -485,7 +488,10 @@ export class ConnectionCoordinator {
     return task;
   }
 
-  private async _executeConnectTask(params: ConnectAttemptParams): Promise<void> {
+  private async _executeConnectTask(
+    params: ConnectAttemptParams,
+    entry: ConnectAttemptEntry,
+  ): Promise<void> {
     const { serverName, ctx, controller, existing, reset, alreadyQueued } = params;
     if (existing) {
       // Wait for a superseded connect to release its callback listener and auth lock.
@@ -504,7 +510,8 @@ export class ConnectionCoordinator {
       return;
     }
     if (!ctx.hasUI) throw new AuthRequiredError(serverName);
-    const runInteractiveAuth = (): Promise<void> => this._authorizeAndRestart(params);
+    entry.phase = "auth";
+    const runInteractiveAuth = (): Promise<void> => this._authorizeAndRestart(params, entry);
     if (alreadyQueued || params.inheritedStartupTurn) {
       await runInteractiveAuth();
     } else {
@@ -530,11 +537,15 @@ export class ConnectionCoordinator {
     }
   }
 
-  private async _authorizeAndRestart(params: InteractiveAuthParams): Promise<void> {
+  private async _authorizeAndRestart(
+    params: InteractiveAuthParams,
+    entry: ConnectAttemptEntry,
+  ): Promise<void> {
     const { serverName, ctx, controller, reset } = params;
     this._ensureActive(controller.signal, serverName);
     await this.deps.authorize(serverName, ctx, controller.signal, reset);
     this._ensureActive(controller.signal, serverName);
+    entry.phase = "connection";
     try {
       await this._startAndGuardAbort(serverName, ctx, controller.signal);
     } catch (err) {
@@ -618,6 +629,7 @@ export class ConnectionCoordinator {
       controller,
       reset,
       waiters: 0,
+      phase: reset ? "auth" : "connection",
     };
     entry.promise = this._startConnectTask(
       {

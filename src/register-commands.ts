@@ -99,7 +99,8 @@ async function handleMcpStart(
     ctx.ui.notify("Usage: /mcp:start <server-name>", "error");
     return;
   }
-  if (!manager.getServer(serverName)) {
+  const server = manager.getServer(serverName);
+  if (!server) {
     ctx.ui.notify(`pi-mcp: No server named "${serverName}"`, "error");
     return;
   }
@@ -108,7 +109,11 @@ async function handleMcpStart(
     ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
   } catch (err) {
     if (err instanceof AuthCancelledError) {
-      ctx.ui.notify(`pi-mcp: ${sanitizeTerminalText(err.message)}`, "info");
+      const message =
+        server.config.auth && err.phase === "auth"
+          ? err.message
+          : `Connection cancelled for ${serverName}`;
+      ctx.ui.notify(`pi-mcp: ${sanitizeTerminalText(message)}`, "info");
       return;
     }
     const msg = formatErrorMessage(err);

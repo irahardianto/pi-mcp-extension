@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { ConnectionCoordinator } from "../src/connection-coordinator.js";
+import { ConnectionCoordinator, type ConnectionCoordinatorDeps } from "../src/connection-coordinator.js";
 import {
   formatErrorMessage,
   startupAuthNowOption,
@@ -379,7 +379,11 @@ describe("ConnectionCoordinator auth hint synchronization (Issue 207)", () => {
     auth: { type: "oauth", clientId: "test" },
   };
 
-  function setup(options: Omit<FakeManagerOptions, "servers"> = {}) {
+  function setup(
+    options: Omit<FakeManagerOptions, "servers"> & {
+      authorize?: ConnectionCoordinatorDeps["authorize"];
+    } = {},
+  ) {
     const fake = makeFakeManager({
       ...options,
       // WHY: A declined server is always a server whose last connect failed with
@@ -393,7 +397,7 @@ describe("ConnectionCoordinator auth hint synchronization (Issue 207)", () => {
       manager: fake.manager,
       bridge: fakeBridge.bridge,
       getConfig: () => ({ settings: { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 0 }, mcpServers: {} }),
-      authorize: async () => {},
+      authorize: options.authorize ?? (async () => {}),
       stopCallbackServer: async () => {},
     });
     const ctx = createMockContext({
@@ -556,5 +560,70 @@ describe("ConnectionCoordinator auth hint synchronization (Issue 207)", () => {
 
     assert.equal(statuses.at(-1), undefined, "a successful authorization must not leave the hint behind");
     assert.equal(coordinator.isStartupAuthDeclined("oauthSrv"), false);
+  });
+
+  it("tags AuthCancelledError with phase 'connection' before/after interactive OAuth and 'auth' during OAuth", async () => {
+    // 1. Pre-auth connection cancel -> phase "connection"
+    let markPreAuthEntered!: () => void;
+    let finishPreAuth!: () => void;
+    const preAuthEntered = new Promise<void>((resolve) => { markPreAuthEntered = resolve; });
+    const preAuthDone = new Promise<void>((resolve) => { finishPreAuth = resolve; });
+    const preAuth = setup({
+      onStartServer: async () => {
+        markPreAuthEntered();
+        await preAuthDone;
+      },
+    });
+    const preAuthConnect = preAuth.coordinator.connect("oauthSrv", preAuth.ctx);
+    await preAuthEntered;
+    preAuth.coordinator.cancelServer("oauthSrv");
+    finishPreAuth();
+    await assert.rejects(
+      preAuthConnect,
+      (err: unknown) => err instanceof AuthCancelledError && err.phase === "connection",
+    );
+
+    // 2. Interactive OAuth cancel -> phase "auth"
+    let markAuthEntered!: () => void;
+    const authEntered = new Promise<void>((resolve) => { markAuthEntered = resolve; });
+    const duringAuth = setup({
+      onStartServer: async () => { throw new AuthRequiredError("oauthSrv"); },
+      authorize: async (_name, _ctx, signal) => {
+        markAuthEntered();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new AuthCancelledError("oauthSrv")), { once: true });
+        });
+      },
+    });
+    const duringAuthConnect = duringAuth.coordinator.connect("oauthSrv", duringAuth.ctx);
+    await authEntered;
+    duringAuth.coordinator.cancelServer("oauthSrv");
+    await assert.rejects(
+      duringAuthConnect,
+      (err: unknown) => err instanceof AuthCancelledError && err.phase === "auth",
+    );
+
+    // 3. Post-auth reconnect cancel -> phase "connection"
+    let startCalls = 0;
+    let markReconnectEntered!: () => void;
+    let finishReconnect!: () => void;
+    const reconnectEntered = new Promise<void>((resolve) => { markReconnectEntered = resolve; });
+    const reconnectDone = new Promise<void>((resolve) => { finishReconnect = resolve; });
+    const postAuth = setup({
+      onStartServer: async () => {
+        startCalls++;
+        if (startCalls === 1) throw new AuthRequiredError("oauthSrv");
+        markReconnectEntered();
+        await reconnectDone;
+      },
+    });
+    const postAuthConnect = postAuth.coordinator.connect("oauthSrv", postAuth.ctx);
+    await reconnectEntered;
+    postAuth.coordinator.cancelServer("oauthSrv");
+    finishReconnect();
+    await assert.rejects(
+      postAuthConnect,
+      (err: unknown) => err instanceof AuthCancelledError && err.phase === "connection",
+    );
   });
 });
