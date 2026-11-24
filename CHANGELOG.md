@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
-- Report a connection cancellation when `/mcp:stop` interrupts `/mcp:start` for a non-OAuth server (#358).
+- Report a connection cancellation when `/mcp:stop` interrupts `/mcp:start` outside interactive OAuth (both non-OAuth servers and OAuth servers cancelled before interactive authorization begins) (#358).
 
 ## [1.16.2] - 2026-11-23
 

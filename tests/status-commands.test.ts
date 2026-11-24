@@ -314,11 +314,41 @@ it("points a headless authorization failure at /mcp:auth", async () => {
   }
 });
 
-for (const { name, auth, cancellation } of [
-  { name: "plain server", auth: undefined, cancellation: "Connection cancelled" },
-  { name: "OAuth server", auth: { type: "oauth" }, cancellation: "Authentication cancelled" },
+for (const { label, name, buildServer } of [
+  {
+    label: "non-OAuth streamable-http server",
+    name: "plain http server",
+    buildServer: (port: number) => ({ transport: "streamable-http", url: `http://127.0.0.1:${port}/mcp` }),
+  },
+  {
+    label: "non-OAuth sse server",
+    name: "plain sse server",
+    buildServer: (port: number) => ({ transport: "sse", url: `http://127.0.0.1:${port}/sse` }),
+  },
+  {
+    label: "non-OAuth stdio server",
+    name: "plain stdio server",
+    buildServer: (port: number) => ({
+      transport: "stdio",
+      command: process.execPath,
+      args: [
+        "-e",
+        "import('node:http').then((h) => h.get(process.argv[1]).on('error', () => {})); setInterval(() => {}, 1000);",
+        `http://127.0.0.1:${port}/stdio-ready`,
+      ],
+    }),
+  },
+  {
+    label: "OAuth server cancelled before interactive authorization starts",
+    name: "OAuth server",
+    buildServer: (port: number) => ({
+      transport: "streamable-http",
+      url: `http://127.0.0.1:${port}/mcp`,
+      auth: { type: "oauth" },
+    }),
+  },
 ] as const) {
-  it(`reports an informational ${cancellation.toLowerCase()} notification when /mcp:stop cancels /mcp:start for ${name}`, async () => {
+  it(`reports an informational connection cancelled notification when /mcp:stop cancels /mcp:start for ${label}`, async () => {
     const { createServer } = await import("node:http");
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-status-cancel-"));
     let markRequestReached!: () => void;
@@ -339,9 +369,7 @@ for (const { name, auth, cancellation } of [
       const configPath = join(dir, "mcp.json");
       await writeFile(configPath, JSON.stringify({
         settings: { maxRetries: 0, requestTimeoutMs: 5000 },
-        mcpServers: {
-          [name]: { transport: "streamable-http", url: `http://127.0.0.1:${address.port}/mcp`, auth },
-        },
+        mcpServers: { [name]: buildServer(address.port) },
       }));
       await extension(api, { bootstrapCwd: dir, globalConfigPath: configPath, authStorageDir: join(dir, "auth") });
       await events.get("session_start")({}, ctx);
@@ -356,7 +384,7 @@ for (const { name, auth, cancellation } of [
       await start;
 
       assert.deepEqual(notifications.sort((a, b) => a.message.localeCompare(b.message)), [
-        { message: `pi-mcp: ${cancellation} for ${name}`, level: "info" },
+        { message: `pi-mcp: Connection cancelled for ${name}`, level: "info" },
         { message: `pi-mcp: Stopped ${name}`, level: "info" },
       ]);
     } finally {
@@ -367,3 +395,83 @@ for (const { name, auth, cancellation } of [
     }
   });
 }
+
+it("reports an informational authentication cancelled notification when /mcp:stop cancels /mcp:start during interactive OAuth", async () => {
+  const { createServer } = await import("node:http");
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-status-cancel-oauth-"));
+  let base = "";
+  const listener = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url?.startsWith("/.well-known/oauth-protected-resource")) {
+      res.end(JSON.stringify({ resource: `${base}/mcp`, authorization_servers: [base] }));
+    } else if (req.url === "/.well-known/oauth-authorization-server") {
+      res.end(JSON.stringify({
+        issuer: base,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+      }));
+    } else {
+      res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+      res.end();
+    }
+  });
+  let markAuthOpened!: () => void;
+  const authOpened = new Promise<void>((resolve) => { markAuthOpened = resolve; });
+  const { api, commands, events } = createMockExtension();
+  const notifications: { message: string; level: string | undefined }[] = [];
+  const ctx = createMockContext({
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => notifications.push({ message, level }),
+      select: () => new Promise(() => {}),
+    },
+  });
+
+  try {
+    await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+    const address = listener.address();
+    assert.ok(address && typeof address === "object");
+    base = `http://127.0.0.1:${address.port}`;
+    const configPath = join(dir, "mcp.json");
+    await writeFile(configPath, JSON.stringify({
+      settings: { maxRetries: 0, requestTimeoutMs: 5000 },
+      mcpServers: {
+        "OAuth server": {
+          transport: "streamable-http",
+          url: `${base}/mcp`,
+          auth: { type: "oauth", clientId: "test-client" },
+        },
+      },
+    }));
+    await extension(api, {
+      bootstrapCwd: dir,
+      globalConfigPath: configPath,
+      authStorageDir: join(dir, "auth"),
+      browserOpen: () => markAuthOpened(),
+    });
+    await events.get("session_start")({}, ctx);
+
+    const start = commands.get("mcp:start").handler("OAuth server", ctx);
+    const inAuth = await Promise.race([
+      authOpened.then(() => true),
+      start.then(() => false),
+    ]);
+    assert.ok(inAuth, "Interactive OAuth must be in flight when stopped");
+    notifications.length = 0;
+    await commands.get("mcp:stop").handler("OAuth server", ctx);
+    await start;
+
+    assert.deepEqual(notifications.sort((a, b) => a.message.localeCompare(b.message)), [
+      { message: "pi-mcp: Authentication cancelled for OAuth server", level: "info" },
+      { message: "pi-mcp: Stopped OAuth server", level: "info" },
+    ]);
+  } finally {
+    await events.get("session_shutdown")?.({}, ctx);
+    listener.closeAllConnections();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});

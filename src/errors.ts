@@ -36,10 +36,15 @@ export class McpError extends Error {
   }
 }
 
+export type CancellationPhase = "auth" | "connection";
+
 export class AuthCancelledError extends Error {
-  constructor(serverName: string) {
+  public readonly phase: CancellationPhase;
+
+  constructor(serverName: string, phase: CancellationPhase = "auth") {
     super(`Authentication cancelled for ${serverName}`);
     this.name = "AuthCancelledError";
+    this.phase = phase;
   }
 }
 

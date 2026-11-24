@@ -109,7 +109,10 @@ async function handleMcpStart(
     ctx.ui.notify(`pi-mcp: Started ${serverName}`, "info");
   } catch (err) {
     if (err instanceof AuthCancelledError) {
-      const message = server.config.auth ? err.message : `Connection cancelled for ${serverName}`;
+      const message =
+        server.config.auth && err.phase === "auth"
+          ? err.message
+          : `Connection cancelled for ${serverName}`;
       ctx.ui.notify(`pi-mcp: ${sanitizeTerminalText(message)}`, "info");
       return;
     }
