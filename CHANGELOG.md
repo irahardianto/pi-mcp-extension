@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.3] - 2026-11-25
+
 ### Fixed
 - Honor Pi's `--no-mcp` when this extension replaces `builtin:mcp`, skipping MCP initialization, event handlers, commands, and tools while respecting CLI flag values and the `--` separator (#339).
 - Report a connection cancellation when `/mcp:stop` interrupts `/mcp:start` outside interactive OAuth (both non-OAuth servers and OAuth servers cancelled before interactive authorization begins) (#358).
