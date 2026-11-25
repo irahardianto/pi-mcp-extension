@@ -333,14 +333,15 @@ describe("authorize-flow", () => {
         let resetCalled = 0;
         let clearedCount = 0;
 
-        // Seed token with scope "read" on disk (no grantedScope on pending yet -> readStoredTokenScopeForStepUp)
+        // Seed token with broader scope "read write" on disk (no grantedScope on pending yet -> readStoredTokenScopeForStepUp).
+        // The 401 probe only advertises "read", so surviving an abort proves storedTokenScope was persisted onto pending before disk clear.
         const seeder = new McpOAuthProvider({
           serverName: "stepup",
           authConfig: { type: "oauth", clientId: "cid", scope: "profile" },
           storageDir: authStorageDir,
           serverUrl: srv.mcpUrl,
         });
-        await seeder.saveTokens({ access_token: "old", token_type: "Bearer", scope: "read" });
+        await seeder.saveTokens({ access_token: "old", token_type: "Bearer", scope: "read write" });
 
         const mockManager = {
           getServer: () => ({
@@ -354,6 +355,11 @@ describe("authorize-flow", () => {
             },
           }),
           getPendingAuthChallenge: () => pending,
+          recordPendingAuthGrantedScope: (_name: string, scope: string | undefined) => {
+            if (pending?.error === "insufficient_scope" && !pending.grantedScope && scope?.trim()) {
+              pending = { ...pending, grantedScope: scope.trim() };
+            }
+          },
           clearPendingAuthChallenge: () => {
             clearedCount += 1;
             pending = undefined;
@@ -375,7 +381,7 @@ describe("authorize-flow", () => {
           },
         } as unknown as ExtensionContext;
 
-        // 1. Aborted run must NOT clear pending challenge
+        // 1. Aborted run must NOT clear pending challenge and must preserve storedTokenScope on pending after clearing disk tokens
         const abortCtrl = new AbortController();
         await assert.rejects(
           () =>
@@ -396,8 +402,10 @@ describe("authorize-flow", () => {
         );
         assert.equal(clearedCount, 0);
         assert.ok(pending);
+        assert.equal(pending.grantedScope, "read write");
+        assert.equal(await seeder.tokens(), undefined);
 
-        // 2. Successful run merges config.auth.scope + storedTokenScope + pending.scope and clears pending
+        // 2. Successful retry merges config.auth.scope + preserved storedTokenScope ("read write") + pending.scope and clears pending
         const okCtrl = new AbortController();
         await authorize(
           {
@@ -412,7 +420,7 @@ describe("authorize-flow", () => {
           okCtrl.signal,
           false,
         );
-        assert.equal(srv.authorizeScopes.at(-1), "profile read admin");
+        assert.equal(srv.authorizeScopes.at(-1), "profile read write admin");
         assert.equal(clearedCount, 1);
         assert.equal(pending, undefined);
 

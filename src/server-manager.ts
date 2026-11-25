@@ -19,8 +19,8 @@ import { AuthCancelledError, AuthRequiredError, McpError } from "./errors.js";
 import type { McpConfig, ServerConfig, Settings } from "./config.js";
 import { getAuthStatus, invalidateStoredTokens, resetAuth } from "./oauth-status.js";
 import {
-  mergePendingAuthChallenge,
-  withGrantedScope,
+  applyPendingAuthChallenge,
+  attachPendingGrantedScope,
   type CapturedAuthChallenge,
   type PendingAuthChallenge,
 } from "./auth-challenge.js";
@@ -223,6 +223,10 @@ export class ServerManager {
     if (server) server.pendingAuthChallenge = undefined;
   }
 
+  recordPendingAuthGrantedScope(name: string, scope: string | undefined): void {
+    attachPendingGrantedScope(this.servers.get(name), scope);
+  }
+
   getServer(name: string): ManagedServer | undefined {
     return this.servers.get(name);
   }
@@ -319,7 +323,7 @@ export class ServerManager {
     await this._shutdown(server);
     server.lastError = authError;
     await invalidateStoredTokens(name, this.storageDir, server.config.url, (scope) => {
-      server.pendingAuthChallenge = withGrantedScope(server.pendingAuthChallenge, scope);
+      attachPendingGrantedScope(server, scope);
     });
     server.lastError = authError;
     return authError;
@@ -440,13 +444,20 @@ export class ServerManager {
     }
   }
 
-  private _createAndInstrumentTransport(server: ManagedServer, cwd: string): Transport {
+  private _createAndInstrumentTransport(
+    server: ManagedServer,
+    cwd: string,
+    signal: AbortSignal,
+  ): Transport {
     let transport: Transport;
     try {
       transport = this.createTransport(server.name, server.config, cwd, (challenge) => {
-        server.pendingAuthChallenge = mergePendingAuthChallenge(
-          server.pendingAuthChallenge,
+        // WHY: Ignore late-settling HTTP responses from a transport that was already shut down,
+        // aborted, or replaced by a reconnect so they cannot pollute pendingAuthChallenge.
+        applyPendingAuthChallenge(
+          server,
           challenge,
+          () => !signal.aborted && server.transport === transport,
         );
       });
     } catch (err) {
@@ -794,7 +805,7 @@ export class ServerManager {
     // It IS reset when startServer() is called explicitly (e.g. /mcp:start)
     // via the caller having already set retryCount = 0 before calling _connect.
 
-    const transport = this._createAndInstrumentTransport(server, currentCwd);
+    const transport = this._createAndInstrumentTransport(server, currentCwd, signal);
     server.transport = transport;
 
     const client = this._createClient(server, cwd, signal);
@@ -904,7 +915,7 @@ export class ServerManager {
     server.lastError = err instanceof Error ? err : new Error(String(err));
     if (invalidateTokens) {
       await invalidateStoredTokens(server.name, this.storageDir, server.config.url, (scope) => {
-        server.pendingAuthChallenge = withGrantedScope(server.pendingAuthChallenge, scope);
+        attachPendingGrantedScope(server, scope);
       });
     }
     const authError = err instanceof AuthRequiredError ? err : new AuthRequiredError(server.name);

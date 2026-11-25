@@ -11,6 +11,7 @@ import type { McpConfig, ServerConfig } from "./config.js";
 import type { ManagedServer, ServerManager } from "./server-manager.js";
 import type { ToolBridge } from "./tool-bridge.js";
 import { McpError, AuthCancelledError, AuthRequiredError, type CancellationPhase } from "./errors.js";
+import { shouldSkipInteractivePreStart } from "./auth-challenge.js";
 import {
   formatErrorMessage,
   promptStartupAuth,
@@ -522,7 +523,21 @@ export class ConnectionCoordinator {
 
   private async _tryStartServer(params: ConnectAttemptParams): Promise<boolean> {
     const { serverName, serverConfig, ctx, controller, reset } = params;
-    if (reset) return false;
+    // WHY: When a 403 insufficient_scope challenge is pending in an interactive session,
+    // go straight to interactive step-up instead of attempting a silent reconnect that
+    // could either waste a 401 probe or accidentally succeed on a surviving under-scoped
+    // token (e.g. after lock contention or a peer refresh) and clear the pending challenge.
+    if (
+      shouldSkipInteractivePreStart({
+        reset,
+        hasUI: ctx.hasUI,
+        hasAuth: Boolean(serverConfig.auth),
+        serverUrl: serverConfig.url,
+        pending: this.deps.manager.getPendingAuthChallenge?.(serverName),
+      })
+    ) {
+      return false;
+    }
     try {
       await this._startAndGuardAbort(serverName, ctx, controller.signal);
       return true;

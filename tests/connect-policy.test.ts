@@ -48,6 +48,19 @@ describe("classifyClientError — sse", () => {
       reason: "SSE stream error, reconnecting",
     });
   });
+
+  it("classifies an SSE OAuth 403 insufficient_scope as an auth error", async () => {
+    const { UnauthorizedError } = await import("@modelcontextprotocol/sdk/client/auth.js");
+    assert.deepEqual(
+      classifyClientError("sse", new UnauthorizedError("HTTP 403 insufficient_scope")),
+      {
+        kind: "recover",
+        event: "server.auth_error",
+        transport: "sse",
+        reason: "SSE auth error, recovering",
+      },
+    );
+  });
 });
 
 describe("classifyClientError — streamable-http", () => {

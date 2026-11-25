@@ -293,6 +293,23 @@ function classifyStreamableHttpError(err: unknown): ClientErrorAction {
   };
 }
 
+function classifySseClientError(err: unknown): ClientErrorAction {
+  if (isOAuthUnauthorizedError(err)) {
+    return {
+      kind: "recover",
+      event: "server.auth_error",
+      transport: "sse",
+      reason: "SSE auth error, recovering",
+    };
+  }
+  return {
+    kind: "recover",
+    event: "server.stream_error",
+    transport: "sse",
+    reason: "SSE stream error, reconnecting",
+  };
+}
+
 /**
  * Pure `client.onerror` classifier for the transports that report stream drops there.
  *
@@ -306,12 +323,7 @@ export function classifyClientError(transport: TransportType, err: unknown): Cli
     return classifyNonFatalClientError(rawMsg);
   }
   if (transport === "sse") {
-    return {
-      kind: "recover",
-      event: "server.stream_error",
-      transport: "sse",
-      reason: "SSE stream error, reconnecting",
-    };
+    return classifySseClientError(err);
   }
   if (transport === "streamable-http") {
     return classifyStreamableHttpError(err);

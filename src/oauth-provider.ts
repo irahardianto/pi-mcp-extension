@@ -83,6 +83,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private _codeVerifier: string | undefined;
   private _cachedTokens: StoredTokens | undefined;
   private _lastReadTokens: StoredTokens | undefined;
+  private _fallbackTokenScope: string | undefined;
   private _reloadedPeerTokens = false;
   private _storedRedirectUris: string[] | null | undefined;
 
@@ -314,7 +315,27 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return this._lastReadTokens?.scope;
   }
 
+  /**
+   * Record the scope requested during interactive authorization so `saveTokens`
+   * preserves it if the authorization server omits `scope` in the token response
+   * (RFC 6749 §5.1).
+   */
+  setFallbackTokenScope(scope: string | undefined): void {
+    const trimmed = scope?.trim();
+    this._fallbackTokenScope = trimmed ? trimmed : undefined;
+  }
+
   // --- saveTokens ---
+
+  private _withFallbackScope(
+    storedTokens: StoredTokens,
+    fallbackScope: string | undefined,
+  ): StoredTokens {
+    if (storedTokens.scope?.trim() || !fallbackScope?.trim()) {
+      return storedTokens;
+    }
+    return { ...storedTokens, scope: fallbackScope.trim() };
+  }
 
   private async _saveTokensSilent(storedTokens: StoredTokens): Promise<void> {
     let handle: AuthLockHandle | undefined;
@@ -322,10 +343,16 @@ export class McpOAuthProvider implements OAuthClientProvider {
       handle = await acquireAuthLock(this.serverName, this.storageDir);
       const state = await loadState(this.serverName, this.storageDir, this.serverUrl);
       stampStateServerUrl(state, this.serverUrl);
-      state.tokens = storedTokens;
+      // WHY: RFC 6749 §6 allows refresh responses to omit `scope` when unchanged.
+      // Preserve the prior granted scope so subsequent 403 step-up still knows it.
+      const tokensToSave = this._withFallbackScope(
+        storedTokens,
+        state.tokens?.scope ?? this._lastReadTokens?.scope,
+      );
+      state.tokens = tokensToSave;
       await saveState(this.serverName, state, this.storageDir, this.isCancelled);
       this._cachedTokens = undefined;
-      this._lastReadTokens = storedTokens;
+      this._lastReadTokens = tokensToSave;
       this._reloadedPeerTokens = false;
       reportDiagnostic({
         level: "info",
@@ -337,8 +364,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
     } catch (err) {
       // WHY: When another process holds the interactive auth lock (e.g. during --reset),
       // keep the refreshed tokens in memory for this session without clobbering disk state.
-      this._cachedTokens = storedTokens;
-      this._lastReadTokens = storedTokens;
+      const tokensToCache = this._withFallbackScope(
+        storedTokens,
+        this._cachedTokens?.scope ?? this._lastReadTokens?.scope,
+      );
+      this._cachedTokens = tokensToCache;
+      this._lastReadTokens = tokensToCache;
       this._reloadedPeerTokens = false;
       if (!(err instanceof AuthLockError)) {
         const { kind, message } = describeError(err);
@@ -356,12 +387,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   private async _saveTokensInteractive(storedTokens: StoredTokens): Promise<void> {
+    const tokensToSave = this._withFallbackScope(storedTokens, this._fallbackTokenScope);
     await this._mutateInteractiveState((state) => {
-      state.tokens = storedTokens;
+      state.tokens = tokensToSave;
       return true;
     });
     this._cachedTokens = undefined;
-    this._lastReadTokens = storedTokens;
+    this._lastReadTokens = tokensToSave;
     this._reloadedPeerTokens = false;
     reportDiagnostic({
       level: "info",

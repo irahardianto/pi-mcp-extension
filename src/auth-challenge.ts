@@ -74,17 +74,25 @@ export function mergeStepUpScope(
   ]);
 }
 
+function normalizeScopeTokens(raw: string | undefined): string | undefined {
+  return dedupeScopeTokens(splitScopeTokens(raw));
+}
+
 function mergeInsufficientScopeChallenge(
   prior: PendingAuthChallenge | undefined,
   incoming: CapturedAuthChallenge,
 ): PendingAuthChallenge {
-  const priorChallenged = prior?.error === "insufficient_scope" ? prior.scope : undefined;
+  const isPriorStepUp = prior?.error === "insufficient_scope";
+  const priorChallenged = isPriorStepUp ? prior.scope : undefined;
   const scope = dedupeScopeTokens([
     ...splitScopeTokens(priorChallenged),
     ...splitScopeTokens(incoming.scope),
   ]);
   const resourceMetadataUrl = incoming.resourceMetadataUrl ?? prior?.resourceMetadataUrl;
-  const grantedScope = incoming.grantedScope ?? prior?.grantedScope;
+  // WHY: Keep the earliest captured grantedScope across retries (e.g. a refresh retry that
+  // omits or narrows scope must not clobber the token scope that originally hit 403).
+  const priorGranted = isPriorStepUp ? normalizeScopeTokens(prior.grantedScope) : undefined;
+  const grantedScope = priorGranted ?? normalizeScopeTokens(incoming.grantedScope);
   return {
     serverUrl: incoming.serverUrl,
     error: "insufficient_scope",
@@ -117,11 +125,12 @@ export function mergePendingAuthChallenge(
       ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
     };
   }
+  const grantedScope = normalizeScopeTokens(incoming.grantedScope);
   return {
     serverUrl: incoming.serverUrl,
     ...(incoming.resourceMetadataUrl ? { resourceMetadataUrl: incoming.resourceMetadataUrl } : {}),
     ...(incoming.scope ? { scope: incoming.scope } : {}),
-    ...(incoming.grantedScope ? { grantedScope: incoming.grantedScope } : {}),
+    ...(grantedScope ? { grantedScope } : {}),
     ...(incoming.error ? { error: incoming.error } : {}),
   };
 }
@@ -134,11 +143,67 @@ export function withGrantedScope(
   pending: PendingAuthChallenge | undefined,
   grantedScope: string | undefined,
 ): PendingAuthChallenge | undefined {
-  if (!pending || pending.error !== "insufficient_scope" || pending.grantedScope) {
+  if (!pending || pending.error !== "insufficient_scope" || normalizeScopeTokens(pending.grantedScope)) {
     return pending;
   }
-  const normalized = dedupeScopeTokens(splitScopeTokens(grantedScope));
+  const normalized = normalizeScopeTokens(grantedScope);
   return normalized ? { ...pending, grantedScope: normalized } : pending;
+}
+
+/**
+ * Return true when `pending` is a `403 insufficient_scope` step-up challenge
+ * bound to `serverUrl`.
+ */
+export function isPendingStepUpChallenge(
+  pending: PendingAuthChallenge | undefined,
+  serverUrl: string | undefined,
+): boolean {
+  return (
+    pending?.error === "insufficient_scope" &&
+    typeof serverUrl === "string" &&
+    urlsMatch(pending.serverUrl, serverUrl)
+  );
+}
+
+/**
+ * Whether `ConnectionCoordinator._tryStartServer` should skip a silent connect
+ * attempt and proceed directly to interactive authorization.
+ */
+export function shouldSkipInteractivePreStart(params: {
+  reset: boolean;
+  hasUI: boolean;
+  hasAuth: boolean;
+  serverUrl: string | undefined;
+  pending: PendingAuthChallenge | undefined;
+}): boolean {
+  if (params.reset) return true;
+  if (!params.hasUI || !params.hasAuth) return false;
+  return isPendingStepUpChallenge(params.pending, params.serverUrl);
+}
+
+/**
+ * Record an incoming OAuth challenge onto `target` only while `isCurrent()` holds,
+ * preventing late-settling responses from a shut-down or replaced transport from
+ * polluting `pendingAuthChallenge`.
+ */
+export function applyPendingAuthChallenge(
+  target: { pendingAuthChallenge?: PendingAuthChallenge | undefined },
+  incoming: CapturedAuthChallenge,
+  isCurrent: () => boolean,
+): void {
+  if (!isCurrent()) return;
+  target.pendingAuthChallenge = mergePendingAuthChallenge(target.pendingAuthChallenge, incoming);
+}
+
+/**
+ * Attach a token's granted scope onto `target.pendingAuthChallenge` when present.
+ */
+export function attachPendingGrantedScope(
+  target: { pendingAuthChallenge?: PendingAuthChallenge | undefined } | undefined,
+  scope: string | undefined,
+): void {
+  if (!target) return;
+  target.pendingAuthChallenge = withGrantedScope(target.pendingAuthChallenge, scope);
 }
 
 /**
@@ -159,7 +224,10 @@ export function resolveAuthorizeChallenge(params: {
     };
   }
   const resourceMetadataUrl = pending.resourceMetadataUrl ?? discovered.resourceMetadataUrl;
-  const effectiveGranted = pending.grantedScope ?? storedTokenScope ?? discovered.scope;
+  const effectiveGranted =
+    normalizeScopeTokens(pending.grantedScope) ??
+    normalizeScopeTokens(storedTokenScope) ??
+    discovered.scope;
   const scope = mergeStepUpScope(configuredScope, effectiveGranted, pending.scope);
   return {
     ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),

@@ -198,6 +198,44 @@ async function readStoredTokenScopeForStepUp(
   }
 }
 
+async function prepareStepUpAuthState(params: {
+  deps: AuthorizeDeps;
+  authProvider: McpOAuthProvider;
+  serverName: string;
+  serverUrl: string;
+  reset: boolean;
+  assertActive: () => void;
+}): Promise<{ pendingChallenge: PendingAuthChallenge | undefined; storedTokenScope: string | undefined }> {
+  const { deps, authProvider, serverName, serverUrl, reset, assertActive } = params;
+  const pendingChallenge = readPendingChallenge(deps, serverName, serverUrl, reset);
+  const storedTokenScope = await readStoredTokenScopeForStepUp(
+    authProvider,
+    pendingChallenge,
+    serverName,
+  );
+  assertActive();
+  if (storedTokenScope) {
+    // WHY: Persist storedTokenScope onto the pending challenge before clearing disk tokens
+    // so cancelling interactive auth and retrying still retains previously granted scopes.
+    deps.manager.recordPendingAuthGrantedScope?.(serverName, storedTokenScope);
+  }
+  if (!reset) {
+    await clearStoredTokensBeforeInteractiveAuth(authProvider, serverName);
+    assertActive();
+  }
+  return { pendingChallenge, storedTokenScope };
+}
+
+function applyRedirectFallbackScope(
+  authProvider: McpOAuthProvider,
+  latestAuthorizationUrl: URL | undefined,
+): void {
+  const requestedScope = latestAuthorizationUrl?.searchParams.get("scope");
+  if (requestedScope) {
+    authProvider.setFallbackTokenScope(requestedScope);
+  }
+}
+
 function notifyAuthorizationSucceeded(ctx: ExtensionContext, serverName: string): void {
   ctx.ui.notify(`pi-mcp: ${serverName} authenticated successfully. Starting MCP server...`, "info");
 }
@@ -548,18 +586,14 @@ export async function authorize(
       onAuthRequired: launchAuthorizationBrowser,
     });
 
-    const pendingChallenge = readPendingChallenge(deps, serverName, serverUrl, reset);
-    const storedTokenScope = await readStoredTokenScopeForStepUp(
+    const { pendingChallenge, storedTokenScope } = await prepareStepUpAuthState({
+      deps,
       authProvider,
-      pendingChallenge,
       serverName,
-    );
-    assertActive();
-
-    if (!reset) {
-      await clearStoredTokensBeforeInteractiveAuth(authProvider, serverName);
-      assertActive();
-    }
+      serverUrl,
+      reset,
+      assertActive,
+    });
 
     // Why set state before calling auth(): the SDK reads provider.state() while
     // building the authorization URL inside auth(), and omits the state parameter
@@ -585,6 +619,7 @@ export async function authorize(
       discovered: discoveredChallenge,
       storedTokenScope,
     });
+    authProvider.setFallbackTokenScope(authChallenge.scope ?? config.auth?.scope);
 
     const callbackPromise = registerCallbackPromise(callbackServer, oauthState);
     const customFetch = staticHeaders ? createHeadersFetch(staticHeaders) : undefined;
@@ -600,6 +635,7 @@ export async function authorize(
       // Auth succeeded without needing browser interaction (e.g., had valid tokens).
       notifyAuthorizationSucceeded(ctx, serverName);
     } else if (authResult === "REDIRECT") {
+      applyRedirectFallbackScope(authProvider, state.latestAuthorizationUrl);
       await completeRedirectAuthFlow({
         serverName,
         serverUrl,
