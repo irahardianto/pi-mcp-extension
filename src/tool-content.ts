@@ -5,7 +5,7 @@
 
 import type { ToolAnnotations } from "@earendil-works/pi-coding-agent";
 import { McpError } from "./errors.js";
-import { convertResourceContent } from "./resource-bridge.js";
+import { convertImagePayload, convertResourceContent } from "./resource-bridge.js";
 import type { McpToolDefinition } from "./tool-discovery.js";
 import {
   buildMcpScriptResult,
@@ -54,11 +54,7 @@ function convertResourceLink(obj: Record<string, unknown>): PiTextContent {
 
 function convertNonTextContent(obj: Record<string, unknown>): PiImageContent | PiTextContent | undefined {
   if (obj["type"] === "image") {
-    return {
-      type: "image",
-      data: String(obj["data"] ?? ""),
-      mimeType: String(obj["mimeType"] ?? "image/png"),
-    };
+    return convertImagePayload(obj["data"], obj["mimeType"]);
   }
   if (obj["type"] === "audio") {
     return {

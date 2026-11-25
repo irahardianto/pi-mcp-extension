@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- MCP `image` tool blocks and `image/*` blob resources now canonicalize MIME types (stripping `; ...` parameters, lowercasing, and normalizing `image/jpg` to `image/jpeg`), decode valid UTF-8 `image/svg+xml` payloads to text blocks, preserve supported raster and Photon-transcodable formats (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`, `image/x-ms-bmp`, `image/tiff`), and degrade empty, non-standard-base64, non-string, invalid-UTF-8 SVG, or unsupported `image/*` payloads into sanitized text summaries instead of poisoning session history across Bedrock, Anthropic, and OpenAI adapters (#334).
+
 ## [1.16.3] - 2026-11-25
 
 ### Fixed
