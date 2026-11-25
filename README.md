@@ -271,6 +271,10 @@ Configured under `auth` (or `oauth`). Token and client state are persisted per s
 | `clientName` (or `oauth.clientName`) | `string` | `pi-mcp/<server name>` | `client_name` sent with Dynamic Client Registration, for servers that only accept known clients |
 | `redirectUrl` (or `oauth.callbackUrl` / `oauth.callbackPort`) | `string` | `http://127.0.0.1:19876/callback` | Local HTTP loopback callback (`localhost`, `127.0.0.1`, or `::1` with path `/callback` and an explicit non-zero port; `callbackPort` maps to `http://127.0.0.1:<port>/callback`). Scans forward from `19876` when omitted; binds the exact host and port when configured. |
 
+When both aliases are set, `oauth.callbackPort` fills in a missing port in `oauth.callbackUrl`
+(`http://localhost/callback` plus `19877` becomes `http://localhost:19877/callback`); a different
+port in the URL is a config error. Port 80 is HTTP's default and counts as missing.
+
 ## Commands
 
 Server-name arguments provide autocomplete suggestions from the configured MCP servers. `/mcp:auth` suggests only servers configured for OAuth.

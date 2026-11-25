@@ -19,6 +19,26 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Fill in a missing `callbackUrl` port; a different explicit port is a config error. */
+function combineCallbackAliases(callbackUrl: string, callbackPort: number): string {
+  let url: URL;
+  try {
+    url = new URL(callbackUrl);
+  } catch {
+    // WHY: Left as written so the existing redirectUrl validation reports it.
+    return callbackUrl;
+  }
+  if (url.port !== "") {
+    if (Number(url.port) !== callbackPort) {
+      throw new McpError("oauth.callbackUrl port does not match oauth.callbackPort", "<config>", "config");
+    }
+    return callbackUrl;
+  }
+  const validPort = Number.isInteger(callbackPort) && callbackPort >= 1 && callbackPort <= 65535;
+  if (validPort) url.port = String(callbackPort);
+  return validPort ? url.toString() : callbackUrl;
+}
+
 /**
  * Rewrite Pi 1.x OAuth config aliases (`callbackUrl`, `callbackPort`) onto `redirectUrl` before
  * schema validation.
@@ -28,7 +48,9 @@ export function normalizeAuthConfigAliases(raw: unknown): unknown {
   const obj: Record<string, unknown> = { ...raw };
   if (obj.redirectUrl === undefined) {
     if (typeof obj.callbackUrl === "string") {
-      obj.redirectUrl = obj.callbackUrl;
+      obj.redirectUrl = typeof obj.callbackPort === "number"
+        ? combineCallbackAliases(obj.callbackUrl, obj.callbackPort)
+        : obj.callbackUrl;
     } else if (typeof obj.callbackPort === "number") {
       obj.redirectUrl = `http://127.0.0.1:${obj.callbackPort}/callback`;
     } else if (obj.callbackUrl !== undefined) {

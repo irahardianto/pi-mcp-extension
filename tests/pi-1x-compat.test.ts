@@ -18,6 +18,7 @@ import {
 import * as callbackUrl from "../src/callback-url.js";
 import * as callbackServer from "../src/callback-server.js";
 import { McpError } from "../src/errors.js";
+import { loadConfig, parseRegisteredServerConfig, ServerConfigSchema } from "../src/config.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 const mockServerPath = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
@@ -348,7 +349,7 @@ describe("config-compat pure alias normalizers and project override merger", () 
 
     const withCallbackUrl = Object.freeze({
       callbackUrl: "http://localhost:19876/callback",
-      callbackPort: 29999,
+      callbackPort: 19876,
       scope: "read",
     });
     assert.deepEqual(normalizeAuthConfigAliases(withCallbackUrl), {
@@ -564,6 +565,138 @@ describe("config-compat pure alias normalizers and project override merger", () 
         err.message.includes("mcpServers.__proto__") &&
         err.message.includes("global server of that name"),
     );
+  });
+});
+
+describe("OAuth callback aliases", () => {
+  for (const [callbackUrl, callbackPort, expected] of [
+    ["http://localhost/callback", 19877, "http://localhost:19877/callback"],
+    ["http://[::1]/callback", 19878, "http://[::1]:19878/callback"],
+    ["http://127.0.0.1:19877/callback", 19877, "http://127.0.0.1:19877/callback"],
+    ["http://localhost/callback", 1, "http://localhost:1/callback"],
+    ["http://localhost/callback", 65535, "http://localhost:65535/callback"],
+  ] as const) {
+    it(`combines callback aliases ${callbackUrl} and ${callbackPort}`, () => {
+      const oauth = Object.freeze({ callbackUrl, callbackPort });
+      const parsed = parseRegisteredServerConfig("remote", { url: "https://example.com/mcp", oauth });
+      assert.equal(parsed.auth?.redirectUrl, expected);
+      assert.deepEqual(oauth, { callbackUrl, callbackPort });
+    });
+  }
+
+  for (const callbackUrl of ["http://localhost:9000/callback", "http://[::1]:9000/callback"]) {
+    it(`rejects conflicting callback aliases in ${callbackUrl} with server context`, () => {
+      const oauth = Object.freeze({ callbackUrl, callbackPort: 9001 });
+      assert.throws(
+        () => normalizeAuthConfigAliases(oauth),
+        (err: unknown) => err instanceof McpError && err.code === "config" &&
+          err.message.includes("oauth.callbackUrl port does not match oauth.callbackPort"),
+      );
+      assert.throws(
+        () => parseRegisteredServerConfig("conflicting", { url: "https://example.com/mcp", oauth }),
+        (err: unknown) => err instanceof McpError && err.code === "config" &&
+          err.server === "conflicting" && err.message.includes("mcpServers.conflicting.auth"),
+      );
+      assert.deepEqual(oauth, { callbackUrl, callbackPort: 9001 });
+    });
+  }
+
+  it("preserves callback aliases URL spelling when no port needs inserting", () => {
+    for (const callbackUrl of [
+      "HTTP://LOCALHOST:19877/callback?x=%2f&x=two",
+      "http://localhost:019877/callback?",
+      "http://localhost:19877/./callback",
+      " http://localhost:19877/callback ",
+    ]) {
+      const parsed = parseRegisteredServerConfig("remote", {
+        url: "https://example.com/mcp", oauth: { callbackUrl, callbackPort: 19877 },
+      });
+      assert.equal(parsed.auth?.redirectUrl, callbackUrl);
+    }
+    for (const callbackUrl of ["http://localhost:19877", "http://localhost:19877/callback/"]) {
+      assert.deepEqual(normalizeAuthConfigAliases({ callbackUrl, callbackPort: 19877 }), {
+        redirectUrl: callbackUrl,
+      });
+    }
+  });
+
+  it("forwards malformed callback aliases to existing redirectUrl validation", () => {
+    const callbackUrl = "not a URL";
+    assert.deepEqual(normalizeAuthConfigAliases({ callbackUrl, callbackPort: 19877 }), { redirectUrl: callbackUrl });
+    const result = ServerConfigSchema.safeParse({ url: "https://example.com/mcp", oauth: { callbackUrl, callbackPort: 19877 } });
+    assert.equal(result.success, false);
+    if (!result.success) assert.deepEqual(result.error.issues[0]?.path, ["auth", "redirectUrl"]);
+  });
+
+  it("keeps explicit redirectUrl precedence over conflicting or malformed callback aliases", () => {
+    for (const callbackUrl of ["http://localhost:9000/callback", "not a URL"]) {
+      const redirectUrl = "HTTP://LOCALHOST:19877/callback?x=%2f";
+      const parsed = parseRegisteredServerConfig("remote", {
+        url: "https://example.com/mcp", oauth: { redirectUrl, callbackUrl, callbackPort: 9001 },
+      });
+      assert.equal(parsed.auth?.redirectUrl, redirectUrl);
+    }
+  });
+
+  it("does not insert invalid callback aliases ports or coerce non-numbers", () => {
+    for (const callbackPort of [0, 70000, 1.5, "19877", null]) {
+      assert.deepEqual(normalizeAuthConfigAliases({ callbackUrl: "http://localhost/callback", callbackPort }), {
+        redirectUrl: "http://localhost/callback",
+      });
+      assert.throws(() => parseRegisteredServerConfig("remote", {
+        url: "https://example.com/mcp", oauth: { callbackUrl: "http://localhost/callback", callbackPort },
+      }), McpError);
+      const raw = { callbackUrl: "http://localhost:19877/callback", callbackPort };
+      if (typeof callbackPort === "number") {
+        assert.throws(() => normalizeAuthConfigAliases(raw), /port does not match/);
+      } else {
+        assert.deepEqual(normalizeAuthConfigAliases(raw), { redirectUrl: raw.callbackUrl });
+      }
+    }
+  });
+
+  it("loads callback aliases from global and project files and partial project overrides", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-callback-aliases-"));
+    const globalPath = join(dir, "global.json");
+    const projectPath = join(dir, ".pi", "mcp.json");
+    const remote = { url: "https://example.com/mcp", oauth: { callbackUrl: "http://localhost/callback", callbackPort: 19877 } };
+    try {
+      await mkdir(join(dir, ".pi"));
+      await writeFile(globalPath, JSON.stringify({ mcpServers: { shared: remote, sibling: { command: "node" } } }));
+      await writeFile(projectPath, JSON.stringify({ mcpServers: {
+        shared: { enabled: false },
+        local: { ...remote, oauth: { callbackUrl: "http://[::1]/callback", callbackPort: 19878 } },
+      } }));
+      const config = await loadConfig(dir, globalPath);
+      assert.equal(config.mcpServers.shared?.auth?.redirectUrl, "http://localhost:19877/callback");
+      assert.equal(config.mcpServers.shared?.lifecycle, "lazy");
+      assert.equal(config.mcpServers.local?.auth?.redirectUrl, "http://[::1]:19878/callback");
+      assert.equal(config.mcpServers.sibling?.command, "node");
+
+      for (const path of [projectPath, globalPath]) {
+        await writeFile(path, JSON.stringify({ mcpServers: {
+          conflicting: { ...remote, oauth: { callbackUrl: "http://localhost:9000/callback", callbackPort: 9001 } },
+          invalid_sibling: { url: "not a URL" },
+        } }));
+        await assert.rejects(() => loadConfig(dir, globalPath), (err: unknown) => {
+          assert.ok(err instanceof McpError);
+          assert.equal(err.code, "config");
+          assert.ok(err.message.includes(path));
+          assert.ok(err.message.includes("mcpServers.conflicting.auth: oauth.callbackUrl port does not match oauth.callbackPort"), err.message);
+          assert.ok(err.message.includes("mcpServers.invalid_sibling"), "normalization must not bypass issue aggregation");
+          return true;
+        });
+        await writeFile(path, JSON.stringify({ mcpServers: {
+          corrected: { ...remote, oauth: { callbackUrl: "http://localhost:9000/callback", callbackPort: 9000 } },
+          sibling: { command: "node" },
+        } }));
+        const corrected = await loadConfig(dir, globalPath);
+        assert.equal(corrected.mcpServers.corrected?.auth?.redirectUrl, "http://localhost:9000/callback");
+        assert.equal(corrected.mcpServers.sibling?.command, "node");
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -87,8 +87,19 @@ function validateAuthConfig(
   }
 }
 
+function preprocessAuthConfig(raw: unknown, ctx: z.RefinementCtx): unknown {
+  try {
+    return normalizeAuthConfigAliases(raw);
+  } catch (err) {
+    if (!(err instanceof McpError)) throw err;
+    // WHY: A thrown preprocess error bypasses Zod's path tracking and issue aggregation.
+    ctx.addIssue({ code: "custom", message: err.message });
+    return z.NEVER;
+  }
+}
+
 const AuthConfigSchema = z.preprocess(
-  normalizeAuthConfigAliases,
+  preprocessAuthConfig,
   AuthConfigObjectSchema.superRefine(validateAuthConfig),
 );
 
