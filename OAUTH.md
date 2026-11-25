@@ -57,7 +57,7 @@ You can provide pre-registered client credentials:
 
 For Pi 1.x compatibility, an `oauth` object (`{ clientId, clientSecret, clientName, scope, redirectUrl | callbackUrl | callbackPort }`) is also accepted as an alias for `auth` (`callbackPort` maps to `http://127.0.0.1:<port>/callback`). `clientName` is the `client_name` sent with Dynamic Client Registration (default `pi-mcp/<server name>`), for authorization servers that only accept known clients.
 
-When both `callbackUrl` and `callbackPort` are set, the port fills in a missing URL port: `http://localhost/callback` with `callbackPort: 19877` becomes `http://localhost:19877/callback`. If the URL has a different port, loading fails with `oauth.callbackUrl port does not match oauth.callbackPort`. Port 80 is HTTP's default and counts as missing. An explicit `redirectUrl` takes precedence over both.
+When both `callbackUrl` and `callbackPort` are set, the port fills in a missing URL port: `http://localhost/callback` with `callbackPort: 19877` becomes `http://localhost:19877/callback`. `callbackPort` must be an integer from `1` to `65535`; if the URL has a different port, loading fails with `oauth.callbackUrl port does not match oauth.callbackPort`. Port 80 is HTTP's default and counts as missing. An explicit `redirectUrl` takes precedence over both.
 
 Pi's `auth.provider` (`/login` provider token) is not supported: it is rejected when the config loads with a `config` error instead of being silently downgraded to OAuth 2.1, because this extension cannot forward a Pi provider token. Use `auth` (OAuth) or static `headers`.
 
