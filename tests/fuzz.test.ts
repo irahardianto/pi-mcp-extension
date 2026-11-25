@@ -36,6 +36,7 @@ import {
   orderUnionMembers,
   convertJsonSchemaToTypebox,
 } from "../src/schema-convert.js";
+import { Compile } from "typebox/compile";
 import {
   buildToolName,
   convertMcpContent,
@@ -725,6 +726,103 @@ describe("fuzz: orderUnionMembers & convertJsonSchemaToTypebox", () => {
             isNullSchema(arrSchema.items.anyOf[0]!),
             "Nested array items union must place null first",
           );
+        },
+      ),
+      testOptions(),
+    );
+  });
+
+  it("convertJsonSchemaToTypebox output compiles cleanly under TypeBox for arbitrary pattern strings (#329)", () => {
+    const trickyPatterns = fc.oneof(
+      arbitraryString,
+      fc.constantFrom(
+        "(?i)^[a-z]+$",
+        "\\A[a-z0-9-]+\\z",
+        "^[\\w-\\.]+$",
+        "([a-z",
+        "^[a-z0-9_-]+$",
+        "\\p{L}+",
+        "",
+      ),
+    );
+
+    fc.assert(
+      fc.property(trickyPatterns, (pattern) => {
+        const schema = {
+          type: "object",
+          properties: {
+            direct: { type: "string", pattern },
+            nested: {
+              type: "object",
+              properties: { inner: { type: "string", pattern } },
+            },
+            nullable: { type: ["string", "null"], pattern },
+          },
+        };
+        const converted = convertJsonSchemaToTypebox(schema);
+        assert.doesNotThrow(() => Compile(converted));
+      }),
+      testOptions(),
+    );
+  });
+
+  it("convertJsonSchemaToTypebox and buildMcpResultSchema preserve Object.prototype property names and survive prototype-named types (#330)", () => {
+    const protoKeyArb = fc.constantFrom(
+      "toString",
+      "constructor",
+      "valueOf",
+      "hasOwnProperty",
+      "prototype",
+      "__proto__",
+    );
+    const propTypeArb = fc.constantFrom("string", "number", "boolean", "toString", "constructor", "__proto__");
+
+    fc.assert(
+      fc.property(
+        fc.uniqueArray(protoKeyArb, { minLength: 1, maxLength: 6 }),
+        propTypeArb,
+        fc.boolean(),
+        (keys, propType, requiredNested) => {
+          const propsEntries = keys.map((k) => [k, { type: propType }] as const);
+          const nestedObj = Object.fromEntries(propsEntries);
+          const defsObj = Object.fromEntries(keys.map((k) => [k, { type: "string" }] as const));
+          const schema: Record<string, unknown> = {
+            type: "object",
+            $defs: defsObj,
+            properties: {
+              ...Object.fromEntries(keys.map((k) => [k, { $ref: `#/$defs/${k}` }] as const)),
+              nested: {
+                type: "object",
+                properties: nestedObj,
+              },
+            },
+            ...(requiredNested ? { required: ["nested"] } : {}),
+          };
+
+          const converted = convertJsonSchemaToTypebox(schema) as unknown as {
+            properties: Record<string, unknown>;
+          };
+          assert.equal(Object.getPrototypeOf(converted.properties), Object.prototype);
+          for (const key of keys) {
+            assert.equal(Object.hasOwn(converted.properties, key), true);
+          }
+          const nestedProps = (
+            converted.properties["nested"] as { properties: Record<string, unknown> }
+          ).properties;
+          assert.equal(Object.getPrototypeOf(nestedProps), Object.prototype);
+          for (const key of keys) {
+            assert.equal(Object.hasOwn(nestedProps, key), true);
+          }
+
+          const resultSchema = buildMcpResultSchema(schema) as {
+            properties: { structuredContent: Record<string, unknown> };
+          };
+          const scProps = resultSchema.properties.structuredContent["properties"] as Record<string, unknown>;
+          const scDefs = resultSchema.properties.structuredContent["$defs"] as Record<string, unknown>;
+          for (const key of keys) {
+            assert.equal(Object.hasOwn(scProps, key), true);
+            assert.equal(Object.hasOwn(scDefs, key), true);
+          }
         },
       ),
       testOptions(),

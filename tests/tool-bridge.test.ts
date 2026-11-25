@@ -9,8 +9,9 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ErrorCode, McpError as SdkMcpError } from "@modelcontextprotocol/sdk/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { McpError } from "../src/errors.js";
+import * as Type from "typebox";
 import type { TSchema } from "typebox";
-import { convertJsonSchemaToTypebox } from "../src/schema-convert.js";
+import { convertJsonSchemaToTypebox, isValidUnicodePattern } from "../src/schema-convert.js";
 import { listAllTools } from "../src/tool-discovery.js";
 import {
   buildToolName,
@@ -1117,6 +1118,247 @@ describe("convertJsonSchemaToTypebox", () => {
           { type: "toolCall", id: "call_6", name: "run", arguments: { v: ["a", { n: "x" }] } },
         ),
       /v\.1\.n: must be integer/,
+    );
+  });
+
+  it("omits non-Unicode /u or malformed regex patterns while preserving valid /u patterns and constraints (#329)", async () => {
+    const { validateToolArguments } = await import("@earendil-works/pi-ai");
+    const nonUnicodePatterns = [
+      "(?i)^[a-z]+$",
+      "\\A[a-z0-9-]+\\z",
+      "^[\\w-\\.]+$",
+      "([a-z",
+    ];
+
+    for (const badPattern of nonUnicodePatterns) {
+      assert.equal(isValidUnicodePattern(badPattern), false);
+      const converted = convertJsonSchemaToTypebox({
+        type: "object",
+        properties: {
+          direct: {
+            type: "string",
+            description: "Direct pattern field",
+            minLength: 2,
+            maxLength: 20,
+            pattern: badPattern,
+          },
+          nested: {
+            type: "object",
+            properties: { inner: { type: "string", pattern: badPattern } },
+            additionalProperties: { type: "string", pattern: badPattern },
+          },
+          arr: { type: "array", items: { type: "string", pattern: badPattern } },
+          tuple: {
+            type: "array",
+            prefixItems: [{ type: "string", pattern: badPattern }],
+            items: { type: "string", pattern: badPattern },
+          },
+          nullable: { type: ["string", "null"], pattern: badPattern },
+          unionField: { anyOf: [{ type: "string", pattern: badPattern }, { type: "integer" }] },
+          oneOfField: { oneOf: [{ type: "string", pattern: badPattern }, { type: "boolean" }] },
+          allOfField: { allOf: [{ type: "string", pattern: badPattern }] },
+          refField: { $ref: "#/$defs/Code" },
+        },
+        required: ["direct"],
+        $defs: {
+          Code: { type: "string", minLength: 1, pattern: badPattern },
+        },
+      }) as SchemaJson;
+
+      const props = converted.properties as Record<string, SchemaJson>;
+      assert.equal(props["direct"]?.type, "string");
+      assert.equal(props["direct"]?.description, "Direct pattern field");
+      assert.equal(props["direct"]?.minLength, 2);
+      assert.equal(props["direct"]?.maxLength, 20);
+      assert.equal("pattern" in (props["direct"] ?? {}), false);
+      assert.equal("pattern" in (props["refField"] ?? {}), false);
+
+      // Must compile and validate via Pi without throwing SyntaxError: Invalid regular expression
+      const validated = validateToolArguments(
+        { name: "p", description: "p", parameters: converted },
+        {
+          type: "toolCall",
+          id: "call_bad_pat",
+          name: "p",
+          arguments: {
+            direct: "abc",
+            nested: { inner: "xyz", extra: "123" },
+            arr: ["one"],
+            tuple: ["head", "tail"],
+            nullable: null,
+            unionField: "hello",
+            oneOfField: "world",
+            allOfField: "ok",
+            refField: "c",
+          },
+        },
+      );
+      assert.equal((validated as Record<string, unknown>)["direct"], "abc");
+    }
+
+    // Valid ECMA-262 /u patterns and empty pattern are preserved and strictly enforced
+    assert.equal(isValidUnicodePattern("^[a-z0-9_-]+$"), true);
+    assert.equal(isValidUnicodePattern("\\p{L}+"), true);
+    assert.equal(isValidUnicodePattern(""), true);
+    const validParameters = convertJsonSchemaToTypebox({
+      type: "object",
+      properties: {
+        slug: { type: "string", pattern: "^[a-z0-9_-]+$" },
+        letters: { type: "string", pattern: "\\p{L}+" },
+        empty: { type: "string", pattern: "" },
+      },
+      required: ["slug", "letters"],
+    }) as SchemaJson;
+    const validProps = validParameters.properties as Record<string, SchemaJson>;
+    assert.equal(validProps["slug"]?.pattern, "^[a-z0-9_-]+$");
+    assert.equal(validProps["letters"]?.pattern, "\\p{L}+");
+    assert.equal(validProps["empty"]?.pattern, "");
+
+    assert.deepEqual(
+      validateToolArguments(
+        { name: "v", description: "v", parameters: validParameters },
+        {
+          type: "toolCall",
+          id: "call_ok",
+          name: "v",
+          arguments: { slug: "good_1", letters: "Alpha", empty: "anything" },
+        },
+      ),
+      { slug: "good_1", letters: "Alpha", empty: "anything" },
+    );
+    assert.throws(
+      () =>
+        validateToolArguments(
+          { name: "v", description: "v", parameters: validParameters },
+          {
+            type: "toolCall",
+            id: "call_bad",
+            name: "v",
+            arguments: { slug: "BAD!", letters: "Alpha" },
+          },
+        ),
+      /slug: must match pattern/,
+    );
+  });
+
+  it("handles Object.prototype key names in types, properties, allOf, $defs, and optional nested objects (#330)", async () => {
+    const { validateToolArguments } = await import("@earendil-works/pi-ai");
+
+    // 1. Prototype-named `type` strings degrade to Type.Any (including optional, required, and union arrays)
+    for (const bogusType of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      const standalone = convertJsonSchemaToTypebox({ type: bogusType, description: "bogus" }) as SchemaJson;
+      assert.equal(standalone.description, "bogus");
+      assert.equal(typeof standalone, "object");
+
+      const multiType = convertJsonSchemaToTypebox({ type: [bogusType, "null"] }) as SchemaJson;
+      assert.ok(Array.isArray(multiType.anyOf));
+
+      const objWithBogus = convertJsonSchemaToTypebox({
+        type: "object",
+        properties: {
+          opt: { type: bogusType },
+          req: { type: bogusType },
+        },
+        required: ["req"],
+      }) as SchemaJson;
+      assert.ok(Object.hasOwn(objWithBogus.properties, "opt"));
+      assert.ok(Object.hasOwn(objWithBogus.properties, "req"));
+    }
+
+    // 2. Object schema with Object.prototype property names at top level, optional nested object, and allOf + $ref
+    const rawInputSchema = JSON.parse(`{
+      "type": "object",
+      "$defs": {
+        "__proto__": { "type": "boolean" },
+        "toString": { "type": "string" },
+        "constructor": { "type": "number" }
+      },
+      "properties": {
+        "toString": { "$ref": "#/$defs/toString" },
+        "constructor": { "$ref": "#/$defs/constructor" },
+        "hasOwnProperty": { "$ref": "#/$defs/hasOwnProperty" },
+        "prototype": { "type": "string" },
+        "__proto__": { "$ref": "#/$defs/__proto__" },
+        "normal": { "type": "string" },
+        "filter": {
+          "type": "object",
+          "properties": {
+            "__proto__": { "type": "boolean" },
+            "constructor": { "type": "number" },
+            "prototype": { "type": "string" },
+            "toString": { "type": "string" }
+          },
+          "required": ["constructor"]
+        }
+      },
+      "required": ["toString", "constructor"],
+      "allOf": [
+        {
+          "properties": {
+            "valueOf": { "type": "integer" }
+          }
+        }
+      ]
+    }`) as Record<string, unknown>;
+
+    const converted = convertJsonSchemaToTypebox(rawInputSchema);
+    const props = (converted as unknown as { properties: Record<string, unknown> }).properties;
+    assert.equal(Object.getPrototypeOf(props), Object.prototype);
+    for (const key of [
+      "toString",
+      "constructor",
+      "valueOf",
+      "hasOwnProperty",
+      "prototype",
+      "__proto__",
+      "normal",
+      "filter",
+    ]) {
+      assert.equal(Object.hasOwn(props, key), true, `Expected top-level own property "${key}"`);
+    }
+    // `valueOf` comes from `allOf` flattening; unresolved `#/$defs/hasOwnProperty` degrades to Type.Any
+    assert.equal((props["valueOf"] as SchemaJson).type, "integer");
+    assert.equal((props["hasOwnProperty"] as SchemaJson).type, undefined);
+    assert.equal((props["__proto__"] as SchemaJson).type, "boolean");
+
+    // Optional nested object `filter` MUST retain `__proto__`, `constructor`, and `prototype`
+    const filterProps = (props["filter"] as { properties: Record<string, unknown>; required?: string[] }).properties;
+    assert.equal(Object.getPrototypeOf(filterProps), Object.prototype);
+    for (const key of ["__proto__", "constructor", "prototype", "toString"]) {
+      assert.equal(
+        Object.hasOwn(filterProps, key),
+        true,
+        `Expected nested optional object own property "${key}"`,
+      );
+    }
+
+    // End-to-end validation enforcement (mirrors #330 repro, providing values for optional
+    // valueOf/hasOwnProperty per TypeBox's upstream Guard.HasPropertyKey behavior)
+    const validArgs = JSON.parse(
+      '{"toString":"ok","constructor":42,"valueOf":7,"hasOwnProperty":"yes","__proto__":true}',
+    );
+    const validated = validateToolArguments(
+      { name: "proto_tool", description: "proto_tool", parameters: converted },
+      { type: "toolCall", id: "call_proto_ok", name: "proto_tool", arguments: validArgs },
+    );
+    assert.equal(Object.hasOwn(validated, "__proto__"), true);
+    assert.equal((validated as Record<string, unknown>)["toString"], "ok");
+    assert.equal((validated as Record<string, unknown>)["constructor"], 42);
+    assert.equal((validated as Record<string, unknown>)["valueOf"], 7);
+    assert.equal((validated as Record<string, unknown>)["hasOwnProperty"], "yes");
+
+    assert.throws(
+      () =>
+        validateToolArguments(
+          { name: "proto_tool", description: "proto_tool", parameters: converted },
+          {
+            type: "toolCall",
+            id: "call_proto_bad",
+            name: "proto_tool",
+            arguments: { toString: 999, constructor: "not-a-num" },
+          },
+        ),
+      /constructor: must be number/,
     );
   });
 });
@@ -3915,6 +4157,38 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
       deep = { items: deep };
     }
     assert.ok(buildMcpResultSchema(deep));
+
+    // #330: buildMcpResultSchema must preserve __proto__, constructor, prototype, and toString in
+    // structuredContent.properties and structuredContent.$defs.
+    const protoOutputSchema = JSON.parse(`{
+      "type": "object",
+      "$defs": {
+        "__proto__": { "type": "string" },
+        "constructor": { "type": "number" },
+        "prototype": { "type": "boolean" }
+      },
+      "properties": {
+        "__proto__": { "$ref": "#/$defs/__proto__" },
+        "constructor": { "$ref": "#/$defs/constructor" },
+        "prototype": { "$ref": "#/$defs/prototype" },
+        "toString": { "type": "string" }
+      }
+    }`) as Record<string, unknown>;
+    const protoResult = buildMcpResultSchema(protoOutputSchema) as {
+      properties: { structuredContent: Record<string, unknown> };
+    };
+    assert.equal(Type.IsUnsafe(protoResult), true);
+    const protoSc = protoResult.properties.structuredContent;
+    const scDefs = protoSc["$defs"] as Record<string, Record<string, unknown>>;
+    const scProps = protoSc["properties"] as Record<string, Record<string, unknown>>;
+    assert.equal(Object.getPrototypeOf(scDefs), Object.prototype);
+    assert.equal(Object.getPrototypeOf(scProps), Object.prototype);
+    for (const key of ["__proto__", "constructor", "prototype"]) {
+      assert.equal(Object.hasOwn(scDefs, key), true, `Expected $defs own key "${key}"`);
+      assert.equal(Object.hasOwn(scProps, key), true, `Expected properties own key "${key}"`);
+      assert.equal(scProps[key]?.["$ref"], `#/properties/structuredContent/$defs/${key}`);
+    }
+    assert.equal(Object.hasOwn(scProps, "toString"), true);
   });
 
   it("normalizes CallToolResult for codemode scripts without _meta or non-JSON values", () => {
@@ -4309,5 +4583,50 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
     assert.equal(registered.get("mcp_svc_echo")?.exposure, "hidden");
     assert.equal(registered.get("mcp_svc_search")?.exposure, "hidden");
     assert.deepEqual(active, ["read"]);
+  });
+
+  it("registers both a tool with prototype-named type fields and a healthy sibling tool (#330)", async () => {
+    const registered = new Map<string, TestToolDefinition>();
+    let active: string[] = [];
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, {
+      registerTool(t: unknown) {
+        const tool = t as TestToolDefinition;
+        registered.set(tool.name, tool);
+      },
+      getActiveTools: () => [...active],
+      setActiveTools: (names: string[]) => {
+        active = [...names];
+      },
+    });
+    const client = {
+      request: async () => ({
+        tools: [
+          {
+            name: "proto_with_bogus_type",
+            inputSchema: {
+              type: "object",
+              properties: {
+                badOpt: { type: "toString" },
+                badProto: { type: "__proto__" },
+              },
+            },
+          },
+          {
+            name: "healthy_sibling",
+            inputSchema: {
+              type: "object",
+              properties: { msg: { type: "string" } },
+              required: ["msg"],
+            },
+          },
+        ],
+      }),
+      callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
+    } as unknown as Client;
+
+    await bridge.refreshTools("srv", client);
+    assert.equal(registered.has("mcp_srv_proto_with_bogus_type"), true);
+    assert.equal(registered.has("mcp_srv_healthy_sibling"), true);
+    assert.deepEqual(active, ["mcp_srv_healthy_sibling", "mcp_srv_proto_with_bogus_type"]);
   });
 });

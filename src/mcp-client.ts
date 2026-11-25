@@ -28,8 +28,16 @@ import {
   ResourceListChangedNotificationSchema,
   LoggingMessageNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
+import type {
+  JsonSchemaType,
+  JsonSchemaValidator,
+  jsonSchemaValidator,
+} from "@modelcontextprotocol/sdk/validation";
 import { McpError, AuthCancelledError } from "./errors.js";
 import { isSdkTimeoutError } from "./connect-policy.js";
+import { describeError } from "./debug-log-format.js";
+import { reportDiagnostic } from "./debug-log.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
 // ─── Timer injection ──────────────────────────────────────────────────────────
@@ -255,6 +263,41 @@ export interface CreateMcpClientOptions {
 }
 
 /**
+ * Wrap the SDK's `AjvJsonSchemaValidator` so an uncompilable tool `outputSchema`
+ * (such as a PCRE/Python regex `pattern` invalid under JS `/u`) does not abort
+ * `tools/list` for the whole server (#329).
+ *
+ * WHY: `@modelcontextprotocol/sdk`'s `Client.listTools()` eagerly calls
+ * `cacheToolMetadata()`, compiling every tool's `outputSchema` uncaught. Falling back to a
+ * pass-through validator for that single tool keeps healthy sibling tools strictly validated
+ * and still lets the SDK enforce `structuredContent` presence when `!isError`.
+ */
+export function createResilientOutputSchemaValidator(serverName: string): jsonSchemaValidator {
+  const inner = new AjvJsonSchemaValidator();
+  return {
+    getValidator<T>(schema: JsonSchemaType): JsonSchemaValidator<T> {
+      try {
+        return inner.getValidator<T>(schema);
+      } catch (err) {
+        const { kind, message } = describeError(err);
+        reportDiagnostic({
+          level: "warn",
+          event: "tools.output_schema_uncompilable",
+          server: serverName,
+          message: `[${serverName}] Skipping strict outputSchema validation because schema compilation failed: ${message}`,
+          fields: { kind },
+        });
+        return (input: unknown) => ({
+          valid: true as const,
+          data: input as T,
+          errorMessage: undefined,
+        });
+      }
+    },
+  };
+}
+
+/**
  * Build the pi-mcp MCP client and wire its protocol surface.
  *
  * The handlers are registered on the client but hold no lifecycle state: each one forwards
@@ -270,6 +313,7 @@ export function createMcpClient(options: CreateMcpClientOptions): Client {
         roots: { listChanged: true },
         // Sampling: explicitly NOT declared — not supported in v1
       },
+      jsonSchemaValidator: createResilientOutputSchemaValidator(options.serverName),
     },
   );
 

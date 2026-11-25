@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Omit non-Unicode (`/u`) or malformed regex `pattern` strings during MCP `inputSchema` → TypeBox conversion and wrap `Client`'s `outputSchema` Ajv validator so PCRE/Python/Go regexes (such as `(?i)^[a-z]+$`, `\A...\z`, `^[\w-\.]+$`, or unterminated expressions) no longer crash tool calls or fail `tools/list` for the entire server while valid `/u` patterns remain strictly enforced (#329).
+- Prevent `Object.prototype` key collisions (`toString`, `constructor`, `valueOf`, `hasOwnProperty`, `prototype`, `__proto__`) from dropping properties in `allOf` flattening, mutating local prototype chains, stripping own keys during TypeBox `Type.Optional` / `Type.Unsafe` cloning, or crashing tool registration when schemas declare prototype-named `type` strings (#330).
 - MCP `image` tool blocks and `image/*` blob resources now canonicalize MIME types (stripping `; ...` parameters, lowercasing, and normalizing `image/jpg` to `image/jpeg`), decode valid UTF-8 `image/svg+xml` payloads to text blocks, preserve supported raster and Photon-transcodable formats (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`, `image/x-ms-bmp`, `image/tiff`), and degrade empty, non-standard-base64, non-string, invalid-UTF-8 SVG, or unsupported `image/*` payloads into sanitized text summaries instead of poisoning session history across Bedrock, Anthropic, and OpenAI adapters (#334).
 - Honor `oauth.callbackPort` alongside a portless `oauth.callbackUrl`, and report conflicting explicit ports as config errors with the server name and source (#338).
 

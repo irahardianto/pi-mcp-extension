@@ -48,7 +48,7 @@ export function orderUnionMembers(members: TSchema[]): TSchema[] {
   return [...nulls, ...nonNulls];
 }
 
-type SchemaOptionKind = "string" | "number" | "boolean" | "defined";
+type SchemaOptionKind = "string" | "number" | "boolean" | "defined" | "pattern";
 
 // WHY: Order matters for byte-stable serialized schemas — keep this table in the
 // same sequence the hand-written checks used before it became a lookup loop.
@@ -57,7 +57,7 @@ const SCHEMA_OPTION_KEYS: ReadonlyArray<readonly [string, SchemaOptionKind]> = [
   ["title", "string"],
   ["default", "defined"],
   ["format", "string"],
-  ["pattern", "string"],
+  ["pattern", "pattern"],
   ["minLength", "number"],
   ["maxLength", "number"],
   ["minimum", "number"],
@@ -72,6 +72,24 @@ const SCHEMA_OPTION_KEYS: ReadonlyArray<readonly [string, SchemaOptionKind]> = [
   ["maxProperties", "number"],
 ];
 
+/**
+ * Check whether a JSON Schema `pattern` compiles as an ECMA-262 Unicode regex (`/u`).
+ * WHY: Pi's `validateToolArguments` runs TypeBox `Compile`, which calls `new RegExp(pattern, "u")`.
+ * PCRE/Python/Go patterns (e.g. `(?i)...`, `\A...\z`, `[\w-\.]`) and malformed patterns throw
+ * `SyntaxError` before any request reaches the MCP server; omitting them lets the server enforce
+ * its own regex on the wire while keeping all other constraints intact.
+ */
+export function isValidUnicodePattern(pattern: string): boolean {
+  try {
+    new RegExp(pattern, "u");
+    return true;
+  } catch {
+    // WHY: TypeBox compiles pattern with new RegExp(pattern, "u"); omit PCRE/malformed
+    // patterns rather than crashing tool calls.
+    return false;
+  }
+}
+
 function hasSchemaOptionValue(
   schema: Record<string, unknown>,
   key: string,
@@ -80,6 +98,9 @@ function hasSchemaOptionValue(
   const value = schema[key];
   if (kind === "defined") {
     return key in schema && value !== undefined;
+  }
+  if (kind === "pattern") {
+    return typeof value === "string" && isValidUnicodePattern(value);
   }
   return typeof value === kind;
 }
@@ -98,6 +119,23 @@ function withSchemaOptions(schema: TSchema, opts: Record<string, unknown>): TSch
   if (Object.keys(opts).length === 0) return schema;
   const clone = Object.defineProperties<TSchema>({}, Object.getOwnPropertyDescriptors(schema));
   return Object.assign(clone, opts);
+}
+
+// WHY: TypeBox 1.x `Type.Optional(schema)` invokes `Memory.Update` -> `Memory.Clone`, which
+// runs `Guard.IsUnsafePropertyKey` and silently drops `"__proto__"`, `"constructor"`, and
+// `"prototype"` from any optional nested object schema. Probe TypeBox's own optional marker
+// descriptor(s) once at load time and apply them to a shallow descriptor clone instead.
+const OPTIONAL_BASE = Type.Any();
+const OPTIONAL_TEMPLATE = Type.Optional(OPTIONAL_BASE);
+const OPTIONAL_MARKER_DESCRIPTORS = Object.fromEntries(
+  Reflect.ownKeys(OPTIONAL_TEMPLATE)
+    .filter((key) => !Object.hasOwn(OPTIONAL_BASE, key))
+    .map((key) => [key, Object.getOwnPropertyDescriptor(OPTIONAL_TEMPLATE, key)!]),
+);
+
+function markSchemaOptional(schema: TSchema): TSchema {
+  const clone = Object.defineProperties<TSchema>({}, Object.getOwnPropertyDescriptors(schema));
+  return Object.defineProperties(clone, OPTIONAL_MARKER_DESCRIPTORS);
 }
 
 function convertRefSchema(
@@ -361,7 +399,7 @@ function convertObjectSchema(
     );
   }
 
-  const props: Record<string, TSchema> = {};
+  const propEntries: Array<[string, TSchema]> = [];
   for (const [key, entry] of Object.entries(merge.properties)) {
     const converted = convertJsonSchemaToTypebox(
       entry.schema,
@@ -369,8 +407,11 @@ function convertObjectSchema(
       ctx.effectiveRoot,
       entry.seenRefs,
     );
-    props[key] = merge.required.has(key) ? converted : Type.Optional(converted);
+    propEntries.push([key, merge.required.has(key) ? converted : markSchemaOptional(converted)]);
   }
+  // WHY: `Object.fromEntries` defines properties via `CreateDataProperty` instead of `[[Set]]`,
+  // so an own `"__proto__"` key becomes an own property instead of mutating `props`'s prototype.
+  const props = Object.fromEntries(propEntries);
 
   const objOpts: Record<string, unknown> = { ...opts };
   if (typeof additionalProperties === "boolean") {
@@ -436,7 +477,7 @@ function convertTypedSchema(
   opts: Record<string, unknown>,
   ctx: ConversionContext,
 ): TSchema {
-  if (type && type in PRIMITIVE_FACTORIES) {
+  if (type && Object.hasOwn(PRIMITIVE_FACTORIES, type)) {
     return PRIMITIVE_FACTORIES[type]!(opts);
   }
   if (type === "array") {
