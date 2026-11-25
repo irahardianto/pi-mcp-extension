@@ -135,4 +135,44 @@ export function authArgumentCompletions(argumentPrefix: string, servers: readonl
   return completions.length > 0 ? completions : null;
 }
 
+// WHY: Pi 1.3.0 only reports --no-mcp through its own parsed arguments; extensions cannot
+// read that setting from ExtensionAPI. Mirror its value-taking flags to avoid treating
+// an option's value as the --no-mcp switch.
+const PI_VALUE_TAKING_FLAGS: ReadonlySet<string> = new Set([
+  "--provider",
+  "--model",
+  "--api-key",
+  "--system-prompt",
+  "--append-system-prompt",
+  "--name",
+  "-n",
+  "--session",
+  "--session-id",
+  "--fork",
+  "--session-dir",
+  "--models",
+  "--tools",
+  "-t",
+  "--exclude-tools",
+  "-xt",
+  "--thinking",
+  "--export",
+  "--extension",
+  "-e",
+  "--skill",
+  "--prompt-template",
+  "--theme",
+]);
+
+/** Return true only when Pi receives --no-mcp as a CLI flag, not as a value or positional argument. */
+export function hasNoMcpFlag(argv: readonly string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--") break;
+    if (arg === "--no-mcp") return true;
+    if (PI_VALUE_TAKING_FLAGS.has(arg)) i++;
+  }
+  return false;
+}
+
 export { collectRegisteredServers, mergeWithRegisteredServers } from "./session-lifecycle.js";
