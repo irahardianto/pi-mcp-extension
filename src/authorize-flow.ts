@@ -6,6 +6,7 @@ import {
   discoverManualAuthChallenge,
   createHeadersFetch,
   resolveAuthorizeChallenge,
+  shouldInvalidateDiscoveryForStepUp,
   stripAuthorizationHeader,
   type ManualAuthChallenge,
   type PendingAuthChallenge,
@@ -186,7 +187,7 @@ async function readStoredTokenScopeForStepUp(
   pending: PendingAuthChallenge | undefined,
   serverName: string,
 ): Promise<string | undefined> {
-  if (pending?.error !== "insufficient_scope" || pending.grantedScope) {
+  if (pending?.error !== "insufficient_scope" || pending.grantedScope?.trim()) {
     return undefined;
   }
   try {
@@ -224,6 +225,50 @@ async function prepareStepUpAuthState(params: {
     assertActive();
   }
   return { pendingChallenge, storedTokenScope };
+}
+
+async function readCachedResourceMetadataUrl(
+  authProvider: McpOAuthProvider,
+  serverName: string,
+): Promise<{ exists: boolean; resourceMetadataUrl: string | undefined }> {
+  try {
+    const cached = await authProvider.discoveryState();
+    return {
+      exists: cached !== undefined,
+      resourceMetadataUrl: cached?.resourceMetadataUrl,
+    };
+  } catch (err) {
+    if (!isCorruptOAuthStateError(err)) throw err;
+    reportCorruptOAuthState(serverName, err);
+    return { exists: false, resourceMetadataUrl: undefined };
+  }
+}
+
+async function invalidateDiscoveryForStepUpIfNeeded(params: {
+  authProvider: McpOAuthProvider;
+  pending: PendingAuthChallenge | undefined;
+  authChallenge: ManualAuthChallenge;
+  serverName: string;
+  assertActive: () => void;
+}): Promise<void> {
+  const { authProvider, pending, authChallenge, serverName, assertActive } = params;
+  if (pending?.error !== "insufficient_scope") return;
+  const cached = await readCachedResourceMetadataUrl(authProvider, serverName);
+  assertActive();
+  if (!cached.exists) return;
+  const shouldInvalidate = shouldInvalidateDiscoveryForStepUp({
+    pending,
+    challengeResourceMetadataUrl: authChallenge.resourceMetadataUrl,
+    cachedResourceMetadataUrl: cached.resourceMetadataUrl,
+  });
+  if (!shouldInvalidate) return;
+  try {
+    await authProvider.invalidateCredentials("discovery");
+  } catch (err) {
+    if (!isCorruptOAuthStateError(err)) throw err;
+    reportCorruptOAuthState(serverName, err);
+  }
+  assertActive();
 }
 
 function applyRedirectFallbackScope(
@@ -618,6 +663,13 @@ export async function authorize(
       pending: pendingChallenge,
       discovered: discoveredChallenge,
       storedTokenScope,
+    });
+    await invalidateDiscoveryForStepUpIfNeeded({
+      authProvider,
+      pending: pendingChallenge,
+      authChallenge,
+      serverName,
+      assertActive,
     });
     authProvider.setFallbackTokenScope(authChallenge.scope ?? config.auth?.scope);
 

@@ -53,22 +53,21 @@ function dedupeScopeTokens(tokens: readonly string[]): string | undefined {
  * Compute a deduplicated space-delimited step-up scope union across
  * `configuredScope`, `grantedScope`, and `challengedScope`.
  *
- * When `challengedScope` is absent or blank, returns only normalized
- * `configuredScope` (or `undefined`) so the SDK can fall back to
- * `resourceMetadata.scopes_supported` instead of repeating the insufficient grant.
+ * When `challengedScope` is absent or blank, returns `undefined` so the SDK follows
+ * SEP-835 (`resourceMetadata.scopes_supported`, then `provider.clientMetadata.scope` /
+ * `config.auth.scope`) instead of repeating an insufficient grant.
  */
 export function mergeStepUpScope(
   configuredScope: string | undefined,
   grantedScope: string | undefined,
   challengedScope: string | undefined,
 ): string | undefined {
-  const configured = splitScopeTokens(configuredScope);
   const challenged = splitScopeTokens(challengedScope);
   if (challenged.length === 0) {
-    return dedupeScopeTokens(configured);
+    return undefined;
   }
   return dedupeScopeTokens([
-    ...configured,
+    ...splitScopeTokens(configuredScope),
     ...splitScopeTokens(grantedScope),
     ...challenged,
   ]);
@@ -233,6 +232,32 @@ export function resolveAuthorizeChallenge(params: {
     ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
     ...(scope ? { scope } : {}),
   };
+}
+
+/**
+ * Whether interactive step-up authorization must invalidate cached `discoveryState`
+ * before calling the MCP SDK's `auth()`.
+ *
+ * WHY: The SDK's `authInternal()` short-circuits Protected Resource Metadata (PRM)
+ * discovery whenever `discoveryState.authorizationServerUrl` and `resourceMetadata`
+ * are cached on disk, silently ignoring a new `resourceMetadataUrl` option or updated
+ * `scopes_supported`. Invalidating only `"discovery"` (keeping `clientInfo` and its
+ * issuer binding intact) ensures a `403 insufficient_scope` challenge with a different
+ * `resource_metadata` URL or an omitted `scope` fetches fresh PRM metadata.
+ */
+export function shouldInvalidateDiscoveryForStepUp(params: {
+  pending: PendingAuthChallenge | undefined;
+  challengeResourceMetadataUrl: URL | undefined;
+  cachedResourceMetadataUrl: string | undefined;
+}): boolean {
+  const { pending, challengeResourceMetadataUrl, cachedResourceMetadataUrl } = params;
+  if (pending?.error !== "insufficient_scope") return false;
+  if (!normalizeScopeTokens(pending.scope)) return true;
+  if (!challengeResourceMetadataUrl) return false;
+  return (
+    !cachedResourceMetadataUrl ||
+    !urlsMatch(cachedResourceMetadataUrl, challengeResourceMetadataUrl.href)
+  );
 }
 
 function extractRequestUrl(input: Parameters<typeof fetch>[0]): string {

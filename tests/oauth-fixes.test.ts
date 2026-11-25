@@ -32,6 +32,7 @@ import {
   mergePendingAuthChallenge,
   mergeStepUpScope,
   resolveAuthorizeChallenge,
+  shouldInvalidateDiscoveryForStepUp,
   shouldSkipInteractivePreStart,
   withGrantedScope,
   type CapturedAuthChallenge,
@@ -3690,6 +3691,10 @@ describe("OAuth Security Fixes", () => {
       billingToolRequiredScope?: string;
       resourceReadRequiredScope?: string;
       plain403OnToolCall?: boolean;
+      stepUpResourceMetadataPath?: string;
+      stepUpScopesSupported?: string[] | null;
+      omitScopeIn403?: boolean;
+      omitScopesSupportedInDefaultPrm?: boolean;
     }
 
     async function startStepUpMockServer(opts: StepUpServerOptions) {
@@ -3698,6 +3703,8 @@ describe("OAuth Security Fixes", () => {
       let authCodeSeq = 0;
       let tokenSeq = 0;
       const authRequests: Array<{ scope: string | null }> = [];
+      const prmRequests: string[] = [];
+      let registerCount = 0;
       const pendingCodes = new Map<string, { codeChallenge: string; scope: string }>();
       const accessTokenScopes = new Map<string, Set<string>>();
       const validRefreshTokens = new Map<string, Set<string>>();
@@ -3744,16 +3751,38 @@ describe("OAuth Security Fixes", () => {
 
           if (
             req.method === "GET" &&
-            (pathname === "/.well-known/oauth-protected-resource" ||
-              pathname === "/.well-known/oauth-protected-resource/mcp" ||
-              pathname === "/.well-known/oauth-protected-resource/sse")
+            opts.stepUpResourceMetadataPath &&
+            pathname === opts.stepUpResourceMetadataPath
           ) {
+            prmRequests.push(pathname);
             res.writeHead(200, { "content-type": "application/json" });
             res.end(
               JSON.stringify({
                 resource: opts.transport === "sse" ? `${base}/sse` : `${base}/mcp`,
                 authorization_servers: [base],
-                scopes_supported: [opts.initial401Scope ?? "read"],
+                ...(opts.stepUpScopesSupported !== null && opts.stepUpScopesSupported !== undefined
+                  ? { scopes_supported: opts.stepUpScopesSupported }
+                  : {}),
+              }),
+            );
+            return;
+          }
+
+          if (
+            req.method === "GET" &&
+            (pathname === "/.well-known/oauth-protected-resource" ||
+              pathname === "/.well-known/oauth-protected-resource/mcp" ||
+              pathname === "/.well-known/oauth-protected-resource/sse")
+          ) {
+            prmRequests.push(pathname);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify({
+                resource: opts.transport === "sse" ? `${base}/sse` : `${base}/mcp`,
+                authorization_servers: [base],
+                ...(opts.omitScopesSupportedInDefaultPrm
+                  ? {}
+                  : { scopes_supported: [opts.initial401Scope ?? "read"] }),
               }),
             );
             return;
@@ -3781,6 +3810,7 @@ describe("OAuth Security Fixes", () => {
           }
 
           if (req.method === "POST" && pathname === "/register") {
+            registerCount += 1;
             const meta = JSON.parse(await readBody(req)) as Record<string, unknown>;
             res.writeHead(201, { "content-type": "application/json" });
             res.end(
@@ -3885,8 +3915,10 @@ describe("OAuth Security Fixes", () => {
           };
 
           const send403InsufficientScope = (requiredScope: string) => {
+            const prmPath = opts.stepUpResourceMetadataPath ?? "/.well-known/oauth-protected-resource";
+            const scopePart = opts.omitScopeIn403 ? "" : `, scope="${requiredScope}"`;
             res.writeHead(403, {
-              "WWW-Authenticate": `Bearer error="insufficient_scope", scope="${requiredScope}", resource_metadata="${base}/.well-known/oauth-protected-resource"`,
+              "WWW-Authenticate": `Bearer error="insufficient_scope"${scopePart}, resource_metadata="${base}${prmPath}"`,
               "content-type": "text/plain",
             });
             res.end("Forbidden");
@@ -4086,6 +4118,10 @@ describe("OAuth Security Fixes", () => {
         baseUrl: base,
         mcpUrl: opts.transport === "sse" ? `${base}/sse` : `${base}/mcp`,
         authRequests,
+        prmRequests,
+        get registerCount() {
+          return registerCount;
+        },
         get sseGetCount() {
           return sseGetCount;
         },
@@ -4112,6 +4148,7 @@ describe("OAuth Security Fixes", () => {
       transport: "streamable-http" | "sse";
       url: string;
       authScope?: string;
+      useDcr?: boolean;
       browserOpen: (url: string) => void | Promise<void>;
       onSelect?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => string | undefined | Promise<string | undefined>;
     }) {
@@ -4167,7 +4204,7 @@ describe("OAuth Security Fixes", () => {
               url: params.url,
               auth: {
                 type: "oauth",
-                clientId: "stepup-client",
+                ...(params.useDcr ? {} : { clientId: "stepup-client" }),
                 ...(params.authScope ? { scope: params.authScope } : {}),
               },
             },
@@ -4570,13 +4607,13 @@ describe("OAuth Security Fixes", () => {
       }
     });
 
-    it("unit: mergeStepUpScope deduplicates, preserves order, and omits grantedScope when challengedScope is empty", () => {
+    it("unit: mergeStepUpScope deduplicates, preserves order, and returns undefined when challengedScope is empty", () => {
       assert.strictEqual(mergeStepUpScope(undefined, "read", "admin"), "read admin");
       assert.strictEqual(mergeStepUpScope("profile", "read", "admin"), "profile read admin");
       assert.strictEqual(mergeStepUpScope("read", "read", "read admin"), "read admin");
       assert.strictEqual(mergeStepUpScope("  read  ", " read  write ", " admin  write "), "read write admin");
       assert.strictEqual(mergeStepUpScope(undefined, "read", undefined), undefined);
-      assert.strictEqual(mergeStepUpScope("  read  ", "read", "   "), "read");
+      assert.strictEqual(mergeStepUpScope("  read  ", "read", "   "), undefined);
       assert.strictEqual(mergeStepUpScope("  ", "read", ""), undefined);
     });
 
@@ -4993,6 +5030,235 @@ describe("OAuth Security Fixes", () => {
           harness.ctx,
         )) as { content: Array<{ text: string }> };
         assert.strictEqual(billingRes.content[0]?.text, "billing-ok");
+      } finally {
+        await harness.cleanup();
+        await server.close();
+      }
+    });
+
+    it("unit: shouldInvalidateDiscoveryForStepUp detects changed resource_metadata URLs and scopeless 403s", () => {
+      const prmBase = new URL("https://example.com/.well-known/oauth-protected-resource");
+      const prmAdmin = new URL("https://example.com/.well-known/oauth-protected-resource/admin");
+      const stepUpWithScope = {
+        serverUrl: "https://example.com/mcp",
+        error: "insufficient_scope",
+        scope: "admin",
+        resourceMetadataUrl: prmAdmin,
+      };
+      const scopelessStepUp = {
+        serverUrl: "https://example.com/mcp",
+        error: "insufficient_scope",
+        grantedScope: "read",
+      };
+
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: undefined,
+          challengeResourceMetadataUrl: prmAdmin,
+          cachedResourceMetadataUrl: prmBase.href,
+        }),
+        false,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: { serverUrl: "https://example.com/mcp", error: "invalid_token", scope: "read" },
+          challengeResourceMetadataUrl: prmAdmin,
+          cachedResourceMetadataUrl: prmBase.href,
+        }),
+        false,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: scopelessStepUp,
+          challengeResourceMetadataUrl: prmBase,
+          cachedResourceMetadataUrl: prmBase.href,
+        }),
+        true,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: { ...stepUpWithScope, scope: "   " },
+          challengeResourceMetadataUrl: prmBase,
+          cachedResourceMetadataUrl: prmBase.href,
+        }),
+        true,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: stepUpWithScope,
+          challengeResourceMetadataUrl: undefined,
+          cachedResourceMetadataUrl: prmBase.href,
+        }),
+        false,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: stepUpWithScope,
+          challengeResourceMetadataUrl: prmBase,
+          cachedResourceMetadataUrl: "https://example.com:443/.well-known/oauth-protected-resource/",
+        }),
+        false,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: stepUpWithScope,
+          challengeResourceMetadataUrl: prmAdmin,
+          cachedResourceMetadataUrl: prmBase.href,
+        }),
+        true,
+      );
+      assert.strictEqual(
+        shouldInvalidateDiscoveryForStepUp({
+          pending: stepUpWithScope,
+          challengeResourceMetadataUrl: prmAdmin,
+          cachedResourceMetadataUrl: undefined,
+        }),
+        true,
+      );
+    });
+
+    it("invalidates cached discoveryState on scopeless 403 insufficient_scope with a new resource_metadata URL so SDK fetches updated scopes_supported even when config.auth.scope is set", async () => {
+      const server = await startStepUpMockServer({
+        transport: "streamable-http",
+        issueRefreshToken: true,
+        tokenOmitsScope: true,
+        initial401Scope: "read",
+        toolCallRequiredScope: "admin",
+        omitScopeIn403: true,
+        stepUpResourceMetadataPath: "/.well-known/oauth-protected-resource/admin",
+        stepUpScopesSupported: ["read", "admin"],
+      });
+      const harness = await setupStepUpExtension({
+        transport: "streamable-http",
+        url: server.mcpUrl,
+        authScope: "read",
+        useDcr: true,
+        browserOpen: server.browserOpen,
+      });
+      try {
+        // 1. Initial auth caches discoveryState pointing at /.well-known/oauth-protected-resource (scopes_supported: ["read"]).
+        await harness.commands.get("mcp:auth").handler("srv", harness.ctx);
+        assert.strictEqual(server.authRequests[0]?.scope, "read");
+        assert.strictEqual(server.registerCount, 1);
+        assert.deepStrictEqual(new Set(server.prmRequests), new Set(["/.well-known/oauth-protected-resource"]));
+
+        // 2. Tool call hits scopeless 403 insufficient_scope pointing at a new PRM URL advertising ["read", "admin"].
+        await assert.rejects(
+          () => harness.tools.get("mcp_srv_admin_action").execute("tc-prm-1", {}, undefined, undefined, harness.ctx),
+          /403|upscoping/,
+        );
+
+        // 3. Re-auth must clear cached discoveryState (without re-running DCR), fetch the new PRM URL,
+        //    and use its scopes_supported ("read admin") instead of repeating config.auth.scope ("read").
+        await harness.commands.get("mcp:auth").handler("srv", harness.ctx);
+        assert.strictEqual(server.registerCount, 1);
+        assert.ok(
+          server.prmRequests.includes("/.well-known/oauth-protected-resource/admin"),
+          `expected step-up PRM fetch, got: ${JSON.stringify(server.prmRequests)}`,
+        );
+        assert.strictEqual(server.authRequests[1]?.scope, "read admin");
+
+        const result = (await harness.tools.get("mcp_srv_admin_action").execute(
+          "tc-prm-ok",
+          {},
+          undefined,
+          undefined,
+          harness.ctx,
+        )) as { content: Array<{ text: string }> };
+        assert.strictEqual(result.content[0]?.text, "admin-ok");
+      } finally {
+        await harness.cleanup();
+        await server.close();
+      }
+    });
+
+    it("invalidates cached discoveryState when a scoped 403 insufficient_scope advertises a different resource_metadata URL while preserving DCR clientInfo", async () => {
+      const server = await startStepUpMockServer({
+        transport: "streamable-http",
+        issueRefreshToken: false,
+        initial401Scope: "read",
+        toolCallRequiredScope: "admin",
+        stepUpResourceMetadataPath: "/.well-known/oauth-protected-resource/elevated",
+        stepUpScopesSupported: ["read", "admin"],
+      });
+      const harness = await setupStepUpExtension({
+        transport: "streamable-http",
+        url: server.mcpUrl,
+        useDcr: true,
+        browserOpen: server.browserOpen,
+      });
+      try {
+        await harness.commands.get("mcp:auth").handler("srv", harness.ctx);
+        assert.strictEqual(server.registerCount, 1);
+        assert.deepStrictEqual(new Set(server.prmRequests), new Set(["/.well-known/oauth-protected-resource"]));
+
+        await assert.rejects(
+          () => harness.tools.get("mcp_srv_admin_action").execute("tc-prm-2", {}, undefined, undefined, harness.ctx),
+          /Authorization required|403|upscoping/,
+        );
+
+        await harness.commands.get("mcp:auth").handler("srv", harness.ctx);
+        assert.strictEqual(server.registerCount, 1);
+        assert.ok(
+          server.prmRequests.includes("/.well-known/oauth-protected-resource/elevated"),
+          `expected elevated PRM fetch, got: ${JSON.stringify(server.prmRequests)}`,
+        );
+        assert.strictEqual(server.authRequests[1]?.scope, "read admin");
+
+        const result = (await harness.tools.get("mcp_srv_admin_action").execute(
+          "tc-prm-2-ok",
+          {},
+          undefined,
+          undefined,
+          harness.ctx,
+        )) as { content: Array<{ text: string }> };
+        assert.strictEqual(result.content[0]?.text, "admin-ok");
+      } finally {
+        await harness.cleanup();
+        await server.close();
+      }
+    });
+
+    it("falls back to config.auth.scope via SDK clientMetadata.scope when scopeless 403 PRM omits scopes_supported", async () => {
+      const server = await startStepUpMockServer({
+        transport: "streamable-http",
+        issueRefreshToken: false,
+        initial401Scope: "read",
+        toolCallRequiredScope: "admin",
+        omitScopeIn403: true,
+        omitScopesSupportedInDefaultPrm: true,
+        stepUpResourceMetadataPath: "/.well-known/oauth-protected-resource/no-scopes",
+        stepUpScopesSupported: null,
+      });
+      const harness = await setupStepUpExtension({
+        transport: "streamable-http",
+        url: server.mcpUrl,
+        authScope: "read admin",
+        browserOpen: server.browserOpen,
+      });
+      try {
+        await harness.commands.get("mcp:auth").handler("srv", harness.ctx);
+        // Initial 401 had scope="read", so first auth only requested "read".
+        assert.strictEqual(server.authRequests[0]?.scope, "read");
+
+        await assert.rejects(
+          () => harness.tools.get("mcp_srv_admin_action").execute("tc-fallback", {}, undefined, undefined, harness.ctx),
+          /Authorization required|403|upscoping/,
+        );
+
+        // Scopeless 403 -> PRM omits scopes_supported -> SDK falls back to provider.clientMetadata.scope ("read admin").
+        await harness.commands.get("mcp:auth").handler("srv", harness.ctx);
+        assert.ok(server.prmRequests.includes("/.well-known/oauth-protected-resource/no-scopes"));
+        assert.strictEqual(server.authRequests[1]?.scope, "read admin");
+
+        const result = (await harness.tools.get("mcp_srv_admin_action").execute(
+          "tc-fallback-ok",
+          {},
+          undefined,
+          undefined,
+          harness.ctx,
+        )) as { content: Array<{ text: string }> };
+        assert.strictEqual(result.content[0]?.text, "admin-ok");
       } finally {
         await harness.cleanup();
         await server.close();
