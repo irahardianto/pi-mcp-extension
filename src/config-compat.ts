@@ -19,6 +19,50 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const INVALID_CALLBACK_PORT_MESSAGE = "oauth.callbackPort must be an integer between 1 and 65535";
+
+/** Validate `oauth.callbackPort` as an integer TCP port (`1..65535`). */
+function parseCallbackPort(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new McpError(INVALID_CALLBACK_PORT_MESSAGE, "<config>", "config");
+  }
+  if (value < 1 || value > 65535) {
+    throw new McpError(INVALID_CALLBACK_PORT_MESSAGE, "<config>", "config");
+  }
+  return value;
+}
+
+/** Fill in a missing `callbackUrl` port; a different explicit port is a config error. */
+function combineCallbackAliases(callbackUrl: string, callbackPort: number): string {
+  let url: URL;
+  try {
+    url = new URL(callbackUrl);
+  } catch {
+    // WHY: Left as written so the existing redirectUrl validation reports it.
+    return callbackUrl;
+  }
+  if (url.port !== "") {
+    if (Number(url.port) !== callbackPort) {
+      throw new McpError("oauth.callbackUrl port does not match oauth.callbackPort", "<config>", "config");
+    }
+    return callbackUrl;
+  }
+  url.port = String(callbackPort);
+  return url.toString();
+}
+
+/** Resolve Pi 1.x `callbackUrl` and `callbackPort` aliases into a single `redirectUrl` candidate. */
+function resolveCallbackRedirectUrl(callbackUrl: unknown, rawCallbackPort: unknown): unknown {
+  const callbackPort = rawCallbackPort !== undefined ? parseCallbackPort(rawCallbackPort) : undefined;
+  if (typeof callbackUrl === "string") {
+    return callbackPort !== undefined ? combineCallbackAliases(callbackUrl, callbackPort) : callbackUrl;
+  }
+  if (callbackPort !== undefined) {
+    return `http://127.0.0.1:${callbackPort}/callback`;
+  }
+  return callbackUrl;
+}
+
 /**
  * Rewrite Pi 1.x OAuth config aliases (`callbackUrl`, `callbackPort`) onto `redirectUrl` before
  * schema validation.
@@ -27,12 +71,9 @@ export function normalizeAuthConfigAliases(raw: unknown): unknown {
   if (!isPlainObject(raw)) return raw;
   const obj: Record<string, unknown> = { ...raw };
   if (obj.redirectUrl === undefined) {
-    if (typeof obj.callbackUrl === "string") {
-      obj.redirectUrl = obj.callbackUrl;
-    } else if (typeof obj.callbackPort === "number") {
-      obj.redirectUrl = `http://127.0.0.1:${obj.callbackPort}/callback`;
-    } else if (obj.callbackUrl !== undefined) {
-      obj.redirectUrl = obj.callbackUrl;
+    const resolved = resolveCallbackRedirectUrl(obj.callbackUrl, obj.callbackPort);
+    if (resolved !== undefined) {
+      obj.redirectUrl = resolved;
     }
   }
   delete obj.callbackUrl;
