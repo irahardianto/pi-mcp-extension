@@ -25,6 +25,7 @@ import {
   listAllResourceTemplates,
 } from "../src/resource-bridge.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
+import { setDiagnosticUi } from "../src/debug-log.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 const TINY_PNG =
@@ -84,6 +85,89 @@ function createGate(): { promise: Promise<void>; open: () => void; fail: (err: u
 }
 
 // ─── Unit: discovery, caching, failure mapping ───────────────────────────────
+
+for (const method of ["resources/list", "resources/templates/list"]) {
+  for (const cycleLength of [1, 2]) {
+    it(`rejects a ${cycleLength}-step ${method} cursor cycle without leaking cursors or fetching again`, async () => {
+      const cursors = Array.from({ length: cycleLength }, (_, i) => ["private", "cursor", i].join("-"));
+      const requested: Array<string | undefined> = [];
+      let templateCalls = 0;
+      const page = (params?: { cursor: string }) => {
+        requested.push(params?.cursor);
+        return { nextCursor: cursors[(requested.length - 1) % cycleLength] };
+      };
+      const client = fakeClient({
+        listResources: async (params?: { cursor: string }) => ({
+          resources: [], ...(method === "resources/list" ? page(params) : {}),
+        }),
+        listResourceTemplates: async (params?: { cursor: string }) => {
+          templateCalls++;
+          return { resourceTemplates: [], ...page(params) };
+        },
+      });
+      const bridge = new ResourceBridge();
+      await assert.rejects(bridge.getCatalog("srv", client, OPTIONS), (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.message, `MCP resource request failed for srv: ${method} pagination cursor repeated; server may be malfunctioning`);
+        let depth = 0;
+        for (let cause: unknown = err; cause !== undefined; cause = cause.cause) {
+          assert.ok(cause instanceof McpError);
+          assert.equal(cause.code, "protocol");
+          assert.equal(cause.server, "srv");
+          for (const cursor of cursors) assert.ok(!`${cause.message} ${cause.stack} ${JSON.stringify(cause)}`.includes(cursor));
+          depth++;
+        }
+        assert.equal(depth, 2);
+        return true;
+      });
+      assert.deepEqual(requested, [undefined, ...cursors]);
+      assert.equal(templateCalls, method === "resources/list" ? 0 : cycleLength + 1);
+    });
+  }
+
+  it(`refetches a catalog truncated by ${method}, notifies, and caches it once complete`, async () => {
+    let pages = 0;
+    let truncated = true;
+    const notices: string[] = [];
+    const fetchPage = () => {
+      pages++;
+      return { nextCursor: truncated ? String(pages) : undefined };
+    };
+    const client = fakeClient({
+      listResources: async () => ({ resources: [], ...(method === "resources/list" ? fetchPage() : {}) }),
+      listResourceTemplates: async () => ({ resourceTemplates: [], ...(method === "resources/templates/list" ? fetchPage() : {}) }),
+    });
+    const bridge = new ResourceBridge();
+    setDiagnosticUi({ notify: (message, level) => notices.push(`${level}: ${message}`) }, true);
+    try {
+      await bridge.getCatalog("srv", client, OPTIONS);
+      await bridge.getCatalog("srv", client, OPTIONS);
+      assert.equal(pages, 200, "truncated catalog must be fetched again");
+      assert.equal(notices.length, 2);
+      assert.ok(notices.every((notice) => notice.startsWith(`warning: pi-mcp: ${method} pagination for srv exceeded 100 pages`)));
+      truncated = false;
+      await bridge.getCatalog("srv", client, OPTIONS);
+      await bridge.getCatalog("srv", client, OPTIONS);
+      assert.equal(pages, 201, "complete catalog must be cached after recovery");
+    } finally {
+      setDiagnosticUi(null, false);
+    }
+  });
+}
+
+it("keeps resource cursor history local to each call, method, and server", async () => {
+  const { client } = pagedClient(
+    [{ resources: [], nextCursor: "1" }, { resources: [{ uri: "mock://a", name: "a" }], nextCursor: "" }],
+    [{ resourceTemplates: [], nextCursor: "1" }, { resourceTemplates: [{ uriTemplate: "mock://{id}", name: "t" }] }],
+  );
+  const bridge = new ResourceBridge();
+  for (const server of ["a", "a", "b"]) {
+    bridge.invalidate(server);
+    const catalog = await bridge.getCatalog(server, client, OPTIONS);
+    assert.equal(catalog.resources.length, 1);
+    assert.equal(catalog.templates.length, 1);
+  }
+});
 
 it("paginates resources/list and resources/templates/list", async () => {
   const { client, calls } = pagedClient(

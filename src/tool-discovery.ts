@@ -37,8 +37,9 @@ function reportPaginationLimit(serverName: string, pageCount: number): void {
     level: "warn",
     event: "tools.pagination_limit",
     server: serverName,
-    message: `tools/list pagination exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
+    message: `tools/list pagination for ${serverName} exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
     fields: { pages: pageCount },
+    notify: true,
   });
 }
 
@@ -122,6 +123,7 @@ export async function listAllTools(
   serverName = "<unknown>",
 ): Promise<McpToolDefinition[]> {
   const tools: McpToolDefinition[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | undefined;
   let pageCount = 0;
 
@@ -143,6 +145,10 @@ export async function listAllTools(
     );
     tools.push(...(result.tools as McpToolDefinition[]));
     cursor = result.nextCursor;
+    if (cursor && seenCursors.has(cursor)) {
+      throw new McpError("tools/list pagination cursor repeated; server may be malfunctioning", serverName, "protocol");
+    }
+    if (cursor) seenCursors.add(cursor);
     pageCount++;
   } while (cursor);
 

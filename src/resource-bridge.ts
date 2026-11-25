@@ -72,8 +72,9 @@ function reportPaginationLimit(serverName: string, method: string): void {
     level: "warn",
     event: "resources.pagination_limit",
     server: serverName,
-    message: `${method} pagination exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
+    message: `${method} pagination for ${serverName} exceeded ${MAX_PAGES} pages, stopping. The server may be malfunctioning.`,
     fields: { pages: MAX_PAGES },
+    notify: true,
   });
 }
 
@@ -117,6 +118,7 @@ async function raceWithAbort<T>(
 /**
  * Follow a cursor across pages until the server stops sending one, degrading a JSON-RPC
  * `-32601 Method not found` response to an empty list.
+ * `onLimit` marks a partial result when the page limit stops discovery.
  * Aborts surface as {@link AuthCancelledError}; every other failure reaches the caller.
  */
 export async function collectPages<T>(
@@ -124,9 +126,10 @@ export async function collectPages<T>(
   method: string,
   signal: AbortSignal | undefined,
   fetchPage: (cursor: string | undefined) => Promise<ResourcePage<T>>,
+  onLimit?: () => void,
 ): Promise<T[]> {
   try {
-    return await collectCursorPages(serverName, method, signal, fetchPage);
+    return await collectCursorPages(serverName, method, signal, fetchPage, onLimit);
   } catch (err) {
     if (isCancellationError(err, signal)) {
       throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
@@ -141,8 +144,10 @@ async function collectCursorPages<T>(
   method: string,
   signal: AbortSignal | undefined,
   fetchPage: (cursor: string | undefined) => Promise<ResourcePage<T>>,
+  onLimit?: () => void,
 ): Promise<T[]> {
   const items: T[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
     if (signal?.aborted) throw new AuthCancelledError(serverName);
@@ -152,8 +157,13 @@ async function collectCursorPages<T>(
     // thing and some servers send it, so neither may win another round trip.
     cursor = result.nextCursor;
     if (!cursor) return items;
+    if (seenCursors.has(cursor)) {
+      throw new McpError(`${method} pagination cursor repeated; server may be malfunctioning`, serverName, "protocol");
+    }
+    seenCursors.add(cursor);
   }
   reportPaginationLimit(serverName, method);
+  onLimit?.();
   return items;
 }
 
@@ -212,22 +222,24 @@ export async function listAllResources(
   client: Client,
   serverName: string,
   options: ResourceRequestOptions,
+  onLimit?: () => void,
 ): Promise<McpResourceDefinition[]> {
   return collectPages(serverName, "resources/list", options.signal, async (cursor) => {
     const result = await fetchResourcesPage(client, cursor, options);
     return { items: result.resources.map(toResourceDefinition), nextCursor: result.nextCursor };
-  });
+  }, onLimit);
 }
 
 export async function listAllResourceTemplates(
   client: Client,
   serverName: string,
   options: ResourceRequestOptions,
+  onLimit?: () => void,
 ): Promise<McpResourceTemplateDefinition[]> {
   return collectPages(serverName, "resources/templates/list", options.signal, async (cursor) => {
     const result = await fetchResourceTemplatesPage(client, cursor, options);
     return { items: result.resourceTemplates.map(toResourceTemplateDefinition), nextCursor: result.nextCursor };
-  });
+  }, onLimit);
 }
 
 function toResourceDefinition(resource: ListResourcesResult["resources"][number]): McpResourceDefinition {
@@ -447,7 +459,8 @@ function formatFailureDetail(err: unknown): string {
  * The catalog is fetched lazily (the first `mcp_list_resources` call for a server) and kept
  * until the server reports `notifications/resources/list_changed`, which bumps a monotonic
  * generation. A page set that was in flight when the notification arrived is discarded rather
- * than cached, because the server has already declared it stale.
+ * than cached, because the server has already declared it stale. Catalogs truncated by the
+ * page limit are returned without caching so the next request retries discovery.
  */
 export class ResourceBridge {
   private readonly catalogs = new Map<string, CachedCatalog>();
@@ -486,11 +499,12 @@ export class ResourceBridge {
     if (cached?.generation === generation) {
       return cloneCatalog(cached.catalog);
     }
-    const catalog = await this._fetchCatalog(serverName, client, options);
+    let truncated = false;
+    const catalog = await this._fetchCatalog(serverName, client, options, () => { truncated = true; });
     // WHY: only cache when the generation has not advanced while these pages were in flight;
     // otherwise a slow stale response would overwrite a newer generation's catalog or
     // repopulate a server that was forgotten while in flight.
-    if (this._generation(serverName) === generation) {
+    if (!truncated && this._generation(serverName) === generation) {
       this.catalogs.set(serverName, { generation, catalog });
     }
     return cloneCatalog(catalog);
@@ -526,10 +540,11 @@ export class ResourceBridge {
     serverName: string,
     client: Client,
     options: ResourceRequestOptions,
+    onLimit: () => void,
   ): Promise<ResourceCatalog> {
     try {
-      const resources = await listAllResources(client, serverName, options);
-      const templates = await listAllResourceTemplates(client, serverName, options);
+      const resources = await listAllResources(client, serverName, options, onLimit);
+      const templates = await listAllResourceTemplates(client, serverName, options, onLimit);
       return { resources, templates };
     } catch (err) {
       return await this._rethrowFailure(serverName, err, options.signal);
