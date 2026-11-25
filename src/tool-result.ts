@@ -121,15 +121,30 @@ export function buildMcpResultSchema(outputSchema?: Record<string, unknown>): TS
         seen: new WeakSet<object>(),
       })
     : {};
-  return Type.Unsafe({
+  // WHY: TypeBox `Type.Unsafe` invokes `Memory.Clone` (`Guard.IsUnsafePropertyKey`), which
+  // silently deletes `"__proto__"`, `"constructor"`, and `"prototype"` from `structuredContent`.
+  // Pass a placeholder to `Type.Unsafe` and attach `structuredContent` onto a shallow clone.
+  const unsafeBase = Type.Unsafe({
     type: "object",
     properties: {
       content: { type: "array", items: CONTENT_BLOCK_SCHEMA },
-      structuredContent,
+      structuredContent: {},
       isError: { type: "boolean" },
     },
     required: ["content"],
     additionalProperties: true,
+  });
+  const baseDescriptors = Object.getOwnPropertyDescriptors(unsafeBase);
+  const baseProperties = (unsafeBase as unknown as { properties: Record<string, unknown> })
+    .properties;
+  return Object.defineProperties<TSchema>({}, {
+    ...baseDescriptors,
+    properties: {
+      value: { ...baseProperties, structuredContent },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    },
   });
 }
 

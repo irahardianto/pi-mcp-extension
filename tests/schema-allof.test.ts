@@ -212,4 +212,74 @@ describe("schema-allof pure raw JSON Schema helpers", () => {
     assert.deepEqual(emptyAccumulator.properties, {});
     assert.equal(emptyAccumulator.required.size, 0);
   });
+
+  it("preserves Object.prototype property names as own enumerable properties in collectObjectSchemaMembers and mergeAllOfSubSchema (#330)", () => {
+    const protoKeys = [
+      "toString",
+      "constructor",
+      "valueOf",
+      "hasOwnProperty",
+      "prototype",
+      "__proto__",
+    ] as const;
+
+    const rawSchema = JSON.parse(`{
+      "type": "object",
+      "$defs": {
+        "Mixin": {
+          "properties": {
+            "toString": { "type": "number" },
+            "constructor": { "type": "number" },
+            "valueOf": { "type": "boolean" },
+            "hasOwnProperty": { "type": "string" },
+            "prototype": { "type": "string" },
+            "__proto__": { "type": "boolean" }
+          },
+          "required": ["constructor", "__proto__"]
+        }
+      },
+      "properties": {
+        "toString": { "type": "string" },
+        "normal": { "type": "string" }
+      },
+      "required": ["toString"],
+      "allOf": [{ "$ref": "#/$defs/Mixin" }]
+    }`) as Record<string, unknown>;
+
+    const defs = rawSchema["$defs"] as Record<string, Record<string, unknown>>;
+    const ctx = makeContext(rawSchema, defs);
+    const merged = collectObjectSchemaMembers(rawSchema, ctx);
+
+    assert.equal(Object.getPrototypeOf(merged.properties), null);
+    for (const key of protoKeys) {
+      assert.equal(
+        Object.hasOwn(merged.properties, key),
+        true,
+        `Expected own property "${key}" in merged.properties`,
+      );
+    }
+    assert.equal(Object.hasOwn(merged.properties, "normal"), true);
+    // Own-property precedence: top-level `toString` ({ type: "string" }) beats Mixin ({ type: "number" })
+    assert.deepEqual(merged.properties["toString"]?.schema, { type: "string" });
+    assert.deepEqual(merged.properties["constructor"]?.schema, { type: "number" });
+    assert.deepEqual(merged.properties["__proto__"]?.schema, { type: "boolean" });
+    assert.deepEqual(new Set(merged.required), new Set(["toString", "constructor", "__proto__"]));
+
+    // Direct mergeAllOfSubSchema call with a caller-supplied `{}` accumulator must also preserve `__proto__`
+    // as an own enumerable data property without mutating the accumulator's prototype.
+    const plainAcc: AllOfMerge = {
+      properties: {},
+      required: new Set(),
+      visitedRefs: new Set(),
+    };
+    const subSchema = JSON.parse('{"properties":{"__proto__":{"type":"boolean"},"toString":{"type":"string"}}}') as Record<
+      string,
+      unknown
+    >;
+    mergeAllOfSubSchema(subSchema, plainAcc, ctx);
+    assert.equal(Object.getPrototypeOf(plainAcc.properties), Object.prototype);
+    assert.equal(Object.hasOwn(plainAcc.properties, "__proto__"), true);
+    assert.equal(Object.hasOwn(plainAcc.properties, "toString"), true);
+    assert.deepEqual(plainAcc.properties["__proto__"]?.schema, { type: "boolean" });
+  });
 });
