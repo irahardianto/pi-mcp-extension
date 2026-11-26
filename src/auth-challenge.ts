@@ -1,12 +1,385 @@
 /**
- * OAuth challenge discovery helpers for manual MCP authentication commands.
+ * OAuth challenge discovery, 403 insufficient_scope capture, and step-up scope helpers.
  */
 
-import { extractWWWAuthenticateParams } from "@modelcontextprotocol/sdk/client/auth.js";
+import { extractWWWAuthenticateParams, UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+import { canonicalServerUrl, urlsMatch } from "./oauth-policy.js";
 
 export interface ManualAuthChallenge {
   resourceMetadataUrl?: URL | undefined;
   scope?: string | undefined;
+}
+
+export interface PendingAuthChallenge {
+  serverUrl: string;
+  resourceMetadataUrl?: URL | undefined;
+  scope?: string | undefined;
+  grantedScope?: string | undefined;
+  error?: string | undefined;
+}
+
+export interface CapturedAuthChallenge {
+  status: 401 | 403;
+  serverUrl: string;
+  resourceMetadataUrl?: URL | undefined;
+  scope?: string | undefined;
+  grantedScope?: string | undefined;
+  error?: string | undefined;
+}
+
+export interface ChallengeCaptureFetchOptions {
+  baseFetch?: typeof fetch | undefined;
+  rejectInsufficientScope?: boolean | undefined;
+  /**
+   * When true, only capture `403 insufficient_scope` from HTTP `POST` requests.
+   *
+   * WHY: On Streamable HTTP, `StreamableHTTPClientTransport._startOrAuthSse` fires
+   * an unawaited optional `GET` probe (and `terminateSession` fires `DELETE`), neither
+   * of which upscopes on `403`. Gating `403` capture to `POST` prevents an ignored
+   * optional `GET` (or teardown `DELETE`) response from silently poisoning
+   * `pendingAuthChallenge` on a `ready` server.
+   */
+  capture403PostOnly?: boolean | undefined;
+}
+
+function splitScopeTokens(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw.trim().split(/\s+/).filter(Boolean);
+}
+
+function dedupeScopeTokens(tokens: readonly string[]): string | undefined {
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const token of tokens) {
+    if (!seen.has(token)) {
+      seen.add(token);
+      unique.push(token);
+    }
+  }
+  return unique.length > 0 ? unique.join(" ") : undefined;
+}
+
+/**
+ * Compute a deduplicated space-delimited step-up scope union across
+ * `configuredScope`, `grantedScope`, and `challengedScope`.
+ *
+ * When `challengedScope` is absent or blank, returns `undefined` so the SDK follows
+ * SEP-835 (`resourceMetadata.scopes_supported`, then `provider.clientMetadata.scope` /
+ * `config.auth.scope`) instead of repeating an insufficient grant.
+ */
+export function mergeStepUpScope(
+  configuredScope: string | undefined,
+  grantedScope: string | undefined,
+  challengedScope: string | undefined,
+): string | undefined {
+  const challenged = splitScopeTokens(challengedScope);
+  if (challenged.length === 0) {
+    return undefined;
+  }
+  return dedupeScopeTokens([
+    ...splitScopeTokens(configuredScope),
+    ...splitScopeTokens(grantedScope),
+    ...challenged,
+  ]);
+}
+
+function normalizeScopeTokens(raw: string | undefined): string | undefined {
+  return dedupeScopeTokens(splitScopeTokens(raw));
+}
+
+function mergeInsufficientScopeChallenge(
+  prior: PendingAuthChallenge | undefined,
+  incoming: CapturedAuthChallenge,
+): PendingAuthChallenge {
+  const isPriorStepUp = prior?.error === "insufficient_scope";
+  const priorChallenged = isPriorStepUp ? prior.scope : undefined;
+  const scope = dedupeScopeTokens([
+    ...splitScopeTokens(priorChallenged),
+    ...splitScopeTokens(incoming.scope),
+  ]);
+  const resourceMetadataUrl = incoming.resourceMetadataUrl ?? prior?.resourceMetadataUrl;
+  // WHY: Keep the earliest captured grantedScope across retries (e.g. a refresh retry that
+  // omits or narrows scope must not clobber the token scope that originally hit 403).
+  const priorGranted = isPriorStepUp ? normalizeScopeTokens(prior.grantedScope) : undefined;
+  const grantedScope = priorGranted ?? normalizeScopeTokens(incoming.grantedScope);
+  return {
+    serverUrl: incoming.serverUrl,
+    error: "insufficient_scope",
+    ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
+    ...(scope ? { scope } : {}),
+    ...(grantedScope ? { grantedScope } : {}),
+  };
+}
+
+/**
+ * Merge an incoming 401/403 challenge into any pending server challenge.
+ *
+ * A subsequent 401 (such as the silent `startServer()` probe before `/mcp:auth`)
+ * never overwrites an existing `insufficient_scope` challenge's `error`, `scope`,
+ * or `grantedScope`, and repeated `403` challenges union scopes while keeping the
+ * earliest captured `grantedScope`.
+ */
+export function mergePendingAuthChallenge(
+  existing: PendingAuthChallenge | undefined,
+  incoming: CapturedAuthChallenge,
+): PendingAuthChallenge {
+  const prior = existing && urlsMatch(existing.serverUrl, incoming.serverUrl) ? existing : undefined;
+  if (incoming.error === "insufficient_scope") {
+    return mergeInsufficientScopeChallenge(prior, incoming);
+  }
+  if (prior?.error === "insufficient_scope") {
+    const resourceMetadataUrl = prior.resourceMetadataUrl ?? incoming.resourceMetadataUrl;
+    return {
+      ...prior,
+      ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
+    };
+  }
+  const grantedScope = normalizeScopeTokens(incoming.grantedScope);
+  return {
+    serverUrl: incoming.serverUrl,
+    ...(incoming.resourceMetadataUrl ? { resourceMetadataUrl: incoming.resourceMetadataUrl } : {}),
+    ...(incoming.scope ? { scope: incoming.scope } : {}),
+    ...(grantedScope ? { grantedScope } : {}),
+    ...(incoming.error ? { error: incoming.error } : {}),
+  };
+}
+
+/**
+ * Attach a token's granted scope to a pending `insufficient_scope` challenge
+ * if it does not already carry one.
+ */
+export function withGrantedScope(
+  pending: PendingAuthChallenge | undefined,
+  grantedScope: string | undefined,
+): PendingAuthChallenge | undefined {
+  if (!pending || pending.error !== "insufficient_scope" || normalizeScopeTokens(pending.grantedScope)) {
+    return pending;
+  }
+  const normalized = normalizeScopeTokens(grantedScope);
+  return normalized ? { ...pending, grantedScope: normalized } : pending;
+}
+
+/**
+ * Return true when `pending` is a `403 insufficient_scope` step-up challenge
+ * bound to `serverUrl`.
+ */
+export function isPendingStepUpChallenge(
+  pending: PendingAuthChallenge | undefined,
+  serverUrl: string | undefined,
+): boolean {
+  return (
+    pending?.error === "insufficient_scope" &&
+    typeof serverUrl === "string" &&
+    urlsMatch(pending.serverUrl, serverUrl)
+  );
+}
+
+/**
+ * Whether `ConnectionCoordinator._tryStartServer` should skip a silent connect
+ * attempt and proceed directly to interactive authorization.
+ */
+export function shouldSkipInteractivePreStart(params: {
+  reset: boolean;
+  hasUI: boolean;
+  hasAuth: boolean;
+  serverUrl: string | undefined;
+  pending: PendingAuthChallenge | undefined;
+}): boolean {
+  if (params.reset) return true;
+  if (!params.hasUI || !params.hasAuth) return false;
+  return isPendingStepUpChallenge(params.pending, params.serverUrl);
+}
+
+/**
+ * Record an incoming OAuth challenge onto `target` only while `isCurrent()` holds,
+ * preventing late-settling responses from a shut-down or replaced transport from
+ * polluting `pendingAuthChallenge`.
+ */
+export function applyPendingAuthChallenge(
+  target: { pendingAuthChallenge?: PendingAuthChallenge | undefined },
+  incoming: CapturedAuthChallenge,
+  isCurrent: () => boolean,
+): void {
+  if (!isCurrent()) return;
+  target.pendingAuthChallenge = mergePendingAuthChallenge(target.pendingAuthChallenge, incoming);
+}
+
+/**
+ * Attach a token's granted scope onto `target.pendingAuthChallenge` when present.
+ */
+export function attachPendingGrantedScope(
+  target: { pendingAuthChallenge?: PendingAuthChallenge | undefined } | undefined,
+  scope: string | undefined,
+): void {
+  if (!target) return;
+  target.pendingAuthChallenge = withGrantedScope(target.pendingAuthChallenge, scope);
+}
+
+/**
+ * Resolve the effective OAuth challenge for `authorize()`, preserving any pending
+ * `403 insufficient_scope` challenge ahead of a baseline `401` probe.
+ */
+export function resolveAuthorizeChallenge(params: {
+  configuredScope?: string | undefined;
+  pending?: PendingAuthChallenge | undefined;
+  discovered: ManualAuthChallenge;
+  storedTokenScope?: string | undefined;
+}): ManualAuthChallenge {
+  const { configuredScope, pending, discovered, storedTokenScope } = params;
+  if (pending?.error !== "insufficient_scope") {
+    return {
+      ...(discovered.resourceMetadataUrl ? { resourceMetadataUrl: discovered.resourceMetadataUrl } : {}),
+      ...(discovered.scope ? { scope: discovered.scope } : {}),
+    };
+  }
+  const resourceMetadataUrl = pending.resourceMetadataUrl ?? discovered.resourceMetadataUrl;
+  const effectiveGranted =
+    normalizeScopeTokens(pending.grantedScope) ??
+    normalizeScopeTokens(storedTokenScope) ??
+    discovered.scope;
+  const scope = mergeStepUpScope(configuredScope, effectiveGranted, pending.scope);
+  return {
+    ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
+    ...(scope ? { scope } : {}),
+  };
+}
+
+/**
+ * Whether interactive step-up authorization must invalidate cached `discoveryState`
+ * before calling the MCP SDK's `auth()`.
+ *
+ * WHY: The SDK's `authInternal()` short-circuits Protected Resource Metadata (PRM)
+ * discovery whenever `discoveryState.authorizationServerUrl` and `resourceMetadata`
+ * are cached on disk, silently ignoring a new `resourceMetadataUrl` option or updated
+ * `scopes_supported`. Invalidating only `"discovery"` (keeping `clientInfo` and its
+ * issuer binding intact) ensures a `403 insufficient_scope` challenge with a different
+ * `resource_metadata` URL or an omitted `scope` fetches fresh PRM metadata.
+ */
+export function shouldInvalidateDiscoveryForStepUp(params: {
+  pending: PendingAuthChallenge | undefined;
+  challengeResourceMetadataUrl: URL | undefined;
+  cachedResourceMetadataUrl: string | undefined;
+}): boolean {
+  const { pending, challengeResourceMetadataUrl, cachedResourceMetadataUrl } = params;
+  if (pending?.error !== "insufficient_scope") return false;
+  if (!normalizeScopeTokens(pending.scope)) return true;
+  if (!challengeResourceMetadataUrl) return false;
+  return (
+    !cachedResourceMetadataUrl ||
+    !urlsMatch(cachedResourceMetadataUrl, challengeResourceMetadataUrl.href)
+  );
+}
+
+function extractRequestUrl(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  return input.url;
+}
+
+function extractRequestMethod(
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+): string {
+  if (init?.method) return init.method.toUpperCase();
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    return input.method.toUpperCase();
+  }
+  return "GET";
+}
+
+function parseServerOrigin(canonicalUrl: string): string | undefined {
+  try {
+    return new URL(canonicalUrl).origin;
+  } catch {
+    // WHY: Malformed serverUrl cannot match any HTTP request origin.
+    return undefined;
+  }
+}
+
+function isSameOriginRequest(input: Parameters<typeof fetch>[0], expectedOrigin: string): boolean {
+  try {
+    return new URL(extractRequestUrl(input)).origin === expectedOrigin;
+  } catch {
+    // WHY: Malformed or relative request URLs cannot verify origin binding.
+    return false;
+  }
+}
+
+function buildCapturedChallenge(
+  status: 401 | 403,
+  serverUrl: string,
+  params: { resourceMetadataUrl?: URL | undefined; scope?: string | undefined; error?: string | undefined },
+): CapturedAuthChallenge {
+  const challenge: CapturedAuthChallenge = { status, serverUrl };
+  if (params.resourceMetadataUrl) challenge.resourceMetadataUrl = params.resourceMetadataUrl;
+  if (params.scope) challenge.scope = params.scope;
+  if (params.error) challenge.error = params.error;
+  return challenge;
+}
+
+interface CapturedResponseContext {
+  response: Response;
+  canonicalUrl: string;
+  onChallenge: (challenge: CapturedAuthChallenge) => void;
+  rejectInsufficientScope: boolean;
+  allow403Capture: boolean;
+}
+
+async function handleCapturedResponse(ctx: CapturedResponseContext): Promise<Response> {
+  const { response, canonicalUrl, onChallenge, rejectInsufficientScope, allow403Capture } = ctx;
+  if (response.status !== 401 && response.status !== 403) {
+    return response;
+  }
+  const params = extractWWWAuthenticateParams(response);
+  if (response.status === 401) {
+    if (params.resourceMetadataUrl !== undefined || params.scope !== undefined) {
+      onChallenge(buildCapturedChallenge(401, canonicalUrl, params));
+    }
+    return response;
+  }
+  if (!allow403Capture || params.error !== "insufficient_scope") {
+    return response;
+  }
+  onChallenge(buildCapturedChallenge(403, canonicalUrl, params));
+  if (rejectInsufficientScope) {
+    await response.body?.cancel().catch(() => {
+      // WHY: Release the HTTP response body before rejecting SSE transport on 403 insufficient_scope.
+    });
+    throw new UnauthorizedError("HTTP 403 insufficient_scope");
+  }
+  return response;
+}
+
+/**
+ * Wrap `fetch` to capture same-origin `401` and `403 insufficient_scope`
+ * `WWW-Authenticate` challenges from an MCP resource server.
+ */
+export function createChallengeCaptureFetch(
+  serverUrl: string,
+  onChallenge: (challenge: CapturedAuthChallenge) => void,
+  options?: ChallengeCaptureFetchOptions,
+): typeof fetch {
+  const baseFetch = options?.baseFetch ?? fetch;
+  const canonicalUrl = canonicalServerUrl(serverUrl);
+  const expectedOrigin = parseServerOrigin(canonicalUrl);
+  if (!expectedOrigin) return baseFetch;
+  const rejectInsufficientScope = options?.rejectInsufficientScope === true;
+  const capture403PostOnly = options?.capture403PostOnly === true;
+
+  return async (input, init) => {
+    const response = await baseFetch(input, init);
+    if (!isSameOriginRequest(input, expectedOrigin)) {
+      return response;
+    }
+    const allow403Capture = !capture403PostOnly || extractRequestMethod(input, init) === "POST";
+    return handleCapturedResponse({
+      response,
+      canonicalUrl,
+      onChallenge,
+      rejectInsufficientScope,
+      allow403Capture,
+    });
+  };
 }
 
 export type AuthChallengeFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;

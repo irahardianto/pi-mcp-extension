@@ -77,6 +77,10 @@ Use `mcp_connect` with the server name, `/mcp:start deepsource`, or `/mcp:auth d
 
 Interactive sessions show `Retry: open browser again`, `Paste redirect URL`, and `Cancel authentication` while authorization is pending, and display the authorization URL directly in Pi. The browser opens once unless you choose Retry. Print and RPC sessions fail promptly if browser authorization is required. Eager startup and background reconnection never open the browser automatically or perform Dynamic Client Registration silently; when an eager OAuth server requires interactive authorization at startup in an interactive Pi session, Pi offers a non-blocking sequential `<name> needs authorization` prompt (`Authorize now` / `Not now`). Choosing `Authorize now` runs the interactive OAuth flow for that server before prompting for the next eager server, while choosing `Not now` leaves the server stopped, displays a `run /mcp:auth <name>` footer hint, and remembers the decline for the rest of the session. A stop, cancellation, or shutdown cancels pending callbacks and retries.
 
+### Step-Up Authorization (`403 insufficient_scope`)
+
+When an authenticated MCP server responds with `HTTP 403` and `WWW-Authenticate: Bearer error="insufficient_scope", scope="..."` (across Streamable HTTP or legacy SSE, during initial discovery or mid-session `tools/call` / `resources/read`), `pi-mcp-extension` preserves the challenged `scope` and `resource_metadata` URL together with the previously granted token scope and any configured `auth.scope` so `/mcp:auth <name>` or `mcp_connect` requests the combined stepped-up scope instead of falling back to the baseline `401` probe. Running `/mcp:auth <name> --reset` clears any pending step-up challenge along with stored credentials.
+
 ### Headless and SSH Sessions
 
 When running Pi on a remote server over SSH, in a container, or in a headless environment where a local browser cannot reach the callback server directly:

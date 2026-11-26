@@ -18,12 +18,16 @@ export async function invalidateStoredTokens(
   serverName: string,
   storageDir?: string,
   serverUrl?: string,
+  onClearedScope?: (scope: string) => void,
 ): Promise<void> {
   let handle: AuthLockHandle | undefined;
   try {
     handle = await acquireAuthLock(serverName, storageDir);
     const state = await loadState(serverName, storageDir, serverUrl);
     if (state.tokens !== undefined) {
+      if (state.tokens.scope) {
+        onClearedScope?.(state.tokens.scope);
+      }
       state.tokens = undefined;
       if (serverUrl) {
         state.serverUrl = canonicalServerUrl(serverUrl);

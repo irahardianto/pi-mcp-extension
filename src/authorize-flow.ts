@@ -5,9 +5,13 @@ import { callbackServerConfigFromRedirectUrl } from "./callback-url.js";
 import {
   discoverManualAuthChallenge,
   createHeadersFetch,
+  resolveAuthorizeChallenge,
+  shouldInvalidateDiscoveryForStepUp,
   stripAuthorizationHeader,
   type ManualAuthChallenge,
+  type PendingAuthChallenge,
 } from "./auth-challenge.js";
+import { urlsMatch } from "./oauth-policy.js";
 import { acquireAuthLock, type AuthLockHandle } from "./auth-lock.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import { McpError, AuthCancelledError, AuthLockError } from "./errors.js";
@@ -164,6 +168,117 @@ function reportCorruptOAuthState(serverName: string, err: McpError): void {
     message,
     fields: { kind },
   });
+}
+
+function readPendingChallenge(
+  deps: AuthorizeDeps,
+  serverName: string,
+  serverUrl: string,
+  reset: boolean,
+): PendingAuthChallenge | undefined {
+  if (reset) return undefined;
+  const pending = deps.manager.getPendingAuthChallenge?.(serverName);
+  if (!pending || !urlsMatch(pending.serverUrl, serverUrl)) return undefined;
+  return pending;
+}
+
+async function readStoredTokenScopeForStepUp(
+  authProvider: McpOAuthProvider,
+  pending: PendingAuthChallenge | undefined,
+  serverName: string,
+): Promise<string | undefined> {
+  if (pending?.error !== "insufficient_scope" || pending.grantedScope?.trim()) {
+    return undefined;
+  }
+  try {
+    return (await authProvider.tokens())?.scope;
+  } catch (err) {
+    if (!isCorruptOAuthStateError(err)) throw err;
+    reportCorruptOAuthState(serverName, err);
+    return undefined;
+  }
+}
+
+async function prepareStepUpAuthState(params: {
+  deps: AuthorizeDeps;
+  authProvider: McpOAuthProvider;
+  serverName: string;
+  serverUrl: string;
+  reset: boolean;
+  assertActive: () => void;
+}): Promise<{ pendingChallenge: PendingAuthChallenge | undefined; storedTokenScope: string | undefined }> {
+  const { deps, authProvider, serverName, serverUrl, reset, assertActive } = params;
+  const pendingChallenge = readPendingChallenge(deps, serverName, serverUrl, reset);
+  const storedTokenScope = await readStoredTokenScopeForStepUp(
+    authProvider,
+    pendingChallenge,
+    serverName,
+  );
+  assertActive();
+  if (storedTokenScope) {
+    // WHY: Persist storedTokenScope onto the pending challenge before clearing disk tokens
+    // so cancelling interactive auth and retrying still retains previously granted scopes.
+    deps.manager.recordPendingAuthGrantedScope?.(serverName, storedTokenScope);
+  }
+  if (!reset) {
+    await clearStoredTokensBeforeInteractiveAuth(authProvider, serverName);
+    assertActive();
+  }
+  return { pendingChallenge, storedTokenScope };
+}
+
+async function readCachedResourceMetadataUrl(
+  authProvider: McpOAuthProvider,
+  serverName: string,
+): Promise<{ exists: boolean; resourceMetadataUrl: string | undefined }> {
+  try {
+    const cached = await authProvider.discoveryState();
+    return {
+      exists: cached !== undefined,
+      resourceMetadataUrl: cached?.resourceMetadataUrl,
+    };
+  } catch (err) {
+    if (!isCorruptOAuthStateError(err)) throw err;
+    reportCorruptOAuthState(serverName, err);
+    return { exists: false, resourceMetadataUrl: undefined };
+  }
+}
+
+async function invalidateDiscoveryForStepUpIfNeeded(params: {
+  authProvider: McpOAuthProvider;
+  pending: PendingAuthChallenge | undefined;
+  authChallenge: ManualAuthChallenge;
+  serverName: string;
+  assertActive: () => void;
+}): Promise<void> {
+  const { authProvider, pending, authChallenge, serverName, assertActive } = params;
+  if (pending?.error !== "insufficient_scope") return;
+  const cached = await readCachedResourceMetadataUrl(authProvider, serverName);
+  assertActive();
+  if (!cached.exists) return;
+  const shouldInvalidate = shouldInvalidateDiscoveryForStepUp({
+    pending,
+    challengeResourceMetadataUrl: authChallenge.resourceMetadataUrl,
+    cachedResourceMetadataUrl: cached.resourceMetadataUrl,
+  });
+  if (!shouldInvalidate) return;
+  try {
+    await authProvider.invalidateCredentials("discovery");
+  } catch (err) {
+    if (!isCorruptOAuthStateError(err)) throw err;
+    reportCorruptOAuthState(serverName, err);
+  }
+  assertActive();
+}
+
+function applyRedirectFallbackScope(
+  authProvider: McpOAuthProvider,
+  latestAuthorizationUrl: URL | undefined,
+): void {
+  const requestedScope = latestAuthorizationUrl?.searchParams.get("scope");
+  if (requestedScope) {
+    authProvider.setFallbackTokenScope(requestedScope);
+  }
 }
 
 function notifyAuthorizationSucceeded(ctx: ExtensionContext, serverName: string): void {
@@ -516,10 +631,14 @@ export async function authorize(
       onAuthRequired: launchAuthorizationBrowser,
     });
 
-    if (!reset) {
-      await clearStoredTokensBeforeInteractiveAuth(authProvider, serverName);
-      assertActive();
-    }
+    const { pendingChallenge, storedTokenScope } = await prepareStepUpAuthState({
+      deps,
+      authProvider,
+      serverName,
+      serverUrl,
+      reset,
+      assertActive,
+    });
 
     // Why set state before calling auth(): the SDK reads provider.state() while
     // building the authorization URL inside auth(), and omits the state parameter
@@ -532,13 +651,27 @@ export async function authorize(
     // authorization server is usually a different origin.
     const staticHeaders = stripAuthorizationHeader(config.headers);
 
-    const authChallenge = await discoverChallengeWithFallback({
+    const discoveredChallenge = await discoverChallengeWithFallback({
       serverName,
       serverUrl,
       headers: staticHeaders,
       signal,
     });
     assertActive();
+    const authChallenge = resolveAuthorizeChallenge({
+      configuredScope: config.auth?.scope,
+      pending: pendingChallenge,
+      discovered: discoveredChallenge,
+      storedTokenScope,
+    });
+    await invalidateDiscoveryForStepUpIfNeeded({
+      authProvider,
+      pending: pendingChallenge,
+      authChallenge,
+      serverName,
+      assertActive,
+    });
+    authProvider.setFallbackTokenScope(authChallenge.scope ?? config.auth?.scope);
 
     const callbackPromise = registerCallbackPromise(callbackServer, oauthState);
     const customFetch = staticHeaders ? createHeadersFetch(staticHeaders) : undefined;
@@ -554,6 +687,7 @@ export async function authorize(
       // Auth succeeded without needing browser interaction (e.g., had valid tokens).
       notifyAuthorizationSucceeded(ctx, serverName);
     } else if (authResult === "REDIRECT") {
+      applyRedirectFallbackScope(authProvider, state.latestAuthorizationUrl);
       await completeRedirectAuthFlow({
         serverName,
         serverUrl,
@@ -581,6 +715,7 @@ export async function authorize(
     }
 
     assertActive();
+    deps.manager.clearPendingAuthChallenge?.(serverName);
     reportDiagnostic({
       level: "info",
       event: "auth.completed",
