@@ -79,7 +79,10 @@ function resolveChallengeFetch(
         ...challenge,
         grantedScope: authProvider?.getLastTokenScope(),
       }),
-    { rejectInsufficientScope: config.transport === "sse" },
+    {
+      rejectInsufficientScope: config.transport === "sse",
+      capture403PostOnly: config.transport === "streamable-http",
+    },
   );
 }
 

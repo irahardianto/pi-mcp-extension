@@ -68,6 +68,13 @@ export interface McpOAuthProviderOptions {
 
 // ─── OAuthClientProvider Implementation ────────────────────────────────────────
 
+function firstNonEmptyScope(
+  primary: string | undefined,
+  fallback: string | undefined,
+): string | undefined {
+  return primary?.trim() || fallback?.trim() || undefined;
+}
+
 export class McpOAuthProvider implements OAuthClientProvider {
   private readonly serverName: string;
   private readonly authConfig: AuthConfig;
@@ -347,7 +354,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       // Preserve the prior granted scope so subsequent 403 step-up still knows it.
       const tokensToSave = this._withFallbackScope(
         storedTokens,
-        state.tokens?.scope ?? this._lastReadTokens?.scope,
+        firstNonEmptyScope(state.tokens?.scope, this._lastReadTokens?.scope),
       );
       state.tokens = tokensToSave;
       await saveState(this.serverName, state, this.storageDir, this.isCancelled);
@@ -366,7 +373,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       // keep the refreshed tokens in memory for this session without clobbering disk state.
       const tokensToCache = this._withFallbackScope(
         storedTokens,
-        this._cachedTokens?.scope ?? this._lastReadTokens?.scope,
+        firstNonEmptyScope(this._cachedTokens?.scope, this._lastReadTokens?.scope),
       );
       this._cachedTokens = tokensToCache;
       this._lastReadTokens = tokensToCache;

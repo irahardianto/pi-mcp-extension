@@ -30,6 +30,16 @@ export interface CapturedAuthChallenge {
 export interface ChallengeCaptureFetchOptions {
   baseFetch?: typeof fetch | undefined;
   rejectInsufficientScope?: boolean | undefined;
+  /**
+   * When true, only capture `403 insufficient_scope` from HTTP `POST` requests.
+   *
+   * WHY: On Streamable HTTP, `StreamableHTTPClientTransport._startOrAuthSse` fires
+   * an unawaited optional `GET` probe (and `terminateSession` fires `DELETE`), neither
+   * of which upscopes on `403`. Gating `403` capture to `POST` prevents an ignored
+   * optional `GET` (or teardown `DELETE`) response from silently poisoning
+   * `pendingAuthChallenge` on a `ready` server.
+   */
+  capture403PostOnly?: boolean | undefined;
 }
 
 function splitScopeTokens(raw: string | undefined): string[] {
@@ -266,6 +276,17 @@ function extractRequestUrl(input: Parameters<typeof fetch>[0]): string {
   return input.url;
 }
 
+function extractRequestMethod(
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+): string {
+  if (init?.method) return init.method.toUpperCase();
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    return input.method.toUpperCase();
+  }
+  return "GET";
+}
+
 function parseServerOrigin(canonicalUrl: string): string | undefined {
   try {
     return new URL(canonicalUrl).origin;
@@ -296,12 +317,16 @@ function buildCapturedChallenge(
   return challenge;
 }
 
-async function handleCapturedResponse(
-  response: Response,
-  canonicalUrl: string,
-  onChallenge: (challenge: CapturedAuthChallenge) => void,
-  rejectInsufficientScope: boolean,
-): Promise<Response> {
+interface CapturedResponseContext {
+  response: Response;
+  canonicalUrl: string;
+  onChallenge: (challenge: CapturedAuthChallenge) => void;
+  rejectInsufficientScope: boolean;
+  allow403Capture: boolean;
+}
+
+async function handleCapturedResponse(ctx: CapturedResponseContext): Promise<Response> {
+  const { response, canonicalUrl, onChallenge, rejectInsufficientScope, allow403Capture } = ctx;
   if (response.status !== 401 && response.status !== 403) {
     return response;
   }
@@ -312,7 +337,7 @@ async function handleCapturedResponse(
     }
     return response;
   }
-  if (params.error !== "insufficient_scope") {
+  if (!allow403Capture || params.error !== "insufficient_scope") {
     return response;
   }
   onChallenge(buildCapturedChallenge(403, canonicalUrl, params));
@@ -339,13 +364,21 @@ export function createChallengeCaptureFetch(
   const expectedOrigin = parseServerOrigin(canonicalUrl);
   if (!expectedOrigin) return baseFetch;
   const rejectInsufficientScope = options?.rejectInsufficientScope === true;
+  const capture403PostOnly = options?.capture403PostOnly === true;
 
   return async (input, init) => {
     const response = await baseFetch(input, init);
     if (!isSameOriginRequest(input, expectedOrigin)) {
       return response;
     }
-    return handleCapturedResponse(response, canonicalUrl, onChallenge, rejectInsufficientScope);
+    const allow403Capture = !capture403PostOnly || extractRequestMethod(input, init) === "POST";
+    return handleCapturedResponse({
+      response,
+      canonicalUrl,
+      onChallenge,
+      rejectInsufficientScope,
+      allow403Capture,
+    });
   };
 }
 
