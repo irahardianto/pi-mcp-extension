@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.4] - 2026-11-26
+
 ### Fixed
 - Preserve `WWW-Authenticate` `403 insufficient_scope` step-up scopes, `resource_metadata` URLs, previously granted token scopes, and `config.auth.scope` across Streamable HTTP and legacy SSE re-authorization (#328). Previously, mid-session and initial-discovery `403 insufficient_scope` challenges (including `refresh_token`, `invalid_grant`, `tools/call`, `resources/read`, and `tools/list` paths) were discarded when stored tokens were cleared, causing `/mcp:auth` and `mcp_connect` to fall back to the baseline `401` probe scope in a loop, while header-only RFC 6750 `403` responses on legacy `sse` transports were misclassified as stream errors and retried in `_recover()`.
 - Omit non-Unicode (`/u`) or malformed regex `pattern` strings during MCP `inputSchema` → TypeBox conversion and wrap `Client`'s `outputSchema` Ajv validator so PCRE/Python/Go regexes (such as `(?i)^[a-z]+$`, `\A...\z`, `^[\w-\.]+$`, or unterminated expressions) no longer crash tool calls or fail `tools/list` for the entire server while valid `/u` patterns remain strictly enforced (#329).
