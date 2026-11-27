@@ -69,6 +69,7 @@ const RUNTIME_MODULES = [
   "server-status.ts",
   "session-lifecycle.ts",
   "startup-auth.ts",
+  "stdio-exit-guard.ts",
   "stdio-process.ts",
   "tool-bridge.ts",
   // WHY: tool-content.ts transforms are pure at call time, but it imports `convertResourceContent`
@@ -574,7 +575,7 @@ describe("ESM dependency boundaries and leaf imports", () => {
         dynamicCheckedCount += 1;
       }
     }
-    assert.equal(dynamicCheckedCount, 45, "Expected all 45 runtime compatibility re-exports to be verified");
+    assert.equal(dynamicCheckedCount, 46, "Expected all 46 runtime compatibility re-exports to be verified");
 
     const errors = await import("../src/errors.js");
     const authLock = await import("../src/auth-lock.js");
@@ -595,6 +596,8 @@ describe("ESM dependency boundaries and leaf imports", () => {
     const callbackServer = await import("../src/callback-server.js");
     const sessionLifecycle = await import("../src/session-lifecycle.js");
     const commands = await import("../src/commands.js");
+    const stdioExitGuard = await import("../src/stdio-exit-guard.js");
+    const stdioProcess = await import("../src/stdio-process.js");
     const toolNames = await import("../src/tool-names.js");
     const toolContent = await import("../src/tool-content.js");
     const toolDiscovery = await import("../src/tool-discovery.js");
@@ -655,6 +658,8 @@ describe("ESM dependency boundaries and leaf imports", () => {
 
     assert.equal(commands.collectRegisteredServers, sessionLifecycle.collectRegisteredServers);
     assert.equal(commands.mergeWithRegisteredServers, sessionLifecycle.mergeWithRegisteredServers);
+
+    assert.equal(stdioProcess.indexProcessTable, stdioExitGuard.indexProcessTable);
 
     assert.equal(toolBridge.buildToolName, toolNames.buildToolName);
     assert.equal(toolBridge.convertMcpContent, toolContent.convertMcpContent);

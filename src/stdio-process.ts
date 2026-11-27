@@ -8,14 +8,19 @@
  * cleanup with injectable process/timer dependencies.
  */
 
-import { execFile } from "node:child_process";
+import { ChildProcess, execFile } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import type { ChildProcess } from "node:child_process";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { isNonRetryableStdioSpawnError } from "./connect-policy.js";
+import { indexProcessTable, StdioExitGuard } from "./stdio-exit-guard.js";
+
+export { indexProcessTable } from "./stdio-exit-guard.js";
 
 const execFileAsync = promisify(execFile);
+
+const defaultStdioExitGuard = new StdioExitGuard();
 
 // ─── Line Splitting ───────────────────────────────────────────────────────────
 
@@ -88,6 +93,7 @@ export const POST_CLOSE_FLUSH_DELAY_MS = 100;
 interface StdioChildRecord {
   process: ChildProcess;
   closed: boolean;
+  trackedPid?: number | undefined;
   /** Flush the buffered partial stderr line before the pipe is destroyed. */
   flushStderr(): void;
 }
@@ -100,6 +106,38 @@ interface StdioChildRecord {
  * keeps both reachable without pinning a closed transport in memory.
  */
 const childRecords = new WeakMap<object, StdioChildRecord>();
+const stdioSpawnErrors = new WeakMap<object, Error>();
+const spawnErrorObservedProcs = new WeakSet<object>();
+
+function attachSpawnErrorCapture(
+  transport: object,
+  proc: ChildProcess | undefined,
+): void {
+  if (!proc || typeof proc.once !== "function" || spawnErrorObservedProcs.has(proc)) {
+    return;
+  }
+  spawnErrorObservedProcs.add(proc);
+  proc.once("error", (err: unknown) => {
+    if (err instanceof Error && isNonRetryableStdioSpawnError("stdio", err)) {
+      stdioSpawnErrors.set(transport, err);
+    }
+  });
+}
+
+/**
+ * Return any deterministic non-retryable stdio spawn error captured on `transport`'s child process.
+ *
+ * WHY: On Windows, `StdioClientTransport.start()` uses `cross-spawn`, which wraps
+ * non-`.exe`/`.com` commands (like `uvx` or `missing-pi-mcp-executable-335`) in
+ * `cmd.exe /d /s /c "..."`. Because `cmd.exe` spawns, `transport.start()` resolves on
+ * `'spawn'` and `Client.connect()` sends `initialize`; when `cmd.exe` exits with status 1,
+ * `cross-spawn` hooks `'exit'` and emits `'error'` (`ENOENT`) on the `ChildProcess`
+ * asynchronously right before `'close'` causes SDK `Protocol._onclose()` to reject
+ * `initialize` with `McpError(-32000, "MCP error -32000: Connection closed")`.
+ */
+export function getStdioSpawnError(transport: object | null | undefined): Error | undefined {
+  return transport ? stdioSpawnErrors.get(transport) : undefined;
+}
 
 /** A transport whose child stderr can be wired and whose `close()` can be wrapped. */
 interface StderrCarrier {
@@ -176,6 +214,43 @@ export function instrumentStderr(
   return flush;
 }
 
+function isLiveChildProcess(
+  proc: ChildProcess | undefined,
+): proc is ChildProcess & { pid: number } {
+  if (!(proc instanceof ChildProcess)) {
+    return false;
+  }
+  return (
+    asPositivePid(proc.pid) !== null &&
+    proc.exitCode === null &&
+    proc.signalCode === null
+  );
+}
+
+function registerChildRecord(
+  transport: StdioClientTransport,
+  proc: ChildProcess,
+  flushStderr: (() => void) | null,
+): void {
+  attachSpawnErrorCapture(transport, proc);
+  const trackedPid = isLiveChildProcess(proc) ? proc.pid : undefined;
+  const record: StdioChildRecord = {
+    process: proc,
+    closed: false,
+    trackedPid,
+    flushStderr: () => flushStderr?.(),
+  };
+  if (trackedPid !== undefined) {
+    defaultStdioExitGuard.track(trackedPid);
+    proc.once("exit", () => defaultStdioExitGuard.untrack(trackedPid));
+  }
+  proc.once?.("close", () => {
+    record.closed = true;
+    defaultStdioExitGuard.untrack(trackedPid);
+  });
+  childRecords.set(transport, record);
+}
+
 export interface InstrumentStdioTransportOptions {
   onPid(pid: number): void;
   onStderrLine(line: string): void;
@@ -200,17 +275,10 @@ export function instrumentStdioTransport(
   const flushStderr = instrumentStderr(transport, onStderrLine);
 
   const recordProcess = (proc: ChildProcess | undefined): void => {
+    attachSpawnErrorCapture(transport, proc);
     if (!proc?.pid) return;
     if (!childRecords.has(transport)) {
-      const record: StdioChildRecord = {
-        process: proc,
-        closed: false,
-        flushStderr: () => flushStderr?.(),
-      };
-      proc.once?.("close", () => {
-        record.closed = true;
-      });
-      childRecords.set(transport, record);
+      registerChildRecord(transport, proc, flushStderr);
     }
     onPid(proc.pid);
   };
@@ -285,6 +353,7 @@ export function destroyStdioStreams(transport: object | null | undefined): void 
   const record = childRecords.get(transport);
   if (!record) return;
   childRecords.delete(transport);
+  defaultStdioExitGuard.untrack(record.trackedPid);
   // WHY: Flush the buffered partial stderr line first. Destroying our read end keeps the
   // SDK's PassThrough from ever emitting 'end', so without this a forced teardown drops the
   // server's last words (the buffered remainder of a line with no trailing newline).
@@ -346,24 +415,6 @@ async function readPsProcessTable(): Promise<Map<number, number[]>> {
     timeout: PS_TIMEOUT_MS,
   });
   return indexProcessTable(stdout);
-}
-
-/** Index `ps -A -o pid=,ppid=` output as a parent PID → child PIDs map. */
-export function indexProcessTable(stdout: string): Map<number, number[]> {
-  const childrenOf = new Map<number, number[]>();
-  for (const line of stdout.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-    if (!match) continue;
-    const childPid = Number(match[1]);
-    const parentPid = Number(match[2]);
-    const siblings = childrenOf.get(parentPid);
-    if (siblings) {
-      siblings.push(childPid);
-    } else {
-      childrenOf.set(parentPid, [childPid]);
-    }
-  }
-  return childrenOf;
 }
 
 function createPlatformChildReader(): (pid: number) => Promise<number[]> {

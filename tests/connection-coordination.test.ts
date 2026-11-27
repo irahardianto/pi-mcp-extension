@@ -83,14 +83,22 @@ describe("coordinated connections", () => {
   });
 
   it("reports exhausted retries and preserves failure status", async () => {
-    const manager = new ServerManager(config("missing-pi-mcp-executable", 0));
+    const retryableConfig: McpConfig = {
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 3000, maxRetries: 0 },
+      mcpServers: { lazy: { lifecycle: "lazy", transport: "stdio", command: process.execPath, args: ["-e", "process.exit(1)"] } },
+    };
+    const manager = new ServerManager(retryableConfig);
     await assert.rejects(manager.startServer("lazy", process.cwd()), /Connection failed after 0 retries/);
     assert.equal(manager.getServer("lazy")?.state, "stopped");
     assert.ok(manager.getServer("lazy")?.lastError);
   });
 
   it("stop during retry delay cancels the pending retry and rejects all waiters", async () => {
-    const manager = new ServerManager(config("missing-pi-mcp-executable", 1));
+    const retryableConfig: McpConfig = {
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 3000, maxRetries: 1 },
+      mcpServers: { lazy: { lifecycle: "lazy", transport: "stdio", command: process.execPath, args: ["-e", "process.exit(1)"] } },
+    };
+    const manager = new ServerManager(retryableConfig);
     const first = manager.startServer("lazy", process.cwd());
     const second = manager.startServer("lazy", process.cwd());
     const failures = Promise.allSettled([first, second]);

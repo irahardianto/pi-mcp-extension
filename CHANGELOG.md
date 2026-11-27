@@ -9,6 +9,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - The `<mcp_servers>` system prompt no longer hands the model an `mcp_connect` argument it can never match (#342). Disconnected indirect (`codemode` / `tool_search`) servers rendered `sanitizeNamespaceText(entry.name, 120)` as a literal `mcp_connect "<name>"` argument, but that sanitizer trims, collapses control characters, redacts secret-shaped text, and truncates — so an ordinary configured key such as `"basic calculator"`, `"secret:manager"`, `" trimmed-server "`, or one longer than 120 characters reached the prompt as `"basic [REDACTED]"` or `"long-server-xxx…"` and `mcp_connect` rejected it with `Unknown MCP server name` on the first turn. The hint now emits the literal argument only when sanitization leaves the configured name unchanged; otherwise it directs the model to `mcp_status` (which returns every configured name verbatim) for the exact name before calling `mcp_connect`, or only tells it to connect with `mcp_connect` when `mcp_status` is inactive. A rewritten name is never emitted as the `mcp_connect` argument; the sanitized, name-derived `namespace` still heads the server's bullet line exactly as before.
 
+## [1.16.6] - 2026-11-27
+
+### Fixed
+- Deterministic local `stdio` spawn errors (`ENOENT`, `EACCES`, `ENOEXEC`, `ENOTDIR`, `EISDIR`) now fail on the first attempt instead of spinning through the 49-second retry backoff schedule, while preserving retry backoff for transient `stdio` failures and HTTP `404` warmup responses (#335).
+- Live `stdio` MCP server process trees are now terminated synchronously on unhandled `SIGINT` (when no active host handler owns `SIGINT`, yielding to interactive TUI `Ctrl+Z` suspend and ignoring passive `signal-exit` wrappers) and on unexpected `process` `exit`, preventing orphaned wrapper/grandchild processes in headless `--mode rpc`, `--mode json`, and `--print` modes (#336).
+
+## [1.16.5] - 2026-11-27
+
+### Fixed
+- Per-server `mcp.json` validation errors and invalid/unknown Pi 1.3.0 partial project overrides no longer wipe out every healthy server across global and project configs (#337). Session loading (`loadSessionConfigWithOrigins`) still fails the whole file on I/O, JSON/JSONC syntax, non-object root/`mcpServers`, or invalid `settings`/`autoEnableCodemode`, while isolating individual `mcpServers.<name>` failures into per-server `Config error` notifications, dropping any global server whose project override or replacement is invalid rather than falling back to un-overridden global settings or same-named extension servers, and keeping all valid global, project, and extension-registered servers active. Strict `loadConfig()` and `loadConfigWithOrigins()` retain their throwing contract.
+
 ## [1.16.4] - 2026-11-26
 
 ### Fixed

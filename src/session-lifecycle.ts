@@ -13,11 +13,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import {
-  loadConfigWithOrigins,
+  loadSessionConfigWithOrigins,
   parseRegisteredServerConfig,
-  type LoadedConfig,
   type McpConfig,
   type ServerConfig,
+  type SessionConfigLoadResult,
 } from "./config.js";
 import {
   withExtensionServers,
@@ -46,6 +46,8 @@ export const DEFAULT_SETTINGS = {
   maxRetries: 5,
 } as const;
 
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
+
 export type SessionProvenance = ConfigProvenance;
 
 export interface BootstrapConfigPaths {
@@ -56,6 +58,7 @@ export interface BootstrapConfigPaths {
 export interface BootstrapConfigState {
   fileConfig: McpConfig;
   fileProvenance: ConfigProvenanceInput;
+  suppressedFileServers?: ReadonlySet<string> | undefined;
   extensionServers: Record<string, ServerConfig>;
   config: McpConfig;
 }
@@ -95,11 +98,16 @@ export function collectRegisteredServers(
   entries: readonly RegisteredMcpServer[],
   fileServers: Record<string, ServerConfig>,
   onError?: (err: unknown) => void,
+  suppressedFileServers?: ReadonlySet<string>,
 ): Record<string, ServerConfig> {
   const registered: Record<string, ServerConfig> = {};
   for (const entry of entries) {
-    // Servers configured in mcp.json take precedence over extension-registered servers.
-    if (Object.prototype.hasOwnProperty.call(fileServers, entry.name)) {
+    // Servers configured in mcp.json (including broken file entries that must not fall back
+    // to extension registrations) take precedence over extension-registered servers.
+    if (
+      Object.prototype.hasOwnProperty.call(fileServers, entry.name) ||
+      suppressedFileServers?.has(entry.name)
+    ) {
       continue;
     }
     try {
@@ -155,12 +163,17 @@ export async function loadBootstrapConfigState(
     projectConfigPath: join(bootstrapCwd, ".pi", "mcp.json"),
     projectConfigIncluded: false,
   };
+  let suppressedFileServers: ReadonlySet<string> = EMPTY_STRING_SET;
   try {
-    const loaded = await loadConfigWithOrigins(bootstrapCwd, paths.globalConfigPath, {
+    const result = await loadSessionConfigWithOrigins(bootstrapCwd, paths.globalConfigPath, {
       includeProjectConfig: false,
     });
-    fileConfig = loaded.config;
-    fileProvenance = loaded;
+    fileConfig = result.loaded.config;
+    fileProvenance = result.loaded;
+    suppressedFileServers = result.suppressedServers;
+    for (const err of result.serverErrors) {
+      reportBootstrapConfigError(err);
+    }
   } catch (err) {
     // Can't notify yet (no ctx), so the diagnostic goes to stderr (and to the
     // debug log when it is enabled). The session_start handler will re-try with
@@ -173,11 +186,13 @@ export async function loadBootstrapConfigState(
     initialEntries,
     fileConfig.mcpServers,
     reportBootstrapConfigError,
+    suppressedFileServers,
   );
   const config = mergeWithRegisteredServers(fileConfig, extensionServers);
   return {
     fileConfig,
     fileProvenance,
+    suppressedFileServers,
     extensionServers,
     config,
   };
@@ -210,9 +225,15 @@ export function abortSupersededEagerStarts(
   registeredEntries: readonly RegisteredMcpServer[],
   fileServers: Record<string, ServerConfig>,
   abortEagerStart: (name: string) => void,
+  suppressedFileServers?: ReadonlySet<string>,
 ): void {
   if (inFlightEager.size === 0) return;
-  const nextPreview = collectRegisteredServers(registeredEntries, fileServers);
+  const nextPreview = collectRegisteredServers(
+    registeredEntries,
+    fileServers,
+    undefined,
+    suppressedFileServers,
+  );
   for (const name of findRemovedOrChangedServers(
     Object.fromEntries(inFlightEager),
     nextPreview,
@@ -266,6 +287,7 @@ export class SessionLifecycle {
   private readonly hasRegisteredServersSource: boolean;
   private fileConfig: McpConfig;
   private fileProvenance: ConfigProvenanceInput;
+  private suppressedFileServers: ReadonlySet<string>;
   private extensionServers: Record<string, ServerConfig>;
   private config: McpConfig;
   private latestEventEntries: RegisteredMcpServer[] = [];
@@ -292,6 +314,7 @@ export class SessionLifecycle {
     this.hasRegisteredServersSource = hasRegisteredServersApi(deps.pi);
     this.fileConfig = deps.initialState.fileConfig;
     this.fileProvenance = deps.initialState.fileProvenance;
+    this.suppressedFileServers = deps.initialState.suppressedFileServers ?? EMPTY_STRING_SET;
     this.extensionServers = deps.initialState.extensionServers;
     this.config = deps.initialState.config;
   }
@@ -330,6 +353,7 @@ export class SessionLifecycle {
       this.getRegisteredEntries(),
       this.fileConfig.mcpServers,
       (name) => this.abortEagerStart(name),
+      this.suppressedFileServers,
     );
     return this.enqueueServerReconcile(ctx);
   }
@@ -378,17 +402,19 @@ export class SessionLifecycle {
     return epoch === this.sessionEpoch && this.changeEventCount !== this.appliedChangeCount;
   }
 
-  private setSessionConfigState(
-    nextFileConfig: McpConfig,
-    nextProvenance: ConfigProvenanceInput,
-    nextExtensionServers: Record<string, ServerConfig>,
-    nextConfig: McpConfig,
-  ): void {
-    this.fileConfig = nextFileConfig;
-    this.fileProvenance = nextProvenance;
+  private setSessionConfigState(next: {
+    fileConfig: McpConfig;
+    fileProvenance: ConfigProvenanceInput;
+    suppressedFileServers: ReadonlySet<string>;
+    extensionServers: Record<string, ServerConfig>;
+    config: McpConfig;
+  }): void {
+    this.fileConfig = next.fileConfig;
+    this.fileProvenance = next.fileProvenance;
+    this.suppressedFileServers = next.suppressedFileServers;
     this.appliedChangeCount = this.changeEventCount;
-    this.extensionServers = nextExtensionServers;
-    this.config = nextConfig;
+    this.extensionServers = next.extensionServers;
+    this.config = next.config;
   }
 
   private syncConfiguredDiscoveryTools(servers: Record<string, ServerConfig>): void {
@@ -452,6 +478,7 @@ export class SessionLifecycle {
           this.getRegisteredEntries(),
           this.fileConfig.mcpServers,
           (name) => this.abortEagerStart(name),
+          this.suppressedFileServers,
         );
       }
       if (this.inFlightEagerBatch.length > 0) {
@@ -517,12 +544,13 @@ export class SessionLifecycle {
       (regErr) => notifySessionConfigError(ctx, regErr),
     );
     const nextConfig = mergeWithRegisteredServers(fallbackFileConfig, nextExtensionServers);
-    this.setSessionConfigState(
-      fallbackFileConfig,
-      fallbackProvenance,
-      nextExtensionServers,
-      nextConfig,
-    );
+    this.setSessionConfigState({
+      fileConfig: fallbackFileConfig,
+      fileProvenance: fallbackProvenance,
+      suppressedFileServers: EMPTY_STRING_SET,
+      extensionServers: nextExtensionServers,
+      config: nextConfig,
+    });
     this.deps.bridge.updateSettings(nextConfig.settings);
     this.deps.bridge.setAutoEnableCodemode(nextConfig.autoEnableCodemode);
     this.deps.manager.rebuildServers(nextConfig);
@@ -532,13 +560,15 @@ export class SessionLifecycle {
       : [];
   }
 
-  private hasSessionConfigChanged(nextLoaded: LoadedConfig): boolean {
+  private hasSessionConfigChanged(result: SessionConfigLoadResult): boolean {
     const previewExtensionServers = collectRegisteredServers(
       this.getRegisteredEntries(),
-      nextLoaded.config.mcpServers,
+      result.loaded.config.mcpServers,
+      undefined,
+      result.suppressedServers,
     );
     const previewConfig = mergeWithRegisteredServers(
-      nextLoaded.config,
+      result.loaded.config,
       previewExtensionServers,
     );
     return JSON.stringify(previewConfig) !== JSON.stringify(this.config);
@@ -546,21 +576,24 @@ export class SessionLifecycle {
 
   private commitLoadedConfig(
     ctx: ExtensionContext,
-    nextLoaded: LoadedConfig,
+    result: SessionConfigLoadResult,
     rebuild: boolean,
   ): Array<[string, ServerConfig]> {
+    const nextLoaded = result.loaded;
     const nextExtensionServers = collectRegisteredServers(
       this.getRegisteredEntries(),
       nextLoaded.config.mcpServers,
       (err) => notifySessionConfigError(ctx, err),
+      result.suppressedServers,
     );
     const sessionConfig = mergeWithRegisteredServers(nextLoaded.config, nextExtensionServers);
-    this.setSessionConfigState(
-      nextLoaded.config,
-      nextLoaded,
-      nextExtensionServers,
-      rebuild ? sessionConfig : this.config,
-    );
+    this.setSessionConfigState({
+      fileConfig: nextLoaded.config,
+      fileProvenance: nextLoaded,
+      suppressedFileServers: result.suppressedServers,
+      extensionServers: nextExtensionServers,
+      config: rebuild ? sessionConfig : this.config,
+    });
     this.deps.bridge.setAutoEnableCodemode(sessionConfig.autoEnableCodemode);
     if (rebuild) {
       this.deps.bridge.updateSettings(sessionConfig.settings);
@@ -594,10 +627,10 @@ export class SessionLifecycle {
 
   private async applyLoadedSessionConfig(
     ctx: ExtensionContext,
-    nextLoaded: LoadedConfig,
+    result: SessionConfigLoadResult,
     epoch: number,
   ): Promise<void> {
-    const configChanged = this.hasSessionConfigChanged(nextLoaded);
+    const configChanged = this.hasSessionConfigChanged(result);
     if (configChanged) {
       reportDiagnostic({
         level: "info",
@@ -608,7 +641,7 @@ export class SessionLifecycle {
       await this.deps.coordinator.teardown(ctx);
       if (!this.isEpochCurrent(epoch)) return;
     }
-    const eagerServers = this.commitLoadedConfig(ctx, nextLoaded, configChanged);
+    const eagerServers = this.commitLoadedConfig(ctx, result, configChanged);
     if (!this.isEpochCurrent(epoch) || eagerServers.length === 0) return;
     await this.runEagerStarts(eagerServers, ctx);
   }
@@ -630,9 +663,9 @@ export class SessionLifecycle {
     });
     const includeProjectConfig = isProjectTrusted(ctx);
 
-    let nextLoaded: LoadedConfig;
+    let result: SessionConfigLoadResult;
     try {
-      nextLoaded = await loadConfigWithOrigins(ctx.cwd, this.deps.globalConfigPath, {
+      result = await loadSessionConfigWithOrigins(ctx.cwd, this.deps.globalConfigPath, {
         includeProjectConfig,
       });
     } catch (err) {
@@ -640,7 +673,10 @@ export class SessionLifecycle {
       return;
     }
     if (!this.isEpochCurrent(epoch)) return;
-    await this.applyLoadedSessionConfig(ctx, nextLoaded, epoch);
+    for (const err of result.serverErrors) {
+      notifySessionConfigError(ctx, err);
+    }
+    await this.applyLoadedSessionConfig(ctx, result, epoch);
   }
 
   private handleReconcileError(err: unknown, epoch: number, ctx: ExtensionContext): void {
@@ -697,6 +733,7 @@ export class SessionLifecycle {
       (err) => {
         configErrors.push(formatErrorMessage(err));
       },
+      this.suppressedFileServers,
     );
 
     const removedOrChanged = findRemovedOrChangedServers(

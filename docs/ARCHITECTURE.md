@@ -170,7 +170,7 @@ what to do:
 - **auth-required** — `AuthRequiredError`, or a genuine 401 (during `initialize` and
   `tools/list`) / 403 `insufficient_scope`; invalidates stale tokens when applicable and
   raises `AuthRequiredError` so the coordinator can offer interactive authorization.
-- **fail** — a fast-fail `config` or `protocol` `McpError`; no retry.
+- **fail** — a fast-fail `config` or `protocol` `McpError`, or a deterministic local `stdio` spawn errno (`ENOENT`, `EACCES`, `ENOEXEC`, `ENOTDIR`, `EISDIR`); no retry.
 - **give-up** — `retryCount >= maxRetries`; wrap in an `McpError` (`timeout` or
   `connection`).
 - **retry** — wait `RETRY_DELAYS_MS[retryCount]` (capped at the last entry) and reconnect.
@@ -211,6 +211,12 @@ microtask; the generation guard prevents a stop during cleanup from being resurr
 deactivates tools, closes the client, and — for stdio — runs
 `ensurePidTerminated()` (SIGTERM → bounded wait → SIGKILL, for the PIDs that accept a signal)
 and then `destroyStdioStreams()`.
+While any live `stdio` `ChildProcess` is running, `instrumentStdioTransport()` also tracks its PID
+in the process-level `StdioExitGuard` (`src/stdio-exit-guard.ts`, untracked on `exit`, `close`, and
+`destroyStdioStreams()`), attaching `SIGINT` and `exit` listeners only while live PIDs exist so
+unhandled `SIGINT` or unexpected process exit in headless modes (`--mode rpc`, `--mode json`,
+`--print`) terminates tracked trees synchronously while yielding to active host `SIGINT` handlers
+(such as interactive TUI `Ctrl+Z` suspend) and discounting passive `signal-exit` wrappers.
 
 `ensurePidTerminated()` snapshots the child's descendant tree first
 (`/proc/<pid>/task/*/children` on Linux, `ps -A -o pid=,ppid=` on other POSIX systems — e.g. an
@@ -256,8 +262,8 @@ sequenceDiagram
     Pi->>Entry: session_start(ctx)
     Entry->>Life: handleSessionStart(ctx)
     Life->>Coord: setActiveContext(ctx)
-    Life->>Cfg: loadConfigWithOrigins(cwd, globalPath, includeProjectConfig = isProjectTrusted())
-    Cfg-->>Life: merged McpConfig + origins or McpError
+    Life->>Cfg: loadSessionConfigWithOrigins(cwd, globalPath, includeProjectConfig = isProjectTrusted())
+    Cfg-->>Life: merged McpConfig + origins + serverErrors + suppressedServers or McpError
     alt config invalid
         Life->>Coord: teardown(ctx)
         Life->>Bridge: updateSettings(default settings)
@@ -278,7 +284,7 @@ sequenceDiagram
     Pi->>Entry: mcp_servers_change(event, ctx)
     Entry->>Life: handleServersChange(event, ctx)
     Life->>Coord: setActiveContext(ctx)
-    Life->>Life: collectRegisteredServers(entries, fileConfig)
+    Life->>Life: collectRegisteredServers(entries, fileConfig, onError, suppressedFileServers)
     loop removed or changed servers
         Life->>Coord: cancelServer(name)
         Life->>Bridge: removeServer(name)
@@ -304,8 +310,15 @@ Key behaviors:
 
 - **Project trust.** `includeProjectConfig` is `ctx.isProjectTrusted()` on
   `session_start`; bootstrap and untrusted projects never read `<cwd>/.pi/mcp.json`.
-- **Invalid config** still tears down the previous session's servers, tools, prompts,
-  and status, then rebuilds from empty defaults rather than leaving stale state active.
+- **Invalid config.** Whole-file failures (I/O, JSON/JSONC syntax, non-object root or
+  `mcpServers`, or invalid `settings` / `autoEnableCodemode`) still tear down the previous
+  session's servers, tools, prompts, and status, then rebuild from empty defaults rather
+  than leaving stale state active. Individual `mcpServers.<name>` validation errors and
+  invalid/unknown project overrides are isolated into per-server `Config error`
+  notifications (`loadSessionConfigWithOrigins`), dropping any global or full project entry
+  whose validation fails (`suppressedServers`) rather than falling back to global or
+  same-named extension registrations, while keeping all healthy sibling servers (and
+  extension-only servers targeted by a stale partial project override) active.
 - **Config changed** tears everything down, applies `ToolBridge.updateSettings`, and
   rebuilds the server map from the new config.
 - **Config identical** still refreshes roots: `ServerManager.updateCwd()` notifies ready
@@ -495,13 +508,7 @@ Behavior:
 - **Extension-registered servers** from `pi.registerMcpServer()` are collected on
   bootstrap and on every `mcp_servers_change`; a same-named `mcp.json` entry takes
   precedence.
-- **Provenance.** `loadConfigWithOrigins()` returns the merged config plus the winning
-  file origin per server (`global` or `project`); `SessionLifecycle` merges in the
-  registered extension server names (`withExtensionServers`) and keeps that record for
-  the current session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a
-  skipped project config renders as `Project config: not loaded (<path>)` instead of
-  silently missing servers. `loadConfig()` remains the thin wrapper that returns only
-  the merged config.
+- **Provenance & per-server isolation.** `loadSessionConfigWithOrigins()` isolates individual `mcpServers.<name>` validation errors and invalid/unknown project overrides into `serverErrors` (without duplicating an already-reported global error against `.pi/mcp.json` when a valid partial project override targets an invalid global server, and dropping failed global or full project entries via `suppressedServers` rather than falling back to global or same-named extension servers), while throwing `McpError("config")` only on whole-file errors; `loadConfigWithOrigins()` returns the merged config plus the winning file origin per server (`global` or `project`) and keeps the strict throwing contract. `SessionLifecycle` merges in the registered extension server names (`withExtensionServers`) and keeps that record for the current session. `/mcp <name>` and `mcp_status` report it as `Source` / `source`, and a skipped project config renders as `Project config: not loaded (<path>)` instead of silently missing servers. `loadConfig()` remains the thin wrapper that returns only the strictly validated merged config.
 
 ---
 

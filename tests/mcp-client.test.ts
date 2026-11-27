@@ -9,7 +9,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -38,6 +39,7 @@ import {
   setDebugLog,
   setDiagnosticUi,
 } from "../src/debug-log.js";
+import { instrumentStdioTransport } from "../src/stdio-process.js";
 import { McpError, AuthCancelledError } from "../src/errors.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -304,6 +306,118 @@ describe("connectClientWithTimeout", () => {
     controller.abort();
     await assert.rejects(promise, AuthCancelledError);
     assert.equal(EventEmitter.getEventListeners(controller.signal, "abort").length, 0);
+  });
+
+  it("surfaces a delayed cross-spawn ENOENT instead of SDK -32000 Connection closed", async () => {
+    const stdioTransport = new StdioClientTransport({
+      command: "missing-pi-mcp-executable-335",
+      args: [],
+      stderr: "pipe",
+    });
+    const fakeProc = Object.assign(new EventEmitter(), {
+      pid: 43210,
+      exitCode: null as number | null,
+      signalCode: null,
+    });
+    const enoent = Object.assign(new Error("spawn missing-pi-mcp-executable-335 ENOENT"), {
+      code: "ENOENT",
+      errno: -2,
+      syscall: "spawn missing-pi-mcp-executable-335",
+      path: "missing-pi-mcp-executable-335",
+    });
+
+    stdioTransport.start = async () => {
+      (stdioTransport as unknown as { _process: unknown })._process = fakeProc;
+      fakeProc.on("error", (err) => {
+        stdioTransport.onerror?.(err as Error);
+      });
+      fakeProc.on("close", () => {
+        (stdioTransport as unknown as { _process: undefined })._process = undefined;
+        stdioTransport.onclose?.();
+      });
+    };
+    stdioTransport.send = async () => {
+      queueMicrotask(() => {
+        fakeProc.exitCode = 1;
+        fakeProc.emit("error", enoent);
+        fakeProc.emit("close", 1);
+      });
+    };
+    stdioTransport.close = async () => {
+      (stdioTransport as unknown as { _process: undefined })._process = undefined;
+    };
+
+    instrumentStdioTransport(stdioTransport, {
+      onPid: () => {},
+      onStderrLine: () => {},
+    });
+
+    const client = new Client({ name: "test", version: "1.0.0" });
+    await assert.rejects(
+      connectClientWithTimeout({
+        client,
+        transport: stdioTransport,
+        timeoutMs: 4000,
+        signal: new AbortController().signal,
+        serverName: "srv",
+      }),
+      (err: unknown) => {
+        assert.equal(err, enoent);
+        return true;
+      },
+    );
+  });
+
+  it("keeps caller abort priority over a captured stdio spawn error", async () => {
+    const stdioTransport = new StdioClientTransport({
+      command: "missing-pi-mcp-executable-335",
+      args: [],
+      stderr: "pipe",
+    });
+    const fakeProc = Object.assign(new EventEmitter(), {
+      pid: 43211,
+      exitCode: null as number | null,
+      signalCode: null,
+    });
+    const controller = new AbortController();
+    const enoent = Object.assign(new Error("spawn missing-pi-mcp-executable-335 ENOENT"), {
+      code: "ENOENT",
+    });
+
+    stdioTransport.start = async () => {
+      (stdioTransport as unknown as { _process: unknown })._process = fakeProc;
+      fakeProc.on("error", (err) => {
+        stdioTransport.onerror?.(err as Error);
+      });
+    };
+    stdioTransport.close = async () => {
+      (stdioTransport as unknown as { _process: undefined })._process = undefined;
+    };
+
+    instrumentStdioTransport(stdioTransport, {
+      onPid: () => {},
+      onStderrLine: () => {},
+    });
+
+    const client = fakeClient({
+      connect: async (t) => {
+        await t.start();
+        fakeProc.emit("error", enoent);
+        controller.abort();
+        throw new SdkMcpError(ErrorCode.ConnectionClosed, "Connection closed");
+      },
+    });
+
+    await assert.rejects(
+      connectClientWithTimeout({
+        client,
+        transport: stdioTransport,
+        timeoutMs: 4000,
+        signal: controller.signal,
+        serverName: "srv",
+      }),
+      AuthCancelledError,
+    );
   });
 });
 
