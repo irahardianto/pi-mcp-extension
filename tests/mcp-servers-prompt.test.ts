@@ -110,6 +110,28 @@ describe("mcp_servers mcp_connect hints (#342)", () => {
     assert.ok(!withoutStatus.includes('mcp_connect "mcp___"'));
   });
 
+  it("keeps the literal hint at exactly 120 characters and drops it at 121", () => {
+    const atLimit = "a".repeat(120);
+    assert.equal(
+      renderDisconnected(atLimit, WITH_STATUS),
+      expectedSection(atLimit, `not connected — mcp_connect ${JSON.stringify(atLimit)}`),
+    );
+    const overLimit = "a".repeat(121);
+    assert.equal(renderDisconnected(overLimit, WITH_STATUS), expectedSection(overLimit, EXACT_NAME_HINT));
+    assert.equal(renderDisconnected(overLimit, WITHOUT_STATUS), expectedSection(overLimit, GENERIC_HINT));
+  });
+
+  it("treats omitted activeTools as mcp_status available", () => {
+    assert.equal(
+      renderDisconnected("filesystem", undefined),
+      expectedSection("filesystem", 'not connected — mcp_connect "filesystem"'),
+    );
+    assert.equal(
+      renderDisconnected("basic calculator", undefined),
+      expectedSection("basic calculator", EXACT_NAME_HINT),
+    );
+  });
+
   it("keeps the altered-name hint out of the section intro and connected bullets", () => {
     const rendered = renderMcpServersSection({
       servers: [

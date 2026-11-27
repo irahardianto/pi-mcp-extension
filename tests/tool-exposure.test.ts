@@ -608,7 +608,7 @@ describe("renderMcpServersSection", () => {
     );
   });
 
-  it("strips ANSI escapes, redacts secrets, and falls back to namespace for control-only server names", () => {
+  it("strips ANSI escapes, redacts secrets, and points control-only server names at mcp_status", () => {
     const syntheticCred = ["api_key", ["tok", "987654"].join("-")].join("=");
     const rendered = renderMcpServersSection({
       servers: [
