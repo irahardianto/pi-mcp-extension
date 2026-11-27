@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Deterministic local `stdio` spawn errors (`ENOENT`, `EACCES`, `ENOEXEC`, `ENOTDIR`, `EISDIR`) now fail on the first attempt instead of spinning through the 49-second retry backoff schedule, while preserving retry backoff for transient `stdio` failures and HTTP `404` warmup responses (#335).
+- Live `stdio` MCP server process trees are now terminated synchronously on unhandled `SIGINT` (when no active host handler owns `SIGINT`, yielding to interactive TUI `Ctrl+Z` suspend and ignoring passive `signal-exit` wrappers) and on unexpected `process` `exit`, preventing orphaned wrapper/grandchild processes in headless `--mode rpc`, `--mode json`, and `--print` modes (#336).
+
 ## [1.16.5] - 2026-11-27
 
 ### Fixed

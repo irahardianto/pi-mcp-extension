@@ -339,7 +339,7 @@ it("cancels a management connect during retry delay", async () => {
   const ctx = createMockContext({ cwd: dir, hasUI: false });
   try {
     await mkdir(join(dir, ".pi"));
-    await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({ settings: { maxRetries: 1 }, mcpServers: { broken: { command: "missing-pi-mcp-executable" } } }));
+    await writeFile(join(dir, ".pi", "mcp.json"), JSON.stringify({ settings: { maxRetries: 1 }, mcpServers: { broken: { command: process.execPath, args: ["-e", "process.exit(1)"] } } }));
     await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "no-global.json") });
     await events.get("session_start")({}, ctx);
     const controller = new AbortController();

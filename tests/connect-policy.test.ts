@@ -7,7 +7,11 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { classifyClientError } from "../src/connect-policy.js";
+import {
+  classifyClientError,
+  classifyConnectFailure,
+  isNonRetryableStdioSpawnError,
+} from "../src/connect-policy.js";
 
 describe("classifyClientError — benign JSON-RPC noise", () => {
   const benignMessages = [
@@ -145,5 +149,116 @@ describe("classifyClientError — stdio and odd payloads", () => {
       transport: "streamable-http",
       reason: "HTTP stream error, reconnecting",
     });
+  });
+});
+
+describe("isNonRetryableStdioSpawnError and classifyConnectFailure (#335)", () => {
+  const nonRetryableCodes = ["ENOENT", "EACCES", "ENOEXEC", "ENOTDIR", "EISDIR"] as const;
+
+  for (const code of nonRetryableCodes) {
+    it(`fast-fails stdio ${code} with the unwrapped ErrnoException`, () => {
+      const err = Object.assign(new Error(`spawn missing ${code}`), { code });
+      assert.equal(isNonRetryableStdioSpawnError("stdio", err), true);
+
+      const action = classifyConnectFailure({
+        error: err,
+        aborted: false,
+        corruptStateRecovered: false,
+        hasAuth: false,
+        transport: "stdio",
+        retryCount: 0,
+        maxRetries: 5,
+        serverName: "broken",
+      });
+      assert.deepEqual(action, { kind: "fail", error: err });
+      assert.equal(action.kind === "fail" && action.error, err);
+    });
+
+    it(`does not fast-fail ${code} on streamable-http or sse`, () => {
+      const err = Object.assign(new Error(`error ${code}`), { code });
+      for (const transport of ["streamable-http", "sse"] as const) {
+        assert.equal(isNonRetryableStdioSpawnError(transport, err), false);
+        assert.deepEqual(
+          classifyConnectFailure({
+            error: err,
+            aborted: false,
+            corruptStateRecovered: false,
+            hasAuth: false,
+            transport,
+            retryCount: 0,
+            maxRetries: 1,
+            serverName: "remote",
+          }),
+          { kind: "retry", delayMs: 1000 },
+        );
+      }
+    });
+  }
+
+  it("keeps transient stdio errors and HTTP 404 retryable", () => {
+    for (const code of ["EPIPE", "ECONNRESET", "EAGAIN"]) {
+      const err = Object.assign(new Error(`spawn ${code}`), { code });
+      assert.equal(isNonRetryableStdioSpawnError("stdio", err), false);
+      assert.deepEqual(
+        classifyConnectFailure({
+          error: err,
+          aborted: false,
+          corruptStateRecovered: false,
+          hasAuth: false,
+          transport: "stdio",
+          retryCount: 0,
+          maxRetries: 1,
+        }),
+        { kind: "retry", delayMs: 1000 },
+      );
+    }
+
+    for (const transport of ["streamable-http", "sse"] as const) {
+      const http404 = Object.assign(new Error("HTTP 404 Not Found"), { status: 404 });
+      assert.deepEqual(
+        classifyConnectFailure({
+          error: http404,
+          aborted: false,
+          corruptStateRecovered: false,
+          hasAuth: false,
+          transport,
+          retryCount: 0,
+          maxRetries: 1,
+        }),
+        { kind: "retry", delayMs: 1000 },
+      );
+    }
+  });
+
+  it("keeps aborted cancellation ahead of stdio spawn errors and handles non-Error objects", () => {
+    const enoent = Object.assign(new Error("spawn missing ENOENT"), { code: "ENOENT" });
+    assert.deepEqual(
+      classifyConnectFailure({
+        error: enoent,
+        aborted: true,
+        corruptStateRecovered: false,
+        hasAuth: false,
+        transport: "stdio",
+        retryCount: 0,
+        maxRetries: 5,
+      }),
+      { kind: "cancelled" },
+    );
+
+    assert.equal(isNonRetryableStdioSpawnError("stdio", null), false);
+    assert.equal(isNonRetryableStdioSpawnError("stdio", "ENOENT"), false);
+    assert.equal(isNonRetryableStdioSpawnError("stdio", { code: "ENOENT" }), true);
+
+    const plainAction = classifyConnectFailure({
+      error: { code: "ENOENT", message: "missing" },
+      aborted: false,
+      corruptStateRecovered: false,
+      hasAuth: false,
+      transport: "stdio",
+      retryCount: 0,
+      maxRetries: 5,
+    });
+    assert.equal(plainAction.kind, "fail");
+    assert.ok(plainAction.kind === "fail" && plainAction.error instanceof Error);
   });
 });

@@ -10,6 +10,7 @@ import {
   createLineSplitter,
   destroyStdioStreams,
   ensurePidTerminated,
+  getStdioSpawnError,
   indexProcessTable,
   instrumentStdioTransport,
   isPidAlive,
@@ -20,6 +21,13 @@ import {
   waitForChildClose,
   type StdioProcessDeps,
 } from "../src/stdio-process.js";
+import {
+  StdioExitGuard,
+  countPassiveSigintListeners,
+  listDescendantPidsSync,
+  terminatePidTreeSync,
+  type SignalExitProcess,
+} from "../src/stdio-exit-guard.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -426,6 +434,60 @@ setInterval(() => {}, 1000);
         }
         await rm(dir, { recursive: true, force: true });
       }
+    });
+
+    it("captures non-retryable spawn errnos even on pid-less processes and deduplicates listeners", async () => {
+      assert.equal(getStdioSpawnError(null), undefined);
+      assert.equal(getStdioSpawnError(undefined), undefined);
+
+      const procWithoutPid = new EventEmitter() as EventEmitter & { pid?: number };
+      const fakeTransport = {
+        _process: undefined as (EventEmitter & { pid?: number }) | undefined,
+        pid: null,
+        stderr: null,
+        start(): Promise<void> {
+          fakeTransport._process = procWithoutPid;
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+
+      instrumentStdioTransport(fakeTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: () => {},
+      });
+      await fakeTransport.start();
+
+      // Even without a pid, the error listener was attached exactly once.
+      assert.equal(procWithoutPid.listenerCount("error"), 1);
+      const enoent = Object.assign(new Error("spawn uvx ENOENT"), { code: "ENOENT" });
+      procWithoutPid.emit("error", enoent);
+      assert.equal(getStdioSpawnError(fakeTransport), enoent);
+
+      // Non-spawn errors (e.g. generic runtime errors) are not captured as spawn failures.
+      const procWithPid = new EventEmitter() as EventEmitter & { pid?: number };
+      procWithPid.pid = 8181;
+      const otherTransport = {
+        _process: procWithPid,
+        pid: 8181,
+        stderr: null,
+        start(): Promise<void> {
+          return Promise.resolve();
+        },
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+      instrumentStdioTransport(otherTransport as unknown as StdioClientTransport, {
+        onPid: () => {},
+        onStderrLine: () => {},
+      });
+      await otherTransport.start();
+      assert.equal(procWithPid.listenerCount("error"), 1);
+      procWithPid.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+      assert.equal(getStdioSpawnError(otherTransport), undefined);
     });
   });
 
@@ -1227,5 +1289,425 @@ describe("terminateStdioTree", () => {
 
     assert.equal(child.stdout.destroyed, true);
     assert.equal(child.stderr.destroyed, true);
+  });
+});
+
+describe("StdioExitGuard and sync tree cleanup (#336)", () => {
+  function createFakeProcess(pid = 9999): {
+    proc: SignalExitProcess & EventEmitter;
+    kills: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }>;
+    exits: number[];
+    setKillThrow(err: Error | null): void;
+  } {
+    const emitter = new EventEmitter();
+    const kills: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+    const exits: number[] = [];
+    let killError: Error | null = null;
+    const proc = Object.assign(emitter, {
+      pid,
+      kill(targetPid: number, signal?: NodeJS.Signals | number): true {
+        kills.push({ pid: targetPid, signal });
+        if (killError) throw killError;
+        return true;
+      },
+      exit(code?: number): never {
+        exits.push(code ?? 0);
+        return undefined as never;
+      },
+    }) as SignalExitProcess & EventEmitter;
+    return {
+      proc,
+      kills,
+      exits,
+      setKillThrow: (err) => {
+        killError = err;
+      },
+    };
+  }
+
+  it("counts passive signal-exit v3 (process) and v4 (globalThis) SIGINT listeners safely", () => {
+    const v4Sym = Symbol.for("signal-exit emitter");
+    assert.equal(countPassiveSigintListeners(null), 0);
+    assert.equal(countPassiveSigintListeners("not-an-object"), 0);
+    assert.equal(countPassiveSigintListeners({}), 0);
+    assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: 0 } }), 0);
+    assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: -1 } }), 0);
+    assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: 1.5 } }), 0);
+    assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: 1 } }), 1);
+
+    // signal-exit v4 stores its emitter on globalThis, never on process.
+    assert.equal(countPassiveSigintListeners({ [v4Sym]: { count: 2 } }), 0);
+    assert.equal(countPassiveSigintListeners({}, { [v4Sym]: { count: 2 } }), 2);
+    assert.equal(countPassiveSigintListeners({}, { [v4Sym]: { count: 0 } }), 0);
+    assert.equal(
+      countPassiveSigintListeners(
+        { __signal_exit_emitter__: { count: 1 } },
+        { [v4Sym]: { count: 1 } },
+      ),
+      2,
+    );
+  });
+
+  it("attaches SIGINT and exit listeners only while live PIDs are tracked", () => {
+    const { proc } = createFakeProcess();
+    const guard = new StdioExitGuard({ proc, terminatePidTreeSync: () => {} });
+
+    assert.equal(proc.listenerCount("SIGINT"), 0);
+    assert.equal(proc.listenerCount("exit"), 0);
+
+    // Invalid PIDs are ignored.
+    guard.track(0);
+    guard.track(-5);
+    guard.track(Number.NaN);
+    guard.track(12.5);
+    assert.equal(guard.trackedCount(), 0);
+    assert.equal(proc.listenerCount("SIGINT"), 0);
+
+    guard.track(101);
+    assert.equal(guard.trackedCount(), 1);
+    assert.equal(proc.listenerCount("SIGINT"), 1);
+    assert.equal(proc.listenerCount("exit"), 1);
+
+    // Second PID reuses the same listeners.
+    guard.track(102);
+    guard.track(102);
+    assert.equal(guard.trackedCount(), 2);
+    assert.equal(proc.listenerCount("SIGINT"), 1);
+    assert.equal(proc.listenerCount("exit"), 1);
+
+    // Removing one keeps listeners attached; removing last detaches both.
+    guard.untrack(101);
+    guard.untrack(null);
+    guard.untrack(undefined);
+    guard.untrack(999);
+    assert.equal(guard.trackedCount(), 1);
+    assert.equal(proc.listenerCount("SIGINT"), 1);
+
+    guard.untrack(102);
+    assert.equal(guard.trackedCount(), 0);
+    assert.equal(proc.listenerCount("SIGINT"), 0);
+    assert.equal(proc.listenerCount("exit"), 0);
+  });
+
+  it("yields as a no-op on SIGINT when another active listener is attached (TUI Ctrl+Z)", () => {
+    const v4Sym = Symbol.for("signal-exit emitter");
+    const { proc, kills } = createFakeProcess(5555);
+    const terminated: number[] = [];
+    const globalScope: Record<symbol, unknown> = { [v4Sym]: { count: 1 } };
+    const guard = new StdioExitGuard({
+      proc,
+      globalScope,
+      terminatePidTreeSync: (pid) => terminated.push(pid),
+    });
+
+    // Simulate signal-exit v3 + v4 passive listeners + Pi TUI's transient ignoreSigint listener.
+    (proc as unknown as { __signal_exit_emitter__?: { count: number } }).__signal_exit_emitter__ = {
+      count: 1,
+    };
+    const passiveSigExitV3 = (): void => {};
+    const passiveSigExitV4 = (): void => {};
+    const ignoreSigint = (): void => {};
+    proc.on("SIGINT", passiveSigExitV3);
+    proc.on("SIGINT", passiveSigExitV4);
+    proc.on("SIGINT", ignoreSigint);
+    guard.track(1001);
+
+    proc.emit("SIGINT");
+    assert.deepEqual(terminated, []);
+    assert.deepEqual(kills, []);
+    assert.equal(guard.trackedCount(), 1);
+    assert.equal(proc.listenerCount("SIGINT"), 4);
+
+    // Also verify without signal-exit present (another active host listener alone).
+    proc.off("SIGINT", passiveSigExitV3);
+    proc.off("SIGINT", passiveSigExitV4);
+    delete (proc as unknown as { __signal_exit_emitter__?: unknown }).__signal_exit_emitter__;
+    delete globalScope[v4Sym];
+    proc.emit("SIGINT");
+    assert.deepEqual(terminated, []);
+    assert.deepEqual(kills, []);
+
+    guard.dispose();
+    assert.equal(guard.trackedCount(), 0);
+    assert.equal(proc.listenerCount("SIGINT"), 1);
+    assert.equal(proc.listenerCount("exit"), 0);
+  });
+
+  it("terminates tracked trees and re-raises SIGINT when sole active listener (with or without signal-exit v3/v4)", () => {
+    const v4Sym = Symbol.for("signal-exit emitter");
+
+    // Case 1: no signal-exit
+    {
+      const { proc, kills } = createFakeProcess(7001);
+      const terminated: number[] = [];
+      const guard = new StdioExitGuard({
+        proc,
+        terminatePidTreeSync: (pid) => terminated.push(pid),
+      });
+      guard.track(2001);
+      guard.track(2002);
+
+      proc.emit("SIGINT");
+      assert.deepEqual(terminated, [2001, 2002]);
+      assert.deepEqual(kills, [{ pid: 7001, signal: "SIGINT" }]);
+      assert.equal(guard.trackedCount(), 0);
+      assert.equal(proc.listenerCount("SIGINT"), 0);
+      assert.equal(proc.listenerCount("exit"), 0);
+    }
+
+    // Case 2: signal-exit v3 present on proc (listenerCount=2, count=1 -> otherActiveListeners=0)
+    {
+      const { proc, kills } = createFakeProcess(7002);
+      const terminated: number[] = [];
+      const guard = new StdioExitGuard({
+        proc,
+        terminatePidTreeSync: (pid) => terminated.push(pid),
+      });
+      (proc as unknown as { __signal_exit_emitter__?: { count: number } }).__signal_exit_emitter__ =
+        { count: 1 };
+      proc.on("SIGINT", () => {});
+      guard.track(2003);
+
+      proc.emit("SIGINT");
+      assert.deepEqual(terminated, [2003]);
+      assert.deepEqual(kills, [{ pid: 7002, signal: "SIGINT" }]);
+      assert.equal(guard.trackedCount(), 0);
+      assert.equal(proc.listenerCount("SIGINT"), 1);
+      assert.equal(proc.listenerCount("exit"), 0);
+    }
+
+    // Case 3: signal-exit v4 present on globalThis (listenerCount=2, count=1 -> otherActiveListeners=0)
+    {
+      const { proc, kills } = createFakeProcess(7005);
+      const terminated: number[] = [];
+      const guard = new StdioExitGuard({
+        proc,
+        globalScope: { [v4Sym]: { count: 1 } },
+        terminatePidTreeSync: (pid) => terminated.push(pid),
+      });
+      proc.on("SIGINT", () => {});
+      guard.track(2004);
+
+      proc.emit("SIGINT");
+      assert.deepEqual(terminated, [2004]);
+      assert.deepEqual(kills, [{ pid: 7005, signal: "SIGINT" }]);
+      assert.equal(guard.trackedCount(), 0);
+      assert.equal(proc.listenerCount("SIGINT"), 1);
+      assert.equal(proc.listenerCount("exit"), 0);
+    }
+  });
+
+  it("falls back to proc.exit(130) when re-raising SIGINT throws, without double-firing exit", () => {
+    const { proc, exits, setKillThrow } = createFakeProcess(7003);
+    const terminated: number[] = [];
+    const guard = new StdioExitGuard({
+      proc,
+      terminatePidTreeSync: (pid) => terminated.push(pid),
+    });
+    setKillThrow(new Error("EPERM"));
+    guard.track(3001);
+
+    proc.emit("SIGINT");
+    assert.deepEqual(terminated, [3001]);
+    assert.deepEqual(exits, [130]);
+    assert.equal(proc.listenerCount("exit"), 0);
+
+    // Even if exit were emitted after, tracked trees are not killed a second time.
+    proc.emit("exit", 130);
+    assert.deepEqual(terminated, [3001]);
+  });
+
+  it("terminates all tracked trees on process exit and detaches", () => {
+    const { proc } = createFakeProcess(7004);
+    const terminated: number[] = [];
+    const guard = new StdioExitGuard({
+      proc,
+      terminatePidTreeSync: (pid) => terminated.push(pid),
+    });
+    guard.track(4001);
+    guard.track(4002);
+
+    proc.emit("exit", 1);
+    assert.deepEqual(terminated, [4001, 4002]);
+    assert.equal(guard.trackedCount(), 0);
+    assert.equal(proc.listenerCount("SIGINT"), 0);
+    assert.equal(proc.listenerCount("exit"), 0);
+  });
+
+  it("listDescendantPidsSync walks deepest-first, handles cycles, and isolates mid-walk child errors", () => {
+    const tree = new Map<number, number[]>([
+      [1, [2, 3]],
+      [2, [4]],
+      [3, [1]],
+      [4, []],
+    ]);
+    assert.deepEqual(
+      listDescendantPidsSync(1, (pid) => tree.get(pid) ?? []),
+      [4, 3, 2],
+    );
+    assert.deepEqual(
+      listDescendantPidsSync(1, () => {
+        throw new Error("ENOENT");
+      }),
+      [],
+    );
+
+    // If child 2 exits mid-walk (throwing ENOENT), sibling 3 and its descendants are still discovered.
+    const midWalkTree = new Map<number, number[]>([
+      [1, [2, 3]],
+      [3, [5]],
+      [5, []],
+    ]);
+    assert.deepEqual(
+      listDescendantPidsSync(1, (pid) => {
+        if (pid === 2) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return midWalkTree.get(pid) ?? [];
+      }),
+      [5, 3, 2],
+    );
+  });
+
+  it("listDescendantPidsSync and terminatePidTreeSync find live children with default args on POSIX (/proc and ps)", {
+    skip: process.platform === "win32" && "WHY: Windows has no /proc or ps",
+  }, async () => {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    try {
+      assert.ok(child.pid);
+      const nativeResult = listDescendantPidsSync(process.pid);
+      assert.ok(nativeResult.includes(child.pid), `Expected ${child.pid} in ${nativeResult.join(",")}`);
+
+      // Exercise the non-Linux POSIX `ps` snapshot path without mutating process.platform.
+      const psResult = listDescendantPidsSync(process.pid, undefined, "darwin");
+      assert.ok(psResult.includes(child.pid), `Expected ${child.pid} via ps in ${psResult.join(",")}`);
+
+      // Default terminatePidTreeSync on macOS discovers descendants without a custom parser.
+      const signalled: number[] = [];
+      terminatePidTreeSync(process.pid, {
+        platform: "darwin",
+        kill: (target) => {
+          signalled.push(target);
+        },
+      });
+      assert.ok(signalled.includes(child.pid), `Expected ${child.pid} signalled via default ps discovery`);
+      assert.equal(signalled.at(-1), process.pid);
+    } finally {
+      const exited = new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once("exit", () => resolve());
+      });
+      child.kill("SIGKILL");
+      await exited;
+    }
+  });
+
+  it("terminatePidTreeSync uses SIGTERM deepest-first on POSIX and taskkill with fallback on Windows", () => {
+    const posixCalls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+    terminatePidTreeSync(100, {
+      platform: "linux",
+      listDescendantPidsSync: () => [102, 101],
+      kill: (pid, signal) => {
+        posixCalls.push({ pid, signal });
+      },
+    });
+    assert.deepEqual(posixCalls, [
+      { pid: 102, signal: "SIGTERM" },
+      { pid: 101, signal: "SIGTERM" },
+      { pid: 100, signal: "SIGTERM" },
+    ]);
+
+    const winSpawns: Array<{ cmd: string; args: readonly string[]; opts: unknown }> = [];
+    const winKills: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+    terminatePidTreeSync(200, {
+      platform: "win32",
+      spawnSync: ((cmd: string, args: readonly string[], opts: unknown) => {
+        winSpawns.push({ cmd, args, opts });
+        return { error: new Error("taskkill missing") } as never;
+      }) as never,
+      kill: (pid, signal) => {
+        winKills.push({ pid, signal });
+      },
+    });
+    assert.equal(winSpawns.length, 1);
+    assert.equal(winSpawns[0]?.cmd, "taskkill");
+    assert.deepEqual(winSpawns[0]?.args, ["/pid", "200", "/T", "/F"]);
+    assert.deepEqual(winKills, [{ pid: 200, signal: "SIGTERM" }]);
+  });
+
+  it("tracks real live ChildProcess instances in instrumentStdioTransport and untracks on exit without touching fake stubs", async () => {
+    const { spawn } = await import("node:child_process");
+    const baseSigint = process.listenerCount("SIGINT");
+    const baseExit = process.listenerCount("exit");
+
+    // Plain and duck-typed EventEmitter fake PID stubs must NEVER attach OS signal listeners.
+    const fakeTransport = {
+      _process: { pid: 4242 },
+      pid: 4242,
+      stderr: null,
+      start: async () => {},
+      close: async () => {},
+    } as unknown as StdioClientTransport;
+    instrumentStdioTransport(fakeTransport, { onPid: () => {}, onStderrLine: () => {} });
+    await fakeTransport.start();
+    assert.equal(process.listenerCount("SIGINT"), baseSigint);
+    assert.equal(process.listenerCount("exit"), baseExit);
+
+    const duckTypedProc = Object.assign(new EventEmitter(), {
+      pid: 4243,
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    });
+    const duckTypedTransport = {
+      _process: duckTypedProc,
+      pid: 4243,
+      stderr: null,
+      start: async () => {},
+      close: async () => {},
+    } as unknown as StdioClientTransport;
+    instrumentStdioTransport(duckTypedTransport, { onPid: () => {}, onStderrLine: () => {} });
+    await duckTypedTransport.start();
+    assert.equal(process.listenerCount("SIGINT"), baseSigint);
+    assert.equal(process.listenerCount("exit"), baseExit);
+
+    // Real live ChildProcess attaches the guard and untracks automatically on exit.
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000);"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const realTransport = {
+      _process: child,
+      get pid() {
+        return child.pid;
+      },
+      stderr: child.stderr,
+      start: async () => {},
+      close: async () => {
+        child.kill("SIGKILL");
+      },
+    } as unknown as StdioClientTransport;
+
+    instrumentStdioTransport(realTransport, { onPid: () => {}, onStderrLine: () => {} });
+    await realTransport.start();
+    assert.equal(process.listenerCount("SIGINT"), baseSigint + 1);
+    assert.equal(process.listenerCount("exit"), baseExit + 1);
+
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    child.kill("SIGKILL");
+    await exited;
+    assert.equal(process.listenerCount("SIGINT"), baseSigint);
+    assert.equal(process.listenerCount("exit"), baseExit);
   });
 });

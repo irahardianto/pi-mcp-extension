@@ -5,6 +5,8 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ServerManager } from "../src/server-manager.js";
 import {
   classifyConnectFailure,
@@ -2166,6 +2168,335 @@ describe("removeServer identity guard (#216)", () => {
       assert.ok(surviving, "the replacement must not be deleted by the outgoing instance's removal");
       assert.deepEqual(surviving.config.args.slice(-1), ["--replacement"]);
       assert.equal(surviving.config.lifecycle, "eager");
+    } finally {
+      await manager.shutdownAll();
+    }
+  });
+});
+
+describe("fast-fail deterministic stdio spawn errors (#335)", () => {
+  it("fast-fails stdio ENOENT on attempt 1 without waiting through retry backoff", async () => {
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 5 },
+      mcpServers: {
+        missing: {
+          command: "missing-pi-mcp-executable-335",
+          args: [],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+    const startedAt = Date.now();
+    try {
+      await assert.rejects(
+        () => manager.startServer("missing", process.cwd()),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.equal(err instanceof McpError, false);
+          assert.equal((err as NodeJS.ErrnoException).code, "ENOENT");
+          return true;
+        },
+      );
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 2000, `Expected immediate ENOENT fast-fail, took ${elapsed}ms`);
+      const srv = manager.getServer("missing");
+      assert.equal(srv?.state, "stopped");
+      assert.equal(srv?.retryCount, 0);
+      assert.equal(srv?.retryTimer, null);
+      assert.ok(srv?.lastError);
+      assert.equal((srv.lastError as NodeJS.ErrnoException).code, "ENOENT");
+    } finally {
+      await manager.shutdownAll();
+    }
+  });
+
+  it("fast-fails stdio EACCES on attempt 1 via transport without retrying", async (t) => {
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 5 },
+      mcpServers: {
+        noexec: {
+          command: "noexec-bin",
+          args: [],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+    let startCalls = 0;
+    t.mock.method(manager, "createTransport", () => ({
+      start: async (): Promise<void> => {
+        startCalls += 1;
+        throw Object.assign(new Error("spawn noexec-bin EACCES"), { code: "EACCES" });
+      },
+      close: async (): Promise<void> => {},
+      send: async (): Promise<void> => {},
+    }));
+
+    try {
+      await assert.rejects(
+        () => manager.startServer("noexec", process.cwd()),
+        (err: unknown) => (err as NodeJS.ErrnoException).code === "EACCES",
+      );
+      assert.equal(startCalls, 1);
+      const noexecSrv = manager.getServer("noexec");
+      assert.equal(noexecSrv?.retryCount, 0);
+      assert.ok(noexecSrv?.lastError);
+      assert.equal((noexecSrv.lastError as NodeJS.ErrnoException).code, "EACCES");
+    } finally {
+      await manager.shutdownAll();
+    }
+  });
+
+  it("fast-fails real POSIX non-executable script with EACCES on attempt 1", {
+    skip: process.platform === "win32" && "WHY: POSIX execute-bit checks do not produce EACCES on Windows",
+  }, async () => {
+    const { chmod, mkdtemp, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(join(tmpdir(), "pi-mcp-eacces-"));
+    const script = join(dir, "noexec.sh");
+    await writeFile(script, "#!/bin/sh\nexit 0\n");
+    await chmod(script, 0o644);
+    const manager = new ServerManager({
+      settings: { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 5 },
+      mcpServers: {
+        noexec: {
+          command: script,
+          args: [],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+    try {
+      await assert.rejects(
+        () => manager.startServer("noexec", dir),
+        (err: unknown) => (err as NodeJS.ErrnoException).code === "EACCES",
+      );
+      assert.equal(manager.getServer("noexec")?.retryCount, 0);
+      assert.equal(manager.getServer("noexec")?.state, "stopped");
+    } finally {
+      await manager.shutdownAll();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("continues to retry stdio non-zero exit and HTTP 404 warmup failures", async () => {
+    const { createServer } = await import("node:http");
+    let httpAttempts = 0;
+    const listener = createServer((req, res) => {
+      if (req.url !== "/mcp" || req.method !== "POST") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      req.on("end", () => {
+        const msg = JSON.parse(body) as { id?: number; method?: string };
+        if (msg.method === "initialize") {
+          httpAttempts += 1;
+          if (httpAttempts === 1) {
+            res.writeHead(404);
+            res.end("warming up");
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: "2025-03-26",
+                capabilities: { tools: {} },
+                serverInfo: { name: "warmup-http", version: "1.0.0" },
+              },
+            }),
+          );
+          return;
+        }
+        if (msg.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (msg.method === "tools/list") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }));
+          return;
+        }
+        res.writeHead(400);
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+    const address = listener.address();
+    assert.ok(address && typeof address === "object");
+    const httpUrl = `http://127.0.0.1:${address.port}/mcp`;
+
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 1 };
+    const manager = new ServerManager({
+      settings,
+      mcpServers: {
+        exits: {
+          command: process.execPath,
+          args: ["-e", "process.exit(1)"],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+        warmup: {
+          url: httpUrl,
+          args: [],
+          transport: "streamable-http",
+          lifecycle: "lazy",
+        },
+      },
+    });
+    const bridge = new ToolBridge(settings, makeMockPi());
+    manager.setToolRefreshCallback(async (name, client, options) => {
+      await bridge.refreshTools(name, client, options);
+    });
+
+    try {
+      await assert.rejects(
+        () => manager.startServer("exits", process.cwd()),
+        /Connection failed after 1 retries/,
+      );
+      await manager.startServer("warmup", process.cwd());
+      assert.equal(httpAttempts, 2);
+      assert.equal(manager.getServer("warmup")?.state, "ready");
+    } finally {
+      await manager.shutdownAll();
+      listener.closeAllConnections();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  it("invokes onRecoveryFailed immediately when mid-session _recover() hits ENOENT", async () => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 5 };
+    const realManager = new ServerManager({
+      settings,
+      mcpServers: {
+        vanish: {
+          command: "node",
+          args: ["--import", "tsx/esm", MOCK_SERVER_PATH],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+    const bridge = new ToolBridge(settings, makeMockPi());
+    realManager.setToolRefreshCallback(async (name, client, options) => {
+      await bridge.refreshTools(name, client, options);
+    });
+
+    let recoveryFailed: { name: string; error: Error } | null = null;
+    realManager.setRecoveryFailedCallback((name, error) => {
+      recoveryFailed = { name, error };
+    });
+
+    try {
+      await realManager.startServer("vanish", process.cwd());
+      const srv = realManager.getServer("vanish");
+      assert.ok(srv && srv.childPid);
+      // Simulate the binary disappearing before recovery re-spawns it.
+      srv.config = { ...srv.config, command: "missing-pi-mcp-executable-recover" };
+      process.kill(srv.childPid, "SIGKILL");
+
+      for (let i = 0; i < 200 && !recoveryFailed; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+      assert.ok(recoveryFailed, "Expected onRecoveryFailed to fire immediately");
+      const failed = recoveryFailed as { name: string; error: Error };
+      assert.equal(failed.name, "vanish");
+      assert.equal((failed.error as NodeJS.ErrnoException).code, "ENOENT");
+      assert.equal(srv.retryCount, 0);
+      assert.equal(srv.state, "stopped");
+    } finally {
+      await realManager.shutdownAll();
+    }
+  });
+
+  it("fast-fails on attempt 1 with unwrapped ENOENT when Windows cross-spawn wrapper resolves start() then emits ENOENT before close (#335)", async (t) => {
+    const settings = { toolPrefix: "mcp", requestTimeoutMs: 5000, maxRetries: 5 };
+    const manager = new ServerManager({
+      settings,
+      mcpServers: {
+        "win-cross-spawn": {
+          command: "missing-pi-mcp-executable-335",
+          args: [],
+          transport: "stdio",
+          lifecycle: "lazy",
+        },
+      },
+    });
+
+    const enoentError = Object.assign(
+      new Error("spawn missing-pi-mcp-executable-335 ENOENT"),
+      {
+        code: "ENOENT",
+        errno: -2,
+        syscall: "spawn missing-pi-mcp-executable-335",
+        path: "missing-pi-mcp-executable-335",
+      },
+    );
+
+    let createTransportCalls = 0;
+    t.mock.method(manager, "createTransport", () => {
+      createTransportCalls += 1;
+      const transport = new StdioClientTransport({
+        command: "missing-pi-mcp-executable-335",
+        args: [],
+        stderr: "pipe",
+      });
+      const fakeProc = Object.assign(new EventEmitter(), {
+        pid: 43210 + createTransportCalls,
+        exitCode: null as number | null,
+        signalCode: null,
+      });
+
+      // Simulate Windows cross-spawn: cmd.exe spawns (start() resolves), initialize is sent,
+      // then cmd.exe exits with 1 -> cross-spawn emits ENOENT right before close triggers -32000.
+      transport.start = async () => {
+        (transport as unknown as { _process: unknown })._process = fakeProc;
+        fakeProc.on("error", (err) => {
+          transport.onerror?.(err as Error);
+        });
+        fakeProc.on("close", () => {
+          (transport as unknown as { _process: undefined })._process = undefined;
+          transport.onclose?.();
+        });
+      };
+      transport.send = async () => {
+        queueMicrotask(() => {
+          fakeProc.exitCode = 1;
+          fakeProc.emit("error", enoentError);
+          fakeProc.emit("close", 1);
+        });
+      };
+      transport.close = async () => {
+        (transport as unknown as { _process: undefined })._process = undefined;
+      };
+      return transport;
+    });
+
+    try {
+      await assert.rejects(
+        () => manager.startServer("win-cross-spawn", process.cwd()),
+        (err: unknown) => {
+          assert.equal(err instanceof McpError, false);
+          assert.equal(err, enoentError);
+          assert.equal((err as NodeJS.ErrnoException).code, "ENOENT");
+          return true;
+        },
+      );
+      assert.equal(createTransportCalls, 1);
+      const srv = manager.getServer("win-cross-spawn");
+      assert.equal(srv?.retryCount, 0);
+      assert.equal(srv?.state, "stopped");
+      assert.equal(srv?.lastError, enoentError);
     } finally {
       await manager.shutdownAll();
     }
