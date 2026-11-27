@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.7] - 2026-11-27
+
 ### Fixed
 - The `<mcp_servers>` system prompt no longer hands the model an `mcp_connect` argument it can never match (#342). Disconnected indirect (`codemode` / `tool_search`) servers rendered `sanitizeNamespaceText(entry.name, 120)` as a literal `mcp_connect "<name>"` argument, but that sanitizer trims, collapses control characters, redacts secret-shaped text, and truncates — so an ordinary configured key such as `"basic calculator"`, `"secret:manager"`, `" trimmed-server "`, or one longer than 120 characters reached the prompt as `"basic [REDACTED]"` or `"long-server-xxx…"` and `mcp_connect` rejected it with `Unknown MCP server name` on the first turn. The hint now emits the literal argument only when sanitization leaves the configured name unchanged; otherwise it directs the model to `mcp_status` (which returns every configured name verbatim) for the exact name before calling `mcp_connect`, or only tells it to connect with `mcp_connect` when `mcp_status` is inactive. A rewritten name is never emitted as the `mcp_connect` argument; the sanitized, name-derived `namespace` still heads the server's bullet line exactly as before.
 
