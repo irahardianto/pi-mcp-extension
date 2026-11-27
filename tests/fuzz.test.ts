@@ -2655,9 +2655,12 @@ describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScrip
     fc.assert(
       fc.property(
         uniqueServersArb,
-        fc.option(fc.array(fc.constantFrom("read", "codemode", "tool_search"), { maxLength: 3 }), {
-          nil: undefined,
-        }),
+        fc.option(
+          fc.uniqueArray(fc.constantFrom("read", "codemode", "tool_search", "mcp_connect", "mcp_status"), {
+            maxLength: 5,
+          }),
+          { nil: undefined },
+        ),
         secretValArb,
         (servers, activeTools, rawSecret) => {
           const credPair = ["api_key", rawSecret].join("=");
@@ -2683,6 +2686,16 @@ describe("fuzz: renderMcpServersSection, buildMcpResultSchema, and buildMcpScrip
             assert.ok(forward.length <= MAX_SERVERS_SECTION_CHARS);
             assert.ok(!forward.includes("\u001b"), "ANSI escapes must be stripped");
             assert.ok(!forward.includes(rawSecret), "Injected credential value must be redacted");
+            // WHY: `mcp_connect` needs an exact configured name, so a literal hint argument must
+            // be one; `mcp_status` must never be suggested while it is inactive (#342).
+            const disconnectedNames = new Set(servers.filter((s) => !s.connected).map((s) => s.name));
+            for (const match of forward.matchAll(/not connected — mcp_connect ("(?:[^"\\]|\\.)*")\)/g)) {
+              const argument = JSON.parse(match[1]!) as string;
+              assert.ok(disconnectedNames.has(argument), `mcp_connect hint ${match[1]} must be an exact disconnected server name`);
+            }
+            if (activeTools !== undefined && !activeTools.includes("mcp_status")) {
+              assert.ok(!forward.includes("check mcp_status"), "mcp_status must not be suggested while inactive");
+            }
           }
         },
       ),
