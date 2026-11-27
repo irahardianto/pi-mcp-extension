@@ -19,8 +19,12 @@ import { z } from "zod";
 import { callbackServerConfigFromRedirectUrl } from "./callback-url.js";
 import {
   applyProjectOverrides,
+  isPlainObject,
+  isProjectOverrideEntry,
   normalizeAuthConfigAliases,
   normalizeServerConfigAliases,
+  resolveProjectOverride,
+  validateProjectOverrideKeys,
   withRegisteredServerLifecycle,
 } from "./config-compat.js";
 import { McpError } from "./errors.js";
@@ -249,14 +253,17 @@ const SettingsSchema = z.object({
   maxRetries: z.number().int().min(0).max(10).default(DEFAULT_SETTINGS.maxRetries),
 });
 
-const McpConfigSchema = z.object({
+const McpConfigEnvelopeSchema = z.object({
   settings: SettingsSchema.default(() => ({ ...DEFAULT_SETTINGS })),
-  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
+  mcpServers: z.record(z.string(), z.unknown()).default({}),
   /**
    * Pi 1.3.0 top-level switch (default `true` when omitted): activate the built-in `codemode`
    * tool automatically when a server with `"codemode"` exposure connects.
    */
   autoEnableCodemode: z.boolean().optional(),
+});
+const McpConfigSchema = McpConfigEnvelopeSchema.extend({
+  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
 });
 
 /**
@@ -272,12 +279,25 @@ const ProjectSettingsSchema = z.object({
   requestTimeoutMs: z.number().positive().optional(),
   maxRetries: z.number().int().min(0).max(10).optional(),
 });
-const ProjectConfigSchema = z.object({
+const ProjectConfigEnvelopeSchema = z.object({
   settings: ProjectSettingsSchema.default({}),
-  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
+  mcpServers: z.record(z.string(), z.unknown()).default({}),
   autoEnableCodemode: z.boolean().optional(),
 });
+const ProjectConfigSchema = ProjectConfigEnvelopeSchema.extend({
+  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
+});
 type ProjectConfig = z.output<typeof ProjectConfigSchema>;
+
+const ProjectOverrideFieldsSchema = z.preprocess(
+  normalizeServerConfigAliases,
+  ServerConfigObjectSchema.pick({
+    enabled: true,
+    lifecycle: true,
+    exposure: true,
+    toolExposure: true,
+  }),
+);
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
@@ -308,6 +328,20 @@ export interface LoadConfigOptions {
    * Default: `true`.
    */
   includeProjectConfig?: boolean;
+}
+
+/** Result of fault-tolerant session config loading with isolated per-server errors. */
+export interface SessionConfigLoadResult {
+  loaded: LoadedConfig;
+  serverErrors: McpError[];
+  /**
+   * Server names rejected from `mcp.json` that must not fall back to global or
+   * extension-registered entries of the same name (failed global entries, broken
+   * project overrides of global entries, and broken full project entries).
+   * Partial project overrides targeting a name absent from global `mcp.json` are
+   * excluded so an extension-registered server of that name stays active.
+   */
+  suppressedServers: ReadonlySet<string>;
 }
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
@@ -420,19 +454,263 @@ export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".pi", "agent");
 }
 
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
+
+function setOwnProperty<T>(target: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
 /** Winning file origin per server name: a project entry replaces a global entry of the same name. */
 function originsOf(
   globalCfg: McpConfig,
   projectCfg: ProjectConfig | undefined,
+  droppedNames: ReadonlySet<string> = EMPTY_STRING_SET,
 ): Record<string, FileConfigOrigin> {
   const origins: Record<string, FileConfigOrigin> = {};
   for (const name of Object.keys(globalCfg.mcpServers)) {
-    origins[name] = "global";
+    if (!droppedNames.has(name)) {
+      setOwnProperty(origins, name, "global");
+    }
   }
   for (const name of Object.keys(projectCfg?.mcpServers ?? {})) {
-    origins[name] = "project";
+    setOwnProperty(origins, name, "project");
   }
   return origins;
+}
+
+function extractRawServers(raw: unknown): Record<string, unknown> {
+  return isPlainObject(raw) && isPlainObject(raw.mcpServers) ? raw.mcpServers : {};
+}
+
+function formatServerValidationError(
+  name: string,
+  issues: z.ZodError["issues"],
+  sourcePath: string,
+): McpError {
+  const formatted = issues
+    .map((i) => `  mcpServers.${name}${i.path.length > 0 ? `.${i.path.join(".")}` : ""}: ${i.message}`)
+    .join("\n");
+  return new McpError(`Invalid mcp.json at ${sourcePath}:\n${formatted}`, "<config>", "config");
+}
+
+function parseGlobalServersTolerant(
+  rawServers: Record<string, unknown>,
+  sourcePath: string,
+): { servers: Record<string, ServerConfig>; invalidNames: Set<string>; errors: McpError[] } {
+  const servers: Record<string, ServerConfig> = {};
+  const invalidNames = new Set<string>();
+  const errors: McpError[] = [];
+  for (const [name, entry] of Object.entries(rawServers)) {
+    const result = ServerConfigSchema.safeParse(entry);
+    if (result.success) {
+      setOwnProperty(servers, name, result.data);
+    } else {
+      invalidNames.add(name);
+      errors.push(formatServerValidationError(name, result.error.issues, sourcePath));
+    }
+  }
+  return { servers, invalidNames, errors };
+}
+
+type ProjectServerEntryResult =
+  | { ok: true; value: ServerConfig }
+  | { ok: false; error?: McpError; suppressFallback: boolean };
+
+function parseValidatedProjectCandidate(
+  name: string,
+  candidate: unknown,
+  sourcePath: string,
+): ProjectServerEntryResult {
+  const parsed = ServerConfigSchema.safeParse(candidate);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: formatServerValidationError(name, parsed.error.issues, sourcePath),
+      suppressFallback: true,
+    };
+  }
+  return { ok: true, value: parsed.data };
+}
+
+function parseOverrideForInvalidGlobal(
+  name: string,
+  override: Record<string, unknown>,
+  sourcePath: string,
+): ProjectServerEntryResult {
+  const keyError = validateProjectOverrideKeys(name, override, sourcePath);
+  if (keyError) {
+    return { ok: false, error: keyError, suppressFallback: true };
+  }
+  const fields = ProjectOverrideFieldsSchema.safeParse(override);
+  if (!fields.success) {
+    return {
+      ok: false,
+      error: formatServerValidationError(name, fields.error.issues, sourcePath),
+      suppressFallback: true,
+    };
+  }
+  // WHY: global validation already reported the broken base server against the global file;
+  // drop the server without emitting a duplicate error falsely attributed to .pi/mcp.json.
+  return { ok: false, suppressFallback: true };
+}
+
+function parseProjectServerEntry(
+  name: string,
+  entry: unknown,
+  globalContext: {
+    rawServers: Record<string, unknown>;
+    invalidNames: ReadonlySet<string>;
+  },
+  sourcePath: string,
+): ProjectServerEntryResult {
+  if (!isProjectOverrideEntry(entry)) {
+    return parseValidatedProjectCandidate(name, entry, sourcePath);
+  }
+  if (globalContext.invalidNames.has(name)) {
+    return parseOverrideForInvalidGlobal(name, entry, sourcePath);
+  }
+  const resolved = resolveProjectOverride(name, entry, globalContext.rawServers, sourcePath);
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      error: resolved.error,
+      suppressFallback: Object.hasOwn(globalContext.rawServers, name),
+    };
+  }
+  return parseValidatedProjectCandidate(name, resolved.value, sourcePath);
+}
+
+function parseProjectServersTolerant(
+  rawServers: Record<string, unknown>,
+  globalContext: {
+    rawServers: Record<string, unknown>;
+    invalidNames: ReadonlySet<string>;
+  },
+  sourcePath: string,
+): {
+  servers: Record<string, ServerConfig>;
+  droppedNames: Set<string>;
+  suppressedNames: Set<string>;
+  errors: McpError[];
+} {
+  const servers: Record<string, ServerConfig> = {};
+  const droppedNames = new Set<string>();
+  const suppressedNames = new Set<string>();
+  const errors: McpError[] = [];
+  for (const [name, entry] of Object.entries(rawServers)) {
+    const parsed = parseProjectServerEntry(name, entry, globalContext, sourcePath);
+    if (parsed.ok) {
+      setOwnProperty(servers, name, parsed.value);
+    } else {
+      droppedNames.add(name);
+      if (parsed.suppressFallback) suppressedNames.add(name);
+      if (parsed.error) errors.push(parsed.error);
+    }
+  }
+  return { servers, droppedNames, suppressedNames, errors };
+}
+
+function filterDroppedServers(
+  servers: Record<string, ServerConfig>,
+  droppedNames: ReadonlySet<string>,
+): Record<string, ServerConfig> {
+  if (droppedNames.size === 0) return servers;
+  const filtered: Record<string, ServerConfig> = {};
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (!droppedNames.has(name)) {
+      setOwnProperty(filtered, name, cfg);
+    }
+  }
+  return filtered;
+}
+
+function mergeSessionConfigs(
+  globalCfg: McpConfig,
+  projectCfg: ProjectConfig,
+  droppedNames: ReadonlySet<string>,
+): McpConfig {
+  // WHY: a broken project override or replacement must drop the global server of that name
+  // rather than silently falling back to un-overridden global settings or credentials.
+  const keptGlobal: McpConfig = droppedNames.size === 0
+    ? globalCfg
+    : { ...globalCfg, mcpServers: filterDroppedServers(globalCfg.mcpServers, droppedNames) };
+  return mergeConfigs(keptGlobal, projectCfg);
+}
+
+function applyProjectSuppressedNames(
+  suppressedServers: Set<string>,
+  validProjectServers: Record<string, ServerConfig>,
+  projectSuppressedNames: ReadonlySet<string>,
+): void {
+  for (const name of Object.keys(validProjectServers)) {
+    suppressedServers.delete(name);
+  }
+  for (const name of projectSuppressedNames) {
+    suppressedServers.add(name);
+  }
+}
+
+/**
+ * Load and merge global and project configs for a session, isolating per-server validation errors
+ * and invalid project overrides so healthy sibling servers stay loaded. Whole-file errors (I/O,
+ * JSON syntax, non-object root/`mcpServers`, invalid `settings` or `autoEnableCodemode`) still
+ * throw `McpError("config")`.
+ */
+export async function loadSessionConfigWithOrigins(
+  cwd: string,
+  globalPath = join(agentDir(), "mcp.json"),
+  options?: LoadConfigOptions,
+): Promise<SessionConfigLoadResult> {
+  const projectConfigIncluded = options?.includeProjectConfig !== false;
+  const projectConfigPath = join(cwd, ".pi", "mcp.json");
+
+  const [globalRaw, projectRaw] = await Promise.all([
+    readJsonFile(globalPath),
+    projectConfigIncluded ? readJsonFile(projectConfigPath) : Promise.resolve(undefined),
+  ]);
+
+  const serverErrors: McpError[] = [];
+  const globalEnvelope = globalRaw !== undefined
+    ? parseWith(McpConfigEnvelopeSchema, globalRaw, globalPath)
+    : McpConfigEnvelopeSchema.parse({});
+  const globalRawServers = extractRawServers(globalRaw);
+  const globalParsed = parseGlobalServersTolerant(globalRawServers, globalPath);
+  serverErrors.push(...globalParsed.errors);
+  const globalCfg: McpConfig = { ...globalEnvelope, mcpServers: globalParsed.servers };
+  const suppressedServers = new Set<string>(globalParsed.invalidNames);
+
+  let projectCfg: ProjectConfig | undefined;
+  let droppedNames: ReadonlySet<string> = EMPTY_STRING_SET;
+  if (projectRaw !== undefined) {
+    const projectEnvelope = parseWith(ProjectConfigEnvelopeSchema, projectRaw, projectConfigPath);
+    const projectParsed = parseProjectServersTolerant(
+      extractRawServers(projectRaw),
+      { rawServers: globalRawServers, invalidNames: globalParsed.invalidNames },
+      projectConfigPath,
+    );
+    serverErrors.push(...projectParsed.errors);
+    droppedNames = projectParsed.droppedNames;
+    applyProjectSuppressedNames(suppressedServers, projectParsed.servers, projectParsed.suppressedNames);
+    projectCfg = { ...projectEnvelope, mcpServers: projectParsed.servers };
+  }
+
+  return {
+    loaded: {
+      config: projectCfg === undefined
+        ? globalCfg
+        : mergeSessionConfigs(globalCfg, projectCfg, droppedNames),
+      origins: originsOf(globalCfg, projectCfg, droppedNames),
+      projectConfigPath,
+      projectConfigIncluded,
+    },
+    serverErrors,
+    suppressedServers,
+  };
 }
 
 /**
