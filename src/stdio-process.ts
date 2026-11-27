@@ -14,21 +14,13 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { isNonRetryableStdioSpawnError } from "./connect-policy.js";
-import {
-  listDescendantPidsSync,
-  StdioExitGuard,
-  terminatePidTreeSync,
-} from "./stdio-exit-guard.js";
+import { indexProcessTable, StdioExitGuard } from "./stdio-exit-guard.js";
+
+export { indexProcessTable } from "./stdio-exit-guard.js";
 
 const execFileAsync = promisify(execFile);
 
-const defaultStdioExitGuard = new StdioExitGuard({
-  terminatePidTreeSync: (pid) =>
-    terminatePidTreeSync(pid, {
-      listDescendantPidsSync: (root) =>
-        listDescendantPidsSync(root, undefined, indexProcessTable),
-    }),
-});
+const defaultStdioExitGuard = new StdioExitGuard();
 
 // ─── Line Splitting ───────────────────────────────────────────────────────────
 
@@ -423,24 +415,6 @@ async function readPsProcessTable(): Promise<Map<number, number[]>> {
     timeout: PS_TIMEOUT_MS,
   });
   return indexProcessTable(stdout);
-}
-
-/** Index `ps -A -o pid=,ppid=` output as a parent PID → child PIDs map. */
-export function indexProcessTable(stdout: string): Map<number, number[]> {
-  const childrenOf = new Map<number, number[]>();
-  for (const line of stdout.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-    if (!match) continue;
-    const childPid = Number(match[1]);
-    const parentPid = Number(match[2]);
-    const siblings = childrenOf.get(parentPid);
-    if (siblings) {
-      siblings.push(childPid);
-    } else {
-      childrenOf.set(parentPid, [childPid]);
-    }
-  }
-  return childrenOf;
 }
 
 function createPlatformChildReader(): (pid: number) => Promise<number[]> {

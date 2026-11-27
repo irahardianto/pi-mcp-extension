@@ -1325,7 +1325,8 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     };
   }
 
-  it("counts passive signal-exit v3 and v4 SIGINT listeners safely", () => {
+  it("counts passive signal-exit v3 (process) and v4 (globalThis) SIGINT listeners safely", () => {
+    const v4Sym = Symbol.for("signal-exit emitter");
     assert.equal(countPassiveSigintListeners(null), 0);
     assert.equal(countPassiveSigintListeners("not-an-object"), 0);
     assert.equal(countPassiveSigintListeners({}), 0);
@@ -1333,15 +1334,16 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: -1 } }), 0);
     assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: 1.5 } }), 0);
     assert.equal(countPassiveSigintListeners({ __signal_exit_emitter__: { count: 1 } }), 1);
+
+    // signal-exit v4 stores its emitter on globalThis, never on process.
+    assert.equal(countPassiveSigintListeners({ [v4Sym]: { count: 2 } }), 0);
+    assert.equal(countPassiveSigintListeners({}, { [v4Sym]: { count: 2 } }), 2);
+    assert.equal(countPassiveSigintListeners({}, { [v4Sym]: { count: 0 } }), 0);
     assert.equal(
-      countPassiveSigintListeners({ [Symbol.for("signal-exit emitter")]: { count: 2 } }),
-      2,
-    );
-    assert.equal(
-      countPassiveSigintListeners({
-        __signal_exit_emitter__: { count: 1 },
-        [Symbol.for("signal-exit emitter")]: { count: 1 },
-      }),
+      countPassiveSigintListeners(
+        { __signal_exit_emitter__: { count: 1 } },
+        { [v4Sym]: { count: 1 } },
+      ),
       2,
     );
   });
@@ -1388,20 +1390,25 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
   });
 
   it("yields as a no-op on SIGINT when another active listener is attached (TUI Ctrl+Z)", () => {
+    const v4Sym = Symbol.for("signal-exit emitter");
     const { proc, kills } = createFakeProcess(5555);
     const terminated: number[] = [];
+    const globalScope: Record<symbol, unknown> = { [v4Sym]: { count: 1 } };
     const guard = new StdioExitGuard({
       proc,
+      globalScope,
       terminatePidTreeSync: (pid) => terminated.push(pid),
     });
 
-    // Simulate signal-exit v3 passive listener + Pi TUI's transient ignoreSigint listener.
+    // Simulate signal-exit v3 + v4 passive listeners + Pi TUI's transient ignoreSigint listener.
     (proc as unknown as { __signal_exit_emitter__?: { count: number } }).__signal_exit_emitter__ = {
       count: 1,
     };
-    const passiveSigExit = (): void => {};
+    const passiveSigExitV3 = (): void => {};
+    const passiveSigExitV4 = (): void => {};
     const ignoreSigint = (): void => {};
-    proc.on("SIGINT", passiveSigExit);
+    proc.on("SIGINT", passiveSigExitV3);
+    proc.on("SIGINT", passiveSigExitV4);
     proc.on("SIGINT", ignoreSigint);
     guard.track(1001);
 
@@ -1409,11 +1416,13 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     assert.deepEqual(terminated, []);
     assert.deepEqual(kills, []);
     assert.equal(guard.trackedCount(), 1);
-    assert.equal(proc.listenerCount("SIGINT"), 3);
+    assert.equal(proc.listenerCount("SIGINT"), 4);
 
     // Also verify without signal-exit present (another active host listener alone).
-    proc.off("SIGINT", passiveSigExit);
+    proc.off("SIGINT", passiveSigExitV3);
+    proc.off("SIGINT", passiveSigExitV4);
     delete (proc as unknown as { __signal_exit_emitter__?: unknown }).__signal_exit_emitter__;
+    delete globalScope[v4Sym];
     proc.emit("SIGINT");
     assert.deepEqual(terminated, []);
     assert.deepEqual(kills, []);
@@ -1424,7 +1433,9 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     assert.equal(proc.listenerCount("exit"), 0);
   });
 
-  it("terminates tracked trees and re-raises SIGINT when sole active listener (with or without signal-exit)", () => {
+  it("terminates tracked trees and re-raises SIGINT when sole active listener (with or without signal-exit v3/v4)", () => {
+    const v4Sym = Symbol.for("signal-exit emitter");
+
     // Case 1: no signal-exit
     {
       const { proc, kills } = createFakeProcess(7001);
@@ -1444,7 +1455,7 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
       assert.equal(proc.listenerCount("exit"), 0);
     }
 
-    // Case 2: signal-exit v3 present (listenerCount=2, count=1 -> otherActiveListeners=0)
+    // Case 2: signal-exit v3 present on proc (listenerCount=2, count=1 -> otherActiveListeners=0)
     {
       const { proc, kills } = createFakeProcess(7002);
       const terminated: number[] = [];
@@ -1460,6 +1471,26 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
       proc.emit("SIGINT");
       assert.deepEqual(terminated, [2003]);
       assert.deepEqual(kills, [{ pid: 7002, signal: "SIGINT" }]);
+      assert.equal(guard.trackedCount(), 0);
+      assert.equal(proc.listenerCount("SIGINT"), 1);
+      assert.equal(proc.listenerCount("exit"), 0);
+    }
+
+    // Case 3: signal-exit v4 present on globalThis (listenerCount=2, count=1 -> otherActiveListeners=0)
+    {
+      const { proc, kills } = createFakeProcess(7005);
+      const terminated: number[] = [];
+      const guard = new StdioExitGuard({
+        proc,
+        globalScope: { [v4Sym]: { count: 1 } },
+        terminatePidTreeSync: (pid) => terminated.push(pid),
+      });
+      proc.on("SIGINT", () => {});
+      guard.track(2004);
+
+      proc.emit("SIGINT");
+      assert.deepEqual(terminated, [2004]);
+      assert.deepEqual(kills, [{ pid: 7005, signal: "SIGINT" }]);
       assert.equal(guard.trackedCount(), 0);
       assert.equal(proc.listenerCount("SIGINT"), 1);
       assert.equal(proc.listenerCount("exit"), 0);
@@ -1503,7 +1534,7 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     assert.equal(proc.listenerCount("exit"), 0);
   });
 
-  it("listDescendantPidsSync walks deepest-first, handles cycles, and bounds errors", () => {
+  it("listDescendantPidsSync walks deepest-first, handles cycles, and isolates mid-walk child errors", () => {
     const tree = new Map<number, number[]>([
       [1, [2, 3]],
       [2, [4]],
@@ -1520,9 +1551,23 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
       }),
       [],
     );
+
+    // If child 2 exits mid-walk (throwing ENOENT), sibling 3 and its descendants are still discovered.
+    const midWalkTree = new Map<number, number[]>([
+      [1, [2, 3]],
+      [3, [5]],
+      [5, []],
+    ]);
+    assert.deepEqual(
+      listDescendantPidsSync(1, (pid) => {
+        if (pid === 2) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return midWalkTree.get(pid) ?? [];
+      }),
+      [5, 3, 2],
+    );
   });
 
-  it("listDescendantPidsSync finds live child processes on POSIX (/proc or ps)", {
+  it("listDescendantPidsSync and terminatePidTreeSync find live children with default args on POSIX (/proc and ps)", {
     skip: process.platform === "win32" && "WHY: Windows has no /proc or ps",
   }, async () => {
     const { spawn } = await import("node:child_process");
@@ -1535,23 +1580,33 @@ describe("StdioExitGuard and sync tree cleanup (#336)", () => {
     });
     try {
       assert.ok(child.pid);
-      const linuxOrPosix = listDescendantPidsSync(process.pid, undefined, indexProcessTable);
-      assert.ok(linuxOrPosix.includes(child.pid), `Expected ${child.pid} in ${linuxOrPosix.join(",")}`);
+      const nativeResult = listDescendantPidsSync(process.pid);
+      assert.ok(nativeResult.includes(child.pid), `Expected ${child.pid} in ${nativeResult.join(",")}`);
 
-      const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
-      Object.defineProperty(process, "platform", {
-        configurable: true,
-        enumerable: true,
-        value: "darwin",
+      // Exercise the non-Linux POSIX `ps` snapshot path without mutating process.platform.
+      const psResult = listDescendantPidsSync(process.pid, undefined, "darwin");
+      assert.ok(psResult.includes(child.pid), `Expected ${child.pid} via ps in ${psResult.join(",")}`);
+
+      // Default terminatePidTreeSync on macOS discovers descendants without a custom parser.
+      const signalled: number[] = [];
+      terminatePidTreeSync(process.pid, {
+        platform: "darwin",
+        kill: (target) => {
+          signalled.push(target);
+        },
       });
-      try {
-        const psResult = listDescendantPidsSync(process.pid, undefined, indexProcessTable);
-        assert.ok(psResult.includes(child.pid), `Expected ${child.pid} via ps in ${psResult.join(",")}`);
-      } finally {
-        if (descriptor) Object.defineProperty(process, "platform", descriptor);
-      }
+      assert.ok(signalled.includes(child.pid), `Expected ${child.pid} signalled via default ps discovery`);
+      assert.equal(signalled.at(-1), process.pid);
     } finally {
+      const exited = new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once("exit", () => resolve());
+      });
       child.kill("SIGKILL");
+      await exited;
     }
   });
 

@@ -40,6 +40,7 @@ export interface SyncTreeTerminationDeps {
 
 export interface StdioExitGuardDeps {
   proc: SignalExitProcess;
+  globalScope?: unknown;
   terminatePidTreeSync: (pid: number) => void;
 }
 
@@ -48,19 +49,57 @@ function readPositiveCount(holder: unknown): number {
   return typeof count === "number" && Number.isInteger(count) && count > 0 ? count : 0;
 }
 
+function resolveGlobalScope(proc: unknown, globalScope?: unknown): unknown {
+  if (globalScope !== undefined) return globalScope;
+  return proc === process ? globalThis : undefined;
+}
+
 /**
  * Count passive `signal-exit` v3/v4 `SIGINT` listeners attached to `proc`.
  *
- * WHY: Pi 1.3.0 bundles `signal-exit` v3 (via `proper-lockfile`), which registers a `SIGINT`
- * listener that only acts when `listeners.length === emitter.count`. Subtracting those passive
- * wrappers lets our guard detect whether an active host handler (such as Pi TUI's `Ctrl+Z`
- * `ignoreSigint`) owns `SIGINT` without deadlocking in headless `rpc`/`json`/`print` modes.
+ * WHY: Pi 1.3.0 bundles `signal-exit` v3 (via `proper-lockfile`), which stores its emitter on
+ * `process.__signal_exit_emitter__`, while `signal-exit` v4 stores its emitter on
+ * `globalThis[Symbol.for("signal-exit emitter")]`. Both register passive `SIGINT` listeners
+ * that only act when `listeners.length === count`. Subtracting those passive wrappers lets our
+ * guard detect whether an active host handler (such as Pi TUI's `Ctrl+Z` `ignoreSigint`) owns
+ * `SIGINT` without deadlocking in headless `rpc`/`json`/`print` modes.
  */
-export function countPassiveSigintListeners(proc: unknown): number {
+export function countPassiveSigintListeners(proc: unknown, globalScope?: unknown): number {
   if (!proc || typeof proc !== "object") return 0;
   const v3 = (proc as { __signal_exit_emitter__?: unknown }).__signal_exit_emitter__;
-  const v4 = (proc as Record<symbol, unknown>)[SIGNAL_EXIT_V4_SYMBOL];
+  const scope = resolveGlobalScope(proc, globalScope);
+  const v4 =
+    scope && typeof scope === "object"
+      ? (scope as Record<symbol, unknown>)[SIGNAL_EXIT_V4_SYMBOL]
+      : undefined;
   return readPositiveCount(v3) + readPositiveCount(v4);
+}
+
+/** Index `ps -A -o pid=,ppid=` output as a parent PID → child PIDs map. */
+export function indexProcessTable(stdout: string): Map<number, number[]> {
+  const childrenOf = new Map<number, number[]>();
+  for (const line of stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!match) continue;
+    const childPid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    const siblings = childrenOf.get(parentPid);
+    if (siblings) {
+      siblings.push(childPid);
+    } else {
+      childrenOf.set(parentPid, [childPid]);
+    }
+  }
+  return childrenOf;
+}
+
+function readTaskIdsSync(taskDir: string): string[] {
+  try {
+    return readdirSync(taskDir);
+  } catch {
+    // WHY: Best-effort sync /proc walk during signal/exit; a child can exit before its task dir is read.
+    return [];
+  }
 }
 
 function readChildrenFileSync(path: string): string {
@@ -74,7 +113,7 @@ function readChildrenFileSync(path: string): string {
 
 function readProcChildrenSync(pid: number): number[] {
   const taskDir = `/proc/${pid}/task`;
-  const tids = readdirSync(taskDir);
+  const tids = readTaskIdsSync(taskDir);
   const children: number[] = [];
   for (const tid of tids) {
     const raw = readChildrenFileSync(`${taskDir}/${tid}/children`);
@@ -88,40 +127,50 @@ function readProcChildrenSync(pid: number): number[] {
   return children;
 }
 
-function readPsProcessTableSync(
-  parseProcessTable?: (stdout: string) => Map<number, number[]>,
-): Map<number, number[]> {
-  if (!parseProcessTable) return new Map();
-  const stdout = execFileSync("ps", ["-A", "-o", "pid=,ppid="], {
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: PS_SYNC_TIMEOUT_MS,
-  });
-  return parseProcessTable(stdout);
+function readPsProcessTableSync(): Map<number, number[]> {
+  try {
+    const stdout = execFileSync("ps", ["-A", "-o", "pid=,ppid="], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: PS_SYNC_TIMEOUT_MS,
+    });
+    return indexProcessTable(stdout);
+  } catch {
+    // WHY: Best-effort sync discovery during signal/exit; cache an empty table so one missing or
+    // slow `ps` does not stall remaining roots, which still receive SIGTERM directly.
+    return new Map();
+  }
 }
 
-function createSyncChildReader(
-  parseProcessTable?: (stdout: string) => Map<number, number[]>,
-): (pid: number) => number[] {
-  if (process.platform === "linux") return readProcChildrenSync;
-  if (process.platform === "win32") return () => [];
+function createSyncChildReader(platform: NodeJS.Platform = process.platform): (pid: number) => number[] {
+  if (platform === "linux") return readProcChildrenSync;
+  if (platform === "win32") return () => [];
   let table: Map<number, number[]> | null = null;
   return (pid: number): number[] => {
-    table ??= readPsProcessTableSync(parseProcessTable);
+    table ??= readPsProcessTableSync();
     return table.get(pid) ?? [];
   };
+}
+
+function readChildrenSafe(pid: number, readChildren: (pid: number) => number[]): number[] {
+  try {
+    return readChildren(pid);
+  } catch {
+    // WHY: Best-effort sync discovery during signal/exit; one exited child must not abort sibling discovery.
+    return [];
+  }
 }
 
 function walkDescendantsSync(pid: number, readChildren: (pid: number) => number[]): number[] {
   const descendants: number[] = [];
   const seen = new Set<number>([pid]);
-  const pending = [...readChildren(pid)];
+  const pending = [...readChildrenSafe(pid, readChildren)];
   while (pending.length > 0 && descendants.length < MAX_DESCENDANTS) {
     const next = pending.shift();
     if (next === undefined || seen.has(next)) continue;
     seen.add(next);
     descendants.push(next);
-    pending.push(...readChildren(next));
+    pending.push(...readChildrenSafe(next, readChildren));
   }
   return descendants;
 }
@@ -133,15 +182,10 @@ function walkDescendantsSync(pid: number, readChildren: (pid: number) => number[
 export function listDescendantPidsSync(
   pid: number,
   readChildren?: (pid: number) => number[],
-  parseProcessTable?: (stdout: string) => Map<number, number[]>,
+  platform: NodeJS.Platform = process.platform,
 ): number[] {
-  try {
-    const reader = readChildren ?? createSyncChildReader(parseProcessTable);
-    return walkDescendantsSync(pid, reader).reverse();
-  } catch {
-    // WHY: Best-effort sync discovery during signal/exit; fallback still signals the root PID.
-    return [];
-  }
+  const reader = readChildren ?? createSyncChildReader(platform);
+  return walkDescendantsSync(pid, reader).reverse();
 }
 
 function trySignalSync(
@@ -188,7 +232,9 @@ export function terminatePidTreeSync(
     killWindowsTreeSync(pid, deps?.spawnSync ?? spawnSync, kill);
     return;
   }
-  const listDescendants = deps?.listDescendantPidsSync ?? listDescendantPidsSync;
+  const listDescendants =
+    deps?.listDescendantPidsSync ??
+    ((root: number) => listDescendantPidsSync(root, undefined, platform));
   const targets = [...listDescendants(pid), pid];
   for (const target of targets) {
     trySignalSync(target, "SIGTERM", kill);
@@ -208,7 +254,8 @@ function isValidPositivePid(pid: number | null | undefined): pid is number {
 export class StdioExitGuard {
   private readonly pids = new Set<number>();
   private readonly proc: SignalExitProcess;
-  private readonly killTreeSync: (pid: number) => void;
+  private readonly globalScope: unknown;
+  private readonly customKillTreeSync: ((pid: number) => void) | undefined;
   private attached = false;
 
   private readonly onSigint = (): void => {
@@ -216,7 +263,9 @@ export class StdioExitGuard {
     // active listener owns SIGINT; ignore passive signal-exit wrappers so headless rpc/json/print
     // modes do not deadlock when both listeners are present.
     const otherActive =
-      this.proc.listenerCount("SIGINT") - 1 - countPassiveSigintListeners(this.proc);
+      this.proc.listenerCount("SIGINT") -
+      1 -
+      countPassiveSigintListeners(this.proc, this.globalScope);
     if (otherActive > 0) return;
     this.terminateAll();
     this.reRaiseSigint();
@@ -228,7 +277,11 @@ export class StdioExitGuard {
 
   constructor(deps?: Partial<StdioExitGuardDeps>) {
     this.proc = deps?.proc ?? (process as unknown as SignalExitProcess);
-    this.killTreeSync = deps?.terminatePidTreeSync ?? ((pid) => terminatePidTreeSync(pid));
+    this.globalScope =
+      deps && "globalScope" in deps
+        ? deps.globalScope
+        : resolveGlobalScope(this.proc);
+    this.customKillTreeSync = deps?.terminatePidTreeSync;
   }
 
   track(pid: number): void {
@@ -270,8 +323,18 @@ export class StdioExitGuard {
     const snapshot = [...this.pids];
     this.pids.clear();
     this.syncListeners();
+    if (this.customKillTreeSync) {
+      for (const pid of snapshot) {
+        this.customKillTreeSync(pid);
+      }
+      return;
+    }
+    // WHY: Share one sync child reader across every tracked root so macOS/BSD teardown runs
+    // at most one bounded `ps` snapshot even when several stdio servers are running.
+    const reader = createSyncChildReader();
+    const listDescendants = (root: number): number[] => listDescendantPidsSync(root, reader);
     for (const pid of snapshot) {
-      this.killTreeSync(pid);
+      terminatePidTreeSync(pid, { listDescendantPidsSync: listDescendants });
     }
   }
 
