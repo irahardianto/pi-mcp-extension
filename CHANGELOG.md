@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.5] - 2026-11-27
+
 ### Fixed
 - Per-server `mcp.json` validation errors and invalid/unknown Pi 1.3.0 partial project overrides no longer wipe out every healthy server across global and project configs (#337). Session loading (`loadSessionConfigWithOrigins`) still fails the whole file on I/O, JSON/JSONC syntax, non-object root/`mcpServers`, or invalid `settings`/`autoEnableCodemode`, while isolating individual `mcpServers.<name>` failures into per-server `Config error` notifications, dropping any global server whose project override or replacement is invalid rather than falling back to un-overridden global settings or same-named extension servers, and keeping all valid global, project, and extension-registered servers active. Strict `loadConfig()` and `loadConfigWithOrigins()` retain their throwing contract.
 
