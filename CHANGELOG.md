@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.16.8] - 2026-11-28
+
 ### Fixed
 - Cross-server tool name collisions no longer depend on connection order or live `tools/list_changed` timing (#331). Configured peers with identical sanitized stems (`my-srv` vs `my_srv`) deterministically award unhashed `<prefix>_<server>_<tool>` identifiers to the lossless/code-point winner while losing peers always hash; cross-server `_` boundary collisions (`a`/`b_c` vs `a_b`/`c`) symmetrically move both tools to their deterministic hashed names while hiding the ambiguous unhashed name, remembering prior unhashed ownership across transient `list_changed` withdrawals, preserving CLI `--tools` / `--exclude-tools` allowlisted hashed names on displacement, and resetting session-scoped collision state across non-reload session shutdowns.
 - Bridged MCP server tools can no longer overwrite or disable `pi-mcp-extension`'s built-in management/resource tools (`mcp_list_resources`, `mcp_read_resource`, `mcp_status`, `mcp_connect`) or peer extensions' tools (such as custom `toolPrefix` collisions) (#332). Reserved management names and foreign `pi.getAllTools()` tools are excluded from unhashed assignment while retired `hidden` placeholders of removed or withdrawn MCP servers remain reclaimable.
