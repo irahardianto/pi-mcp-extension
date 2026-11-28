@@ -115,10 +115,23 @@ async function raceWithAbort<T>(
   }
 }
 
+export interface CollectPagesOptions {
+  /** Invoked when pagination stops at `MAX_PAGES` while the server still returns `nextCursor`. */
+  onLimit?: (() => void) | undefined;
+}
+
+interface CollectCursorPagesParams<T> {
+  serverName: string;
+  method: string;
+  signal: AbortSignal | undefined;
+  fetchPage: (cursor: string | undefined) => Promise<ResourcePage<T>>;
+  onLimit?: (() => void) | undefined;
+}
+
 /**
  * Follow a cursor across pages until the server stops sending one, degrading a JSON-RPC
  * `-32601 Method not found` response to an empty list.
- * `onLimit` marks a partial result when the page limit stops discovery.
+ * `options.onLimit` marks a partial result when the page limit stops discovery.
  * Aborts surface as {@link AuthCancelledError}; every other failure reaches the caller.
  */
 export async function collectPages<T>(
@@ -126,10 +139,10 @@ export async function collectPages<T>(
   method: string,
   signal: AbortSignal | undefined,
   fetchPage: (cursor: string | undefined) => Promise<ResourcePage<T>>,
-  onLimit?: () => void,
+  options?: CollectPagesOptions,
 ): Promise<T[]> {
   try {
-    return await collectCursorPages(serverName, method, signal, fetchPage, onLimit);
+    return await collectCursorPages({ serverName, method, signal, fetchPage, onLimit: options?.onLimit });
   } catch (err) {
     if (isCancellationError(err, signal)) {
       throw err instanceof AuthCancelledError ? err : new AuthCancelledError(serverName);
@@ -139,13 +152,8 @@ export async function collectPages<T>(
   }
 }
 
-async function collectCursorPages<T>(
-  serverName: string,
-  method: string,
-  signal: AbortSignal | undefined,
-  fetchPage: (cursor: string | undefined) => Promise<ResourcePage<T>>,
-  onLimit?: () => void,
-): Promise<T[]> {
+async function collectCursorPages<T>(params: CollectCursorPagesParams<T>): Promise<T[]> {
+  const { serverName, method, signal, fetchPage, onLimit } = params;
   const items: T[] = [];
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
@@ -222,24 +230,24 @@ export async function listAllResources(
   client: Client,
   serverName: string,
   options: ResourceRequestOptions,
-  onLimit?: () => void,
+  pagination?: CollectPagesOptions,
 ): Promise<McpResourceDefinition[]> {
   return collectPages(serverName, "resources/list", options.signal, async (cursor) => {
     const result = await fetchResourcesPage(client, cursor, options);
     return { items: result.resources.map(toResourceDefinition), nextCursor: result.nextCursor };
-  }, onLimit);
+  }, pagination);
 }
 
 export async function listAllResourceTemplates(
   client: Client,
   serverName: string,
   options: ResourceRequestOptions,
-  onLimit?: () => void,
+  pagination?: CollectPagesOptions,
 ): Promise<McpResourceTemplateDefinition[]> {
   return collectPages(serverName, "resources/templates/list", options.signal, async (cursor) => {
     const result = await fetchResourceTemplatesPage(client, cursor, options);
     return { items: result.resourceTemplates.map(toResourceTemplateDefinition), nextCursor: result.nextCursor };
-  }, onLimit);
+  }, pagination);
 }
 
 function toResourceDefinition(resource: ListResourcesResult["resources"][number]): McpResourceDefinition {
@@ -543,8 +551,9 @@ export class ResourceBridge {
     onLimit: () => void,
   ): Promise<ResourceCatalog> {
     try {
-      const resources = await listAllResources(client, serverName, options, onLimit);
-      const templates = await listAllResourceTemplates(client, serverName, options, onLimit);
+      const pagination: CollectPagesOptions = { onLimit };
+      const resources = await listAllResources(client, serverName, options, pagination);
+      const templates = await listAllResourceTemplates(client, serverName, options, pagination);
       return { resources, templates };
     } catch (err) {
       return await this._rethrowFailure(serverName, err, options.signal);

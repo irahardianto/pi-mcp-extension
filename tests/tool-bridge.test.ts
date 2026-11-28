@@ -3782,6 +3782,114 @@ describe("listAllTools pagination", () => {
     }
   });
 
+  it("rejects a cursor repeated on the 100th tools page without emitting a pagination-limit warning", async () => {
+    const notices: string[] = [];
+    const repeatCursor = "secret-tools-page-1-cursor";
+    let pages = 0;
+    const client = {
+      listTools: async () => {
+        pages++;
+        const nextCursor = pages === 1 || pages === 100 ? repeatCursor : `cursor-${pages}`;
+        return { tools: [{ name: `tool_${pages}`, inputSchema: {} }], nextCursor };
+      },
+    } as unknown as Client;
+    setDiagnosticUi({ notify: (message, level) => notices.push(`${level}: ${message}`) }, true);
+    try {
+      await assert.rejects(discoverServerTools({ client, serverName: "srv", requestTimeoutMs: 1000 }), (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, "protocol");
+        assert.equal(err.message, "Failed to list tools from srv: tools/list pagination cursor repeated; server may be malfunctioning");
+        assert.ok(!`${err.message} ${err.stack} ${JSON.stringify(err)}`.includes(repeatCursor));
+        return true;
+      });
+      assert.equal(pages, 100);
+      assert.deepEqual(notices, []);
+    } finally {
+      setDiagnosticUi(null, false);
+    }
+  });
+
+  it("returns all 100 pages without warning when the 100th tools page clears nextCursor", async () => {
+    const notices: string[] = [];
+    let pages = 0;
+    const client = {
+      listTools: async () => {
+        pages++;
+        return {
+          tools: [{ name: `tool_${pages}`, inputSchema: {} }],
+          nextCursor: pages < 100 ? `cursor-${pages}` : undefined,
+        };
+      },
+    } as unknown as Client;
+    setDiagnosticUi({ notify: (message, level) => notices.push(`${level}: ${message}`) }, true);
+    try {
+      const tools = await listAllTools(client, 1000, undefined, "srv");
+      assert.equal(pages, 100);
+      assert.equal(tools.length, 100);
+      assert.deepEqual(notices, []);
+    } finally {
+      setDiagnosticUi(null, false);
+    }
+  });
+
+  it("preserves previously active tools when a live ToolBridge.refreshTools hits a repeated cursor", async () => {
+    const registered = new Map<string, { name: string; exposure?: string }>();
+    let active: string[] = ["read"];
+    const bridge = new ToolBridge(
+      { toolPrefix: "mcp", requestTimeoutMs: 1000, maxRetries: 2 },
+      {
+        registerTool: (t: unknown) => {
+          const tool = t as { name: string; exposure?: string };
+          registered.set(tool.name, tool);
+          if (tool.exposure === "direct" && !active.includes(tool.name)) {
+            active = [...active, tool.name];
+          }
+        },
+        getActiveTools: () => [...active],
+        setActiveTools: (names: string[]) => {
+          active = [...names];
+        },
+      },
+    );
+
+    let broken = false;
+    let cyclingCalls = 0;
+    const client = {
+      listTools: async () => {
+        if (!broken) {
+          return {
+            tools: [
+              { name: "alpha", inputSchema: {} },
+              { name: "beta", inputSchema: {} },
+            ],
+          };
+        }
+        cyclingCalls++;
+        return {
+          tools: [{ name: "alpha", inputSchema: {} }],
+          nextCursor: "stuck-cursor",
+        };
+      },
+    } as unknown as Client;
+
+    await bridge.refreshTools("srv", client);
+    assert.deepEqual(active, ["read", "mcp_srv_alpha", "mcp_srv_beta"]);
+    assert.deepEqual(bridge.getToolActivity("srv"), { discovered: 2, active: 2, expected: 2 });
+
+    broken = true;
+    await assert.rejects(bridge.refreshTools("srv", client), (err: unknown) => {
+      assert.ok(err instanceof McpError);
+      assert.equal(err.code, "protocol");
+      assert.equal(err.message, "Failed to list tools from srv: tools/list pagination cursor repeated; server may be malfunctioning");
+      return true;
+    });
+
+    assert.equal(cyclingCalls, 2);
+    assert.deepEqual(active, ["read", "mcp_srv_alpha", "mcp_srv_beta"]);
+    assert.deepEqual(bridge.getToolActivity("srv"), { discovered: 2, active: 2, expected: 2 });
+    assert.deepEqual([...registered.keys()], ["mcp_srv_alpha", "mcp_srv_beta"]);
+  });
+
   it("follows nextCursor until exhausted", async () => {
     const pages = [
       { tools: [{ name: "tool_a", inputSchema: {} }], nextCursor: "page2" },
