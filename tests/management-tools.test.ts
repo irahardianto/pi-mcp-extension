@@ -8,6 +8,7 @@ import extension from "../src/index.js";
 import { acquireAuthLock, AuthLockError, AuthRequiredError, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
 import { formatMcpConnectError, formatConnectSuccess, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
+import { buildToolName } from "../src/tool-names.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 for (const { name, error, options, expected } of [
@@ -1252,4 +1253,364 @@ it("before_agent_start omits mcp_servers when active codemode tool lacks reaches
   }
 });
 
+it("preserves built-in resource tools and peer-extension tools across colliding MCP servers and /mcp:stop (#332)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-reserved-tools-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const serverScript = join(dir, "colliding-server.mjs");
+  const noopExecute = async () => ({ content: [{ type: "text", text: "peer-git-ok" }] as [{ type: "text"; text: string }] });
+  const mockExt = createMockExtension({
+    activeTools: ["read", "git_commit_amend"],
+    tools: [
+      { name: "read", description: "Read", execute: noopExecute },
+      { name: "git_commit_amend", description: "Peer git amend", exposure: "direct", execute: noopExecute },
+    ],
+  });
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+  try {
+    const sdkServerUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/index.js");
+    const sdkStdioUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js");
+    const sdkTypesUrl = import.meta.resolve("@modelcontextprotocol/sdk/types.js");
+    await writeFile(
+      serverScript,
+      `
+import { Server } from ${JSON.stringify(sdkServerUrl)};
+import { StdioServerTransport } from ${JSON.stringify(sdkStdioUrl)};
+import { CallToolRequestSchema, ListToolsRequestSchema } from ${JSON.stringify(sdkTypesUrl)};
+const toolName = process.env.TOOL_NAME;
+const server = new Server({ name: "colliding", version: "1.0.0" }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [{ name: toolName, description: "MCP_" + toolName, inputSchema: { type: "object" } }],
+}));
+server.setRequestHandler(CallToolRequestSchema, async (req) => ({
+  content: [{ type: "text", text: "from-mcp:" + req.params.name }],
+}));
+await server.connect(new StdioServerTransport());
+`,
+    );
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          list: { command: "node", args: [serverScript], env: { TOOL_NAME: "resources" }, lifecycle: "eager" },
+          read: { command: "node", args: [serverScript], env: { TOOL_NAME: "resource" }, lifecycle: "eager" },
+          docs: { command: "node", args: ["--import", tsxEsmLoader, mock], lifecycle: "eager" },
+        },
+      }),
+    );
 
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+
+    const listResTool = mockExt.tools.get("mcp_list_resources");
+    const readResTool = mockExt.tools.get("mcp_read_resource");
+    assert.ok(listResTool.description.includes("List MCP resources"), "mcp_list_resources must not be overwritten");
+    assert.ok(readResTool.description.includes("Read one MCP resource"), "mcp_read_resource must not be overwritten");
+
+    const listed = JSON.parse((await listResTool.execute("l1", { server: "docs" }, undefined, undefined, ctx)).content[0].text);
+    assert.equal(listed.servers[0].server, "docs");
+    assert.ok(listed.servers[0].resources.length > 0);
+
+    await mockExt.commands.get("mcp:stop").handler("list", ctx);
+    await mockExt.commands.get("mcp:stop").handler("read", ctx);
+    assert.ok(mockExt.tools.get("mcp_list_resources").description.includes("List MCP resources"));
+    assert.ok(mockExt.tools.get("mcp_read_resource").description.includes("Read one MCP resource"));
+
+    // Peer extension tool under custom toolPrefix: "git"
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { toolPrefix: "git", maxRetries: 0 },
+        mcpServers: {
+          commit: { command: "node", args: [serverScript], env: { TOOL_NAME: "amend" }, lifecycle: "eager" },
+        },
+      }),
+    );
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.equal(mockExt.tools.get("git_commit_amend").description, "Peer git amend");
+    assert.ok(mockExt.activeTools.includes("git_commit_amend"));
+    await mockExt.commands.get("mcp:stop").handler("commit", ctx);
+    assert.equal(mockExt.tools.get("git_commit_amend").description, "Peer git amend");
+    assert.ok(mockExt.activeTools.includes("git_commit_amend"));
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("restores /tree-deactivated direct tools on mcp_connect and /mcp:start without overriding extension restrictions (#333)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-tree-restore-"));
+  const mock = join(dirname(fileURLToPath(import.meta.url)), "mock-server.ts");
+  const tsxEsmLoader = import.meta.resolve("tsx/esm");
+  const mockExt = createMockExtension({ activeTools: ["read", "mcp_connect"] });
+  const notifications: Array<{ message: string; level?: string | undefined }> = [];
+  const ctx = createMockContext({
+    cwd: dir,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => {
+        notifications.push({ message, level });
+      },
+    },
+  });
+  try {
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          lazy_srv: {
+            command: "node",
+            args: ["--import", tsxEsmLoader, mock],
+            lifecycle: "lazy",
+            exposure: "hidden",
+            toolExposure: { echo: "direct", get_cwd: "direct" },
+          },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect"]);
+
+    // Turn 2: mcp_connect connects lazy_srv and activates echo + get_cwd
+    await mockExt.tools.get("mcp_connect").execute("c1", { name: "lazy_srv" }, undefined, undefined, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "mcp_lazy_srv_echo", "mcp_lazy_srv_get_cwd"]);
+
+    // Multi-hop /tree: Turn 2 -> Turn 1a -> Turn 1b, then mcp_connect restores both
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect"];
+    await mockExt.events.get("session_tree")({}, ctx);
+
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect"];
+    await mockExt.events.get("session_tree")({}, ctx);
+
+    const reconnected = await mockExt.tools.get("mcp_connect").execute("c2", { name: "lazy_srv" }, undefined, undefined, ctx);
+    assert.match(reconnected.content[0].text, /ready; tools discovered and active/);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "mcp_lazy_srv_echo", "mcp_lazy_srv_get_cwd"]);
+
+    // Mixed case: policy extension deactivates get_cwd on Turn 2 while echo stays active -> /tree -> Turn 1
+    mockExt.activeTools = ["read", "mcp_connect", "mcp_lazy_srv_echo"];
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect"];
+    await mockExt.events.get("session_tree")({}, ctx);
+
+    // mcp_connect restores ONLY echo (keeps get_cwd restricted) and still reports inactiveDirect
+    await assert.rejects(
+      () => mockExt.tools.get("mcp_connect").execute("c3", { name: "lazy_srv" }, undefined, undefined, ctx),
+      /configured as direct are inactive/,
+    );
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "mcp_lazy_srv_echo"]);
+
+    // /mcp:start after another /tree restores echo cleanly and warns about remaining inactive get_cwd
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect"];
+    await mockExt.events.get("session_tree")({}, ctx);
+    notifications.length = 0;
+    await mockExt.commands.get("mcp:start").handler("lazy_srv", ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "mcp_lazy_srv_echo"]);
+    assert.ok(notifications.some((n) => n.level === "warning" && n.message.includes("inactive")));
+
+    // Forward /tree back to Turn 2 where both are active clears tracked deactivations
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect", "mcp_lazy_srv_echo", "mcp_lazy_srv_get_cwd"];
+    await mockExt.events.get("session_tree")({}, ctx);
+
+    // Cancelled session_before_tree + before_agent_start + policy deactivation must NOT resurrect tools on mcp_connect
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    await mockExt.events.get("before_agent_start")({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect"];
+    await assert.rejects(
+      () => mockExt.tools.get("mcp_connect").execute("c4", { name: "lazy_srv" }, undefined, undefined, ctx),
+      /configured as direct are inactive/,
+    );
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect"]);
+
+    // Cancelled session_before_tree + session_start + session_tree without a fresh before_tree must NOT record stale deactivations
+    mockExt.activeTools = ["read", "mcp_connect", "mcp_lazy_srv_echo"];
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    await mockExt.events.get("session_start")({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect"];
+    await mockExt.events.get("session_tree")({}, ctx);
+    await assert.rejects(
+      () => mockExt.tools.get("mcp_connect").execute("c5", { name: "lazy_srv" }, undefined, undefined, ctx),
+      /configured as direct are inactive/,
+    );
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect"]);
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("resets cross-server collision state across non-reload session_shutdown + session_start without treating retired placeholders as foreign (#331, #332)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-new-session-reset-"));
+  const sdkServerUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/index.js");
+  const sdkStdioUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js");
+  const sdkTypesUrl = import.meta.resolve("@modelcontextprotocol/sdk/types.js");
+  const serverScript = join(dir, "tool-server.mjs");
+  const mockExt = createMockExtension({ activeTools: ["read", "mcp_connect"] });
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+  try {
+    await writeFile(
+      serverScript,
+      `import { Server } from ${JSON.stringify(sdkServerUrl)};
+import { StdioServerTransport } from ${JSON.stringify(sdkStdioUrl)};
+import { CallToolRequestSchema, ListToolsRequestSchema } from ${JSON.stringify(sdkTypesUrl)};
+const toolName = process.env.TOOL_NAME;
+const server = new Server({ name: "boundary", version: "1.0.0" }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [{ name: toolName, inputSchema: { type: "object" } }],
+}));
+server.setRequestHandler(CallToolRequestSchema, async (req) => ({
+  content: [{ type: "text", text: req.params.name }],
+}));
+await server.connect(new StdioServerTransport());
+`,
+    );
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          a: { command: "node", args: [serverScript], env: { TOOL_NAME: "b_c" }, lifecycle: "eager" },
+          a_b: { command: "node", args: [serverScript], env: { TOOL_NAME: "c" }, lifecycle: "lazy" },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.ok(mockExt.activeTools.includes("mcp_a_b_c"), "Eager server starts unhashed before lazy peer connects");
+
+    // Connect lazy colliding peer in Session 1 -> both move to hashed names
+    await mockExt.tools.get("mcp_connect").execute("c1", { name: "a_b" }, undefined, undefined, ctx);
+    assert.ok(!mockExt.activeTools.includes("mcp_a_b_c"));
+    assert.equal(mockExt.activeTools.filter((name) => name.startsWith("mcp_a_b_c_")).length, 2);
+
+    // Non-reload session_shutdown + session_start (same config, like /new)
+    await mockExt.events.get("session_shutdown")({ type: "session_shutdown", reason: "new" }, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect"]);
+
+    await mockExt.events.get("session_start")({}, ctx);
+    assert.ok(
+      mockExt.activeTools.includes("mcp_a_b_c"),
+      "Fresh /new session must reclaim unhashed mcp_a_b_c rather than leaking Session 1 collision state",
+    );
+    assert.equal(mockExt.activeTools.filter((name) => name.startsWith("mcp_a_b_c_")).length, 0);
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("restores /tree-deactivated direct tools across live tools/list_changed drop+re-advertise and intra-server rename on mcp_connect (#333)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-tree-list-changed-"));
+  const sdkServerUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/index.js");
+  const sdkStdioUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js");
+  const sdkTypesUrl = import.meta.resolve("@modelcontextprotocol/sdk/types.js");
+  const serverScript = join(dir, "dynamic-tools-server.mjs");
+  const mockExt = createMockExtension({ activeTools: ["read", "mcp_connect"] });
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
+
+  const waitUntil = async (predicate: () => boolean, label: string): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    while (!predicate()) {
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for ${label}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  };
+
+  try {
+    await writeFile(
+      serverScript,
+      `import { Server } from ${JSON.stringify(sdkServerUrl)};
+import { StdioServerTransport } from ${JSON.stringify(sdkStdioUrl)};
+import { CallToolRequestSchema, ListToolsRequestSchema } from ${JSON.stringify(sdkTypesUrl)};
+let toolNames = ["control", "my-tool"];
+const server = new Server(
+  { name: "dynamic", version: "1.0.0" },
+  { capabilities: { tools: { listChanged: true } } },
+);
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: toolNames.map((name) => ({
+    name,
+    inputSchema: { type: "object", properties: { next: { type: "array", items: { type: "string" } } } },
+  })),
+}));
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "control" && Array.isArray(req.params.arguments?.next)) {
+    toolNames = req.params.arguments.next;
+    await server.sendToolListChanged();
+  }
+  return { content: [{ type: "text", text: "ok:" + req.params.name }] };
+});
+await server.connect(new StdioServerTransport());
+`,
+    );
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          dyn: { command: "node", args: [serverScript], lifecycle: "lazy" },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+
+    // Connect lazy server -> control + my-tool (`mcp_dyn_my_tool`) activate
+    await mockExt.tools.get("mcp_connect").execute("c1", { name: "dyn" }, undefined, undefined, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "mcp_dyn_control", "mcp_dyn_my_tool"]);
+
+    // /tree strips `mcp_dyn_my_tool` while keeping `mcp_dyn_control` active
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect", "mcp_dyn_control"];
+    await mockExt.events.get("session_tree")({}, ctx);
+
+    // Live tools/list_changed #1: transiently drop `my-tool`
+    await mockExt.tools
+      .get("mcp_dyn_control")
+      .execute("t1", { next: ["control", "marker"] }, undefined, undefined, ctx);
+    await waitUntil(
+      () => mockExt.activeTools.includes("mcp_dyn_marker"),
+      "transient drop refresh",
+    );
+    assert.equal(mockExt.tools.get("mcp_dyn_my_tool")?.exposure, "hidden");
+
+    // Live tools/list_changed #2: re-advertise `my-tool` alongside lossless colliding `my_tool`
+    const hashedMyTool = buildToolName("mcp", "dyn", "my-tool", true);
+    await mockExt.tools
+      .get("mcp_dyn_control")
+      .execute("t2", { next: ["control", "my-tool", "my_tool"] }, undefined, undefined, ctx);
+    await waitUntil(
+      () => mockExt.tools.get(hashedMyTool)?.exposure === "direct",
+      "re-advertise + intra-server rename refresh",
+    );
+    // `my_tool` claimed & activated `mcp_dyn_my_tool`, while `my-tool` returned inactive on its hashed name
+    assert.ok(mockExt.activeTools.includes("mcp_dyn_my_tool"));
+    assert.ok(!mockExt.activeTools.includes(hashedMyTool));
+
+    // Reconnecting via mcp_connect restores `my-tool` on its new hashed Pi name cleanly
+    const reconnected = await mockExt.tools
+      .get("mcp_connect")
+      .execute("c2", { name: "dyn" }, undefined, undefined, ctx);
+    assert.match(reconnected.content[0].text, /ready; tools discovered and active/);
+    assert.ok(mockExt.activeTools.includes(hashedMyTool));
+    assert.ok(mockExt.activeTools.includes("mcp_dyn_my_tool"));
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});

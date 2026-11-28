@@ -9,12 +9,35 @@ import { compareCodePoints } from "./tool-order.js";
 
 export const MAX_TOOL_NAME_LEN = 64;
 
+/** Built-in Pi management tool names registered outside `ToolBridge.toolOwners` (#332). */
+export const MANAGEMENT_TOOL_NAMES = {
+  status: "mcp_status",
+  connect: "mcp_connect",
+  listResources: "mcp_list_resources",
+  readResource: "mcp_read_resource",
+} as const;
+
+/** Management tool names that bridged MCP server tools must never overwrite or hide (#332). */
+export const RESERVED_MANAGEMENT_TOOL_NAMES: ReadonlySet<string> = new Set(
+  Object.values(MANAGEMENT_TOOL_NAMES),
+);
+
 export interface ResolveUniqueToolNameOptions {
   prefix: string;
   serverName: string;
   rawToolName: string;
   seenInBatch: ReadonlySet<string>;
   toolOwners: ReadonlyMap<string, string>;
+  forceHash?: boolean | undefined;
+  collidedBaseNames?: ReadonlySet<string> | undefined;
+  reservedNames?: ReadonlySet<string> | undefined;
+}
+
+interface CollisionContext {
+  serverName: string;
+  seenInBatch: ReadonlySet<string>;
+  toolOwners: ReadonlyMap<string, string>;
+  reservedNames: ReadonlySet<string> | undefined;
 }
 
 /** Replace any character outside `[a-zA-Z0-9_]` with `_`. */
@@ -108,28 +131,41 @@ export function orderToolsForNameAssignment(
   return ordered;
 }
 
-function isToolNameTaken(
-  name: string,
+/**
+ * True when another configured peer server sanitizes to the same `[a-zA-Z0-9_]` stem
+ * as `serverName` and outranks it under {@link compareNamesForAssignment} (lossless
+ * `[a-zA-Z0-9_]+` wins, then code-point order) (#331).
+ */
+export function isCollidingServerStemLoser(
   serverName: string,
-  seenInBatch: ReadonlySet<string>,
-  toolOwners: ReadonlyMap<string, string>,
+  peerServerNames: Iterable<string> | undefined,
 ): boolean {
-  if (seenInBatch.has(name)) return true;
-  const owner = toolOwners.get(name);
-  return owner !== undefined && owner !== serverName;
+  if (!peerServerNames) return false;
+  const stem = sanitizeIdentifierSegment(serverName);
+  for (const peer of peerServerNames) {
+    if (
+      peer !== serverName &&
+      sanitizeIdentifierSegment(peer) === stem &&
+      compareNamesForAssignment(peer, serverName) < 0
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
-function findSuffixedToolName(
-  hashedCandidate: string,
-  serverName: string,
-  seenInBatch: ReadonlySet<string>,
-  toolOwners: ReadonlyMap<string, string>,
-): string {
+function isToolNameTaken(name: string, ctx: CollisionContext): boolean {
+  if (ctx.seenInBatch.has(name) || ctx.reservedNames?.has(name)) return true;
+  const owner = ctx.toolOwners.get(name);
+  return owner !== undefined && owner !== ctx.serverName;
+}
+
+function findSuffixedToolName(hashedCandidate: string, ctx: CollisionContext): string {
   let suffix = 2;
   while (true) {
     const tag = `_${suffix}`;
     const candidate = `${hashedCandidate.slice(0, MAX_TOOL_NAME_LEN - tag.length)}${tag}`;
-    if (!isToolNameTaken(candidate, serverName, seenInBatch, toolOwners)) {
+    if (!isToolNameTaken(candidate, ctx)) {
       return candidate;
     }
     suffix++;
@@ -138,21 +174,32 @@ function findSuffixedToolName(
 
 /**
  * Resolve a collision-free Pi tool name for `rawToolName` on `serverName`.
- * Tries the unhashed `<prefix>_<server>_<tool>` name first, falls back to the
- * 8-character SHA-256 suffix when taken, and appends `_2`, `_3`, … if even the
- * hashed identifier is owned by another server or earlier tool in the batch.
+ * Tries the unhashed `<prefix>_<server>_<tool>` name first (unless `forceHash` or
+ * `collidedBaseNames` forbids it), falls back to the 8-character SHA-256 suffix when
+ * taken or reserved, and appends `_2`, `_3`, … if even the hashed identifier is taken.
  */
 export function resolveUniqueToolName(options: ResolveUniqueToolNameOptions): string {
-  const { prefix, serverName, rawToolName, seenInBatch, toolOwners } = options;
+  const {
+    prefix,
+    serverName,
+    rawToolName,
+    seenInBatch,
+    toolOwners,
+    forceHash = false,
+    collidedBaseNames,
+    reservedNames,
+  } = options;
+  const ctx: CollisionContext = { serverName, seenInBatch, toolOwners, reservedNames };
   const baseCandidate = buildToolName(prefix, serverName, rawToolName, false);
-  if (!isToolNameTaken(baseCandidate, serverName, seenInBatch, toolOwners)) {
+  const mustHash = forceHash || collidedBaseNames?.has(baseCandidate) === true;
+  if (!mustHash && !isToolNameTaken(baseCandidate, ctx)) {
     return baseCandidate;
   }
 
   const hashedCandidate = buildToolName(prefix, serverName, rawToolName, true);
-  if (!isToolNameTaken(hashedCandidate, serverName, seenInBatch, toolOwners)) {
+  if (!isToolNameTaken(hashedCandidate, ctx)) {
     return hashedCandidate;
   }
 
-  return findSuffixedToolName(hashedCandidate, serverName, seenInBatch, toolOwners);
+  return findSuffixedToolName(hashedCandidate, ctx);
 }

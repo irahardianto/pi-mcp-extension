@@ -36,18 +36,32 @@ import {
   collectReboundToolDefinitions,
   mergePeerServerNames,
 } from "./tool-namespace.js";
+import {
+  buildToolName,
+  RESERVED_MANAGEMENT_TOOL_NAMES,
+  resolveUniqueToolName,
+} from "./tool-names.js";
 import { orderOwnedEntries, orderPayloadToolEntries, sameToolList } from "./tool-order.js";
 import {
+  collectAddedExposures,
+  collectReservedToolNames,
   deleteServerOwnedTools,
   filterOwnedTools,
+  forgetServerCollisionState,
   mergePendingRestoredTools,
   mergeRawToolExposures,
   normalizeRefreshArgs,
   orderOwnedActiveTools,
   planActiveToolReconciliation,
   planServerToolBatch,
+  planTreeDirectToolRestore,
+  pruneTreeDeactivatedDirectTools,
   reconcileLiveRefreshState,
+  recordBaseNameCandidate,
+  recordCrossServerCollision,
   snapshotActiveStateByRawName,
+  updateTreeDeactivatedDirectTools,
+  type ServerToolBatchPlan,
 } from "./tool-reconcile.js";
 
 export { buildToolName } from "./tool-names.js";
@@ -96,6 +110,34 @@ interface RegisterToolParams {
   client: Client;
   exposure: McpExposure;
   namespace: ToolNamespace;
+}
+
+interface DisplacementResult {
+  oldNames: Set<string>;
+  desiredActive: Set<string>;
+  cliFilteredDirectNames: Set<string>;
+  piExposures: Map<string, McpExposure>;
+  affectedIncumbents: Set<string>;
+}
+
+interface DisplaceIncumbentContext {
+  baseName: string;
+  incumbentServer: string;
+  batchToolNames: ReadonlySet<string>;
+  collidedBaseNames: ReadonlySet<string>;
+  reservedNames: ReadonlySet<string>;
+  activeBeforeSet: ReadonlySet<string>;
+  allToolsBeforeNames: ReadonlySet<string> | undefined;
+  displacement: DisplacementResult;
+}
+
+interface DisplaceCollisionsOptions {
+  incomingServer: string;
+  batch: ServerToolBatchPlan;
+  collidedBaseNames: Set<string>;
+  reservedNames: ReadonlySet<string>;
+  activeBeforeSet: ReadonlySet<string>;
+  allToolsBeforeNames: ReadonlySet<string> | undefined;
 }
 
 // ─── Tool Bridge ──────────────────────────────────────────────────────────────
@@ -150,6 +192,23 @@ export class ToolBridge {
   private readonly refreshGenerations = new Map<string, number>();
   /** Per-server request timeout overrides resolved during refreshTools. */
   private readonly serverTimeouts = new Map<string, number>();
+  /**
+   * Every Pi tool name ever registered by this bridge, so retired `hidden` placeholders in
+   * `pi.getAllTools()` are never misclassified as foreign tools (#332).
+   */
+  private readonly bridgeRegisteredNames = new Set<string>();
+  /** Live registration inputs by Pi tool name so displaced cross-server incumbents can be rebound (#331). */
+  private readonly liveToolBindings = new Map<string, Omit<RegisterToolParams, "piName">>();
+  /** Unhashed `<prefix>_<server>_<tool>` ownership kept across transient withdrawals/stops (#331). */
+  private readonly baseNameOwners = new Map<string, string>();
+  /** Unhashed Pi base names -> servers advertising tools targeting that base name (#331). */
+  private readonly baseNameCandidates = new Map<string, Set<string>>();
+  /** Colliding unhashed Pi tool names -> competing server names (pruned when `< 2` remain) (#331). */
+  private readonly collidedBaseServers = new Map<string, Set<string>>();
+  /** Snapshot of `pi.getActiveTools()` taken on `session_before_tree` and consumed on `session_tree` (#333). */
+  private preTreeActiveSnapshot: Set<string> | undefined;
+  /** Per server, raw MCP tool names of `direct` tools deactivated by `/tree` for one-shot restore (#333). */
+  private readonly treeDeactivatedDirectTools = new Map<string, Set<string>>();
   private onAuthError?: ToolAuthErrorHandler | undefined;
   private onDiscoveryWarning?: ((message: string) => void) | undefined;
 
@@ -214,7 +273,13 @@ export class ToolBridge {
   /** Update bridge settings when session config is reloaded on session_start. */
   updateSettings(settings: Settings): void {
     const prevDefaultTimeoutMs = this.settings.requestTimeoutMs;
+    const prefixChanged = settings.toolPrefix !== this.settings.toolPrefix;
     this.settings = settings;
+    if (prefixChanged) {
+      this.baseNameOwners.clear();
+      this.baseNameCandidates.clear();
+      this.collidedBaseServers.clear();
+    }
     for (const [serverName, timeoutMs] of this.serverTimeouts.entries()) {
       if (timeoutMs === prevDefaultTimeoutMs) {
         this.serverTimeouts.delete(serverName);
@@ -302,6 +367,63 @@ export class ToolBridge {
     return [...direct].filter((name) => !active.has(name));
   }
 
+  /** Capture active tools immediately before `/tree` restores transcript tools (#333). */
+  snapshotPreTreeActiveTools(): void {
+    this.preTreeActiveSnapshot = new Set(this.pi.getActiveTools());
+  }
+
+  /** Discard any pending pre-`/tree` snapshot (e.g. after a cancelled `session_before_tree`) (#333). */
+  clearPreTreeSnapshot(): void {
+    this.preTreeActiveSnapshot = undefined;
+  }
+
+  /**
+   * Record `direct` tools stripped across `/tree` (accumulating across consecutive `/tree` hops
+   * and pruning any tools active again on the target branch) (#333).
+   */
+  recordTreeDeactivations(): void {
+    const before = this.preTreeActiveSnapshot;
+    this.preTreeActiveSnapshot = undefined;
+    const current = new Set(this.pi.getActiveTools());
+    const servers = new Set([
+      ...this.directToolNames.keys(),
+      ...this.treeDeactivatedDirectTools.keys(),
+    ]);
+    for (const serverName of servers) {
+      const next = updateTreeDeactivatedDirectTools({
+        existing: this.treeDeactivatedDirectTools.get(serverName),
+        directTools: this.directToolNames.get(serverName),
+        rawToolNames: this.rawToolNames.get(serverName),
+        droppedToolState: this.droppedToolState.get(serverName),
+        rawToolExposures: this.rawToolExposures.get(serverName),
+        beforeActive: before,
+        currentActive: current,
+      });
+      this._setOrDeleteMapEntry(this.treeDeactivatedDirectTools, serverName, next);
+    }
+  }
+
+  /**
+   * One-shot restoration of `direct` tools previously deactivated by `/tree` for `serverName`,
+   * called by `mcp_connect` and `/mcp:start` without overriding extension restrictions (#333).
+   */
+  restoreTreeDeactivatedDirectTools(serverName: string): void {
+    const pending = this.treeDeactivatedDirectTools.get(serverName);
+    this.treeDeactivatedDirectTools.delete(serverName);
+    if (!this.activeServers.has(serverName)) return;
+    const activeBefore = this.pi.getActiveTools();
+    const nextActive = planTreeDirectToolRestore({
+      pendingRawNames: pending,
+      directTools: this.directToolNames.get(serverName),
+      rawToolNames: this.rawToolNames.get(serverName),
+      activeBefore,
+      isOwned: (name) => this.toolOwners.has(name),
+    });
+    if (nextActive !== undefined) {
+      this.pi.setActiveTools(nextActive);
+    }
+  }
+
   /**
    * Re-apply this bridge's deterministic tool order to Pi's active list when owned tools have
    * been reordered externally, and do nothing when already ordered.
@@ -314,6 +436,7 @@ export class ToolBridge {
    */
   orderActiveTools(): void {
     const current = this.pi.getActiveTools();
+    this._pruneActiveTreeDeactivations(new Set(current));
     const ordered = orderOwnedEntries(
       current,
       (name) => name,
@@ -349,6 +472,8 @@ export class ToolBridge {
     this.activeServers.delete(serverName);
     this.activeServerExposures.delete(serverName);
     this.indirectFilteredServers.delete(serverName);
+    this.treeDeactivatedDirectTools.delete(serverName);
+    this._deleteServerLiveBindings(serverName);
     // WHY: stopping the server turns every tool off, so what each one "left in" belongs to a
     // connection that no longer exists; a fresh connect rediscovers the state from scratch.
     this.droppedToolState.delete(serverName);
@@ -385,6 +510,14 @@ export class ToolBridge {
     this.activeServers.delete(serverName);
     this.activeServerExposures.delete(serverName);
     this.indirectFilteredServers.delete(serverName);
+    this.treeDeactivatedDirectTools.delete(serverName);
+    this._deleteServerLiveBindings(serverName);
+    forgetServerCollisionState(
+      serverName,
+      this.baseNameOwners,
+      this.collidedBaseServers,
+      this.baseNameCandidates,
+    );
     this.droppedToolState.delete(serverName);
     this.rawToolNames.delete(serverName);
     this.rawToolExposures.delete(serverName);
@@ -393,6 +526,31 @@ export class ToolBridge {
     this._hideOwnedServerTools(serverName, true);
     this._deactivateServerTools(serverName, activeBefore);
     deleteServerOwnedTools(serverName, this.serverToolNames, this.toolOwners);
+  }
+
+  /**
+   * Clear all session-scoped ownership, activity, exposure, collision, and `/tree` state after
+   * a non-reload `session_shutdown` teardown so a subsequent `new_session` starts identically
+   * to a fresh process while keeping `bridgeRegisteredNames` intact for retired Pi placeholders.
+   */
+  resetSessionState(): void {
+    this.preTreeActiveSnapshot = undefined;
+    this.treeDeactivatedDirectTools.clear();
+    this.baseNameOwners.clear();
+    this.baseNameCandidates.clear();
+    this.collidedBaseServers.clear();
+    this.toolOwners.clear();
+    this.serverToolNames.clear();
+    this.directToolNames.clear();
+    this.registeredDefinitions.clear();
+    this.activeServers.clear();
+    this.liveToolBindings.clear();
+    this.droppedToolState.clear();
+    this.rawToolNames.clear();
+    this.rawToolExposures.clear();
+    this.activeServerExposures.clear();
+    this.indirectFilteredServers.clear();
+    this.serverTimeouts.clear();
   }
 
   /**
@@ -482,6 +640,16 @@ export class ToolBridge {
       peerServerNames,
     });
 
+    const allToolsBefore = this.pi.getAllTools?.();
+    const allToolsBeforeNames = allToolsBefore
+      ? new Set(allToolsBefore.map((tool) => tool.name))
+      : undefined;
+    const reservedNames = collectReservedToolNames(
+      RESERVED_MANAGEMENT_TOOL_NAMES,
+      allToolsBefore,
+      this.bridgeRegisteredNames,
+    );
+    const collidedBaseNames = new Set(this.collidedBaseServers.keys());
     const batch = planServerToolBatch({
       prefix: this.settings.toolPrefix,
       serverName,
@@ -489,6 +657,18 @@ export class ToolBridge {
       toolOwners: this.toolOwners,
       ownedPreviousNames,
       exposureConfig: options,
+      peerServerNames,
+      collidedBaseNames,
+      baseNameOwners: this.baseNameOwners,
+      reservedNames,
+    });
+    const displacement = this._displaceCrossServerCollisions({
+      incomingServer: serverName,
+      batch,
+      collidedBaseNames,
+      reservedNames,
+      activeBeforeSet: new Set(activeBefore),
+      allToolsBeforeNames,
     });
     for (const { piName, tool, exposure } of batch.plannedTools) {
       this.toolOwners.set(piName, serverName);
@@ -496,11 +676,17 @@ export class ToolBridge {
       // Pi's registerTool overwrites by name, so this is idempotent.
       this._registerTool({ piName, serverName, tool, client, exposure, namespace });
     }
+    this._recordBaseNameOwners(serverName, batch, collidedBaseNames, reservedNames);
     const activeAfterRegistration = [...this.pi.getActiveTools()];
     this._releaseWithdrawnTools(batch.withdrawnToolNames);
 
     const allTools = this.pi.getAllTools?.();
+    this._promoteAllowedDisplacedDirect(displacement, allTools);
     const serverExposures = this._assessServerExposures(serverName, batch.piExposures, allTools);
+    const incumbentExposures = this._reassessAffectedIncumbents(
+      displacement.affectedIncumbents,
+      allTools,
+    );
 
     // WHY: `pi.setActiveTools` is shared with every other extension and the user, so an already
     // connected server's tool set may have been narrowed on purpose. A live `tools/list_changed`
@@ -516,29 +702,41 @@ export class ToolBridge {
           previousStateByRawName,
         )
       : batch.directToolNames;
+    const mergedPiExposures = new Map([...batch.piExposures, ...displacement.piExposures]);
     const desiredActive = mergePendingRestoredTools({
-      desiredActive: baseDesiredActive,
-      piExposures: batch.piExposures,
+      desiredActive: new Set([...baseDesiredActive, ...displacement.desiredActive]),
+      piExposures: mergedPiExposures,
       activeBefore,
       activeAfterRegistration,
       allTools,
     });
-
-    this.rawToolExposures.set(
-      serverName,
-      mergeRawToolExposures(
-        this.rawToolExposures.get(serverName),
-        batch.currentExposures,
-        this.droppedToolState.get(serverName),
-      ),
+    for (const oldName of displacement.oldNames) {
+      ownedPreviousNames.add(oldName);
+    }
+    const mergedRawExposures = mergeRawToolExposures(
+      this.rawToolExposures.get(serverName),
+      batch.currentExposures,
+      this.droppedToolState.get(serverName),
     );
+    this._syncTreeDeactivationsOnReconcile(
+      serverName,
+      previousStateByRawName !== undefined,
+      batch,
+      mergedRawExposures,
+      desiredActive,
+    );
+
+    this.rawToolExposures.set(serverName, mergedRawExposures);
     this.serverToolNames.set(serverName, batch.currentToolNames);
     this.rawToolNames.set(serverName, batch.currentRawNames);
     this.directToolNames.set(serverName, batch.directToolNames);
     this.activeServerExposures.set(serverName, serverExposures);
     this.activeServers.add(serverName);
     this._rebindActiveNamespaces(peerServerNames);
-    const discoveryToActivate = this._resolveDiscoveryTools(serverExposures, activeBefore);
+    const discoveryToActivate = this._resolveDiscoveryTools(
+      new Set([...serverExposures, ...incumbentExposures]),
+      activeBefore,
+    );
     this._reconcileActiveTools(ownedPreviousNames, desiredActive, activeBefore, discoveryToActivate);
   }
 
@@ -577,12 +775,241 @@ export class ToolBridge {
       previousExposures: this.rawToolExposures.get(serverName),
       previousDropped: this.droppedToolState.get(serverName),
     });
-    if (dropped) {
-      this.droppedToolState.set(serverName, dropped);
-    } else {
-      this.droppedToolState.delete(serverName);
-    }
+    this._setOrDeleteMapEntry(this.droppedToolState, serverName, dropped);
     return desiredActive;
+  }
+
+  private _setOrDeleteMapEntry<V>(map: Map<string, V>, key: string, value: V | undefined): void {
+    if (value !== undefined) {
+      map.set(key, value);
+    } else {
+      map.delete(key);
+    }
+  }
+
+  private _pruneActiveTreeDeactivations(nowActive: ReadonlySet<string>): void {
+    for (const [serverName, pending] of this.treeDeactivatedDirectTools) {
+      const next = pruneTreeDeactivatedDirectTools({
+        existing: pending,
+        directTools: this.directToolNames.get(serverName),
+        rawToolNames: this.rawToolNames.get(serverName),
+        droppedToolState: this.droppedToolState.get(serverName),
+        rawToolExposures: this.rawToolExposures.get(serverName),
+        nowActive,
+      });
+      this._setOrDeleteMapEntry(this.treeDeactivatedDirectTools, serverName, next);
+    }
+  }
+
+  private _syncTreeDeactivationsOnReconcile(
+    serverName: string,
+    isLiveRefresh: boolean,
+    batch: ServerToolBatchPlan,
+    mergedRawExposures: ReadonlyMap<string, McpExposure>,
+    desiredActive: ReadonlySet<string>,
+  ): void {
+    if (!isLiveRefresh) {
+      this.treeDeactivatedDirectTools.delete(serverName);
+      return;
+    }
+    const remaining = pruneTreeDeactivatedDirectTools({
+      existing: this.treeDeactivatedDirectTools.get(serverName),
+      directTools: batch.directToolNames,
+      rawToolNames: batch.currentRawNames,
+      droppedToolState: this.droppedToolState.get(serverName),
+      rawToolExposures: mergedRawExposures,
+      nowActive: desiredActive,
+    });
+    this._setOrDeleteMapEntry(this.treeDeactivatedDirectTools, serverName, remaining);
+  }
+
+  private _deleteServerLiveBindings(serverName: string): void {
+    for (const [piName, binding] of this.liveToolBindings) {
+      if (binding.serverName === serverName) {
+        this.liveToolBindings.delete(piName);
+      }
+    }
+  }
+
+  private _clearStoppedIncumbentClaim(baseName: string, incumbentServer: string): void {
+    this._hideTool(baseName, true);
+    this.toolOwners.delete(baseName);
+    this.liveToolBindings.delete(baseName);
+    this.serverToolNames.get(incumbentServer)?.delete(baseName);
+    this.directToolNames.get(incumbentServer)?.delete(baseName);
+    this.rawToolNames.get(incumbentServer)?.delete(baseName);
+  }
+
+  private _renameIncumbentTracking(
+    serverName: string,
+    oldPiName: string,
+    newPiName: string,
+    rawToolName: string,
+  ): void {
+    const serverTools = this.serverToolNames.get(serverName);
+    serverTools?.delete(oldPiName);
+    serverTools?.add(newPiName);
+    const rawNames = this.rawToolNames.get(serverName);
+    rawNames?.delete(oldPiName);
+    rawNames?.set(newPiName, rawToolName);
+    for (const set of [this.directToolNames.get(serverName), this.preTreeActiveSnapshot]) {
+      if (set?.has(oldPiName)) {
+        set.delete(oldPiName);
+        set.add(newPiName);
+      }
+    }
+  }
+
+  private _displaceLiveIncumbent(ctx: DisplaceIncumbentContext): void {
+    const {
+      baseName,
+      incumbentServer,
+      batchToolNames,
+      collidedBaseNames,
+      reservedNames,
+      activeBeforeSet,
+      allToolsBeforeNames,
+      displacement,
+    } = ctx;
+    const binding = this.liveToolBindings.get(baseName);
+    if (!binding) return;
+    const newPiName = resolveUniqueToolName({
+      prefix: this.settings.toolPrefix,
+      serverName: incumbentServer,
+      rawToolName: binding.tool.name,
+      seenInBatch: batchToolNames,
+      toolOwners: this.toolOwners,
+      forceHash: true,
+      collidedBaseNames,
+      reservedNames,
+    });
+    const currentNamespace = this.registeredDefinitions.get(baseName)?.namespace ?? binding.namespace;
+    this._hideTool(baseName, true);
+    this.toolOwners.delete(baseName);
+    this.liveToolBindings.delete(baseName);
+    this._renameIncumbentTracking(incumbentServer, baseName, newPiName, binding.tool.name);
+    this.toolOwners.set(newPiName, incumbentServer);
+    this._registerTool({ ...binding, namespace: currentNamespace, piName: newPiName });
+    displacement.oldNames.add(baseName);
+    if (activeBeforeSet.has(baseName)) {
+      displacement.desiredActive.add(newPiName);
+    } else if (
+      binding.exposure === "direct" &&
+      allToolsBeforeNames !== undefined &&
+      !allToolsBeforeNames.has(baseName)
+    ) {
+      // WHY: Pi omits CLI-filtered (`--tools` / `--exclude-tools`) tools from `getAllTools()`,
+      // whereas extension-deactivated and `/tree`-stripped tools remain registered there. If the
+      // unhashed base name was excluded by CLI filters while the deterministic hashed name is
+      // allowed, promote it after registration so connect order stays invariant (#331).
+      displacement.cliFilteredDirectNames.add(newPiName);
+    }
+    displacement.piExposures.set(newPiName, binding.exposure);
+    displacement.affectedIncumbents.add(incumbentServer);
+  }
+
+  private _promoteAllowedDisplacedDirect(
+    displacement: DisplacementResult,
+    allTools: readonly RegisteredToolSummary[] | undefined,
+  ): void {
+    if (displacement.cliFilteredDirectNames.size === 0 || !allTools) return;
+    const allowedAfter = new Set(allTools.map((tool) => tool.name));
+    for (const piName of displacement.cliFilteredDirectNames) {
+      if (allowedAfter.has(piName)) {
+        displacement.desiredActive.add(piName);
+      }
+    }
+  }
+
+  private _displaceCrossServerCollisions(options: DisplaceCollisionsOptions): DisplacementResult {
+    const {
+      incomingServer,
+      batch,
+      collidedBaseNames,
+      reservedNames,
+      activeBeforeSet,
+      allToolsBeforeNames,
+    } = options;
+    const displacement: DisplacementResult = {
+      oldNames: new Set(),
+      desiredActive: new Set(),
+      cliFilteredDirectNames: new Set(),
+      piExposures: new Map(),
+      affectedIncumbents: new Set(),
+    };
+    for (const [baseName, incumbentServer] of batch.crossServerCollisions) {
+      recordCrossServerCollision(
+        baseName,
+        incumbentServer,
+        incomingServer,
+        this.collidedBaseServers,
+        this.baseNameCandidates,
+      );
+      collidedBaseNames.add(baseName);
+      this.baseNameOwners.delete(baseName);
+      if (this.toolOwners.get(baseName) !== incumbentServer) continue;
+      if (this.activeServers.has(incumbentServer)) {
+        this._displaceLiveIncumbent({
+          baseName,
+          incumbentServer,
+          batchToolNames: batch.currentToolNames,
+          collidedBaseNames,
+          reservedNames,
+          activeBeforeSet,
+          allToolsBeforeNames,
+          displacement,
+        });
+      } else {
+        this._clearStoppedIncumbentClaim(baseName, incumbentServer);
+      }
+    }
+    return displacement;
+  }
+
+  private _recordBaseNameOwners(
+    serverName: string,
+    batch: ServerToolBatchPlan,
+    collidedBaseNames: ReadonlySet<string>,
+    reservedNames: ReadonlySet<string>,
+  ): void {
+    const prefix = this.settings.toolPrefix;
+    for (const { piName, tool } of batch.plannedTools) {
+      const base = buildToolName(prefix, serverName, tool.name, false);
+      const hashed = buildToolName(prefix, serverName, tool.name, true);
+      if (base === hashed || reservedNames.has(base)) continue;
+      recordBaseNameCandidate(this.baseNameCandidates, base, serverName);
+      if (collidedBaseNames.has(base)) {
+        this.collidedBaseServers.get(base)?.add(serverName);
+      } else if (piName === base) {
+        this.baseNameOwners.set(base, serverName);
+      }
+    }
+  }
+
+  private _collectServerPiExposures(serverName: string): Map<string, McpExposure> {
+    const exposures = new Map<string, McpExposure>();
+    for (const piName of this.serverToolNames.get(serverName) ?? []) {
+      const binding = this.liveToolBindings.get(piName);
+      if (binding) {
+        exposures.set(piName, binding.exposure);
+      }
+    }
+    return exposures;
+  }
+
+  private _reassessAffectedIncumbents(
+    affectedIncumbents: ReadonlySet<string>,
+    allTools: readonly RegisteredToolSummary[] | undefined,
+  ): Set<McpExposure> {
+    const addedExposures: Set<McpExposure>[] = [];
+    for (const incumbent of affectedIncumbents) {
+      const previous = this.activeServerExposures.get(incumbent);
+      const exposures = this._collectServerPiExposures(incumbent);
+      const assessed = this._assessServerExposures(incumbent, exposures, allTools);
+      this.activeServerExposures.set(incumbent, assessed);
+      addedExposures.push(collectAddedExposures(previous, assessed));
+    }
+    return collectConnectedExposures(addedExposures);
   }
 
   private _registerTool(registration: RegisterToolParams): void {
@@ -600,6 +1027,8 @@ export class ToolBridge {
       // bridge is constructed, and it is the caller for every server, so it takes the name.
       onAuthError: (srv, err) => this.onAuthError?.(srv, err),
     });
+    this.bridgeRegisteredNames.add(piName);
+    this.liveToolBindings.set(piName, { serverName, tool, client, exposure, namespace });
     this.registeredDefinitions.set(piName, definition);
     this.pi.registerTool(definition);
   }
@@ -650,6 +1079,7 @@ export class ToolBridge {
     for (const existingName of withdrawnToolNames) {
       this._hideTool(existingName, true);
       this.toolOwners.delete(existingName);
+      this.liveToolBindings.delete(existingName);
     }
   }
 

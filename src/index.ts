@@ -171,6 +171,7 @@ export default async function (
 
   // ── 3. Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx: ExtensionContext) => {
+    bridge.clearPreTreeSnapshot();
     seenDiscoveryWarnings.clear();
     return lifecycle.handleSessionStart(ctx);
   });
@@ -186,11 +187,15 @@ export default async function (
   const normalizeActiveTools = (): void => {
     bridge.orderActiveTools();
   };
+  pi.on("session_before_tree", () => {
+    bridge.snapshotPreTreeActiveTools();
+  });
   pi.on("session_tree", () => {
     restoreSessionTreeTools(manager, bridge);
   });
   pi.on("input", normalizeActiveTools);
   pi.on("before_agent_start", (event) => {
+    bridge.clearPreTreeSnapshot();
     bridge.orderActiveTools();
     // WHY: read `pi.getActiveTools()` rather than `event.systemPromptOptions?.selectedTools` — an
     // earlier `before_agent_start` handler may have called `pi.setActiveTools(...)`, which Pi only
@@ -201,9 +206,14 @@ export default async function (
   pi.on("before_provider_request", (event) => bridge.orderPayloadTools(event.payload));
 
   pi.on("session_shutdown", async (event, ctx: ExtensionContext) => {
-    bridge.setReloadShutdown(event?.reason === "reload");
+    const isReload = event?.reason === "reload";
+    bridge.clearPreTreeSnapshot();
+    bridge.setReloadShutdown(isReload);
     try {
       await lifecycle.handleSessionShutdown(ctx);
+      if (!isReload) {
+        bridge.resetSessionState();
+      }
     } finally {
       bridge.setReloadShutdown(false);
     }
@@ -233,9 +243,10 @@ export default async function (
 
 function restoreSessionTreeTools(manager: ServerManager, bridge: ToolBridge): void {
   // WHY: `/tree` runs `AgentSession._restoreToolsFromTranscript()`, which resets `activeTools` to
-  // the target turn's declared loadout. If an indirect (`codemode` / `deferred`) server was added
-  // or started after that turn, re-ensuring reaching discovery tools keeps its tools reachable
-  // without re-activating `direct` tools that the restored branch did not declare (#257, #278).
+  // the target turn's declared loadout. Record which `direct` tools `/tree` stripped before
+  // re-ensuring reaching discovery tools so `mcp_connect` / `/mcp:start` can restore only those
+  // tools later without overriding another extension's restrictions (#257, #278, #333).
+  bridge.recordTreeDeactivations();
   bridge.ensureDiscoveryTools(
     collectRequiredDiscoveryExposures(
       manager.getAllServers().map((server) => server.config),
