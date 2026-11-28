@@ -5298,4 +5298,461 @@ describe("codemode CallToolResult outputSchema & structuredContent (#257)", () =
     bridge.restoreTreeDeactivatedDirectTools("a");
     assert.deepEqual(active, ["read"]);
   });
+
+  it("activates discovery tools when cross-server displacement moves a CLI-filtered indirect incumbent onto an allowed hashed name without touching unrelated servers (#331)", async () => {
+    const hashedA = buildToolName("mcp", "a", "b_c", true);
+    const hashedAB = buildToolName("mcp", "a_b", "c", true);
+    const makeClient = (toolName: string) =>
+      ({
+        request: async () => ({ tools: [{ name: toolName, inputSchema: { type: "object" } }] }),
+      }) as unknown as Client;
+
+    const runScenario = async (
+      order: Array<"a" | "a_b">,
+      incumbentExposure: "deferred" | "codemode",
+      isAllowed: (name: string) => boolean,
+      autoEnableCodemode = true,
+    ) => {
+      const registered = new Map<string, TestToolDefinition>();
+      let active: string[] = ["read"];
+      const warnings: string[] = [];
+      const bridge = new ToolBridge(
+        BRIDGE_SETTINGS,
+        {
+          registerTool: (t: unknown) => {
+            const tool = t as TestToolDefinition;
+            registered.set(tool.name, tool);
+            if (tool.exposure === "direct" && isAllowed(tool.name) && !active.includes(tool.name)) {
+              active = [...active, tool.name];
+            }
+          },
+          getActiveTools: () => [...active],
+          setActiveTools: (names: string[]) => {
+            active = names.filter(
+              (name) =>
+                name === "read" ||
+                name === "codemode" ||
+                name === "tool_search" ||
+                isAllowed(name),
+            );
+          },
+          getAllTools: () => [
+            { name: "read" },
+            { name: "codemode", reachesTools: true },
+            { name: "tool_search", reachesTools: true },
+            ...[...registered.values()]
+              .filter((tool) => isAllowed(tool.name))
+              .map((tool) => ({ name: tool.name, exposure: tool.exposure })),
+          ],
+        },
+        autoEnableCodemode,
+      );
+      bridge.setDiscoveryWarningCallback((msg) => warnings.push(msg));
+      const clients = { a: makeClient("b_c"), a_b: makeClient("c") };
+      for (const name of order) {
+        await bridge.refreshTools(
+          name,
+          clients[name],
+          name === "a" ? { exposure: incumbentExposure } : { exposure: "direct" },
+        );
+      }
+      return {
+        active,
+        exposuresA: [...bridge.getServerExposures("a")].sort(),
+        filteredA: bridge.hasAllIndirectToolsFiltered("a"),
+        warnings,
+      };
+    };
+
+    // --exclude-tools mcp_a_b_c with deferred incumbent: both connect orders activate tool_search identically
+    const defExclude1 = await runScenario(["a", "a_b"], "deferred", (n) => n !== "mcp_a_b_c");
+    const defExclude2 = await runScenario(["a_b", "a"], "deferred", (n) => n !== "mcp_a_b_c");
+    assert.deepEqual(defExclude1.active, defExclude2.active);
+    assert.deepEqual(defExclude1.exposuresA, ["deferred"]);
+    assert.equal(defExclude1.filteredA, false);
+    assert.equal(defExclude2.filteredA, false);
+    assert.ok(defExclude1.active.includes("tool_search"));
+    assert.ok(defExclude1.active.includes(hashedAB));
+
+    // --tools allowlisting only hashed names with codemode incumbent: both orders activate codemode identically
+    const allowHashed = new Set([hashedA, hashedAB]);
+    const cmAllow1 = await runScenario(["a", "a_b"], "codemode", (n) => allowHashed.has(n));
+    const cmAllow2 = await runScenario(["a_b", "a"], "codemode", (n) => allowHashed.has(n));
+    assert.deepEqual(cmAllow1.active, cmAllow2.active);
+    assert.deepEqual(cmAllow1.exposuresA, ["codemode"]);
+    assert.equal(cmAllow1.filteredA, false);
+    assert.ok(cmAllow1.active.includes("codemode"));
+    assert.ok(cmAllow1.active.includes(hashedAB));
+
+    // autoEnableCodemode: false emits unreachable warning once when displaced onto allowed hashed name
+    const cmDisabled1 = await runScenario(
+      ["a", "a_b"],
+      "codemode",
+      (n) => n !== "mcp_a_b_c",
+      false,
+    );
+    const cmDisabled2 = await runScenario(
+      ["a_b", "a"],
+      "codemode",
+      (n) => n !== "mcp_a_b_c",
+      false,
+    );
+    assert.deepEqual(cmDisabled1.active, cmDisabled2.active);
+    assert.ok(!cmDisabled1.active.includes("codemode"));
+    assert.ok(cmDisabled1.warnings.some((w) => w.includes("autoEnableCodemode is false")));
+    assert.ok(cmDisabled2.warnings.some((w) => w.includes("autoEnableCodemode is false")));
+
+    // Unrelated deferred server whose tool_search was intentionally deactivated must NOT be touched,
+    // and an already-visible deferred incumbent whose tool_search was deactivated must also stay untouched.
+    const registeredIso = new Map<string, TestToolDefinition>();
+    let activeIso: string[] = ["read"];
+    const bridgeIso = new ToolBridge(BRIDGE_SETTINGS, {
+      registerTool: (t: unknown) => {
+        const tool = t as TestToolDefinition;
+        registeredIso.set(tool.name, tool);
+        if (tool.exposure === "direct" && !activeIso.includes(tool.name)) {
+          activeIso = [...activeIso, tool.name];
+        }
+      },
+      getActiveTools: () => [...activeIso],
+      setActiveTools: (names: string[]) => {
+        activeIso = [...names];
+      },
+      getAllTools: () => [
+        { name: "read" },
+        { name: "tool_search", reachesTools: true },
+        ...[...registeredIso.values()].map((tool) => ({ name: tool.name, exposure: tool.exposure })),
+      ],
+    });
+    await bridgeIso.refreshTools("unrelated", makeClient("ping"), { exposure: "deferred" });
+    assert.ok(activeIso.includes("tool_search"));
+    activeIso = activeIso.filter((n) => n !== "tool_search");
+    await bridgeIso.refreshTools("x", makeClient("y_z"), { exposure: "direct" });
+    await bridgeIso.refreshTools("x_y", makeClient("z"), { exposure: "direct" });
+    assert.ok(!activeIso.includes("tool_search"), "Unrelated server discovery tool must stay deactivated");
+
+    await bridgeIso.refreshTools("a", makeClient("b_c"), { exposure: "deferred" });
+    assert.ok(activeIso.includes("tool_search"));
+    activeIso = activeIso.filter((n) => n !== "tool_search");
+    await bridgeIso.refreshTools("a_b", makeClient("c"), { exposure: "direct" });
+    assert.ok(
+      !activeIso.includes("tool_search"),
+      "Displacing an already-visible deferred incumbent must not undo intentional tool_search deactivation",
+    );
+  });
+
+  it("resetSessionState is self-contained without prior deactivateServer calls while keeping bridgeRegisteredNames intact", async () => {
+    const registered = new Map<string, TestToolDefinition>();
+    let active: string[] = ["read"];
+    let allowAll = false;
+    let lastTimeout: number | undefined;
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, {
+      registerTool: (t: unknown) => {
+        const tool = t as TestToolDefinition;
+        registered.set(tool.name, tool);
+        if (tool.exposure === "direct" && !active.includes(tool.name)) {
+          active = [...active, tool.name];
+        }
+      },
+      getActiveTools: () => [...active],
+      setActiveTools: (names: string[]) => {
+        active = [...names];
+      },
+      getAllTools: () => [
+        { name: "read" },
+        ...[...registered.values()]
+          .filter((tool) => allowAll || tool.name !== "mcp_filtered_hidden_ind")
+          .map((tool) => ({ name: tool.name, exposure: tool.exposure })),
+      ],
+    });
+
+    let srvTools = ["keep", "drop_me"];
+    const makeClient = (getTools: () => string[]) =>
+      ({
+        request: async () => ({
+          tools: getTools().map((name) => ({ name, inputSchema: { type: "object" } })),
+        }),
+        callTool: async (_params: unknown, _schema: unknown, opts?: { timeout?: number }) => {
+          lastTimeout = opts?.timeout;
+          return { content: [{ type: "text", text: "ok" }] };
+        },
+      }) as unknown as Client;
+
+    const clientSrv = makeClient(() => srvTools);
+    const clientA = makeClient(() => ["b_c"]);
+    const clientAB = makeClient(() => ["c"]);
+    const clientFiltered = makeClient(() => ["hidden_ind"]);
+
+    // Populate activeServers, liveToolBindings, droppedToolState, rawToolNames, rawToolExposures,
+    // activeServerExposures, indirectFilteredServers, serverTimeouts, collision maps, and /tree state.
+    await bridge.refreshTools("srv", clientSrv, { requestTimeoutMs: 1234 });
+    active = active.filter((n) => n !== "mcp_srv_drop_me");
+    srvTools = ["keep"];
+    await bridge.refreshTools("srv", clientSrv, { requestTimeoutMs: 1234 });
+    await bridge.refreshTools("a", clientA);
+    await bridge.refreshTools("a_b", clientAB);
+    await bridge.refreshTools("filtered", clientFiltered, { exposure: "deferred" });
+    bridge.snapshotPreTreeActiveTools();
+    active = ["read"];
+    bridge.recordTreeDeactivations();
+
+    const staleSession1Tool = registered.get("mcp_srv_keep")!;
+    assert.equal(bridge.isServerActive("srv"), true);
+    assert.equal(bridge.hasAllIndirectToolsFiltered("filtered"), true);
+    assert.ok(bridge.getConnectedExposures().has("direct"));
+
+    // Call resetSessionState directly WITHOUT calling deactivateServer first.
+    bridge.resetSessionState();
+
+    assert.equal(bridge.isServerActive("srv"), false);
+    assert.equal(bridge.isServerActive("a"), false);
+    assert.equal(bridge.isServerActive("a_b"), false);
+    assert.equal(bridge.hasAllIndirectToolsFiltered("filtered"), false);
+    assert.equal(bridge.getServerExposures("srv").size, 0);
+    assert.equal(bridge.getConnectedExposures().size, 0);
+    await assert.rejects(
+      () => staleSession1Tool.execute("stale", {}),
+      (err: unknown) => err instanceof McpError && err.code === "connection",
+    );
+
+    // Session 2: fresh connect does NOT inherit Session 1 dropped-inactive state, timeout override, or collision state,
+    // and still recognizes retired placeholders in getAllTools() as bridge-owned (not foreign).
+    allowAll = true;
+    srvTools = ["keep", "drop_me"];
+    await bridge.refreshTools("srv", clientSrv);
+    assert.ok(
+      active.includes("mcp_srv_drop_me"),
+      "Session 1 dropped-inactive state must not suppress fresh Session 2 activation",
+    );
+    await registered.get("mcp_srv_keep")!.execute("fresh", {});
+    assert.equal(
+      lastTimeout,
+      BRIDGE_SETTINGS.requestTimeoutMs,
+      "Session 1 per-server timeout override must be cleared",
+    );
+
+    // Retired hidden placeholder from Session 1 must not be treated as foreign
+    await bridge.refreshTools("a", clientA);
+    assert.ok(active.includes("mcp_a_b_c"), "Session 2 must reclaim unhashed mcp_a_b_c");
+    assert.equal(registered.get("mcp_a_b_c")?.exposure, "direct");
+  });
+
+  it("tracks /tree-deactivated direct tools by raw MCP name across transient drops, intra-server collision renames, and exposure changes (#333)", async () => {
+    const registered = new Map<string, TestToolDefinition>();
+    let active: string[] = ["read"];
+    const bridge = new ToolBridge(BRIDGE_SETTINGS, {
+      registerTool: (t: unknown) => {
+        const tool = t as TestToolDefinition;
+        registered.set(tool.name, tool);
+        if (tool.exposure === "direct" && !active.includes(tool.name)) {
+          active = [...active, tool.name];
+        }
+      },
+      getActiveTools: () => [...active],
+      setActiveTools: (names: string[]) => {
+        active = [...names];
+      },
+    });
+
+    // (a) Transient drop + re-advertise between /tree and restore (including multi-hop /tree + orderActiveTools while dropped)
+    let dropTools = ["alpha", "stay"];
+    const dropClient = {
+      request: async () => ({
+        tools: dropTools.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+    } as unknown as Client;
+
+    await bridge.refreshTools("drop_srv", dropClient);
+    assert.deepEqual(active, ["read", "mcp_drop_srv_alpha", "mcp_drop_srv_stay"]);
+
+    bridge.snapshotPreTreeActiveTools();
+    active = ["read"];
+    bridge.recordTreeDeactivations();
+
+    // Live refresh #1: transiently drop `alpha` while adding `fresh`
+    dropTools = ["stay", "fresh"];
+    await bridge.refreshTools("drop_srv", dropClient);
+    assert.deepEqual(active, ["read", "mcp_drop_srv_fresh"]);
+
+    // Another /tree hop and orderActiveTools while `alpha` is dropped must retain `alpha`
+    bridge.snapshotPreTreeActiveTools();
+    bridge.recordTreeDeactivations();
+    bridge.orderActiveTools();
+
+    // Live refresh #2: re-advertise `alpha` -> stays inactive on refresh, then restore brings back both `alpha` and `stay`
+    dropTools = ["alpha", "stay", "fresh"];
+    await bridge.refreshTools("drop_srv", dropClient);
+    assert.deepEqual(active, ["read", "mcp_drop_srv_fresh"]);
+
+    bridge.restoreTreeDeactivatedDirectTools("drop_srv");
+    assert.deepEqual(active, [
+      "read",
+      "mcp_drop_srv_alpha",
+      "mcp_drop_srv_fresh",
+      "mcp_drop_srv_stay",
+    ]);
+
+    // (b) Intra-server collision rename between /tree and restore
+    let renameTools = ["my-tool"];
+    const renameClient = {
+      request: async () => ({
+        tools: renameTools.map((name) => ({ name, inputSchema: { type: "object" } })),
+      }),
+    } as unknown as Client;
+
+    active = ["read"];
+    await bridge.refreshTools("ren_srv", renameClient);
+    assert.deepEqual(active, ["read", "mcp_ren_srv_my_tool"]);
+
+    bridge.snapshotPreTreeActiveTools();
+    active = ["read"];
+    bridge.recordTreeDeactivations();
+
+    // Live refresh adds lossless `my_tool` -> claims & activates `mcp_ren_srv_my_tool`, shifts `my-tool` to hashed (inactive)
+    renameTools = ["my-tool", "my_tool"];
+    await bridge.refreshTools("ren_srv", renameClient);
+    const hashedHyphen = buildToolName("mcp", "ren_srv", "my-tool", true);
+    assert.deepEqual(active, ["read", "mcp_ren_srv_my_tool"]);
+
+    // orderActiveTools sees `mcp_ren_srv_my_tool` (raw `my_tool`) active, must NOT prune raw `my-tool`
+    bridge.orderActiveTools();
+    bridge.restoreTreeDeactivatedDirectTools("ren_srv");
+    assert.deepEqual(active, ["read", "mcp_ren_srv_my_tool", hashedHyphen]);
+
+    // (c) Exposure change away from `direct` prunes the pending raw tool
+    const expClient = {
+      request: async () => ({
+        tools: [{ name: "shift", inputSchema: { type: "object" } }],
+      }),
+    } as unknown as Client;
+    active = ["read"];
+    await bridge.refreshTools("exp_srv", expClient, { exposure: "direct" });
+    assert.deepEqual(active, ["read", "mcp_exp_srv_shift"]);
+
+    bridge.snapshotPreTreeActiveTools();
+    active = ["read"];
+    bridge.recordTreeDeactivations();
+
+    // Exposure narrows to `deferred` -> prunes `shift` from treeDeactivatedDirectTools
+    await bridge.refreshTools("exp_srv", expClient, { exposure: "deferred" });
+    assert.deepEqual(active, ["read"]);
+
+    // Later returns to `direct` (activates via exposure crossing), then policy deactivates it -> restore must NOT resurrect it
+    await bridge.refreshTools("exp_srv", expClient, { exposure: "direct" });
+    assert.deepEqual(active, ["read", "mcp_exp_srv_shift"]);
+    active = ["read"];
+    bridge.restoreTreeDeactivatedDirectTools("exp_srv");
+    assert.deepEqual(active, ["read"]);
+  });
+
+  it("keeps 3-server combined stem-loser and _-boundary dynamic removal identical across all connect permutations while keeping lazy winner unhashed (#331)", async () => {
+    const makeTaggedClient = (serverTag: string, toolName: string) =>
+      ({
+        request: async () => ({
+          tools: [{ name: toolName, inputSchema: { type: "object" } }],
+        }),
+        callTool: async (params: { name: string }) => ({
+          content: [{ type: "text", text: JSON.stringify({ serverTag, toolName: params.name }) }],
+        }),
+      }) as unknown as Client;
+
+    const hashedMy = buildToolName("mcp", "my", "srv_run", true);
+    const hashedMyUnder = buildToolName("mcp", "my_srv", "run", true);
+    const hashedMyDash = buildToolName("mcp", "my-srv", "run", true);
+
+    type SrvName = "my" | "my_srv" | "my-srv";
+    const allPermutations: Array<[SrvName, SrvName, SrvName]> = [
+      ["my", "my_srv", "my-srv"],
+      ["my", "my-srv", "my_srv"],
+      ["my_srv", "my", "my-srv"],
+      ["my_srv", "my-srv", "my"],
+      ["my-srv", "my", "my_srv"],
+      ["my-srv", "my_srv", "my"],
+    ];
+
+    const runPermutation = async (order: [SrvName, SrvName, SrvName]) => {
+      const registered = new Map<string, TestToolDefinition>();
+      let active: string[] = [];
+      const bridge = new ToolBridge(BRIDGE_SETTINGS, {
+        registerTool: (t: unknown) => {
+          const tool = t as TestToolDefinition;
+          registered.set(tool.name, tool);
+          if (tool.exposure === "direct" && !active.includes(tool.name)) {
+            active = [...active, tool.name];
+          }
+        },
+        getActiveTools: () => [...active],
+        setActiveTools: (names: string[]) => {
+          active = [...names];
+        },
+      });
+      const clients: Record<SrvName, Client> = {
+        my: makeTaggedClient("my", "srv_run"),
+        my_srv: makeTaggedClient("my_srv", "run"),
+        "my-srv": makeTaggedClient("my-srv", "run"),
+      };
+      const allPeers: SrvName[] = ["my", "my_srv", "my-srv"];
+      for (const name of order) {
+        await bridge.refreshTools(name, clients[name], { peerServerNames: allPeers });
+      }
+      const afterAllThree = [...active];
+
+      // Remove `my_srv` and refresh `my` before `my-srv` refreshes -> `my` must STAY hashed in every permutation
+      bridge.removeServer("my_srv");
+      await bridge.refreshTools("my", clients.my, { peerServerNames: ["my", "my-srv"] });
+      const afterRemoveWinner = [...active];
+
+      // Also remove `my-srv` and refresh `my` -> `my` cleanly reclaims unhashed `mcp_my_srv_run`
+      bridge.removeServer("my-srv");
+      await bridge.refreshTools("my", clients.my, { peerServerNames: ["my"] });
+      const afterRemoveBoth = [...active];
+
+      return { afterAllThree, afterRemoveWinner, afterRemoveBoth };
+    };
+
+    const baseline = await runPermutation(allPermutations[0]!);
+    assert.deepEqual(baseline.afterAllThree, [hashedMy, hashedMyDash, hashedMyUnder].sort());
+    assert.deepEqual(baseline.afterRemoveWinner, [hashedMy, hashedMyDash].sort());
+    assert.deepEqual(baseline.afterRemoveBoth, ["mcp_my_srv_run"]);
+
+    for (const perm of allPermutations.slice(1)) {
+      const result = await runPermutation(perm);
+      assert.deepEqual(result, baseline, `Permutation ${perm.join(" -> ")} diverged from baseline`);
+    }
+
+    // Lazy `my_srv` invariant: when only `my` + `my-srv` connect while `my_srv` stays configured/lazy,
+    // `my` must still claim unhashed `mcp_my_srv_run` in both connect orders.
+    for (const pairOrder of [
+      ["my", "my-srv"],
+      ["my-srv", "my"],
+    ] as const) {
+      let activePair: string[] = [];
+      const bridgePair = new ToolBridge(BRIDGE_SETTINGS, {
+        registerTool: (t: unknown) => {
+          const tool = t as TestToolDefinition;
+          if (tool.exposure === "direct" && !activePair.includes(tool.name)) {
+            activePair = [...activePair, tool.name];
+          }
+        },
+        getActiveTools: () => [...activePair],
+        setActiveTools: (names: string[]) => {
+          activePair = [...names];
+        },
+      });
+      const clients = {
+        my: makeTaggedClient("my", "srv_run"),
+        "my-srv": makeTaggedClient("my-srv", "run"),
+      };
+      for (const name of pairOrder) {
+        await bridgePair.refreshTools(name, clients[name], {
+          peerServerNames: ["my", "my_srv", "my-srv"],
+        });
+      }
+      assert.deepEqual(
+        activePair,
+        ["mcp_my_srv_run", hashedMyDash].sort(),
+        `Order ${pairOrder.join(" -> ")} with lazy my_srv must keep my unhashed`,
+      );
+    }
+  });
 });

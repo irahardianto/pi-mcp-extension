@@ -17,6 +17,7 @@ import {
   type McpExposure,
   type RegisteredToolSummary,
 } from "./tool-exposure.js";
+import { MANAGEMENT_TOOL_NAMES } from "./tool-names.js";
 import {
   resolveAllServerNamespaceIds,
   sanitizeNamespaceText,
@@ -34,12 +35,6 @@ const MAX_SERVER_SUMMARY_CHARS = 250;
 
 /** Bound for sanitized raw server names rendered inside `mcp_connect "<name>"` hints. */
 const MAX_SAFE_SERVER_NAME_CHARS = 120;
-
-/** Management tool name required to connect lazy/stopped servers from the prompt. */
-const MCP_CONNECT_TOOL_NAME = "mcp_connect";
-
-/** Management tool name that reports every configured server name verbatim. */
-const MCP_STATUS_TOOL_NAME = "mcp_status";
 
 export type IndirectReachMode = "codemode" | "tool_search";
 
@@ -90,8 +85,8 @@ function resolveReachAvailability(
   return {
     codemode: isReachingAvailable(active, allTools, CODEMODE_TOOL_NAME),
     toolSearch: isReachingAvailable(active, allTools, TOOL_SEARCH_TOOL_NAME),
-    mcpConnect: active ? active.has(MCP_CONNECT_TOOL_NAME) : true,
-    mcpStatus: active ? active.has(MCP_STATUS_TOOL_NAME) : true,
+    mcpConnect: active ? active.has(MANAGEMENT_TOOL_NAMES.connect) : true,
+    mcpStatus: active ? active.has(MANAGEMENT_TOOL_NAMES.status) : true,
   };
 }
 

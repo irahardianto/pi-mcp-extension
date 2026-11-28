@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { McpToolDefinition } from "../src/tool-discovery.js";
 import {
+  collectAddedExposures,
   collectWithdrawnTools,
   deleteServerOwnedTools,
   filterOwnedTools,
@@ -18,6 +19,8 @@ import {
   planTreeDirectToolRestore,
   pruneTreeDeactivatedDirectTools,
   reconcileLiveRefreshState,
+  recordBaseNameCandidate,
+  recordCrossServerCollision,
   snapshotActiveStateByRawName,
   updateTreeDeactivatedDirectTools,
 } from "../src/tool-reconcile.js";
@@ -369,7 +372,7 @@ describe("tool-reconcile: cross-server stem disambiguation, reservedNames, and b
     assert.equal(suffixedPlan.plannedTools[0]!.piName, `${firstHash}_2`);
   });
 
-  it("forgetServerCollisionState transfers sole survivor to baseNameOwners and clears on final removal (#331)", () => {
+  it("forgetServerCollisionState, recordBaseNameCandidate, and recordCrossServerCollision keep 3-server stem-loser collisions order-invariant (#331)", () => {
     // 2-way collision set -> drop 1 -> survivor moves to baseNameOwners -> drop survivor -> empty
     const baseOwners2 = new Map<string, string>([["mcp_a_other", "a_b"]]);
     const collided2 = new Map<string, Set<string>>([["mcp_a_b_c", new Set(["a", "a_b"])]]);
@@ -397,71 +400,177 @@ describe("tool-reconcile: cross-server stem disambiguation, reservedNames, and b
     forgetServerCollisionState("x_y", baseOwners3, collided3);
     assert.equal(collided3.size, 0);
     assert.equal(baseOwners3.size, 0);
+
+    // Stem-loser `my-srv` connected before `my` + `my_srv` collided: baseNameCandidates pulls it into collidedBaseServers
+    const candidates = new Map<string, Set<string>>();
+    const baseOwnersCombined = new Map<string, string>();
+    const collidedCombined = new Map<string, Set<string>>();
+    recordBaseNameCandidate(candidates, "mcp_my_srv_run", "my-srv");
+    recordBaseNameCandidate(candidates, "mcp_my_srv_run", "my");
+    recordCrossServerCollision("mcp_my_srv_run", "my", "my_srv", collidedCombined, candidates);
+    recordBaseNameCandidate(candidates, "mcp_my_srv_run", "my_srv");
+    assert.deepEqual(collidedCombined.get("mcp_my_srv_run"), new Set(["my", "my_srv", "my-srv"]));
+
+    // Removing `my_srv` retains {"my", "my-srv"} in collidedBaseServers
+    forgetServerCollisionState("my_srv", baseOwnersCombined, collidedCombined, candidates);
+    assert.deepEqual(collidedCombined.get("mcp_my_srv_run"), new Set(["my", "my-srv"]));
+    assert.deepEqual(candidates.get("mcp_my_srv_run"), new Set(["my-srv", "my"]));
+    assert.equal(baseOwnersCombined.size, 0);
+
+    // Removing `my-srv` transfers sole survivor `my` back to baseNameOwners
+    forgetServerCollisionState("my-srv", baseOwnersCombined, collidedCombined, candidates);
+    assert.equal(collidedCombined.has("mcp_my_srv_run"), false);
+    assert.deepEqual(baseOwnersCombined, new Map([["mcp_my_srv_run", "my"]]));
+    assert.deepEqual(candidates.get("mcp_my_srv_run"), new Set(["my"]));
+
+    // Removing `my` clears every map cleanly
+    forgetServerCollisionState("my", baseOwnersCombined, collidedCombined, candidates);
+    assert.equal(collidedCombined.size, 0);
+    assert.equal(baseOwnersCombined.size, 0);
+    assert.equal(candidates.size, 0);
+  });
+
+  it("collectAddedExposures returns only exposures newly added relative to previous", () => {
+    assert.deepEqual(
+      collectAddedExposures(undefined, new Set(["deferred", "direct"])),
+      new Set(["deferred", "direct"]),
+    );
+    assert.deepEqual(collectAddedExposures(new Set(), new Set(["codemode"])), new Set(["codemode"]));
+    assert.deepEqual(
+      collectAddedExposures(new Set(["deferred"]), new Set(["deferred", "codemode"])),
+      new Set(["codemode"]),
+    );
+    assert.deepEqual(
+      collectAddedExposures(new Set(["deferred"]), new Set(["deferred"])),
+      new Set(),
+    );
   });
 });
 
 describe("tool-reconcile: /tree deactivated direct tool helpers (#333)", () => {
-  it("accumulates multi-hop /tree deactivations, ignores missing beforeActive, and clears on forward hop", () => {
+  it("accumulates multi-hop /tree deactivations by raw name, ignores missing beforeActive, and clears on forward hop", () => {
     const direct = new Set(["mcp_s_a", "mcp_s_b"]);
+    const rawToolNames = new Map<string, string>([
+      ["mcp_s_a", "raw-a"],
+      ["mcp_s_b", "raw-b"],
+    ]);
     // Hop 1: Turn 2 (only a active) -> Turn 1a (neither active)
-    const hop1 = updateTreeDeactivatedDirectTools(
-      undefined,
-      direct,
-      new Set(["read", "mcp_s_a"]),
-      new Set(["read"]),
-    );
-    assert.deepEqual(hop1, new Set(["mcp_s_a"]));
+    const hop1 = updateTreeDeactivatedDirectTools({
+      existing: undefined,
+      directTools: direct,
+      rawToolNames,
+      beforeActive: new Set(["read", "mcp_s_a"]),
+      currentActive: new Set(["read"]),
+    });
+    assert.deepEqual(hop1, new Set(["raw-a"]));
 
-    // Hop 2: Turn 1a -> Turn 1b (neither active) retains mcp_s_a
-    const hop2 = updateTreeDeactivatedDirectTools(
-      hop1,
-      direct,
-      new Set(["read"]),
-      new Set(["read"]),
-    );
-    assert.deepEqual(hop2, new Set(["mcp_s_a"]));
+    // Hop 2: Turn 1a -> Turn 1b (neither active) retains raw-a
+    const hop2 = updateTreeDeactivatedDirectTools({
+      existing: hop1,
+      directTools: direct,
+      rawToolNames,
+      beforeActive: new Set(["read"]),
+      currentActive: new Set(["read"]),
+    });
+    assert.deepEqual(hop2, new Set(["raw-a"]));
 
     // Missing beforeActive records no new deactivations, only prunes currentActive
     assert.equal(
-      updateTreeDeactivatedDirectTools(undefined, direct, undefined, new Set(["read"])),
+      updateTreeDeactivatedDirectTools({
+        existing: undefined,
+        directTools: direct,
+        rawToolNames,
+        beforeActive: undefined,
+        currentActive: new Set(["read"]),
+      }),
       undefined,
     );
     assert.deepEqual(
-      updateTreeDeactivatedDirectTools(hop2, direct, undefined, new Set(["read"])),
-      new Set(["mcp_s_a"]),
+      updateTreeDeactivatedDirectTools({
+        existing: hop2,
+        directTools: direct,
+        rawToolNames,
+        beforeActive: undefined,
+        currentActive: new Set(["read"]),
+      }),
+      new Set(["raw-a"]),
     );
 
-    // Forward hop to Turn 2 where mcp_s_a is active clears it
+    // Forward hop to Turn 2 where mcp_s_a is active clears raw-a
     assert.equal(
-      updateTreeDeactivatedDirectTools(hop2, direct, new Set(["read"]), new Set(["read", "mcp_s_a"])),
+      updateTreeDeactivatedDirectTools({
+        existing: hop2,
+        directTools: direct,
+        rawToolNames,
+        beforeActive: new Set(["read"]),
+        currentActive: new Set(["read", "mcp_s_a"]),
+      }),
       undefined,
     );
   });
 
-  it("prunes deactivated direct tools and plans additive ordered restoration", () => {
-    const pruned = pruneTreeDeactivatedDirectTools(
-      new Set(["mcp_s_a", "mcp_s_b", "mcp_s_gone"]),
-      new Set(["mcp_s_a", "mcp_s_b"]),
-      new Set(["mcp_s_b"]),
-    );
-    assert.deepEqual(pruned, new Set(["mcp_s_a"]));
+  it("retains transiently dropped direct raw tools across /tree and pruning while pruning exposure changes and active tools", () => {
+    const dropped = new Map<string, boolean>([
+      ["dropped_direct", false],
+      ["dropped_deferred", false],
+    ]);
+    const exposures = new Map<string, "direct" | "deferred" | "codemode" | "hidden">([
+      ["my-tool", "direct"],
+      ["my_tool", "direct"],
+      ["dropped_direct", "direct"],
+      ["dropped_deferred", "deferred"],
+      ["turned_deferred", "deferred"],
+    ]);
+    // Intra-server rename: `my_tool` claimed & activated `mcp_s_my_tool`, while `my-tool` moved to hashed and stayed inactive
+    const rawToolNames = new Map<string, string>([
+      ["mcp_s_my_tool", "my_tool"],
+      ["mcp_s_my_tool_deadbeef", "my-tool"],
+      ["mcp_s_turned_deferred", "turned_deferred"],
+    ]);
+    const directTools = new Set(["mcp_s_my_tool", "mcp_s_my_tool_deadbeef"]);
 
-    const owned = new Set(["mcp_s_a", "mcp_s_b", "mcp_other_z"]);
-    const next = planTreeDirectToolRestore(
-      new Set(["mcp_s_a"]),
-      new Set(["mcp_s_a", "mcp_s_b"]),
-      ["read", "mcp_other_z"],
-      (n) => owned.has(n),
-    );
-    assert.deepEqual(next, ["read", "mcp_other_z", "mcp_s_a"]);
+    const pruned = pruneTreeDeactivatedDirectTools({
+      existing: new Set(["my-tool", "my_tool", "dropped_direct", "dropped_deferred", "turned_deferred"]),
+      directTools,
+      rawToolNames,
+      droppedToolState: dropped,
+      rawToolExposures: exposures,
+      nowActive: new Set(["mcp_s_my_tool"]),
+    });
+    assert.deepEqual(pruned, new Set(["my-tool", "dropped_direct"]));
 
+    // Multi-hop /tree while `dropped_direct` is still dropped retains it
+    const afterTreeDuringDrop = updateTreeDeactivatedDirectTools({
+      existing: new Set(["dropped_direct"]),
+      directTools: new Set(),
+      rawToolNames: new Map(),
+      droppedToolState: dropped,
+      rawToolExposures: exposures,
+      beforeActive: new Set(["read"]),
+      currentActive: new Set(["read"]),
+    });
+    assert.deepEqual(afterTreeDuringDrop, new Set(["dropped_direct"]));
+
+    // Restoring resolves raw `my-tool` onto its current hashed Pi name without touching already-active tools
+    const owned = new Set(["mcp_s_my_tool", "mcp_s_my_tool_deadbeef", "mcp_other_z"]);
+    const next = planTreeDirectToolRestore({
+      pendingRawNames: new Set(["my-tool", "dropped_direct"]),
+      directTools,
+      rawToolNames,
+      activeBefore: ["read", "mcp_other_z", "mcp_s_my_tool"],
+      isOwned: (n) => owned.has(n),
+    });
+    assert.deepEqual(next, ["read", "mcp_other_z", "mcp_s_my_tool", "mcp_s_my_tool_deadbeef"]);
+
+    // Already active -> undefined
     assert.equal(
-      planTreeDirectToolRestore(
-        new Set(["mcp_s_a"]),
-        new Set(["mcp_s_a"]),
-        ["read", "mcp_s_a"],
-        (n) => owned.has(n),
-      ),
+      planTreeDirectToolRestore({
+        pendingRawNames: new Set(["my_tool"]),
+        directTools,
+        rawToolNames,
+        activeBefore: ["read", "mcp_s_my_tool"],
+        isOwned: (n) => owned.has(n),
+      }),
       undefined,
     );
   });

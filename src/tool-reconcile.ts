@@ -185,15 +185,58 @@ export function collectReservedToolNames(
   return reserved;
 }
 
+function getOrCreateSet(map: Map<string, Set<string>>, key: string): Set<string> {
+  let set = map.get(key);
+  if (!set) {
+    set = new Set<string>();
+    map.set(key, set);
+  }
+  return set;
+}
+
 /**
- * Remove `serverName` from cross-server base-ownership and collision-set tracking,
- * deleting any collision entry that drops below 2 competing servers and transferring
- * any sole surviving server back to `baseNameOwners` (#331).
+ * Record that `serverName` advertises a tool targeting unhashed `baseName`, so if a real
+ * cross-server collision later occurs on `baseName` this server is included in
+ * `collidedBaseServers` regardless of connect order (#331).
+ */
+export function recordBaseNameCandidate(
+  baseNameCandidates: Map<string, Set<string>>,
+  baseName: string,
+  serverName: string,
+): void {
+  getOrCreateSet(baseNameCandidates, baseName).add(serverName);
+}
+
+/**
+ * Record a cross-server base-name collision and include any previously connected server
+ * (such as a stem-loser peer) that also targets `baseName` so dynamic peer removal stays
+ * connect-order invariant (#331).
+ */
+export function recordCrossServerCollision(
+  baseName: string,
+  incumbentServer: string,
+  incomingServer: string,
+  collidedBaseServers: Map<string, Set<string>>,
+  baseNameCandidates?: ReadonlyMap<string, ReadonlySet<string>>,
+): void {
+  const servers = getOrCreateSet(collidedBaseServers, baseName);
+  servers.add(incumbentServer);
+  servers.add(incomingServer);
+  for (const candidate of baseNameCandidates?.get(baseName) ?? []) {
+    servers.add(candidate);
+  }
+}
+
+/**
+ * Remove `serverName` from cross-server base-ownership, collision-set, and candidate-base
+ * tracking, deleting any collision entry that drops below 2 competing servers and
+ * transferring any sole surviving server back to `baseNameOwners` (#331).
  */
 export function forgetServerCollisionState(
   serverName: string,
   baseNameOwners: Map<string, string>,
   collidedBaseServers: Map<string, Set<string>>,
+  baseNameCandidates?: Map<string, Set<string>>,
 ): void {
   for (const [baseName, owner] of baseNameOwners) {
     if (owner === serverName) {
@@ -210,6 +253,20 @@ export function forgetServerCollisionState(
       }
     }
   }
+  for (const [baseName, candidates] of baseNameCandidates ?? []) {
+    candidates.delete(serverName);
+    if (candidates.size === 0) {
+      baseNameCandidates?.delete(baseName);
+    }
+  }
+}
+
+/** Collect resolved MCP exposures present in `next` that were absent from `previous`. */
+export function collectAddedExposures(
+  previous: ReadonlySet<McpExposure> | undefined,
+  next: ReadonlySet<McpExposure>,
+): Set<McpExposure> {
+  return new Set([...next].filter((exposure) => !previous?.has(exposure)));
 }
 
 /**
@@ -458,64 +515,118 @@ export function planActiveToolReconciliation(
   return sameToolList(currentActive, nextActive) ? undefined : nextActive;
 }
 
+/** Input for recording raw MCP tool names of `direct` tools stripped across `/tree` hops (#333). */
+export interface UpdateTreeDeactivatedInput {
+  existing: ReadonlySet<string> | undefined;
+  directTools: ReadonlySet<string> | undefined;
+  rawToolNames?: ReadonlyMap<string, string> | undefined;
+  droppedToolState?: ReadonlyMap<string, boolean> | undefined;
+  rawToolExposures?: ReadonlyMap<string, McpExposure> | undefined;
+  beforeActive: ReadonlySet<string> | undefined;
+  currentActive: ReadonlySet<string>;
+}
+
+/** Input for pruning tracked raw `/tree`-deactivated `direct` tool names (#333). */
+export interface PruneTreeDeactivatedInput {
+  existing: ReadonlySet<string> | undefined;
+  directTools: ReadonlySet<string> | undefined;
+  rawToolNames?: ReadonlyMap<string, string> | undefined;
+  droppedToolState?: ReadonlyMap<string, boolean> | undefined;
+  rawToolExposures?: ReadonlyMap<string, McpExposure> | undefined;
+  nowActive: ReadonlySet<string>;
+}
+
+/** Input for restoring tracked raw `/tree`-deactivated `direct` tools onto Pi's active set (#333). */
+export interface PlanTreeDirectToolRestoreInput {
+  pendingRawNames: ReadonlySet<string> | undefined;
+  directTools: ReadonlySet<string> | undefined;
+  rawToolNames?: ReadonlyMap<string, string> | undefined;
+  activeBefore: readonly string[];
+  isOwned: (name: string) => boolean;
+}
+
+function collectDroppedDirectTools(
+  existing: ReadonlySet<string> | undefined,
+  activeRaw: ReadonlySet<string>,
+  droppedToolState: ReadonlyMap<string, boolean> | undefined,
+  rawToolExposures: ReadonlyMap<string, McpExposure> | undefined,
+  target: Set<string>,
+): void {
+  if (!existing || !droppedToolState || !rawToolExposures) return;
+  for (const rawName of existing) {
+    if (
+      !activeRaw.has(rawName) &&
+      droppedToolState.has(rawName) &&
+      rawToolExposures.get(rawName) === "direct"
+    ) {
+      target.add(rawName);
+    }
+  }
+}
+
 /**
- * Accumulate direct tools stripped across one or more `/tree` hops while pruning any that
- * are active again on the target branch (`currentActive`) or no longer `direct` (#333).
+ * Accumulate raw MCP tool names of `direct` tools stripped across one or more `/tree` hops,
+ * retaining transiently dropped `direct` tools while pruning any that are active again on
+ * `currentActive` or no longer `direct` (#333).
  * When `beforeActive` is `undefined`, no new deactivations are recorded.
  */
 export function updateTreeDeactivatedDirectTools(
-  existing: ReadonlySet<string> | undefined,
-  directTools: ReadonlySet<string> | undefined,
-  beforeActive: ReadonlySet<string> | undefined,
-  currentActive: ReadonlySet<string>,
+  input: UpdateTreeDeactivatedInput,
 ): Set<string> | undefined {
-  if (!directTools || directTools.size === 0) return undefined;
   const next = new Set<string>();
-  for (const name of directTools) {
-    if (currentActive.has(name)) continue;
-    if (beforeActive?.has(name) || existing?.has(name)) {
-      next.add(name);
+  const activeRaw = new Set<string>();
+  if (input.directTools) {
+    for (const piName of input.directTools) {
+      const rawName = input.rawToolNames?.get(piName) ?? piName;
+      if (input.currentActive.has(piName)) {
+        activeRaw.add(rawName);
+      } else if (input.beforeActive?.has(piName) || input.existing?.has(rawName)) {
+        next.add(rawName);
+      }
     }
   }
+  collectDroppedDirectTools(
+    input.existing,
+    activeRaw,
+    input.droppedToolState,
+    input.rawToolExposures,
+    next,
+  );
   return next.size > 0 ? next : undefined;
 }
 
 /**
- * Prune tracked `/tree`-deactivated direct tools against `keepAllowed` and `nowActive` (#333).
+ * Prune tracked raw `/tree`-deactivated `direct` tool names against current `direct` tools,
+ * dropped-direct memory, and `nowActive` Pi tool names (#333).
  */
 export function pruneTreeDeactivatedDirectTools(
-  existing: ReadonlySet<string> | undefined,
-  keepAllowed: ReadonlySet<string>,
-  nowActive: ReadonlySet<string>,
+  input: PruneTreeDeactivatedInput,
 ): Set<string> | undefined {
-  if (!existing || existing.size === 0) return undefined;
-  const next = new Set<string>();
-  for (const name of existing) {
-    if (keepAllowed.has(name) && !nowActive.has(name)) {
-      next.add(name);
-    }
-  }
-  return next.size > 0 ? next : undefined;
+  return updateTreeDeactivatedDirectTools({
+    ...input,
+    beforeActive: undefined,
+    currentActive: input.nowActive,
+  });
 }
 
 /**
  * Plan an additive, deterministically ordered active-tool list restoring `/tree`-deactivated
- * `direct` tools without altering any other extension's restrictions (#333).
+ * `direct` tools (resolved from raw MCP tool names to their current Pi names) without altering
+ * any other extension's restrictions (#333).
  */
 export function planTreeDirectToolRestore(
-  pending: ReadonlySet<string> | undefined,
-  directTools: ReadonlySet<string> | undefined,
-  activeBefore: readonly string[],
-  isOwned: (name: string) => boolean,
+  input: PlanTreeDirectToolRestoreInput,
 ): string[] | undefined {
-  if (!pending || pending.size === 0 || !directTools || directTools.size === 0) {
+  const { pendingRawNames, directTools, rawToolNames, activeBefore, isOwned } = input;
+  if (!pendingRawNames?.size || !directTools?.size) {
     return undefined;
   }
   const activeSet = new Set(activeBefore);
   const toRestore: string[] = [];
-  for (const name of pending) {
-    if (directTools.has(name) && !activeSet.has(name)) {
-      toRestore.push(name);
+  for (const piName of directTools) {
+    const rawName = rawToolNames?.get(piName) ?? piName;
+    if (pendingRawNames.has(rawName) && !activeSet.has(piName)) {
+      toRestore.push(piName);
     }
   }
   if (toRestore.length === 0) return undefined;

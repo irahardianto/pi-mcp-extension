@@ -8,6 +8,7 @@ import extension from "../src/index.js";
 import { acquireAuthLock, AuthLockError, AuthRequiredError, getAuthStatus, McpOAuthProvider } from "../src/oauth-provider.js";
 import { AuthCancelledError, McpError } from "../src/errors.js";
 import { formatMcpConnectError, formatConnectSuccess, registerManagementTools, type ManagementToolDeps } from "../src/register-tools.js";
+import { buildToolName } from "../src/tool-names.js";
 import { createMockExtension, createMockContext } from "./helpers/mock-extension.js";
 
 for (const { name, error, options, expected } of [
@@ -1509,4 +1510,107 @@ await server.connect(new StdioServerTransport());
   }
 });
 
+it("restores /tree-deactivated direct tools across live tools/list_changed drop+re-advertise and intra-server rename on mcp_connect (#333)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-mcp-tree-list-changed-"));
+  const sdkServerUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/index.js");
+  const sdkStdioUrl = import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js");
+  const sdkTypesUrl = import.meta.resolve("@modelcontextprotocol/sdk/types.js");
+  const serverScript = join(dir, "dynamic-tools-server.mjs");
+  const mockExt = createMockExtension({ activeTools: ["read", "mcp_connect"] });
+  const ctx = createMockContext({ cwd: dir, hasUI: false });
 
+  const waitUntil = async (predicate: () => boolean, label: string): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    while (!predicate()) {
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for ${label}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  };
+
+  try {
+    await writeFile(
+      serverScript,
+      `import { Server } from ${JSON.stringify(sdkServerUrl)};
+import { StdioServerTransport } from ${JSON.stringify(sdkStdioUrl)};
+import { CallToolRequestSchema, ListToolsRequestSchema } from ${JSON.stringify(sdkTypesUrl)};
+let toolNames = ["control", "my-tool"];
+const server = new Server(
+  { name: "dynamic", version: "1.0.0" },
+  { capabilities: { tools: { listChanged: true } } },
+);
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: toolNames.map((name) => ({
+    name,
+    inputSchema: { type: "object", properties: { next: { type: "array", items: { type: "string" } } } },
+  })),
+}));
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "control" && Array.isArray(req.params.arguments?.next)) {
+    toolNames = req.params.arguments.next;
+    await server.sendToolListChanged();
+  }
+  return { content: [{ type: "text", text: "ok:" + req.params.name }] };
+});
+await server.connect(new StdioServerTransport());
+`,
+    );
+    await mkdir(join(dir, ".pi"));
+    await writeFile(
+      join(dir, ".pi", "mcp.json"),
+      JSON.stringify({
+        settings: { maxRetries: 0 },
+        mcpServers: {
+          dyn: { command: "node", args: [serverScript], lifecycle: "lazy" },
+        },
+      }),
+    );
+
+    await extension(mockExt.api, { bootstrapCwd: dir, globalConfigPath: join(dir, "absent-global.json") });
+    await mockExt.events.get("session_start")({}, ctx);
+
+    // Connect lazy server -> control + my-tool (`mcp_dyn_my_tool`) activate
+    await mockExt.tools.get("mcp_connect").execute("c1", { name: "dyn" }, undefined, undefined, ctx);
+    assert.deepEqual(mockExt.activeTools, ["read", "mcp_connect", "mcp_dyn_control", "mcp_dyn_my_tool"]);
+
+    // /tree strips `mcp_dyn_my_tool` while keeping `mcp_dyn_control` active
+    await mockExt.events.get("session_before_tree")?.({}, ctx);
+    mockExt.activeTools = ["read", "mcp_connect", "mcp_dyn_control"];
+    await mockExt.events.get("session_tree")({}, ctx);
+
+    // Live tools/list_changed #1: transiently drop `my-tool`
+    await mockExt.tools
+      .get("mcp_dyn_control")
+      .execute("t1", { next: ["control", "marker"] }, undefined, undefined, ctx);
+    await waitUntil(
+      () => mockExt.activeTools.includes("mcp_dyn_marker"),
+      "transient drop refresh",
+    );
+    assert.equal(mockExt.tools.get("mcp_dyn_my_tool")?.exposure, "hidden");
+
+    // Live tools/list_changed #2: re-advertise `my-tool` alongside lossless colliding `my_tool`
+    const hashedMyTool = buildToolName("mcp", "dyn", "my-tool", true);
+    await mockExt.tools
+      .get("mcp_dyn_control")
+      .execute("t2", { next: ["control", "my-tool", "my_tool"] }, undefined, undefined, ctx);
+    await waitUntil(
+      () => mockExt.tools.get(hashedMyTool)?.exposure === "direct",
+      "re-advertise + intra-server rename refresh",
+    );
+    // `my_tool` claimed & activated `mcp_dyn_my_tool`, while `my-tool` returned inactive on its hashed name
+    assert.ok(mockExt.activeTools.includes("mcp_dyn_my_tool"));
+    assert.ok(!mockExt.activeTools.includes(hashedMyTool));
+
+    // Reconnecting via mcp_connect restores `my-tool` on its new hashed Pi name cleanly
+    const reconnected = await mockExt.tools
+      .get("mcp_connect")
+      .execute("c2", { name: "dyn" }, undefined, undefined, ctx);
+    assert.match(reconnected.content[0].text, /ready; tools discovered and active/);
+    assert.ok(mockExt.activeTools.includes(hashedMyTool));
+    assert.ok(mockExt.activeTools.includes("mcp_dyn_my_tool"));
+  } finally {
+    await mockExt.events.get("session_shutdown")?.({}, ctx);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
