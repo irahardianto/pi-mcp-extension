@@ -138,8 +138,8 @@ flowchart TD
   first-appearance order, which a pure reorder never updates. The order is therefore a
   function of the tool set rather than eager-connect timing (#278).
 - **ResourceBridge** lazily caches each server's `resources/list` + `resources/templates/list`
-  catalog (invalidated by `notifications/resources/list_changed` and dropped on stop or
-  removal) and converts `resources/read` payloads into Pi text/image content blocks.
+  catalog (invalidated by `notifications/resources/list_changed`, dropped on stop or removal, and
+  never cached when the page limit cut it short) and converts `resources/read` payloads into Pi text/image content blocks.
 - **McpOAuthProvider** is the SDK `OAuthClientProvider`. It reads and writes per-server
   state on disk and is serialized against other Pi processes by a lock file. The
   **CallbackServer** is a loopback HTTP listener used only by the interactive flow.

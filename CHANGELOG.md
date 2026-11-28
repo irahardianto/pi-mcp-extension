@@ -6,6 +6,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Stop tool and resource discovery when a server repeats a pagination cursor, warn when the 100-page limit is reached, and refetch truncated resource catalogs instead of caching them (#350).
+
 ## [1.16.8] - 2026-11-28
 
 ### Fixed
